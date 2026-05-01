@@ -59,12 +59,14 @@ def trans_cookies(cookies_str: str) -> dict:
     """将cookies字符串转换为字典"""
     if not cookies_str:
         raise ValueError("cookies不能为空")
-        
+
+    cookies_str = str(cookies_str).replace("\ufeff", "").strip()
     cookies = {}
-    for cookie in cookies_str.split("; "):
+    for cookie in cookies_str.split(";"):
+        cookie = cookie.strip()
         if "=" in cookie:
             key, value = cookie.split("=", 1)
-            cookies[key] = value
+            cookies[key.strip()] = value.strip()
     return cookies
 
 

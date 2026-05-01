@@ -3436,6 +3436,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
             headless=not show_browser,
             initial_cookies=existing_cookie_info.get('value', ''),
             proxy=proxy_config,
+            slider_max_retries=4,
         )
         slider_instance.risk_session_id = password_login_sessions.get(session_id, {}).get('risk_session_id') or session_id
         slider_instance.risk_trigger_scene = 'manual_password_refresh' if is_refresh_mode else 'password_login'
@@ -3916,6 +3917,7 @@ async def _execute_manual_cookie_import(
             headless=not show_browser,
             initial_cookies=cookie_value,
             proxy=proxy_config,
+            slider_max_retries=4,
         )
         manual_cookie_import_sessions[session_id]['slider_instance'] = slider_instance
 
@@ -10596,6 +10598,18 @@ class UpdateResultResponse(PydanticBaseModel):
     new_version: str = ""
 
 
+def _is_auto_update_enabled() -> bool:
+    """自动更新总开关，默认关闭，避免线上实例被远端清单偷偷覆盖。"""
+    raw_value = str(os.getenv("AUTO_UPDATE_ENABLED", "false")).strip().lower()
+    return raw_value in {"1", "true", "yes", "on"}
+
+
+def _ensure_auto_update_enabled():
+    """自动更新关闭时直接拒绝整组更新接口。"""
+    if not _is_auto_update_enabled():
+        raise HTTPException(status_code=403, detail="自动更新已禁用")
+
+
 @app.get('/api/update/check')
 async def check_for_updates(current_user: Dict[str, Any] = Depends(get_current_user)):
     """
@@ -10604,6 +10618,7 @@ async def check_for_updates(current_user: Dict[str, Any] = Depends(get_current_u
     返回更新信息，包括新版本号、更新内容等
     """
     try:
+        _ensure_auto_update_enabled()
         updater = get_updater()
         manifest = await updater.check_for_updates()
         
@@ -10664,6 +10679,8 @@ async def check_for_updates(current_user: Dict[str, Any] = Depends(get_current_u
             }
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"检查更新失败: {e}")
         return {
@@ -10680,6 +10697,7 @@ async def apply_updates(current_user: Dict[str, Any] = Depends(get_current_user)
     下载并安装所有可用更新
     """
     try:
+        _ensure_auto_update_enabled()
         # 只允许管理员执行更新，兼容历史 admin 用户名判断
         if not current_user.get('is_admin') and current_user.get('username') != 'admin':
             raise HTTPException(status_code=403, detail="只有管理员可以执行更新")
@@ -10718,6 +10736,7 @@ async def get_update_progress(current_user: Dict[str, Any] = Depends(get_current
     返回当前更新状态和进度信息
     """
     try:
+        _ensure_auto_update_enabled()
         updater = get_updater()
         progress = updater.progress
         
@@ -10735,6 +10754,8 @@ async def get_update_progress(current_user: Dict[str, Any] = Depends(get_current
             }
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取更新进度失败: {e}")
         return {
@@ -10751,6 +10772,7 @@ async def get_local_file_hashes(current_user: Dict[str, Any] = Depends(get_curre
     用于服务端比对哪些文件需要更新
     """
     try:
+        _ensure_auto_update_enabled()
         # 只允许管理员查看（检查username是否为admin）
         if current_user.get('username') != 'admin':
             raise HTTPException(status_code=403, detail="只有管理员可以查看文件哈希")
@@ -10786,6 +10808,7 @@ async def cleanup_old_backups(days: int = 7, current_user: Dict[str, Any] = Depe
         days: 保留天数，默认7天
     """
     try:
+        _ensure_auto_update_enabled()
         # 只允许管理员执行（检查username是否为admin）
         if current_user.get('username') != 'admin':
             raise HTTPException(status_code=403, detail="只有管理员可以清理备份")
@@ -10818,6 +10841,7 @@ async def get_file_changes(current_user: Dict[str, Any] = Depends(get_current_us
     用于检测哪些文件在更新后被本地修改过
     """
     try:
+        _ensure_auto_update_enabled()
         # 只允许管理员查看
         if current_user.get('username') != 'admin':
             raise HTTPException(status_code=403, detail="只有管理员可以查看文件变化")
@@ -10848,6 +10872,7 @@ async def save_current_hashes(current_user: Dict[str, Any] = Depends(get_current
     用于记录当前状态，以便以后比较
     """
     try:
+        _ensure_auto_update_enabled()
         # 只允许管理员执行
         if current_user.get('username') != 'admin':
             raise HTTPException(status_code=403, detail="只有管理员可以保存哈希清单")
@@ -10878,6 +10903,7 @@ async def get_saved_hashes(current_user: Dict[str, Any] = Depends(get_current_us
     获取上次保存的文件哈希清单
     """
     try:
+        _ensure_auto_update_enabled()
         # 只允许管理员查看
         if current_user.get('username') != 'admin':
             raise HTTPException(status_code=403, detail="只有管理员可以查看哈希清单")
@@ -10921,6 +10947,7 @@ async def restart_application(current_user: Dict[str, Any] = Depends(get_current
     注意：此操作会重启整个应用
     """
     try:
+        _ensure_auto_update_enabled()
         # 只允许管理员执行
         if not current_user.get('is_admin'):
             raise HTTPException(status_code=403, detail="只有管理员可以重启应用")

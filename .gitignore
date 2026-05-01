@@ -68,6 +68,7 @@ update_files.json
 # 日志文件
 logs/
 realtime.log
+.playwright-browsers/
 
 # 数据目录
 data/

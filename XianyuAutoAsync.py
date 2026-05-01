@@ -58,6 +58,8 @@ REQUIRED_SESSION_COOKIE_FIELDS = (
     '_m_h5_tk',
     '_m_h5_tk_enc',
     't',
+)
+OBSERVED_SESSION_COOKIE_FIELDS = (
     'cna',
 )
 
@@ -1480,6 +1482,8 @@ class XianyuLive:
             cookies_str = COOKIES_STR
         if not cookies_str:
             raise ValueError("未提供cookies，请在global_config.yml中配置COOKIES_STR或通过参数传入")
+
+        cookies_str = str(cookies_str).replace("\ufeff", "").strip()
 
         logger.info(f"【{cookie_id}】解析cookies...")
         self.cookies = trans_cookies(cookies_str)
@@ -5404,32 +5408,46 @@ class XianyuLive:
         window = window_seconds or self.slider_success_reentry_window
         return (time.time() - self.last_slider_success_at) <= window
 
-    async def preflight_token_after_manual_refresh(self) -> str:
-        """手动刷新成功后的 token 预检，确认新实例可直接完成初始化。
-
-        🔧 增加重试机制：密码登录获取的 Cookie 可能需要短暂时间在服务端生效，
-        首次 Token 刷新可能因 session 未就绪而失败，等待后重试可提高成功率。
-        """
-        logger.info(f"【{self.cookie_id}】开始执行手动刷新后的Token预检...")
+    async def _preflight_token_for_fresh_auth_cookies(self, label: str, token_source: str) -> str:
+        """对刚获取到的新认证 Cookie 做一次 token 预检，避免新实例冷启动立刻撞上未生效窗口。"""
+        logger.info(f"【{self.cookie_id}】开始执行{label}...")
         self.last_message_received_time = 0
+        previous_skip_reload_flag = bool(getattr(self, '_skip_db_cookie_reload_for_token_refresh', False))
+        self._skip_db_cookie_reload_for_token_refresh = True
+        try:
+            max_preflight_retries = 3
+            for attempt in range(1, max_preflight_retries + 1):
+                token = await self.refresh_token(allow_password_login_recovery=False)
+                if token:
+                    self.cache_auth_prewarmed_token(self.cookie_id, token, source=token_source)
+                    logger.info(f"【{self.cookie_id}】{label}成功（第{attempt}次），已缓存预热token供新实例复用")
+                    return token
 
-        max_preflight_retries = 3
-        for attempt in range(1, max_preflight_retries + 1):
-            token = await self.refresh_token(allow_password_login_recovery=False)
-            if token:
-                self.cache_auth_prewarmed_token(self.cookie_id, token, source='manual_refresh_handoff')
-                logger.info(f"【{self.cookie_id}】手动刷新后的Token预检成功（第{attempt}次），已缓存预热token供新实例复用")
-                return token
+                if attempt < max_preflight_retries:
+                    wait_secs = 2.0 * attempt
+                    logger.warning(
+                        f"【{self.cookie_id}】{label}第{attempt}次失败（状态: {self.last_token_refresh_status}），"
+                        f"等待{wait_secs:.0f}秒后重试（Cookie可能尚未在服务端生效）"
+                    )
+                    await asyncio.sleep(wait_secs)
+        finally:
+            self._skip_db_cookie_reload_for_token_refresh = previous_skip_reload_flag
 
-            if attempt < max_preflight_retries:
-                wait_secs = 2.0 * attempt
-                logger.warning(
-                    f"【{self.cookie_id}】Token预检第{attempt}次失败（状态: {self.last_token_refresh_status}），"
-                    f"等待{wait_secs:.0f}秒后重试（Cookie可能尚未在服务端生效）"
-                )
-                await asyncio.sleep(wait_secs)
+        raise InitAuthError(f"{label}失败，状态: {self.last_token_refresh_status or 'unknown'}")
 
-        raise InitAuthError(f"手动刷新后的Token预检失败，状态: {self.last_token_refresh_status or 'unknown'}")
+    async def preflight_token_after_manual_refresh(self) -> str:
+        """手动刷新成功后的 token 预检，确认新实例可直接完成初始化。"""
+        return await self._preflight_token_for_fresh_auth_cookies(
+            label='手动刷新后的Token预检',
+            token_source='manual_refresh_handoff',
+        )
+
+    async def preflight_token_after_password_login(self) -> str:
+        """自动密码登录成功后的 token 预检，避免重启后首轮初始化立刻撞上 Session 未生效窗口。"""
+        return await self._preflight_token_for_fresh_auth_cookies(
+            label='密码登录后的Token预检',
+            token_source='password_login_refresh',
+        )
 
     async def refresh_token(self, captcha_retry_count: int = 0, allow_password_login_recovery: bool = True):
         if self.token_refresh_lock.locked():
@@ -5602,7 +5620,10 @@ class XianyuLive:
             # 【重要】在刷新token前，先从数据库重新加载最新的cookie
             # 这样即使用户已经手动更新了cookie，代码也会使用最新的cookie
             logger.info(f"【{self.cookie_id}】开始执行Cookie刷新任务...")
-            self._reload_latest_cookies_from_db("token刷新前")
+            if getattr(self, '_skip_db_cookie_reload_for_token_refresh', False):
+                logger.info(f"【{self.cookie_id}】当前Token刷新使用内存中的新认证Cookie，跳过token刷新前的数据库重载")
+            else:
+                self._reload_latest_cookies_from_db("token刷新前")
 
             # 生成更精确的时间戳
             timestamp = str(int(time.time() * 1000))
@@ -5920,7 +5941,26 @@ class XianyuLive:
                                             extra={'cookie_id': self.cookie_id},
                                         ),
                                     )
-                                
+
+                                if allow_password_login_recovery:
+                                    logger.warning(
+                                        f"【{self.cookie_id}】Token刷新滑块链路失败，改走账号密码登录恢复，"
+                                        f"verification_url={verification_url}"
+                                    )
+                                    refresh_success = await self._try_password_login_refresh(
+                                        "滑块验证失败",
+                                        risk_session_id=captcha_session_id,
+                                        trigger_scene=captcha_trigger_scene,
+                                    )
+                                    if refresh_success:
+                                        return await self._refresh_token_impl(
+                                            captcha_retry_count,
+                                            post_slider_session_grace_used=False,
+                                            allow_password_login_recovery=allow_password_login_recovery,
+                                            manual_refresh_browser_stabilization_used=manual_refresh_browser_stabilization_used,
+                                            post_slider_session_retry_count=0,
+                                        )
+
                                 # 标记已处理，避免后续再发送通用失败通知
                                 notification_sent = True
                         except Exception as captcha_e:
@@ -6253,12 +6293,22 @@ class XianyuLive:
                 from utils.xianyu_slider_stealth import XianyuSliderStealth
                 logger.info(f"【{self.cookie_id}】XianyuSliderStealth导入成功，使用滑块验证")
 
+                account_info = db_manager.get_cookie_details(self.cookie_id) or {}
+                force_headful = os.environ.get("XY_SLIDER_FORCE_HEADFUL", "").strip().lower() in {"1", "true", "yes", "on"}
+                show_browser = bool(account_info.get('show_browser', False) or force_headful)
+                logger.info(
+                    f"【{self.cookie_id}】自动滑块验证准备启动："
+                    f"show_browser={show_browser}, force_headful={force_headful}, "
+                    f"proxy_type={self.proxy_config.get('proxy_type', 'none')}"
+                )
+
                 # 创建独立的滑块验证实例（每个用户独立实例，避免并发冲突）
                 slider_stealth = XianyuSliderStealth(
-                    # user_id=f"{self.cookie_id}_{int(time.time() * 1000)}",  # 使用唯一ID避免冲突
-                    user_id=f"{self.cookie_id}",  # 使用唯一ID避免冲突
-                    enable_learning=True,  # 启用学习功能
-                    headless=True  # 使用有头模式（可视化浏览器）
+                    user_id=f"{self.cookie_id}",
+                    enable_learning=True,
+                    headless=not show_browser,
+                    initial_cookies=self.cookies_str,
+                    proxy=self.proxy_config,
                 )
 
                 # 直接使用异步方法执行滑块验证（避免 ThreadPoolExecutor 导致的 Playwright 初始化问题）
@@ -6768,7 +6818,8 @@ class XianyuLive:
             
             username = account_info.get('username', '')
             password = account_info.get('password', '')
-            show_browser = account_info.get('show_browser', False)
+            force_headful = os.environ.get("XY_SLIDER_FORCE_HEADFUL", "").strip().lower() in {"1", "true", "yes", "on"}
+            show_browser = bool(account_info.get('show_browser', False) or force_headful)
             
             # 检查是否配置了用户名和密码
             if not username or not password:
@@ -6810,7 +6861,13 @@ class XianyuLive:
             
             # 在单独的线程中运行同步的登录方法
             import asyncio
-            slider = XianyuSliderStealth(user_id=self.cookie_id, enable_learning=True, headless=not show_browser)
+            slider = XianyuSliderStealth(
+                user_id=self.cookie_id,
+                enable_learning=True,
+                headless=not show_browser,
+                initial_cookies=self.cookies_str,
+                proxy=self.proxy_config,
+            )
             slider.risk_session_id = risk_session_id
             slider.risk_trigger_scene = trigger_scene
             result = await asyncio.to_thread(
@@ -6826,6 +6883,50 @@ class XianyuLive:
                 logger.info(f"【{self.cookie_id}】密码登录成功，获取到Cookie")
                 logger.info(f"【{self.cookie_id}】Cookie内容: {result}")
                 XianyuLive.clear_password_login_failure_backoff(self.cookie_id)
+
+                # 密码登录返回的浏览器快照经常会遗漏 havana_lgc2_77 等关键字段；
+                # 先与当前会话做一次保护性合并，避免不完整快照把仍可复用的会话字段冲掉。
+                merge_result = self.protected_merge_cookie_dicts(self.cookies, result)
+                self._log_protected_merge_event("password_login_protected_merge", merge_result)
+                self._log_cookie_merge_summary(
+                    merge_result['merged_cookies_dict'],
+                    merge_result['updated_fields'],
+                    merge_result['changed_fields'],
+                    merge_result['new_fields'],
+                    context="密码登录Cookie合并",
+                    preserved_fields=merge_result['preserved_fields'],
+                    preserved_protected_fields=merge_result['preserved_protected_fields'],
+                    would_remove_fields=merge_result['would_remove_fields'],
+                    removed_fields=merge_result['removed_fields'],
+                    missing_protected_fields=merge_result['missing_protected_fields'],
+                    missing_required_fields=merge_result['missing_required_fields'],
+                    incoming_missing_protected_fields=merge_result['incoming_missing_protected_fields'],
+                    account_switched=merge_result['account_switched'],
+                )
+
+                if merge_result['missing_required_fields']:
+                    logger.error(
+                        f"【{self.cookie_id}】密码登录后的Cookie合并结果仍缺失核心字段，放弃继续交接: "
+                        f"{', '.join(merge_result['missing_required_fields'])}"
+                    )
+                    self.last_token_refresh_error_message = (
+                        "密码登录后的Cookie合并结果缺失核心字段: "
+                        + ', '.join(merge_result['missing_required_fields'])
+                    )
+                    if refresh_risk_log_id:
+                        self._update_risk_log(
+                            refresh_risk_log_id,
+                            session_id=risk_session_id,
+                            trigger_scene=trigger_scene,
+                            result_code='password_login_cookie_incomplete',
+                            processing_status='failed',
+                            error_message=self.last_token_refresh_error_message[:200],
+                            duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                            event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
+                        )
+                    return False
+
+                result = merge_result['merged_cookies_dict']
                 
                 # 打印密码登录获取的Cookie字段详情
                 logger.info(f"【{self.cookie_id}】========== 密码登录Cookie字段详情 ==========")
@@ -6838,7 +6939,7 @@ class XianyuLive:
                         logger.info(f"【{self.cookie_id}】  {i:2d}. {key}: {value}")
                 
                 # 检查关键字段
-                important_keys = ['unb', '_m_h5_tk', '_m_h5_tk_enc', 'cookie2', 't', 'sgcookie', 'cna']
+                important_keys = list(REQUIRED_SESSION_COOKIE_FIELDS) + list(OBSERVED_SESSION_COOKIE_FIELDS)
                 logger.info(f"【{self.cookie_id}】关键字段检查:")
                 for key in important_keys:
                     if key in result:
@@ -6851,6 +6952,38 @@ class XianyuLive:
                 # 将cookie字典转换为字符串格式
                 new_cookies_str = '; '.join([f"{k}={v}" for k, v in result.items()])
                 logger.info(f"【{self.cookie_id}】Cookie字符串摘要: {self._summarize_cookie_string(new_cookies_str)}")
+
+                # 先做 token 预检，确认这批新 Cookie 已被服务端接受，再交给新实例接管。
+                try:
+                    preflight_xianyu = XianyuLive(
+                        cookies_str=new_cookies_str,
+                        cookie_id=self.cookie_id,
+                        user_id=self.user_id,
+                        register_instance=False,
+                    )
+                    await preflight_xianyu.preflight_token_after_password_login()
+                    if preflight_xianyu.cookies_str and preflight_xianyu.cookies_str != new_cookies_str:
+                        new_cookies_str = preflight_xianyu.cookies_str
+                        result = trans_cookies(new_cookies_str)
+                        logger.info(f"【{self.cookie_id}】密码登录后的Token预检通过，将使用预检确认后的Cookie继续交接")
+                        logger.info(f"【{self.cookie_id}】预检后Cookie字符串摘要: {self._summarize_cookie_string(new_cookies_str)}")
+                except Exception as preflight_err:
+                    preflight_error = self._safe_str(preflight_err)
+                    logger.error(f"【{self.cookie_id}】密码登录成功，但Token预检失败: {preflight_error}")
+                    self.last_token_refresh_error_message = f"密码登录后的Token预检失败: {preflight_error}"
+                    XianyuLive.clear_auth_prewarmed_token(self.cookie_id)
+                    if refresh_risk_log_id:
+                        self._update_risk_log(
+                            refresh_risk_log_id,
+                            session_id=risk_session_id,
+                            trigger_scene=trigger_scene,
+                            result_code='password_login_preflight_failed',
+                            processing_status='failed',
+                            error_message=self.last_token_refresh_error_message[:200],
+                            duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                            event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
+                        )
+                    return False
                 
                 # 记录密码登录时间，防止重复登录
                 XianyuLive._last_password_login_time[self.cookie_id] = time.time()
@@ -11880,7 +12013,7 @@ class XianyuLive:
                     logger.info(f"【{target_cookie_id}】  {i:2d}. {key}: {value}")
             
             # 检查关键字段
-            important_keys = ['unb', '_m_h5_tk', '_m_h5_tk_enc', 'cookie2', 't', 'sgcookie', 'cna']
+            important_keys = list(REQUIRED_SESSION_COOKIE_FIELDS) + list(OBSERVED_SESSION_COOKIE_FIELDS)
             logger.info(f"【{target_cookie_id}】关键字段检查:")
             for key in important_keys:
                 if key in real_cookies_dict:

@@ -8,6 +8,7 @@
 import time
 import random
 import json
+import glob
 import hashlib
 import os
 import math
@@ -18,7 +19,7 @@ import subprocess
 import re
 import sys
 from datetime import datetime
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlencode, quote_plus
 from playwright.sync_api import sync_playwright as playwright_sync_playwright, ElementHandle
 try:
     from patchright.sync_api import sync_playwright as patchright_sync_playwright
@@ -928,11 +929,14 @@ class XianyuSliderStealth:
         self.proxy_config = dict(proxy or {})
         self.browser_channel = browser_channel or os.environ.get("XY_SLIDER_BROWSER_CHANNEL", "").strip() or None
         self.executable_path = executable_path or os.environ.get("XY_SLIDER_BROWSER_PATH", "").strip() or None
+        self._browser_channel_explicit = bool(self.browser_channel)
+        self._browser_path_explicit = bool(self.executable_path)
         self.slider_max_retries = max(1, min(int(slider_max_retries or 3), 4))
         self.project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         self.playwright_browser_name = os.environ.get("XY_SLIDER_PLAYWRIGHT_BROWSER", "chromium").strip() or "chromium"
         existing_playwright_cache_dir = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
         is_docker_env = os.environ.get("DOCKER_ENV", "").strip().lower() in {"1", "true", "yes", "on"}
+        self.is_docker_env = is_docker_env
         if existing_playwright_cache_dir and existing_playwright_cache_dir != "0":
             self.playwright_browser_cache_dir = existing_playwright_cache_dir
         elif is_docker_env and os.path.isdir("/ms-playwright"):
@@ -954,9 +958,13 @@ class XianyuSliderStealth:
         self.keep_verification_screenshots = (
             os.environ.get("XY_KEEP_VERIFICATION_SCREENSHOT", "").strip().lower() in {"1", "true", "yes", "on"}
         )
-        self.disable_headless_warmup = (
-            os.environ.get("XY_SLIDER_HEADLESS_WARMUP", "").strip().lower() not in {"1", "true", "yes", "on"}
-        )
+        headless_warmup_override = os.environ.get("XY_SLIDER_HEADLESS_WARMUP", "").strip().lower()
+        if headless_warmup_override:
+            self.disable_headless_warmup = headless_warmup_override not in {"1", "true", "yes", "on"}
+        else:
+            # Docker 无头容器里空白上下文更容易被风控直接判死，默认保留一次轻量预热；
+            # 桌面环境继续维持原来的“默认跳过预热”策略，避免把已有可用上下文搞脏。
+            self.disable_headless_warmup = not self.is_docker_env
         backend_env = os.environ.get("XY_SLIDER_AUTOMATION_BACKEND", "").strip().lower()
         if backend_env in {"patchright", "playwright"}:
             self.automation_backend = backend_env
@@ -968,6 +976,18 @@ class XianyuSliderStealth:
         self.page = None
         self.context = None
         self.local_browser_info = {}
+        if not self.browser_channel and not self.executable_path:
+            detected_browser = self._detect_local_browser_info()
+            if detected_browser:
+                self.local_browser_info = dict(detected_browser)
+                detected_path = str(detected_browser.get("path") or "").strip()
+                detected_channel = str(detected_browser.get("channel") or "").strip()
+                if os.name == 'nt' and detected_channel:
+                    self.browser_channel = detected_channel
+                elif detected_path:
+                    self.executable_path = detected_path
+                elif detected_channel:
+                    self.browser_channel = detected_channel
         self.playwright = None
         
         # 提取纯用户ID（移除时间戳部分）
@@ -1004,6 +1024,7 @@ class XianyuSliderStealth:
         self._slider_refresh_mode = False
         self.risk_session_id = None
         self.risk_trigger_scene = None
+        self._password_slider_runtime_hardened = False
         self.browser_features = {}
         self.browser_identity = {}
         self.profile_id = "unassigned"
@@ -1025,14 +1046,14 @@ class XianyuSliderStealth:
         # 保存最后一次使用的轨迹参数（用于分析优化）
         self.last_trajectory_params = {}
 
-        self.local_browser_info = {}
-        if self.executable_path:
+        if self.executable_path and not self.local_browser_info:
             version_text = self._read_local_browser_version(self.executable_path)
             self.local_browser_info = {
                 "path": self.executable_path,
                 "version": version_text,
                 "major_version": (version_text.split(".", 1)[0] if version_text else ""),
                 "family": self._get_browser_family(),
+                "source": "explicit_path",
             }
 
     def _fail_login(self, message: str):
@@ -1181,6 +1202,9 @@ class XianyuSliderStealth:
     def _get_slider_failure_message(self, default_message: str) -> str:
         feedback = self.last_verification_feedback or {}
         feedback_message = str(feedback.get("message") or "").strip()
+        feedback_source = str(feedback.get("source") or "").strip()
+        if feedback_source in {"punish_captcha", "feedback_block"} and feedback_message:
+            return feedback_message
         if feedback_message:
             return f"滑块验证失败：{feedback_message}"
         return default_message
@@ -1349,6 +1373,90 @@ class XianyuSliderStealth:
         self.browser_identity = identity
         return identity
 
+    def _extract_profile_window_size(self, profile_id: Optional[str]) -> Optional[str]:
+        match = re.search(r'_(\d+)x(\d+)$', str(profile_id or '').strip())
+        if not match:
+            return None
+        return f"{match.group(1)},{match.group(2)}"
+
+    def _allow_small_sample_learning(self, history: List[Dict[str, Any]],
+                                     reference_distance: Optional[float] = None) -> bool:
+        if len(history) < 2:
+            return False
+
+        profile_ids = set()
+        distances = []
+        for record in history:
+            if not isinstance(record, dict) or not record.get("success"):
+                return False
+
+            verification_result = record.get("verification_result", {}) or {}
+            record_profile_id = str(
+                record.get("profile_id")
+                or verification_result.get("profile_id")
+                or ""
+            ).strip()
+            if record_profile_id:
+                profile_ids.add(record_profile_id)
+
+            distance_value = record.get("distance")
+            if isinstance(distance_value, (int, float)):
+                distances.append(float(distance_value))
+
+        if self.profile_id and profile_ids and profile_ids != {self.profile_id}:
+            return False
+        if len(profile_ids) > 1:
+            return False
+        if reference_distance is None:
+            return False
+        if not distances or any(abs(distance - float(reference_distance)) > 12.0 for distance in distances):
+            return False
+
+        return True
+
+    def _select_preferred_browser_profile(self, browser_profiles: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        stable_profile = next(
+            (item for item in browser_profiles if item.get('window_size') == '1600,900'),
+            None,
+        )
+
+        # 无头滑块已经验证过 1600x900 更稳，别再让画像乱飘。
+        if self.headless and stable_profile:
+            return stable_profile
+
+        if self.risk_trigger_scene not in {'password_login', 'manual_password_refresh'}:
+            return None
+
+        history = self._load_success_history()
+        for record in reversed(history):
+            if not isinstance(record, dict) or not record.get("success"):
+                continue
+
+            verification_result = record.get("verification_result", {}) or {}
+            record_profile_id = str(
+                record.get("profile_id")
+                or verification_result.get("profile_id")
+                or ""
+            ).strip()
+            preferred_window_size = self._extract_profile_window_size(record_profile_id)
+            if not preferred_window_size:
+                continue
+
+            matched_profile = next(
+                (item for item in browser_profiles if item.get('window_size') == preferred_window_size),
+                None,
+            )
+            if matched_profile:
+                logger.info(
+                    f"【{self.pure_user_id}】密码登录优先复用成功画像: {record_profile_id}"
+                )
+                return matched_profile
+
+        if stable_profile:
+            logger.info(f"【{self.pure_user_id}】密码登录未命中成功画像，回退到 1600x900 稳定画像")
+            return stable_profile
+        return None
+
     def _update_current_result_meta(
         self,
         status: str,
@@ -1416,31 +1524,71 @@ class XianyuSliderStealth:
         return False, ""
 
     def _detect_local_browser_info(self) -> Dict[str, Any]:
-        if os.name != 'nt':
-            return {}
+        browser_candidates: List[Dict[str, str]] = []
 
-        browser_candidates = [
-            {
-                "family": "edge",
-                "channel": "msedge",
-                "path": r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            },
-            {
-                "family": "edge",
-                "channel": "msedge",
-                "path": r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-            },
-            {
-                "family": "chrome",
-                "channel": "chrome",
-                "path": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            },
-            {
-                "family": "chrome",
-                "channel": "chrome",
-                "path": r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-            },
-        ]
+        if os.name == 'nt':
+            browser_candidates = [
+                {
+                    "family": "edge",
+                    "channel": "msedge",
+                    "path": r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                },
+                {
+                    "family": "edge",
+                    "channel": "msedge",
+                    "path": r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                },
+                {
+                    "family": "chrome",
+                    "channel": "chrome",
+                    "path": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                },
+                {
+                    "family": "chrome",
+                    "channel": "chrome",
+                    "path": r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                },
+            ]
+        elif sys.platform.startswith("linux"):
+            browser_candidates = [
+                {
+                    "family": "chrome",
+                    "channel": "",
+                    "path": "/usr/bin/google-chrome",
+                },
+                {
+                    "family": "chrome",
+                    "channel": "",
+                    "path": "/usr/bin/google-chrome-stable",
+                },
+                {
+                    "family": "chrome",
+                    "channel": "",
+                    "path": "/opt/google/chrome/chrome",
+                },
+                {
+                    "family": "chrome",
+                    "channel": "",
+                    "path": "/usr/bin/chromium",
+                },
+                {
+                    "family": "chrome",
+                    "channel": "",
+                    "path": "/usr/bin/chromium-browser",
+                },
+                {
+                    "family": "edge",
+                    "channel": "",
+                    "path": "/usr/bin/microsoft-edge",
+                },
+                {
+                    "family": "edge",
+                    "channel": "",
+                    "path": "/usr/bin/microsoft-edge-stable",
+                },
+            ]
+        else:
+            return {}
 
         for candidate in browser_candidates:
             browser_path = candidate["path"]
@@ -1454,6 +1602,7 @@ class XianyuSliderStealth:
                 version_match = re.search(r"(\d+)(?:\.\d+){0,3}", version_text)
                 if version_match:
                     info["major_version"] = version_match.group(1)
+            info["source"] = "local_system"
             return info
 
         return {}
@@ -1486,10 +1635,13 @@ class XianyuSliderStealth:
         elif sys.platform.startswith("linux"):
             search_rules = {
                 "chromium": [
+                    ("chromium-*", os.path.join("chrome-linux64", "chrome")),
                     ("chromium-*", os.path.join("chrome-linux", "chrome")),
+                    ("chromium_headless_shell-*", os.path.join("chrome-headless-shell-linux64", "chrome-headless-shell")),
                     ("chromium-*", os.path.join("chrome-linux", "headless_shell")),
                 ],
                 "chrome": [
+                    ("chrome-*", os.path.join("chrome-linux64", "chrome")),
                     ("chrome-*", os.path.join("chrome-linux", "chrome")),
                 ],
                 "msedge": [("msedge-*", os.path.join("msedge-linux", "msedge"))],
@@ -1677,6 +1829,17 @@ class XianyuSliderStealth:
             return "edge"
         return "chrome"
 
+    def _should_prefer_project_browser_for_playwright(self) -> bool:
+        if self.automation_backend != "playwright":
+            return False
+        if self._browser_channel_explicit or self._browser_path_explicit:
+            return False
+        current_source = str((getattr(self, "local_browser_info", None) or {}).get("source") or "").strip().lower()
+        return current_source in {"", "local_system"}
+
+    def _should_prefer_project_browser_for_headless_playwright(self) -> bool:
+        return self.headless and self._should_prefer_project_browser_for_playwright()
+
     def _get_sync_playwright_factory(self):
         if self.automation_backend == "patchright" and patchright_sync_playwright is not None:
             return patchright_sync_playwright
@@ -1687,6 +1850,18 @@ class XianyuSliderStealth:
         if override in {"off", "lite", "full"}:
             return override
 
+        # Docker 无头 Playwright 在落到系统兜底浏览器时，full 改写容易把风控打醒。
+        # 但如果已经锁定到项目内浏览器缓存/显式浏览器路径，full 模式反而更稳定。
+        if self.headless and self.is_docker_env and self.automation_backend == "playwright":
+            local_browser_info = getattr(self, "local_browser_info", None) or {}
+            if (
+                str(local_browser_info.get("source") or "") == "project_playwright_cache"
+                or bool(local_browser_info.get("version"))
+                or bool(self.executable_path)
+            ):
+                return "full"
+            return "lite"
+
         # Patchright 的 init_script 是通过路由注入的，额外脚本越多越容易把自己暴露出去。
         if self.headless and self.automation_backend == "patchright":
             return "off"
@@ -1696,8 +1871,26 @@ class XianyuSliderStealth:
     def _use_headless_stable_profile(self) -> bool:
         return bool(
             self.headless
-            and str(self.profile_id or "").startswith("win_chrome_147_1600x900")
+            and str(self.profile_id or "").startswith("win_chrome_")
+            and str(self.profile_id or "").endswith("_1600x900")
         )
+
+    def _should_prefer_docker_conservative_profile(self, has_learning: bool) -> bool:
+        if has_learning:
+            return False
+        if not (self.headless and self.is_docker_env and self.automation_backend == "playwright"):
+            return False
+        if not self._use_headless_stable_profile():
+            return False
+        local_browser_info = getattr(self, "local_browser_info", None) or {}
+        return bool(
+            str(local_browser_info.get("source") or "") == "project_playwright_cache"
+            or bool(local_browser_info.get("version"))
+            or bool(self.executable_path)
+        )
+
+    def _should_force_docker_cold_start_conservative(self, attempt: int, has_learning: bool) -> bool:
+        return attempt == 1 and self._should_prefer_docker_conservative_profile(has_learning)
 
     def _get_light_stealth_script(self, browser_features: Dict[str, Any]) -> str:
         locale = json.dumps(browser_features.get("locale") or "zh-CN", ensure_ascii=False)
@@ -1750,6 +1943,60 @@ class XianyuSliderStealth:
             f"backend={self.automation_backend}, headless={self.headless}"
         )
 
+    def _apply_runtime_stealth_script(self, runtime_target, browser_features: Dict[str, Any], mode: str = "full") -> bool:
+        if runtime_target is None or not browser_features:
+            return False
+
+        script = self._get_stealth_script(browser_features)
+        if str(mode or "").strip().lower() == "lite":
+            script = self._get_light_stealth_script(browser_features)
+
+        try:
+            runtime_target.evaluate(script)
+            return True
+        except Exception as e:
+            logger.debug(f"【{self.pure_user_id}】运行时注入{mode}反检测脚本失败: {e}")
+            return False
+
+    def _harden_password_slider_runtime(self, search_target=None):
+        if not (self.headless and self._is_password_login_scene() and self.page):
+            return
+
+        browser_features = dict(self.browser_features or {})
+        if not browser_features:
+            return
+
+        full_script = self._get_stealth_script(browser_features)
+        if not self._password_slider_runtime_hardened:
+            try:
+                self.page.add_init_script(full_script)
+            except Exception as e:
+                logger.debug(f"【{self.pure_user_id}】补充注册账密滑块 full init_script 失败: {e}")
+
+            try:
+                self._apply_headless_network_fingerprint(self.page, browser_features)
+            except Exception as e:
+                logger.debug(f"【{self.pure_user_id}】补强账密滑块网络指纹失败: {e}")
+
+            self._password_slider_runtime_hardened = True
+            logger.info(f"【{self.pure_user_id}】账密滑块场景已切换到 full runtime stealth 补强")
+
+        applied_targets = []
+        targets = []
+        if search_target is not None:
+            targets.append(("target", search_target))
+        if self.page is not None and self.page is not search_target:
+            targets.append(("page", self.page))
+
+        for target_name, runtime_target in targets:
+            if self._apply_runtime_stealth_script(runtime_target, browser_features, mode="full"):
+                applied_targets.append(target_name)
+
+        if applied_targets:
+            logger.info(
+                f"【{self.pure_user_id}】已对账密滑块当前文档补注入 full stealth: {', '.join(applied_targets)}"
+            )
+
     def _collect_runtime_debug_info(self, search_target=None) -> Dict[str, Any]:
         runtime_targets = []
         if search_target is not None:
@@ -1778,12 +2025,41 @@ class XianyuSliderStealth:
                     href: location.href,
                     title: document.title,
                     readyState: document.readyState,
+                    visibilityState: document.visibilityState,
                     userAgent: navigator.userAgent,
                     webdriver: navigator.webdriver,
                     languages: Array.from(navigator.languages || []),
                     platform: navigator.platform,
                     vendor: navigator.vendor,
                     brands,
+                    userAgentDataMobile: !!(navigator.userAgentData && navigator.userAgentData.mobile),
+                    innerWidth: window.innerWidth,
+                    innerHeight: window.innerHeight,
+                    outerWidth: window.outerWidth,
+                    outerHeight: window.outerHeight,
+                    devicePixelRatio: window.devicePixelRatio,
+                    screenWidth: screen.width,
+                    screenHeight: screen.height,
+                    availWidth: screen.availWidth,
+                    availHeight: screen.availHeight,
+                    pluginCount: navigator.plugins ? navigator.plugins.length : -1,
+                    mimeTypeCount: navigator.mimeTypes ? navigator.mimeTypes.length : -1,
+                    notificationPermission: (window.Notification && Notification.permission) || '',
+                    chromeKeys: window.chrome ? Object.keys(window.chrome).slice(0, 20) : [],
+                    localStorageKeys: (() => {
+                        try {
+                            return Object.keys(window.localStorage || {}).slice(0, 30);
+                        } catch (e) {
+                            return ['__unavailable__'];
+                        }
+                    })(),
+                    sessionStorageKeys: (() => {
+                        try {
+                            return Object.keys(window.sessionStorage || {}).slice(0, 30);
+                        } catch (e) {
+                            return ['__unavailable__'];
+                        }
+                    })(),
                     hasNocaptcha: !!document.querySelector('#nocaptcha'),
                     hasSliderButton: !!document.querySelector('#nc_1_n1z'),
                     hasSliderTrack: !!document.querySelector('#nc_1_n1t'),
@@ -1911,7 +2187,37 @@ class XianyuSliderStealth:
         if not self.initial_cookies:
             return []
 
+        cross_domain_cookie_names = {
+            "t",
+            "tracknick",
+            "isg",
+            "unb",
+            "cookie2",
+            "_tb_token_",
+            "sgcookie",
+            "csg",
+            "tfstk",
+            "_m_h5_tk",
+            "_m_h5_tk_enc",
+            "havana_lgc2_77",
+            "_hvn_lgc_",
+            "havana_lgc_exp",
+            "mtop_partitioned_detect",
+            "_samesite_flag_",
+            "sdkSilent",
+            "cna",
+            "x5sec",
+            "x5secdata",
+            "XSRF-TOKEN",
+            "thw",
+            "cbc",
+            "cnaui",
+            "aui",
+            "sca",
+        }
+        target_domains = [".goofish.com"]
         cookies: List[Dict[str, Any]] = []
+        seen = set()
         for cookie_pair in self.initial_cookies.split(";"):
             cookie_pair = cookie_pair.strip()
             if not cookie_pair or "=" not in cookie_pair:
@@ -1921,12 +2227,22 @@ class XianyuSliderStealth:
             value = value.strip()
             if not name:
                 continue
-            cookies.append({
-                "name": name,
-                "value": value,
-                "domain": ".goofish.com",
-                "path": "/",
-            })
+
+            domains = list(target_domains)
+            if name in cross_domain_cookie_names:
+                domains.append(".taobao.com")
+
+            for domain in domains:
+                dedupe_key = (name, value, domain)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                cookies.append({
+                    "name": name,
+                    "value": value,
+                    "domain": domain,
+                    "path": "/",
+                })
         return cookies
 
     def _try_reset_slider_error_state(self, search_root, slider_container=None) -> bool:
@@ -1976,7 +2292,7 @@ class XianyuSliderStealth:
     def init_browser(self):
         """初始化浏览器 - 增强反检测版本"""
         try:
-            if not self.browser_channel and not self.executable_path:
+            if self._should_prefer_project_browser_for_playwright():
                 self._ensure_project_playwright_browser()
 
             # 启动 Playwright
@@ -2163,6 +2479,119 @@ class XianyuSliderStealth:
             logger.warning(f"【{self.pure_user_id}】加载历史数据失败: {e}")
             return []
     
+    def _get_learning_history_with_fallback(self, reference_distance: Optional[float] = None,
+                                            limit: int = 24) -> List[Dict[str, Any]]:
+        """Cold-start fallback: reuse recent success samples from the same headless profile."""
+        history = self._load_success_history()
+        if len(history) >= 3 or not self._use_headless_stable_profile():
+            return history
+
+        try:
+            history_dir = os.path.dirname(self.success_history_file) or "trajectory_history"
+            current_file = os.path.abspath(self.success_history_file)
+            matched_records = []
+            relaxed_records = []
+            distance_tolerance = 3.0 if self._is_password_login_scene() else 12.0
+
+            for history_path in glob.glob(os.path.join(history_dir, "*_success.json")):
+                try:
+                    if os.path.abspath(history_path) == current_file:
+                        continue
+
+                    with open(history_path, 'r', encoding='utf-8') as f:
+                        raw_records = json.load(f)
+
+                    if isinstance(raw_records, dict):
+                        raw_records = [raw_records]
+                    if not isinstance(raw_records, list):
+                        continue
+
+                    for record in raw_records:
+                        if not isinstance(record, dict) or not record.get("success"):
+                            continue
+                        if not self._is_password_scene_success_sample(history_path, record):
+                            continue
+
+                        verification_result = record.get("verification_result", {}) or {}
+                        record_headless = bool(record.get("headless", verification_result.get("headless", self.headless)))
+                        if record_headless != bool(self.headless):
+                            continue
+
+                        record_profile_id = str(
+                            record.get("profile_id")
+                            or verification_result.get("profile_id")
+                            or ""
+                        ).strip()
+                        if self.profile_id and record_profile_id and record_profile_id != self.profile_id:
+                            continue
+
+                        distance_value = record.get("distance")
+                        if reference_distance is not None and isinstance(distance_value, (int, float)):
+                            if abs(float(distance_value) - float(reference_distance)) <= distance_tolerance:
+                                matched_records.append(record)
+                            else:
+                                relaxed_records.append(record)
+                        else:
+                            matched_records.append(record)
+                except Exception as history_err:
+                    logger.debug(f"【{self.pure_user_id}】读取全局成功样本失败 {history_path}: {history_err}")
+
+            matched_records.sort(key=lambda item: item.get("timestamp", 0), reverse=True)
+            relaxed_records.sort(key=lambda item: item.get("timestamp", 0), reverse=True)
+
+            if reference_distance is not None and len(matched_records) < 3 and not self._is_password_login_scene():
+                matched_records.extend(relaxed_records)
+
+            if limit > 0:
+                matched_records = matched_records[:limit]
+
+            if matched_records:
+                needed = max(0, limit - len(history))
+                injected_records = matched_records[:needed]
+                history = list(history) + injected_records
+                logger.info(
+                    f"【{self.pure_user_id}】本地成功记录不足，补充加载 {len(injected_records)} 条同画像全局成功样本"
+                )
+        except Exception as e:
+            logger.debug(f"【{self.pure_user_id}】加载全局成功样本失败: {e}")
+
+        return history
+
+    def _get_password_scene_final_retry_template(self, effective_ranges: Dict[str, Tuple[float, float]],
+                                                 bounds: Dict[str, Any]) -> Dict[str, Tuple[float, float]]:
+        def clamp_range(source_range: Tuple[float, float], hard_range: Tuple[float, float], fallback: Tuple[float, float]):
+            lower = max(source_range[0], hard_range[0])
+            upper = min(source_range[1], hard_range[1])
+            if lower > upper:
+                lower, upper = fallback
+            return (lower, upper)
+
+        overshoot = clamp_range(
+            effective_ranges["overshoot"],
+            (1.028, min(bounds.get("max_overshoot_ratio", 1.18), 1.055)),
+            (1.032, 1.050),
+        )
+        delay = clamp_range(effective_ranges["delay"], (0.0108, 0.0128), (0.0110, 0.0124))
+        curve = clamp_range(effective_ranges["curve"], (1.76, 1.86), (1.78, 1.84))
+        jitter = clamp_range(
+            effective_ranges["jitter"],
+            (max(bounds.get("min_y_jitter", 0.8), 1.55), min(bounds.get("max_y_jitter", 3.5), 2.35)),
+            (1.70, 2.20),
+        )
+
+        step_min = max(30, effective_ranges["steps"][0], 32)
+        step_max = min(36, max(step_min, effective_ranges["steps"][1]))
+        if step_min > step_max:
+            step_min, step_max = 32, 35
+
+        return {
+            "overshoot": overshoot,
+            "delay": delay,
+            "curve": curve,
+            "jitter": jitter,
+            "steps": (step_min, step_max),
+        }
+
     def _save_success_record(self, trajectory_data: Dict[str, Any]):
         """保存成功记录（增强版 - 记录所有随机参数用于学习优化）"""
         try:
@@ -2408,16 +2837,19 @@ class XianyuSliderStealth:
         except Exception as e:
             logger.debug(f"【{self.pure_user_id}】保存调试快照失败: {e}")
     
-    def _optimize_trajectory_params(self) -> Dict[str, Any]:
+    def _optimize_trajectory_params(self, reference_distance: Optional[float] = None) -> Dict[str, Any]:
         """基于历史成功数据优化轨迹参数（增强版 - 智能学习）"""
         try:
             if not self.enable_learning:
                 return self.trajectory_params
             
-            history = self._load_success_history()
-            if len(history) < 3:  # 至少需要3条成功记录才开始优化
+            history = self._get_learning_history_with_fallback(reference_distance=reference_distance)
+            required_history_count = 2 if self._allow_small_sample_learning(history, reference_distance) else 3
+            if len(history) < required_history_count:
                 logger.info(f"【{self.pure_user_id}】历史成功数据不足({len(history)}条)，使用默认参数")
                 return self.trajectory_params
+            if required_history_count == 2:
+                logger.info(f"【{self.pure_user_id}】成功样本虽仅2条，但同画像且同距离区间，直接启用学习参数")
             
             # 🎯 新版参数学习：基于新的随机参数结构
             # 收集新版参数（overshoot_ratio, acceleration_curve等）
@@ -2769,15 +3201,9 @@ class XianyuSliderStealth:
             # 等待一下确保cookie完全更新
             time.sleep(1)
             
-            # 获取浏览器中的所有cookie
-            cookies = self.context.cookies()
-            
-            if cookies:
-                # 将cookie转换为字典格式
-                new_cookies = {}
-                for cookie in cookies:
-                    new_cookies[cookie['name']] = cookie['value']
-                
+            new_cookies = self._snapshot_context_cookies(self.context, page=self.page)
+
+            if new_cookies:
                 logger.info(f"【{self.pure_user_id}】滑块验证成功后已获取cookie，共{len(new_cookies)}个cookie")
                 
                 # 记录所有cookie的详细信息
@@ -2849,18 +3275,94 @@ class XianyuSliderStealth:
         '_m_h5_tk',
         '_m_h5_tk_enc',
         't',
+    )
+    _OBSERVED_SESSION_COOKIE_FIELDS = (
         'cna',
+    )
+    _IDENTITY_VERIFY_PENDING_COOKIE_FIELDS = (
+        'ivActionType',
+        'tmp0',
+        'siv20',
+        'last_u_xianyu_web',
     )
     _X5_COOKIE_PREFIX = 'x5'
 
-    def _snapshot_context_cookies(self, context=None) -> Dict[str, str]:
-        """快照浏览器上下文中的所有 Cookie，返回 {name: value} 字典"""
+    def _snapshot_context_cookies_via_cdp(self, context=None, page=None) -> Dict[str, str]:
+        """通过 CDP 兜底抓取 Chromium 全量 Cookie，补齐 Playwright context.cookies() 可能遗漏的票据。"""
+        current_context = context or self.context
+        if not current_context:
+            return {}
+
+        probe_page = page
+        if not probe_page:
+            pages = self._get_context_pages(current_context)
+            probe_page = pages[0] if pages else None
+        if not probe_page:
+            return {}
+
+        session = None
+        try:
+            session = current_context.new_cdp_session(probe_page)
+            try:
+                session.send("Network.enable")
+            except Exception:
+                pass
+            response = session.send("Network.getAllCookies") or {}
+            raw_cookies = response.get("cookies") if isinstance(response, dict) else []
+            merged = {}
+            for item in raw_cookies or []:
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    continue
+                merged[name] = str(item.get("value") or "")
+            return merged
+        except Exception as cdp_e:
+            logger.debug(f"【{self.pure_user_id}】CDP Cookie 快照失败: {cdp_e}")
+            return {}
+        finally:
+            if session:
+                try:
+                    session.detach()
+                except Exception:
+                    pass
+
+    def _snapshot_context_cookies(self, context=None, page=None) -> Dict[str, str]:
+        """快照浏览器上下文中的所有 Cookie，返回 {name: value} 字典。"""
         try:
             current_context = context or self.context
             if not current_context:
                 return {}
-            raw = current_context.cookies()
-            return {c['name']: c['value'] for c in raw} if raw else {}
+
+            playwright_cookies = {}
+            try:
+                raw = current_context.cookies()
+                playwright_cookies = {c['name']: c['value'] for c in raw} if raw else {}
+            except Exception as playwright_e:
+                logger.debug(f"【{self.pure_user_id}】Playwright Cookie 快照失败: {playwright_e}")
+
+            cdp_cookies = self._snapshot_context_cookies_via_cdp(current_context, page=page)
+            if not cdp_cookies:
+                return playwright_cookies
+
+            merged_cookies = dict(playwright_cookies)
+            merged_cookies.update(cdp_cookies)
+
+            extra_keys = sorted(set(cdp_cookies.keys()) - set(playwright_cookies.keys()))
+            if extra_keys:
+                protected_from_cdp = [
+                    key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
+                    if key in extra_keys
+                ]
+                logger.info(
+                    f"【{self.pure_user_id}】CDP Cookie 快照补充了 {len(extra_keys)} 个字段: "
+                    f"{extra_keys[:12]}{' ...' if len(extra_keys) > 12 else ''}"
+                )
+                if protected_from_cdp:
+                    logger.info(
+                        f"【{self.pure_user_id}】CDP Cookie 快照补到了关键字段: {protected_from_cdp}"
+                    )
+
+            return merged_cookies
         except Exception as e:
             logger.warning(f"【{self.pure_user_id}】快照 Cookie 失败: {e}")
             return {}
@@ -2892,6 +3394,471 @@ class XianyuSliderStealth:
                 f"field_count={len(cookies_dict)}, "
                 f"missing_required_fields={missing_required_fields}"
             )
+
+    def _detect_pending_identity_verification_cookie_state(self, cookies_dict: Dict[str, str]) -> List[str]:
+        """识别“前端已登录但仍卡在二次身份校验态”的 Cookie 痕迹。"""
+        if not cookies_dict:
+            return []
+
+        pending_markers = [
+            key for key in self._IDENTITY_VERIFY_PENDING_COOKIE_FIELDS
+            if cookies_dict.get(key)
+        ]
+        if not pending_markers:
+            return []
+
+        if cookies_dict.get('havana_lgc2_77') or cookies_dict.get('x5secdata'):
+            return []
+
+        return pending_markers
+
+    def _resolve_pending_identity_verification_url(self, cookies_dict: Dict[str, str]) -> Optional[str]:
+        """基于半登录态 Cookie 反查身份校验页面链接。"""
+        if not cookies_dict:
+            return None
+
+        cookie_text = '; '.join(
+            f"{key}={value}"
+            for key, value in cookies_dict.items()
+            if key and value is not None
+        )
+        if not cookie_text:
+            return None
+
+        try:
+            verification_url = resolve_verification_url_from_cookie(
+                cookie_text,
+                proxy=self.proxy_config,
+            )
+            if verification_url:
+                logger.info(
+                    f"【{self.pure_user_id}】已根据半登录态Cookie反查到身份验证链接: {verification_url}"
+                )
+                return verification_url
+        except Exception as resolve_err:
+            logger.warning(
+                f"【{self.pure_user_id}】根据半登录态Cookie反查身份验证链接失败: {resolve_err}"
+            )
+
+        return None
+
+    def _is_password_login_scene(self) -> bool:
+        return self.risk_trigger_scene in {'password_login', 'manual_password_refresh'}
+
+    def _is_password_scene_success_sample(self, history_path: str, record: Optional[Dict[str, Any]] = None) -> bool:
+        if not self._is_password_login_scene():
+            return True
+
+        parts = [os.path.basename(str(history_path or ""))]
+        if isinstance(record, dict):
+            parts.append(str(record.get("user_id") or ""))
+
+        sample_text = " ".join(parts).lower()
+        if not sample_text:
+            return False
+
+        if any(token in sample_text for token in ("cookie", "import_user_cookie", "ui_cookie")):
+            return False
+
+        return any(token in sample_text for token in ("password", "pwd"))
+
+    def _handle_pending_identity_verification_state(
+        self,
+        context,
+        fallback_page,
+        cookies_dict: Dict[str, str],
+        notification_callback: Optional[Callable] = None,
+        notification_scene: str = '账号密码登录',
+    ):
+        """处理“前端已登录但服务端仍要求二次身份校验”的半登录态。"""
+        pending_identity_markers = self._detect_pending_identity_verification_cookie_state(cookies_dict)
+        if not pending_identity_markers:
+            return None
+
+        logger.error(
+            f"【{self.pure_user_id}】检测到前端已登录但仍处于二次身份校验态，"
+            f"待确认Cookie标记: {pending_identity_markers}"
+        )
+        logger.error(
+            f"【{self.pure_user_id}】该状态下通常不会下发完整业务会话Cookie，"
+            f"例如 havana_lgc2_77 / x5secdata"
+        )
+
+        monitor_page = self._select_monitor_page(context, fallback_page) or fallback_page
+        if monitor_page:
+            try:
+                has_qr, qr_frame = self._detect_qr_code_verification(monitor_page)
+                if has_qr:
+                    logger.warning(f"【{self.pure_user_id}】半登录态下检测到可见身份验证页，转入验证等待流程")
+                    return self._process_verification_requirement(
+                        context,
+                        monitor_page,
+                        qr_frame,
+                        notification_callback,
+                        notification_scene,
+                    )
+            except PasswordLoginVerificationError:
+                raise
+            except Exception as verify_probe_err:
+                logger.warning(
+                    f"【{self.pure_user_id}】半登录态复检身份验证页失败，准备尝试反查验证链接: {verify_probe_err}"
+                )
+
+        verification_url = self._resolve_pending_identity_verification_url(cookies_dict)
+        if verification_url and context:
+            verify_page = None
+            try:
+                verify_page = context.new_page()
+                logger.info(f"【{self.pure_user_id}】打开反查到的身份验证链接...")
+                verify_page.goto(verification_url, wait_until="domcontentloaded", timeout=30000)
+                time.sleep(2)
+
+                verification_type = self._detect_verification_type(verify_page)
+                if verification_type == 'unknown' and 'identity_verify' in verification_url.lower():
+                    verification_type = 'qr_verify'
+
+                verification_screenshot = self._capture_verification_screenshot(verify_page)
+                verification_wrapper = VerificationFrameWrapper(
+                    verify_page,
+                    verification_type=verification_type,
+                    verify_url=verification_url,
+                    screenshot_path=verification_screenshot,
+                )
+                logger.warning(f"【{self.pure_user_id}】已根据半登录态Cookie恢复身份验证页面，转入验证等待流程")
+                return self._process_verification_requirement(
+                    context,
+                    verify_page,
+                    verification_wrapper,
+                    notification_callback,
+                    notification_scene,
+                )
+            except Exception as open_verify_err:
+                logger.warning(
+                    f"【{self.pure_user_id}】打开反查到的身份验证链接失败: {open_verify_err}"
+                )
+                try:
+                    if verify_page:
+                        verify_page.close()
+                except Exception:
+                    pass
+
+            self._notify_verification_required(
+                'qr_verify',
+                verification_url,
+                None,
+                notification_callback,
+                notification_scene,
+            )
+            return self._fail_login(
+                "检测到二次身份校验未完成，请按通知中的验证链接完成验证后重试"
+            )
+
+        return self._fail_login(
+            "检测到二次身份校验未完成，当前仅形成前端登录态，服务端会话未建立"
+        )
+
+    def _extract_set_cookie_updates_from_playwright_response(self, response) -> Dict[str, str]:
+        """从 Playwright Response 中提取 Set-Cookie，避免关键票据已下发但未沉淀到 context.cookies。"""
+        if not response:
+            return {}
+
+        set_cookie_values = []
+        try:
+            if hasattr(response, 'header_values'):
+                set_cookie_values = response.header_values('set-cookie') or []
+        except Exception:
+            set_cookie_values = []
+
+        if not set_cookie_values:
+            try:
+                if hasattr(response, 'header_value'):
+                    raw_value = response.header_value('set-cookie')
+                    if raw_value:
+                        set_cookie_values = [item.strip() for item in str(raw_value).splitlines() if item.strip()]
+            except Exception:
+                set_cookie_values = []
+
+        if not set_cookie_values:
+            try:
+                headers = response.headers or {}
+                raw_value = headers.get('set-cookie') or headers.get('Set-Cookie')
+                if isinstance(raw_value, list):
+                    set_cookie_values = [str(item).strip() for item in raw_value if str(item).strip()]
+                elif raw_value:
+                    set_cookie_values = [item.strip() for item in str(raw_value).splitlines() if item.strip()]
+            except Exception:
+                set_cookie_values = []
+
+        updates = {}
+        for cookie_line in set_cookie_values:
+            first_part = str(cookie_line).split(';', 1)[0].strip()
+            if not first_part or '=' not in first_part:
+                continue
+            name, value = first_part.split('=', 1)
+            name = name.strip()
+            value = value.strip()
+            if not name:
+                continue
+            updates[name] = value
+        return updates
+
+    def _stabilize_logged_in_context_cookies(self, context, page=None, scene: str = "登录完成后") -> Dict[str, str]:
+        """登录成功后补做一次轻量页面稳定化，尽量把延迟下发的会话 Cookie 补齐。"""
+        best_cookies = self._snapshot_context_cookies(context, page=page)
+        best_missing = [
+            key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
+            if not best_cookies.get(key)
+        ]
+        self._log_cookie_snapshot_integrity(best_cookies, f"{scene}初始快照")
+        if not best_missing:
+            return best_cookies
+
+        work_page = page
+        if not work_page:
+            pages = self._get_context_pages(context)
+            work_page = pages[0] if pages else None
+        if not work_page:
+            return best_cookies
+
+        actions = [
+            ("reload_current", None),
+            ("goto_home", "https://www.goofish.com/"),
+            ("goto_im", "https://www.goofish.com/im"),
+        ]
+
+        logger.info(
+            f"【{self.pure_user_id}】{scene}检测到关键Cookie缺失，开始轻量稳定化: "
+            f"missing_protected_fields={best_missing}"
+        )
+
+        for action_name, target_url in actions:
+            try:
+                if target_url:
+                    logger.info(f"【{self.pure_user_id}】{scene}稳定化动作: {action_name} -> {target_url}")
+                    work_page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
+                else:
+                    logger.info(f"【{self.pure_user_id}】{scene}稳定化动作: {action_name}")
+                    work_page.reload(wait_until="domcontentloaded", timeout=15000)
+            except Exception as nav_e:
+                logger.warning(f"【{self.pure_user_id}】{scene}稳定化动作 {action_name} 失败: {nav_e}")
+                continue
+
+            time.sleep(1.0)
+            try:
+                work_page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+            current_cookies = self._snapshot_context_cookies(context, page=work_page)
+            current_missing = [
+                key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
+                if not current_cookies.get(key)
+            ]
+            self._log_cookie_snapshot_integrity(current_cookies, f"{scene}稳定化[{action_name}]")
+
+            if current_cookies and len(current_missing) < len(best_missing):
+                best_cookies = current_cookies
+                best_missing = current_missing
+                logger.info(
+                    f"【{self.pure_user_id}】{scene}稳定化后关键Cookie缺失减少到 {len(best_missing)} 个: {best_missing}"
+                )
+
+            if not best_missing:
+                break
+
+        if best_missing:
+            warmed_cookies = self._perform_browser_cookie_warmup_probes(
+                context,
+                work_page,
+                scene=scene,
+                initial_cookies=best_cookies,
+            )
+            warmed_missing = [
+                key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
+                if not warmed_cookies.get(key)
+            ]
+            if warmed_cookies and len(warmed_missing) < len(best_missing):
+                best_cookies = warmed_cookies
+                best_missing = warmed_missing
+
+        return best_cookies
+
+    def _build_browser_mtop_probe_requests(self, cookies_dict: Dict[str, str]) -> List[Dict[str, str]]:
+        """构造登录成功后的浏览器侧业务预热探测请求。"""
+        token = str((cookies_dict or {}).get('_m_h5_tk') or '').split('_')[0]
+        user_id = str((cookies_dict or {}).get('unb') or '').strip()
+        if not token or not user_id:
+            return []
+
+        common_params = {
+            'jsv': '2.7.2',
+            'appKey': '34839810',
+            'v': '1.0',
+            'type': 'originaljson',
+            'accountSite': 'xianyu',
+            'dataType': 'json',
+            'timeout': '20000',
+            'sessionOption': 'AutoLoginOnly',
+            'spm_cnt': 'a21ybx.im.0.0',
+        }
+        probes: List[Dict[str, str]] = []
+
+        token_ts = str(int(time.time() * 1000))
+        token_data = json.dumps(
+            {
+                "appKey": "444e9908a51d1cb236a27862abc769c9",
+                "deviceId": generate_cookie_verification_device_id(user_id),
+            },
+            separators=(',', ':'),
+            ensure_ascii=False,
+        )
+        token_params = dict(common_params)
+        token_params.update({
+            't': token_ts,
+            'api': 'mtop.taobao.idlemessage.pc.login.token',
+            'dangerouslySetWindvaneParams': '%5Bobject%20Object%5D',
+            'smToken': 'token',
+            'queryToken': 'sm',
+            'sm': 'sm',
+            'sign': build_cookie_verification_sign(token_ts, token, token_data),
+        })
+        probes.append({
+            'name': 'login_token_fetch',
+            'url': (
+                "https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/?"
+                + urlencode(token_params)
+            ),
+            'body': f"data={quote_plus(token_data)}",
+        })
+
+        user_ts = str(int(time.time() * 1000))
+        user_data = '{}'
+        user_params = dict(common_params)
+        user_params.update({
+            't': user_ts,
+            'api': 'mtop.taobao.idlemessage.pc.loginuser.get',
+            'sign': build_cookie_verification_sign(user_ts, token, user_data),
+        })
+        probes.append({
+            'name': 'login_user_fetch',
+            'url': (
+                "https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.loginuser.get/1.0/?"
+                + urlencode(user_params)
+            ),
+            'body': f"data={quote_plus(user_data)}",
+        })
+
+        return probes
+
+    def _perform_browser_cookie_warmup_probes(
+        self,
+        context,
+        page,
+        scene: str,
+        initial_cookies: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
+        """在浏览器上下文中主动探测业务接口，尝试逼出延迟下发的关键 Cookie。"""
+        if not context or not page:
+            return initial_cookies or {}
+
+        best_cookies = dict(initial_cookies or self._snapshot_context_cookies(context, page=page))
+        best_missing = [
+            key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
+            if not best_cookies.get(key)
+        ]
+        probe_requests = self._build_browser_mtop_probe_requests(best_cookies)
+        if not probe_requests:
+            logger.info(f"【{self.pure_user_id}】{scene}浏览器业务预热跳过：缺少 _m_h5_tk 或 unb")
+            return best_cookies
+
+        logger.info(
+            f"【{self.pure_user_id}】{scene}标准稳定化后仍缺少关键Cookie，开始浏览器业务预热: "
+            f"missing_protected_fields={best_missing}"
+        )
+
+        for probe in probe_requests:
+            probe_name = probe.get('name') or 'unknown_probe'
+            try:
+                logger.info(f"【{self.pure_user_id}】{scene}浏览器业务预热探测: {probe_name}")
+                probe_result = page.evaluate(
+                    """
+                    async ({ url, body }) => {
+                        try {
+                            const resp = await fetch(url, {
+                                method: 'POST',
+                                credentials: 'include',
+                                cache: 'no-store',
+                                headers: {
+                                    'accept': 'application/json, text/plain, */*',
+                                    'content-type': 'application/x-www-form-urlencoded',
+                                },
+                                body,
+                            });
+                            const text = await resp.text();
+                            return {
+                                ok: resp.ok,
+                                status: resp.status,
+                                text: text.slice(0, 600),
+                            };
+                        } catch (error) {
+                            return {
+                                ok: false,
+                                status: 0,
+                                error: String(error),
+                            };
+                        }
+                    }
+                    """,
+                    {"url": probe['url'], "body": probe['body']},
+                )
+                if isinstance(probe_result, dict):
+                    summary = str(
+                        probe_result.get('error')
+                        or probe_result.get('text')
+                        or ''
+                    ).replace('\n', ' ')[:220]
+                    logger.info(
+                        f"【{self.pure_user_id}】{scene}浏览器业务预热结果[{probe_name}]: "
+                        f"status={probe_result.get('status')} ok={probe_result.get('ok')} summary={summary}"
+                    )
+                    if (
+                        "FAIL_SYS_SESSION_EXPIRED" in summary or
+                        "FAIL_SYS_USER_VALIDATE" in summary
+                    ):
+                        logger.warning(
+                            f"【{self.pure_user_id}】{scene}浏览器业务预热[{probe_name}]仍提示服务端Session未就绪"
+                        )
+            except Exception as probe_e:
+                logger.warning(f"【{self.pure_user_id}】{scene}浏览器业务预热[{probe_name}]失败: {probe_e}")
+                continue
+
+            time.sleep(1.0)
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+            current_cookies = self._snapshot_context_cookies(context, page=page)
+            current_missing = [
+                key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
+                if not current_cookies.get(key)
+            ]
+            self._log_cookie_snapshot_integrity(current_cookies, f"{scene}业务预热[{probe_name}]")
+
+            if current_cookies and len(current_missing) < len(best_missing):
+                best_cookies = current_cookies
+                best_missing = current_missing
+                logger.info(
+                    f"【{self.pure_user_id}】{scene}浏览器业务预热后关键Cookie缺失减少到 "
+                    f"{len(best_missing)} 个: {best_missing}"
+                )
+
+            if not best_missing:
+                break
+
+        return best_cookies
 
     def _safe_page_url(self, page) -> str:
         try:
@@ -3330,7 +4297,7 @@ class XianyuSliderStealth:
 
     def _probe_context_login_success(self, context, fallback_page=None) -> Tuple[bool, Any, Dict[str, str]]:
         monitor_page = self._select_monitor_page(context, fallback_page)
-        cookie_dict = self._snapshot_context_cookies(context)
+        cookie_dict = self._snapshot_context_cookies(context, page=monitor_page)
 
         if monitor_page:
             try:
@@ -3357,15 +4324,15 @@ class XianyuSliderStealth:
             probe_page.goto('https://www.goofish.com/im', wait_until='domcontentloaded', timeout=30000)
             time.sleep(1.5)
 
-            probe_cookies = self._snapshot_context_cookies(context)
+            probe_cookies = self._snapshot_context_cookies(context, page=probe_page)
             probe_url = self._safe_page_url(probe_page)
             if self._check_login_success_by_element(probe_page):
                 logger.success(f"【{self.pure_user_id}】✅ 通过探测页面确认登录成功")
-                return True, monitor_page or fallback_page, probe_cookies
+                return True, probe_page, probe_cookies
 
             if self._has_completed_login_cookies(probe_cookies) and self._is_logged_in_url(probe_url):
                 logger.success(f"【{self.pure_user_id}】✅ 通过探测页面URL和Cookie确认登录成功")
-                return True, monitor_page or fallback_page, probe_cookies
+                return True, probe_page, probe_cookies
         except Exception as e:
             logger.debug(f"【{self.pure_user_id}】探测上下文登录状态失败: {e}")
         finally:
@@ -3392,15 +4359,15 @@ class XianyuSliderStealth:
 
         login_success, active_page, _ = self._probe_context_login_success(context, page)
         if login_success:
-            cookies_dict = self._snapshot_context_cookies(context)
-            logger.info(f"【{self.pure_user_id}】复检已登录成功，Cookie字段数: {len(cookies_dict)}")
-            if cookies_dict:
-                self._log_cookie_snapshot_integrity(cookies_dict, f"{missing_field}复检已登录场景")
-                logger.success(f"【{self.pure_user_id}】✅ 页面实际已登录，停止继续账密输入")
-                return True, cookies_dict
-
-            logger.error(f"【{self.pure_user_id}】❌ 复检已登录后仍未获取到有效Cookie")
-            return True, self._fail_login("复检已登录后未获取到有效Cookie")
+            cookies_result = self._finalize_logged_in_cookies(
+                context,
+                active_page or page,
+                scene=f"{missing_field}复检已登录",
+                notification_callback=notification_callback,
+                notification_scene=notification_scene,
+            )
+            logger.success(f"【{self.pure_user_id}】✅ 页面实际已登录，停止继续账密输入")
+            return True, cookies_result
 
         monitor_page = self._select_monitor_page(context, active_page or page) or active_page or page
         if monitor_page:
@@ -3483,6 +4450,96 @@ class XianyuSliderStealth:
                     logger.warning(f"【{self.pure_user_id}】⚠️ 删除截图失败: {e}")
         except Exception as e:
             logger.error(f"【{self.pure_user_id}】删除截图时出错: {e}")
+
+    def _finalize_logged_in_cookies(
+        self,
+        context,
+        page,
+        *,
+        scene: str,
+        notification_callback: Optional[Callable] = None,
+        notification_scene: str = '账号密码登录',
+    ):
+        """登录态已确认后，尽量获取完整 Cookie，并对半登录态做最后兜底。"""
+        target_page = page
+        try:
+            if target_page and hasattr(target_page, 'is_closed') and target_page.is_closed():
+                target_page = None
+        except Exception:
+            pass
+
+        if not target_page:
+            target_page = self._select_monitor_page(context, page)
+
+        cookies_dict = self._snapshot_context_cookies(context, page=target_page)
+        logger.info(f"【{self.pure_user_id}】{scene}后获取到 {len(cookies_dict)} 个Cookie字段")
+
+        if not cookies_dict:
+            logger.error(f"【{self.pure_user_id}】❌ {scene}后未获取到Cookie")
+            return self._fail_login(f"{scene}后未获取到Cookie")
+
+        missing_protected_fields = [
+            key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
+            if not cookies_dict.get(key)
+        ]
+        if missing_protected_fields:
+            logger.warning(
+                f"【{self.pure_user_id}】{scene}后Cookie仍缺少关键字段，先执行标准稳定化: "
+                f"{missing_protected_fields}"
+            )
+            stabilized_cookies = self._stabilize_logged_in_context_cookies(
+                context,
+                target_page,
+                scene=scene,
+            )
+            if stabilized_cookies:
+                cookies_dict = stabilized_cookies
+
+        missing_protected_fields = [
+            key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
+            if not cookies_dict.get(key)
+        ]
+        if missing_protected_fields and target_page:
+            logger.warning(
+                f"【{self.pure_user_id}】{scene}标准稳定化后仍缺少关键字段，继续执行浏览器业务预热: "
+                f"{missing_protected_fields}"
+            )
+            warmed_cookies = self._perform_browser_cookie_warmup_probes(
+                context,
+                target_page,
+                scene=scene,
+                initial_cookies=cookies_dict,
+            )
+            if warmed_cookies:
+                cookies_dict = warmed_cookies
+
+        pending_identity_result = self._handle_pending_identity_verification_state(
+            context,
+            target_page,
+            cookies_dict,
+            notification_callback=notification_callback,
+            notification_scene=notification_scene,
+        )
+        if pending_identity_result is not None:
+            return pending_identity_result
+
+        missing_required_fields = [
+            key for key in self._REQUIRED_SESSION_COOKIE_FIELDS
+            if not cookies_dict.get(key)
+        ]
+        if missing_required_fields:
+            self._log_cookie_snapshot_integrity(cookies_dict, f"{scene}完成后")
+            logger.error(
+                f"【{self.pure_user_id}】❌ {scene}后Cookie仍缺失核心字段: "
+                f"{missing_required_fields}"
+            )
+            return self._fail_login(
+                f"{scene}后Cookie仍缺失核心字段: {', '.join(missing_required_fields)}"
+            )
+
+        self._log_cookie_snapshot_integrity(cookies_dict, f"{scene}完成后")
+        logger.success(f"【{self.pure_user_id}】✅ {scene}后Cookie获取完成，字段数: {len(cookies_dict)}")
+        return cookies_dict
 
     def _wait_for_context_login(self, context, fallback_page, max_wait_time: int = 450, check_interval: int = 10) -> Tuple[bool, Any]:
         waited_time = 0
@@ -3654,8 +4711,14 @@ class XianyuSliderStealth:
         wait_timeout = max(5, int(getattr(self, 'verification_wait_timeout', 450) or 450))
         logger.info(f"【{self.pure_user_id}】等待二维码/人脸验证完成... (timeout={wait_timeout}s)")
         login_success = False
+        success_page = fallback_page
         try:
-            login_success, _ = self._wait_for_context_login(context, fallback_page, max_wait_time=wait_timeout, check_interval=10)
+            login_success, success_page = self._wait_for_context_login(
+                context,
+                fallback_page,
+                max_wait_time=wait_timeout,
+                check_interval=10,
+            )
         finally:
             if self.keep_verification_screenshots:
                 logger.info(f"【{self.pure_user_id}】保留验证截图供后续调试")
@@ -3667,14 +4730,13 @@ class XianyuSliderStealth:
             return self._fail_login(f"等待{type_name}超时（{wait_timeout}秒）")
 
         logger.success(f"【{self.pure_user_id}】✅ 验证成功，登录状态已确认！")
-        cookies_dict = self._snapshot_context_cookies(context)
-        if cookies_dict:
-            logger.success(f"【{self.pure_user_id}】✅ 验证后获取Cookie成功，{len(cookies_dict)}个字段")
-            self._log_cookie_snapshot_integrity(cookies_dict, "验证完成后")
-            return cookies_dict
-
-        logger.error(f"【{self.pure_user_id}】❌ 验证成功后未获取到Cookie")
-        return self._fail_login("验证成功后未获取到Cookie")
+        return self._finalize_logged_in_cookies(
+            context,
+            success_page or fallback_page,
+            scene=f"{type_name}验证完成",
+            notification_callback=notification_callback,
+            notification_scene=notification_scene,
+        )
 
     def _has_meaningful_cookie_refresh(self, baseline: Dict[str, str], current: Dict[str, str]) -> bool:
         """判断关键 Cookie 是否发生了有意义的变化。
@@ -3831,16 +4893,9 @@ class XianyuSliderStealth:
         )
 
         profile = browser_profiles[identity["profile_index"]]
-
-        # 实测阿里 nocaptcha 在 Windows 无头下对 1366x768 / 高 DPI 组合更敏感，
-        # 1600x900 + scale 1.0 的桌面画像通过率明显更稳，直接固定到这套。
-        if runtime_is_windows and self.headless:
-            preferred_profile = next(
-                (item for item in browser_profiles if item.get('window_size') == '1600,900'),
-                None,
-            )
-            if preferred_profile:
-                profile = preferred_profile
+        preferred_profile = self._select_preferred_browser_profile(browser_profiles)
+        if preferred_profile:
+            profile = preferred_profile
         lang, accept_lang = languages[identity["language_index"]]
 
         # 解析窗口大小
@@ -3881,334 +4936,6 @@ class XianyuSliderStealth:
             'battery_level': identity.get('battery_level', 0.76),
         }
         return self._apply_runtime_browser_profile(features)
-    
-    def _get_stealth_script(self, browser_features):
-        """获取增强反检测脚本"""
-        return f"""
-            // 隐藏webdriver属性
-            Object.defineProperty(navigator, 'webdriver', {{
-                get: () => undefined,
-            }});
-            
-            // 隐藏自动化相关属性
-            delete navigator.__proto__.webdriver;
-            delete window.navigator.webdriver;
-            delete window.navigator.__proto__.webdriver;
-            
-            // 覆盖plugins - 随机化
-            const pluginCount = {browser_features['plugin_count']};
-            Object.defineProperty(navigator, 'plugins', {{
-                get: () => Array.from({{length: pluginCount}}, (_, i) => ({{
-                    name: 'Plugin' + i,
-                    description: 'Plugin ' + i
-                }})),
-            }});
-            
-            // 覆盖languages
-            Object.defineProperty(navigator, 'languages', {{
-                get: () => ['{browser_features['locale']}', 'zh', 'en'],
-            }});
-            
-            // 模拟真实的屏幕信息 - 使用 Profile 一致值
-            Object.defineProperty(screen, 'availWidth', {{ get: () => {browser_features['viewport_width']} }});
-            Object.defineProperty(screen, 'availHeight', {{ get: () => {browser_features['viewport_height'] - 40} }});
-            Object.defineProperty(screen, 'width', {{ get: () => {browser_features['viewport_width']} }});
-            Object.defineProperty(screen, 'height', {{ get: () => {browser_features['viewport_height']} }});
-            Object.defineProperty(screen, 'colorDepth', {{ get: () => {browser_features['color_depth']} }});
-            Object.defineProperty(screen, 'pixelDepth', {{ get: () => {browser_features['color_depth']} }});
-            
-            // 隐藏自动化检测 - 使用 Profile 一致的硬件信息
-            Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {browser_features['hardware_concurrency']} }});
-            Object.defineProperty(navigator, 'deviceMemory', {{ get: () => {browser_features['device_memory']} }});
-            
-            // 模拟真实的时区
-            Object.defineProperty(Intl.DateTimeFormat.prototype, 'resolvedOptions', {{
-                value: function() {{
-                    return {{ timeZone: '{browser_features['timezone_id']}' }};
-                }}
-            }});
-            
-            // 隐藏自动化痕迹
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-            
-            // 模拟有头模式的特征 - 使用 Profile 一致值
-            Object.defineProperty(navigator, 'maxTouchPoints', {{ get: () => {browser_features['max_touch_points']} }});
-            Object.defineProperty(navigator, 'platform', {{ get: () => '{browser_features['platform']}' }});
-            Object.defineProperty(navigator, 'vendor', {{ get: () => '{browser_features['vendor']}' }});
-            Object.defineProperty(navigator, 'vendorSub', {{ get: () => '' }});
-            Object.defineProperty(navigator, 'productSub', {{ get: () => '20030107' }});
-            
-            // 模拟真实的连接信息 - 使用 Profile 一致值
-            Object.defineProperty(navigator, 'connection', {{
-                get: () => ({{
-                    effectiveType: "{browser_features['connection_type']}",
-                    rtt: {browser_features['connection_rtt']},
-                    downlink: {browser_features['connection_downlink']}
-                }})
-            }});
-            
-            // 隐藏无头模式特征
-            Object.defineProperty(navigator, 'headless', {{ get: () => undefined }});
-            Object.defineProperty(window, 'outerHeight', {{ get: () => {browser_features['viewport_height']} }});
-            Object.defineProperty(window, 'outerWidth', {{ get: () => {browser_features['viewport_width']} }});
-            
-            // 模拟真实的媒体设备
-            Object.defineProperty(navigator, 'mediaDevices', {{
-                get: () => ({{
-                    enumerateDevices: () => Promise.resolve([])
-                }}),
-            }});
-            
-            // 隐藏自动化检测特征
-            Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
-            Object.defineProperty(navigator, '__webdriver_script_fn', {{ get: () => undefined }});
-            Object.defineProperty(navigator, '__webdriver_evaluate', {{ get: () => undefined }});
-            Object.defineProperty(navigator, '__webdriver_unwrapped', {{ get: () => undefined }});
-            Object.defineProperty(navigator, '__fxdriver_evaluate', {{ get: () => undefined }});
-            Object.defineProperty(navigator, '__driver_evaluate', {{ get: () => undefined }});
-            Object.defineProperty(navigator, '__webdriver_script_func', {{ get: () => undefined }});
-            
-            // 隐藏Playwright特定的对象
-            delete window.playwright;
-            delete window.__playwright;
-            delete window.__pw_manual;
-            delete window.__pw_original;
-            
-            // 模拟真实的用户代理
-            Object.defineProperty(navigator, 'userAgent', {{
-                get: () => '{browser_features['user_agent']}'
-            }});
-            
-            // 隐藏自动化相关的全局变量
-            delete window.webdriver;
-            delete window.__webdriver_script_fn;
-            delete window.__webdriver_evaluate;
-            delete window.__webdriver_unwrapped;
-            delete window.__fxdriver_evaluate;
-            delete window.__driver_evaluate;
-            delete window.__webdriver_script_func;
-            delete window._selenium;
-            delete window._phantom;
-            delete window.callPhantom;
-            delete window._phantom;
-            delete window.phantom;
-            delete window.Buffer;
-            delete window.emit;
-            delete window.spawn;
-            
-            // Canvas指纹随机化
-            const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
-            HTMLCanvasElement.prototype.toDataURL = function() {{
-                const context = this.getContext('2d');
-                if (context) {{
-                    const imageData = context.getImageData(0, 0, this.width, this.height);
-                    const data = imageData.data;
-                    for (let i = 0; i < data.length; i += 4) {{
-                        if (Math.random() < 0.001) {{
-                            data[i] = Math.floor(Math.random() * 256);
-                        }}
-                    }}
-                    context.putImageData(imageData, 0, 0);
-                }}
-                return originalToDataURL.apply(this, arguments);
-            }};
-            
-            // 音频指纹随机化
-            const originalGetChannelData = AudioBuffer.prototype.getChannelData;
-            AudioBuffer.prototype.getChannelData = function(channel) {{
-                const data = originalGetChannelData.call(this, channel);
-                for (let i = 0; i < data.length; i += 1000) {{
-                    if (Math.random() < 0.01) {{
-                        data[i] += Math.random() * 0.0001;
-                    }}
-                }}
-                return data;
-            }};
-            
-            // WebGL指纹随机化
-            const originalGetParameter = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(parameter) {{
-                if (parameter === 37445) {{ // UNMASKED_VENDOR_WEBGL
-                    return 'Intel Inc.';
-                }}
-                if (parameter === 37446) {{ // UNMASKED_RENDERER_WEBGL
-                    return 'Intel Iris OpenGL Engine';
-                }}
-                return originalGetParameter.call(this, parameter);
-            }};
-            
-            // 模拟真实的鼠标事件
-            const originalAddEventListener = EventTarget.prototype.addEventListener;
-            EventTarget.prototype.addEventListener = function(type, listener, options) {{
-                if (type === 'mousedown' || type === 'mouseup' || type === 'mousemove') {{
-                    const originalListener = listener;
-                    listener = function(event) {{
-                        setTimeout(() => originalListener.call(this, event), Math.random() * 10);
-                    }};
-                }}
-                return originalAddEventListener.call(this, type, listener, options);
-            }};
-            
-            // 随机化字体检测
-            Object.defineProperty(document, 'fonts', {{
-                get: () => ({{
-                    ready: Promise.resolve(),
-                    check: () => true,
-                    load: () => Promise.resolve([])
-                }})
-            }});
-
-            // 增强鼠标移动轨迹记录
-            let mouseMovements = [];
-            let lastMouseTime = Date.now();
-            document.addEventListener('mousemove', function(e) {{
-                const now = Date.now();
-                const timeDiff = now - lastMouseTime;
-                mouseMovements.push({{
-                    x: e.clientX,
-                    y: e.clientY,
-                    time: now,
-                    timeDiff: timeDiff
-                }});
-                lastMouseTime = now;
-                // 保持最近100个移动记录
-                if (mouseMovements.length > 100) {{
-                    mouseMovements.shift();
-                }}
-            }}, true);
-
-            // 模拟真实的电池API
-            if (navigator.getBattery) {{
-                const originalGetBattery = navigator.getBattery;
-                navigator.getBattery = async function() {{
-                    const battery = await originalGetBattery.call(navigator);
-                        Object.defineProperty(battery, 'charging', {{ get: () => {str(browser_features['battery_charging']).lower()} }});
-                        Object.defineProperty(battery, 'level', {{ get: () => {browser_features['battery_level']:.2f} }});
-                    return battery;
-                }};
-            }}
-            
-            // 伪装鼠标移动加速度（反检测关键）
-            let velocityProfile = [];
-            window.addEventListener('mousemove', function(e) {{
-                const now = performance.now();
-                velocityProfile.push({{ x: e.clientX, y: e.clientY, t: now }});
-                if (velocityProfile.length > 50) velocityProfile.shift();
-            }}, true);
-            
-            // 伪装Permission API
-            const originalQuery = Permissions.prototype.query;
-            Permissions.prototype.query = function(parameters) {{
-                if (parameters.name === 'notifications') {{
-                    return Promise.resolve({{ state: '{browser_features['notification_permission']}' }});
-                }}
-                return originalQuery.apply(this, arguments);
-            }};
-            
-            // 伪装Performance API
-            const originalNow = Performance.prototype.now;
-            Performance.prototype.now = function() {{
-                return originalNow.call(this) + Math.random() * 0.1;
-            }};
-            
-            // 伪装Date API（添加微小随机偏移）
-            const OriginalDate = Date;
-            Date = function(...args) {{
-                if (args.length === 0) {{
-                    const date = new OriginalDate();
-                    const offset = Math.floor(Math.random() * 3) - 1; // -1到1毫秒
-                    return new OriginalDate(date.getTime() + offset);
-                }}
-                return new OriginalDate(...args);
-            }};
-            Date.prototype = OriginalDate.prototype;
-            Date.now = function() {{
-                return OriginalDate.now() + Math.floor(Math.random() * 3) - 1;
-            }};
-            
-            // 伪装RTCPeerConnection（WebRTC指纹）
-            if (window.RTCPeerConnection) {{
-                const originalRTC = window.RTCPeerConnection;
-                window.RTCPeerConnection = function(...args) {{
-                    const pc = new originalRTC(...args);
-                    const originalCreateOffer = pc.createOffer;
-                    pc.createOffer = function(...args) {{
-                        return originalCreateOffer.apply(this, args).then(offer => {{
-                            // 修改SDP指纹
-                            offer.sdp = offer.sdp.replace(/a=fingerprint:.*\\r\\n/g, 
-                                `a=fingerprint:sha-256 ${{Array.from({{length:64}}, ()=>Math.floor(Math.random()*16).toString(16)).join('')}}\\r\\n`);
-                            return offer;
-                        }});
-                    }};
-                    return pc;
-                }};
-            }}
-            
-            // 伪装 Notification 权限（防止被检测为自动化）
-            Object.defineProperty(Notification, 'permission', {{
-                get: function() {{
-                    return '{browser_features['notification_permission']}';
-                }}
-            }});
-
-            // 伪装 DoNotTrack
-            Object.defineProperty(navigator, 'doNotTrack', {{
-                get: function() {{
-                    return '{browser_features['do_not_track']}';
-                }}
-            }});
-            
-            // 伪装 Geolocation（添加微小延迟和误差）
-            if (navigator.geolocation) {{
-                const originalGetCurrentPosition = navigator.geolocation.getCurrentPosition;
-                navigator.geolocation.getCurrentPosition = function(success, error, options) {{
-                    const wrappedSuccess = function(position) {{
-                        // 添加微小的位置偏移（模拟真实GPS误差）
-                        const offset = Math.random() * 0.001;
-                        position.coords.latitude += offset;
-                        position.coords.longitude += offset;
-                        success(position);
-                    }};
-                    // 添加随机延迟
-                    setTimeout(() => {{
-                        originalGetCurrentPosition.call(this, wrappedSuccess, error, options);
-                    }}, Math.random() * 100);
-                }};
-            }}
-            
-            // 伪装 Clipboard API（防止检测剪贴板访问模式）
-            if (navigator.clipboard) {{
-                const originalReadText = navigator.clipboard.readText;
-                navigator.clipboard.readText = async function() {{
-                    // 添加微小延迟
-                    await new Promise(resolve => setTimeout(resolve, Math.random() * 50));
-                    return originalReadText.call(this);
-                }};
-            }}
-
-            // 🔑 伪装chrome对象（统一定义，防止检测headless）
-            window.chrome = {{
-                runtime: {{
-                    id: undefined,
-                    sendMessage: function() {{}},
-                    connect: function() {{}}
-                }},
-                loadTimes: function() {{}},
-                csi: function() {{}},
-                app: {{}}
-            }};
-
-            // 🔑 覆盖Function.prototype.toString以隐藏代理
-            const oldToString = Function.prototype.toString;
-            Function.prototype.toString = function() {{
-                if (this === navigator.permissions.query) {{
-                    return 'function query() {{ [native code] }}';
-                }}
-                return oldToString.call(this);
-            }};
-        """
     
     def _bezier_curve(self, p0, p1, p2, p3, t):
         """三次贝塞尔曲线 - 生成更自然的轨迹"""
@@ -4617,7 +5344,7 @@ class XianyuSliderStealth:
             random_state_snapshot = random.getstate()[1][:5]  # 记录前5个随机状态
             
             # 🧠 尝试从历史成功数据中学习最优参数
-            optimized_params = self._optimize_trajectory_params()
+            optimized_params = self._optimize_trajectory_params(reference_distance=distance)
             force_explore_threshold = ML_STRATEGY_CONFIG.get("force_explore_after_failures", 2)
             slow_fallback_threshold = max(3, force_explore_threshold + 1)
             has_learning = optimized_params.get("learning_enabled") and optimized_params.get("history_count", 0) >= 3
@@ -4631,42 +5358,61 @@ class XianyuSliderStealth:
             if attempt >= slow_fallback_threshold:
                 # 第 3 次及以后：优先使用 learned 变体（加大抖动），无学习数据时才轮换
                 if has_learning:
-                    # 🔧 优化：第3次仍然使用学习参数，但加大抖动幅度以增加多样性
-                    selected_strategy = "learned_with_jitter"
-                    profile_name = "retry_learned_aggressive_jitter"
+                    if self._is_password_login_scene() and attempt >= max(4, self.slider_max_retries):
+                        template_ranges = self._get_password_scene_final_retry_template(effective_ranges, bounds)
+                        selected_strategy = "learned_password_template"
+                        profile_name = "password_scene_final_template"
+                        overshoot_ratio = random.uniform(template_ranges["overshoot"][0], template_ranges["overshoot"][1])
+                        steps = random.randint(template_ranges["steps"][0], template_ranges["steps"][1])
+                        base_delay = random.uniform(template_ranges["delay"][0], template_ranges["delay"][1])
+                        acceleration_curve = random.uniform(template_ranges["curve"][0], template_ranges["curve"][1])
+                        y_jitter_max = random.uniform(template_ranges["jitter"][0], template_ranges["jitter"][1])
 
-                    jitter_config = ML_STRATEGY_CONFIG.get("param_jitter", {})
-                    # 第3次使用更大的抖动幅度（原来的2倍）
-                    overshoot_jitter = jitter_config.get("overshoot_ratio_jitter", 0.05) * 2.0
+                        logger.info(
+                            f"【{self.pure_user_id}】🧷 第{attempt}次尝试，账密无头最终模板回放: "
+                            f"超调{(overshoot_ratio-1)*100:.1f}%, 步数{steps}, "
+                            f"延迟{base_delay*1000:.1f}ms, 曲线^{acceleration_curve:.2f}"
+                        )
+                    else:
+                        # 🔧 优化：第3次仍然使用学习参数，但加大抖动幅度以增加多样性
+                        selected_strategy = "learned_with_jitter"
+                        profile_name = "retry_learned_aggressive_jitter"
 
-                    overshoot_ratio = random.uniform(effective_ranges["overshoot"][0], effective_ranges["overshoot"][1])
-                    overshoot_ratio *= random.uniform(1 - overshoot_jitter, 1 + overshoot_jitter)
-                    overshoot_ratio = max(1.01, min(bounds.get("max_overshoot_ratio", 1.18), overshoot_ratio))
+                        jitter_config = ML_STRATEGY_CONFIG.get("param_jitter", {})
+                        # 第3次使用更大的抖动幅度（原来的2倍）
+                        overshoot_jitter = jitter_config.get("overshoot_ratio_jitter", 0.05) * 2.0
 
-                    # 步数和延迟也加大变化范围
-                    steps_min = max(18, effective_ranges["steps"][0] - 3)
-                    steps_max = min(42, effective_ranges["steps"][1] + 5)
-                    steps = random.randint(steps_min, steps_max)
+                        overshoot_ratio = random.uniform(effective_ranges["overshoot"][0], effective_ranges["overshoot"][1])
+                        overshoot_ratio *= random.uniform(1 - overshoot_jitter, 1 + overshoot_jitter)
+                        overshoot_ratio = max(1.01, min(bounds.get("max_overshoot_ratio", 1.18), overshoot_ratio))
 
-                    delay_min = max(0.004, effective_ranges["delay"][0] * 0.85)
-                    delay_max = min(0.022, effective_ranges["delay"][1] * 1.5)
-                    base_delay = random.uniform(delay_min, delay_max)
+                        # 步数和延迟也加大变化范围
+                        steps_min = max(18, effective_ranges["steps"][0] - 3)
+                        steps_max = min(42, effective_ranges["steps"][1] + 5)
+                        steps = random.randint(steps_min, steps_max)
 
-                    curve_min = max(1.2, effective_ranges["curve"][0] - 0.2)
-                    curve_max = min(2.6, effective_ranges["curve"][1] + 0.2)
-                    acceleration_curve = random.uniform(curve_min, curve_max)
+                        delay_min = max(0.004, effective_ranges["delay"][0] * 0.85)
+                        delay_max = min(0.022, effective_ranges["delay"][1] * 1.5)
+                        base_delay = random.uniform(delay_min, delay_max)
 
-                    jitter_min = max(0.8, effective_ranges["jitter"][0] - 0.3)
-                    jitter_max = min(3.5, effective_ranges["jitter"][1] + 0.5)
-                    y_jitter_max = random.uniform(jitter_min, jitter_max)
+                        curve_min = max(1.2, effective_ranges["curve"][0] - 0.2)
+                        curve_max = min(2.6, effective_ranges["curve"][1] + 0.2)
+                        acceleration_curve = random.uniform(curve_min, curve_max)
 
-                    logger.info(
-                        f"【{self.pure_user_id}】🛟 第{attempt}次尝试，使用学习参数(大抖动): "
-                        f"超调{(overshoot_ratio-1)*100:.1f}%, 步数{steps}, "
-                        f"延迟{base_delay*1000:.1f}ms, 曲线^{acceleration_curve:.2f}"
-                    )
+                        jitter_min = max(0.8, effective_ranges["jitter"][0] - 0.3)
+                        jitter_max = min(3.5, effective_ranges["jitter"][1] + 0.5)
+                        y_jitter_max = random.uniform(jitter_min, jitter_max)
+
+                        logger.info(
+                            f"【{self.pure_user_id}】🛟 第{attempt}次尝试，使用学习参数(大抖动): "
+                            f"超调{(overshoot_ratio-1)*100:.1f}%, 步数{steps}, "
+                            f"延迟{base_delay*1000:.1f}ms, 曲线^{acceleration_curve:.2f}"
+                        )
                 else:
-                    rotation_strategies = ["aggressive", "standard"]
+                    if self._should_prefer_docker_conservative_profile(has_learning):
+                        rotation_strategies = ["conservative", "standard"]
+                    else:
+                        rotation_strategies = ["aggressive", "standard"]
                     rotation_idx = (attempt - slow_fallback_threshold) % len(rotation_strategies)
                     selected_strategy = rotation_strategies[rotation_idx]
                     profile_name = f"retry_rotation_{selected_strategy}"
@@ -4683,6 +5429,21 @@ class XianyuSliderStealth:
                         f"超调{(overshoot_ratio-1)*100:.1f}%, 步数{steps}, "
                         f"延迟{base_delay*1000:.1f}ms, 曲线^{acceleration_curve:.2f}"
                     )
+            elif attempt == 2 and self._should_prefer_docker_conservative_profile(has_learning):
+                selected_strategy = "conservative"
+                profile_name = "docker_retry_conservative"
+
+                overshoot_ratio = random.uniform(1.015, 1.045)
+                steps = random.randint(32, 42)
+                base_delay = random.uniform(0.011, 0.019)
+                acceleration_curve = random.uniform(1.95, 2.30)
+                y_jitter_max = random.uniform(0.9, 1.8)
+
+                logger.info(
+                    f"【{self.pure_user_id}】🧱 Docker第2次继续保守策略: "
+                    f"超调{(overshoot_ratio-1)*100:.1f}%, 步数{steps}, "
+                    f"延迟{base_delay*1000:.1f}ms, 曲线^{acceleration_curve:.2f}"
+                )
             elif attempt == 2 and has_learning:
                 selected_strategy = "learned_with_jitter"
                 profile_name = "retry_stabilized"
@@ -4717,7 +5478,21 @@ class XianyuSliderStealth:
                 )
             else:
                 exploration_rate = ML_STRATEGY_CONFIG.get("exploration_rate", 0.35)
-                if not has_learning and random.random() < exploration_rate:
+                if self._should_force_docker_cold_start_conservative(attempt, has_learning):
+                    conservative = ML_STRATEGY_CONFIG["strategies"]["conservative"]
+                    overshoot_ratio = random.uniform(*conservative["overshoot_ratio"])
+                    steps = random.randint(*conservative["steps"])
+                    base_delay = random.uniform(*conservative["base_delay"])
+                    acceleration_curve = random.uniform(*conservative["acceleration_curve"])
+                    y_jitter_max = random.uniform(*conservative["y_jitter_max"])
+                    selected_strategy = "conservative"
+                    profile_name = "docker_cold_start_conservative"
+                    logger.info(
+                        f"【{self.pure_user_id}】🧱 Docker冷启动优先保守策略: "
+                        f"超调{(overshoot_ratio-1)*100:.1f}%, 步数{steps}, "
+                        f"延迟{base_delay*1000:.1f}ms, 曲线^{acceleration_curve:.2f}"
+                    )
+                elif not has_learning and random.random() < exploration_rate:
                     use_exploration = True
                     overshoot_ratio, steps, base_delay, acceleration_curve, y_jitter_max, selected_strategy = \
                         self._select_exploration_strategy(attempt)
@@ -5020,7 +5795,8 @@ class XianyuSliderStealth:
         """模拟滑动 - 优化版本（增强随机性+智能学习）"""
         try:
             # 🧠 获取学习到的行为参数
-            optimized_params = self._optimize_trajectory_params()
+            reference_distance = ((getattr(self, 'current_trajectory_data', {}) or {}).get("distance"))
+            optimized_params = self._optimize_trajectory_params(reference_distance=reference_distance)
             learned_behavior = optimized_params.get("learned_behavior", {})
             is_learned = optimized_params.get("learning_enabled", False) and len(learned_behavior) > 0
 
@@ -5391,6 +6167,10 @@ class XianyuSliderStealth:
             return False
 
         try:
+            special_block = self._detect_special_captcha_block(target_page)
+            if special_block:
+                return True
+
             page_text = ""
             try:
                 page_text = target_page.inner_text('body', timeout=1500) or ""
@@ -5438,6 +6218,117 @@ class XianyuSliderStealth:
             pass
 
         return False
+
+    def _detect_special_captcha_block(self, target=None) -> Optional[Dict[str, Any]]:
+        """检测验证码处罚页/反馈拦截页，避免把不可解风控页继续当普通滑块拖。"""
+        target_page = target or self.page
+        if not target_page:
+            return None
+
+        try:
+            try:
+                current_url = str(getattr(target_page, 'url', '') or '')
+            except Exception:
+                current_url = ''
+            current_url_lower = current_url.lower()
+
+            current_title = ''
+            try:
+                raw_title = target_page.title() if callable(getattr(target_page, 'title', None)) else getattr(target_page, 'title', '')
+                current_title = str(raw_title or '')
+            except Exception:
+                current_title = ''
+            current_title_lower = current_title.lower()
+
+            page_text = ''
+            try:
+                page_text = target_page.inner_text('body', timeout=1500) or ''
+            except Exception:
+                try:
+                    page_text = target_page.content() or ''
+                except Exception:
+                    page_text = ''
+            page_text_lower = str(page_text or '').lower()
+
+            has_slider_button = False
+            for selector in ("#nc_1_n1z", ".btn_slide", ".sm-btn", ".sm-btn-wrapper", ".nc_scale"):
+                try:
+                    element = target_page.query_selector(selector)
+                    if element and element.is_visible():
+                        has_slider_button = True
+                        break
+                except Exception:
+                    continue
+
+            has_slider_track = False
+            for selector in ("#nc_1_n1t", ".nc_scale", ".sm-btn-wrapper", "#nocaptcha"):
+                try:
+                    element = target_page.query_selector(selector)
+                    if element and element.is_visible():
+                        has_slider_track = True
+                        break
+                except Exception:
+                    continue
+
+            has_operable_slider = has_slider_button or has_slider_track
+
+            punish_tokens = (
+                'punish?x5secdata',
+                'action=captcha',
+                'purecaptcha=true',
+                'x5step=2',
+            )
+            punish_hit_count = sum(1 for token in punish_tokens if token in current_url_lower)
+            punish_title_hit = ('验证码拦截' in current_title) or ('captcha intercept' in current_title_lower)
+            punish_text_hit = ('验证码拦截' in page_text) or ('验证失败，点击框体重试' in page_text)
+            if punish_hit_count >= 2 or punish_title_hit or punish_text_hit:
+                if has_operable_slider:
+                    logger.debug(
+                        f"【{self.pure_user_id}】当前命中 pureCaptcha/处罚页特征，但页面仍存在可操作滑块，继续按普通滑块处理"
+                    )
+                else:
+                    return {
+                        'kind': 'punish_captcha',
+                        'url': current_url,
+                        'title': current_title,
+                        'message': '当前命中阿里验证码拦截处罚页（pureCaptcha），且页面不存在可操作滑块',
+                    }
+
+            hard_block_keywords = [
+                "抱歉，页面访问出现了问题",
+                "页面访问出现了问题",
+                "点我反馈",
+            ]
+            keyword_hit = any(keyword in page_text for keyword in hard_block_keywords)
+            has_qrcode = False
+            has_feedback_link = False
+            for selector in (
+                ".bx-pu-qrcode-wrap",
+                ".captcha-qrcode",
+                "#bx-feedback-btn",
+                "a[href*='page/feedback']",
+            ):
+                try:
+                    element = target_page.query_selector(selector)
+                    if element:
+                        if selector in (".bx-pu-qrcode-wrap", ".captcha-qrcode"):
+                            has_qrcode = True
+                        else:
+                            has_feedback_link = True
+                except Exception:
+                    continue
+
+            if keyword_hit and (has_qrcode or has_feedback_link) and not has_operable_slider:
+                return {
+                    'kind': 'feedback_block',
+                    'url': current_url,
+                    'title': current_title,
+                    'message': '当前命中反馈二维码/处罚页，不存在可操作滑块',
+                }
+        except Exception:
+            return None
+
+        return None
     
     def find_slider_elements(self, fast_mode=False):
         """查找滑块元素（支持在主页面和所有frame中查找）
@@ -5450,8 +6341,20 @@ class XianyuSliderStealth:
             if not fast_mode:
                 time.sleep(0.1)
 
-            if self._is_hard_block_page(self.page):
-                logger.error(f"【{self.pure_user_id}】当前页面是处罚页/反馈二维码页，不存在可操作滑块，停止元素查找")
+            current_block = self._detect_special_captcha_block(self.page)
+            if current_block:
+                logger.error(
+                    f"【{self.pure_user_id}】当前页面命中高风险验证码页[{current_block['kind']}]: "
+                    f"{current_block['message']}"
+                )
+                self.last_verification_feedback = {
+                    "status": "hard_block",
+                    "source": current_block["kind"],
+                    "message": current_block["message"],
+                    "url": current_block.get("url") or "",
+                    "title": current_block.get("title") or "",
+                }
+                self._save_debug_snapshot("hard_block_page", self.page)
                 return None, None, None
             
             # ===== 【优化】优先在 frames 中快速查找最常见的滑块组合 =====
@@ -5462,6 +6365,24 @@ class XianyuSliderStealth:
                 frames = self.page.frames
                 for idx, frame in enumerate(frames):
                     try:
+                        frame_block = self._detect_special_captcha_block(frame)
+                        if frame_block:
+                            logger.error(
+                                f"【{self.pure_user_id}】Frame {idx} 命中高风险验证码页[{frame_block['kind']}]: "
+                                f"{frame_block['message']}"
+                            )
+                            self._detected_slider_frame = frame
+                            self.last_verification_feedback = {
+                                "status": "hard_block",
+                                "source": frame_block["kind"],
+                                "message": frame_block["message"],
+                                "url": frame_block.get("url") or "",
+                                "title": frame_block.get("title") or "",
+                                "frame_index": idx,
+                            }
+                            self._save_debug_snapshot("hard_block_page", frame)
+                            return None, None, None
+
                         # 优先查找最常见的按钮选择器
                         button_element = frame.query_selector("#nc_1_n1z")
                         if button_element and button_element.is_visible():
@@ -6573,6 +7494,23 @@ class XianyuSliderStealth:
             try:
                 logger.info(f"【{self.pure_user_id}】开始处理滑块验证... (第{attempt}/{max_retries}次尝试)")
 
+                current_block = self._detect_special_captcha_block(self.page)
+                if current_block:
+                    logger.error(
+                        f"【{self.pure_user_id}】当前页面命中高风险验证码页[{current_block['kind']}]: "
+                        f"{current_block['message']}，停止继续滑块重试"
+                    )
+                    self.last_verification_feedback = {
+                        "status": "hard_block",
+                        "source": current_block["kind"],
+                        "message": current_block["message"],
+                        "url": current_block.get("url") or "",
+                        "title": current_block.get("title") or "",
+                        "attempt": attempt,
+                    }
+                    self._save_debug_snapshot("hard_block_page", self.page)
+                    break
+
                 # 检测账号受限状态（如果受限则立即停止，不浪费重试机会）
                 try:
                     page_text = self.page.inner_text('body', timeout=2000) if self.page else ''
@@ -6619,6 +7557,9 @@ class XianyuSliderStealth:
                 slider_container, slider_button, slider_track = self.find_slider_elements(fast_mode=fast_mode)
                 if not all([slider_container, slider_button, slider_track]):
                     logger.error(f"【{self.pure_user_id}】滑块元素查找失败")
+                    if (self.last_verification_feedback or {}).get("status") == "hard_block":
+                        logger.error(f"【{self.pure_user_id}】当前页面已识别为高风险验证码页，停止当前滑块流程")
+                        break
                     self.last_verification_feedback = {
                         "status": "page_state_changed",
                         "source": "slider_missing",
@@ -6641,6 +7582,9 @@ class XianyuSliderStealth:
 
                     logger.warning(f"【{self.pure_user_id}】当前页面已无滑块，不再继续同轮滑块重试")
                     break
+
+                slider_search_target = getattr(self, "_detected_slider_frame", None)
+                self._harden_password_slider_runtime(slider_search_target)
                 
                 # 2. 计算滑动距离
                 slide_distance = self.calculate_slide_distance(slider_button, slider_track)
@@ -7087,7 +8031,7 @@ class XianyuSliderStealth:
                                     verification_url=frame.url if hasattr(frame, 'url') else getattr(page, 'url', None),
                                     detection_phase='verification_probe',
                                 )
-                                slider_success = self.solve_slider(max_retries=3)
+                                slider_success = self.solve_slider(max_retries=self.slider_max_retries)
                                 if slider_success:
                                     logger.success(f"【{self.pure_user_id}】✅ 滑块验证成功！")
                                     self._finish_password_login_slider_risk_log(
@@ -7099,13 +8043,15 @@ class XianyuSliderStealth:
                                     )
                                     time.sleep(3)  # 等待滑块验证后的状态更新
                                 else:
-                                    # 3次失败后，刷新页面重试
-                                    logger.warning(f"【{self.pure_user_id}】⚠️ 滑块处理3次都失败，刷新页面后重试...")
+                                    # 常规重试仍失败后，刷新页面再补一次机会。
+                                    logger.warning(
+                                        f"【{self.pure_user_id}】⚠️ 滑块处理{self.slider_max_retries}次仍失败，刷新页面后重试..."
+                                    )
                                     try:
                                         self.page.reload(wait_until="domcontentloaded", timeout=30000)
                                         logger.info(f"【{self.pure_user_id}】✅ 页面刷新完成")
                                         time.sleep(2)
-                                        slider_success = self.solve_slider(max_retries=3)
+                                        slider_success = self.solve_slider(max_retries=self.slider_max_retries)
                                         if not slider_success:
                                             logger.error(f"【{self.pure_user_id}】❌ 刷新后滑块验证仍然失败")
                                             self._finish_password_login_slider_risk_log(
@@ -7579,7 +8525,7 @@ class XianyuSliderStealth:
                 logger.error(f"【{self.pure_user_id}】日期验证失败，无法执行登录")
                 return self._fail_login("日期验证失败，无法执行登录")
 
-            if not self.browser_channel and not self.executable_path:
+            if self._should_prefer_project_browser_for_playwright():
                 self._ensure_project_playwright_browser()
             
             # 验证必需参数
@@ -7655,7 +8601,7 @@ class XianyuSliderStealth:
             ]
 
             # 启动浏览器
-            if not self.browser_channel and not self.executable_path:
+            if self._should_prefer_project_browser_for_playwright():
                 self._ensure_project_playwright_browser()
 
             playwright_factory = self._get_sync_playwright_factory()
@@ -7748,6 +8694,35 @@ class XianyuSliderStealth:
             if not browser:
                 browser = context.browser
             page = context.new_page()
+            self._apply_headless_network_fingerprint(page, browser_features)
+            observed_set_cookie_updates: Dict[str, str] = {}
+
+            def _capture_response_set_cookie(response):
+                try:
+                    updates = self._extract_set_cookie_updates_from_playwright_response(response)
+                    if not updates:
+                        return
+                    interesting_keys = [
+                        key for key in ('havana_lgc2_77', 'x5secdata', 'x5sec', '_m_h5_tk', '_m_h5_tk_enc', 'sgcookie')
+                        if key in updates
+                    ]
+                    for key, value in updates.items():
+                        observed_set_cookie_updates[key] = value
+                    if interesting_keys:
+                        summary = ', '.join(
+                            f"{key}(长度:{len(str(observed_set_cookie_updates.get(key) or ''))})"
+                            for key in interesting_keys
+                        )
+                        logger.info(
+                            f"【{self.pure_user_id}】登录网络响应捕获到Set-Cookie: {summary} | URL: {getattr(response, 'url', '')}"
+                        )
+                except Exception as capture_e:
+                    logger.debug(f"【{self.pure_user_id}】捕获登录响应Set-Cookie失败: {capture_e}")
+
+            try:
+                context.on("response", _capture_response_set_cookie)
+            except Exception as listener_e:
+                logger.warning(f"【{self.pure_user_id}】注册登录响应监听失败（不影响主流程）: {listener_e}")
 
             # 有头模式使用轻量反检测脚本（完整脚本会覆盖 document.fonts / EventTarget /
             # Performance.now / Date 等浏览器核心 API，导致页面白屏无法渲染）；
@@ -7763,8 +8738,12 @@ class XianyuSliderStealth:
             else:
                 password_login_stealth_mode = None
                 if not show_browser and not self.stealth_mode_override:
+                    # 账密登录页对 full 改写更敏感，先保证登录表单能稳定出现；
+                    # 真正过滑块主要靠稳定画像 + 学习轨迹，不靠这里硬怼 full。
                     password_login_stealth_mode = "lite"
-                    logger.info(f"【{self.pure_user_id}】密码登录链路默认使用 lite 反检测脚本，避免无头登录页白屏")
+                    logger.info(
+                        f"【{self.pure_user_id}】密码登录链路默认使用 {password_login_stealth_mode} 反检测脚本"
+                    )
                 self._install_stealth_init_script(page, browser_features, mode_override=password_login_stealth_mode)
 
             logger.info(f"【{self.pure_user_id}】浏览器已成功启动（{browser_mode}模式，画像: {self.profile_id}）")
@@ -7926,7 +8905,7 @@ class XianyuSliderStealth:
                                 detection_phase='pre_login_monitor',
                             )
                             time.sleep(3)
-                            slider_success = self.solve_slider(max_retries=3)
+                            slider_success = self.solve_slider(max_retries=self.slider_max_retries)
                             
                             if not slider_success:
                                 feedback = self.last_verification_feedback or {}
@@ -7941,13 +8920,15 @@ class XianyuSliderStealth:
                                     )
                                     return self._fail_login(self._get_slider_failure_message("页面状态已变化，未找到滑块容器，请重新尝试刷新Cookie"))
 
-                                # 3次失败后，刷新页面重试
-                                logger.warning(f"【{self.pure_user_id}】⚠️ 滑块处理3次都失败，刷新页面后重试...")
+                                # 常规重试仍失败后，刷新页面再补一次机会。
+                                logger.warning(
+                                    f"【{self.pure_user_id}】⚠️ 滑块处理{self.slider_max_retries}次仍失败，刷新页面后重试..."
+                                )
                                 try:
                                     page.reload(wait_until="domcontentloaded", timeout=30000)
                                     logger.info(f"【{self.pure_user_id}】✅ 页面刷新完成")
                                     time.sleep(2)
-                                    slider_success = self.solve_slider(max_retries=3)
+                                    slider_success = self.solve_slider(max_retries=self.slider_max_retries)
                                     if not slider_success:
                                         feedback = self.last_verification_feedback or {}
                                         if feedback.get("source") == "slider_missing":
@@ -7998,18 +8979,13 @@ class XianyuSliderStealth:
                             
                             if login_success:
                                 logger.success(f"【{self.pure_user_id}】✅ 滑块验证后登录成功")
-                                
-                                # 只有在登录成功后才获取Cookie
-                                cookies_dict = self._snapshot_context_cookies(context)
-                                logger.info(f"【{self.pure_user_id}】成功获取Cookie，包含 {len(cookies_dict)} 个字段")
-
-                                if cookies_dict:
-                                    self._log_cookie_snapshot_integrity(cookies_dict, "滑块验证后")
-                                    logger.success("✅ Cookie有效")
-                                    return cookies_dict
-
-                                logger.error("❌ Cookie为空")
-                                return self._fail_login("登录成功后未获取到有效Cookie")
+                                return self._finalize_logged_in_cookies(
+                                    context,
+                                    active_page or page,
+                                    scene="滑块验证后登录成功",
+                                    notification_callback=notification_callback,
+                                    notification_scene=notification_scene,
+                                )
                             else:
                                 # 滑块验证后登录状态不明确，检测是否需要人脸/短信/二维码验证
                                 logger.warning(f"【{self.pure_user_id}】⚠️ 滑块验证后登录状态不明确，检测是否需要身份验证...")
@@ -8035,18 +9011,13 @@ class XianyuSliderStealth:
                             login_success, active_page, _ = self._probe_context_login_success(context, page)
                             if login_success:
                                 logger.success(f"【{self.pure_user_id}】✅ 检测到已登录状态")
-                                
-                                # 只有在登录成功后才获取Cookie
-                                cookies_dict = self._snapshot_context_cookies(context)
-                                logger.info(f"【{self.pure_user_id}】成功获取Cookie，包含 {len(cookies_dict)} 个字段")
-
-                                if cookies_dict:
-                                    self._log_cookie_snapshot_integrity(cookies_dict, "无滑块已登录场景")
-                                    logger.success("✅ Cookie有效")
-                                    return cookies_dict
-
-                                logger.error("❌ Cookie为空")
-                                return self._fail_login("未获取到有效Cookie")
+                                return self._finalize_logged_in_cookies(
+                                    context,
+                                    active_page or page,
+                                    scene="无滑块已登录场景",
+                                    notification_callback=notification_callback,
+                                    notification_scene=notification_scene,
+                                )
                             else:
                                 monitor_page = self._select_monitor_page(context, active_page or page)
                                 has_qr, qr_frame = self._detect_qr_code_verification(monitor_page)
@@ -8116,13 +9087,13 @@ class XianyuSliderStealth:
                                     # 跳出当前分支，继续走下面的账密输入流程
                                 else:
                                     logger.info(f"【{self.pure_user_id}】✅ 服务端Session验证通过，Cookie有效")
-                                    cookies_dict = self._snapshot_context_cookies(context)
-                                    if cookies_dict:
-                                        self._log_cookie_snapshot_integrity(cookies_dict, "无 iframe 已登录场景(Session已验证)")
-                                        logger.success("✅ 登录成功！Cookie有效且Session有效")
-                                        return cookies_dict
-                                    logger.error("❌ Cookie为空")
-                                    return None
+                                    return self._finalize_logged_in_cookies(
+                                        context,
+                                        active_page or page,
+                                        scene="无 iframe 已登录场景(Session已验证)",
+                                        notification_callback=notification_callback,
+                                        notification_scene=notification_scene,
+                                    )
                             except Exception as verify_e:
                                 logger.warning(f"【{self.pure_user_id}】Session验证异常: {verify_e}，按Session过期处理")
                                 page, login_frame, found_login_form, matched_selector, reopened_fresh_page = (
@@ -8140,14 +9111,13 @@ class XianyuSliderStealth:
                                     logger.info(f"【{self.pure_user_id}】Session异常后已切换到新页面继续账密登录")
                         else:
                             # 非刷新模式，直接返回Cookie
-                            cookies_dict = self._snapshot_context_cookies(context)
-                            if cookies_dict:
-                                self._log_cookie_snapshot_integrity(cookies_dict, "无 iframe 已登录场景")
-                                logger.success("✅ 登录成功！Cookie有效")
-                                return cookies_dict
-
-                            logger.error("❌ Cookie为空")
-                            return None
+                            return self._finalize_logged_in_cookies(
+                                context,
+                                active_page or page,
+                                scene="无 iframe 已登录场景",
+                                notification_callback=notification_callback,
+                                notification_scene=notification_scene,
+                            )
                     else:
                         # 持久化上下文可能因浏览器缓存导致页面处于"半登录"状态
                         # 既没有登录 iframe，也没有已登录元素
@@ -8340,7 +9310,7 @@ class XianyuSliderStealth:
                         )
 
                         # 【复用】直接调用 solve_slider() 方法处理滑块
-                        slider_success = self.solve_slider(max_retries=3)
+                        slider_success = self.solve_slider(max_retries=self.slider_max_retries)
 
                         if slider_success:
                             logger.success(f"【{self.pure_user_id}】✅ 滑块验证成功！")
@@ -8352,7 +9322,7 @@ class XianyuSliderStealth:
                                 extra_meta={'detection_source': 'login_with_password_playwright_post_login'},
                             )
                         else:
-                            logger.error(f"【{self.pure_user_id}】❌ 滑块验证3次均失败")
+                            logger.error(f"【{self.pure_user_id}】❌ 滑块验证{self.slider_max_retries}次均失败")
                             self._finish_password_login_slider_risk_log(
                                 slider_risk_log,
                                 success=False,
@@ -8391,7 +9361,7 @@ class XianyuSliderStealth:
                             verification_url=getattr(active_page or page, 'url', None),
                             detection_phase='post_wait_monitor',
                         )
-                        slider_success = self.solve_slider(max_retries=3)
+                        slider_success = self.solve_slider(max_retries=self.slider_max_retries)
                         if slider_success:
                             logger.success(f"【{self.pure_user_id}】✅ 滑块验证成功！")
                             self._finish_password_login_slider_risk_log(
@@ -8419,6 +9389,17 @@ class XianyuSliderStealth:
                     login_success, active_page, _ = self._probe_context_login_success(context, page)
                     
                     if login_success:
+                        monitor_page = self._select_monitor_page(context, active_page or page)
+                        has_qr, qr_frame = self._detect_qr_code_verification(monitor_page)
+                        if has_qr:
+                            logger.warning(f"【{self.pure_user_id}】虽然页面元素判定已登录，但当前仍存在身份验证页，转入验证等待流程")
+                            return self._process_verification_requirement(
+                                context,
+                                monitor_page,
+                                qr_frame,
+                                notification_callback,
+                                notification_scene,
+                            )
                         logger.success(f"【{self.pure_user_id}】✅ 登录验证成功！")
                     else:
                         # 检查是否有账密错误
@@ -8486,14 +9467,51 @@ class XianyuSliderStealth:
                     time.sleep(1)
                     cookies_dict = {}
                     try:
-                        cookies_list = context.cookies()
-                        for cookie in cookies_list:
-                            cookies_dict[cookie.get('name', '')] = cookie.get('value', '')
+                        cookies_dict = self._snapshot_context_cookies(context, page=active_page or page)
+                        if observed_set_cookie_updates:
+                            merged_from_network = dict(cookies_dict)
+                            merged_from_network.update(observed_set_cookie_updates)
+                            cookies_dict = merged_from_network
+                            observed_names = sorted(observed_set_cookie_updates.keys())
+                            observed_protected = [
+                                key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
+                                if key in observed_set_cookie_updates
+                            ]
+                            logger.info(
+                                f"【{self.pure_user_id}】已合并登录响应中的 {len(observed_set_cookie_updates)} 个Set-Cookie 到最终Cookie快照: "
+                                f"{observed_names[:16]}{' ...' if len(observed_names) > 16 else ''}"
+                            )
+                            if observed_protected:
+                                logger.info(
+                                    f"【{self.pure_user_id}】登录响应中包含关键会话Cookie: {observed_protected}"
+                                )
+                        missing_protected_fields = [
+                            key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
+                            if not cookies_dict.get(key)
+                        ]
+                        if missing_protected_fields:
+                            stabilized_cookies = self._stabilize_logged_in_context_cookies(
+                                context,
+                                active_page or page,
+                                scene="密码登录完成后",
+                            )
+                            if stabilized_cookies:
+                                cookies_dict = stabilized_cookies
+
+                        pending_identity_result = self._handle_pending_identity_verification_state(
+                            context,
+                            active_page or page,
+                            cookies_dict,
+                            notification_callback=notification_callback,
+                            notification_scene=notification_scene,
+                        )
+                        if pending_identity_result is not None:
+                            return pending_identity_result
                         
                         logger.info(f"【{self.pure_user_id}】成功获取Cookie，包含 {len(cookies_dict)} 个字段")
                         
                         # 打印关键Cookie字段
-                        important_keys = ['unb', '_m_h5_tk', '_m_h5_tk_enc', 'cookie2', 't', 'sgcookie', 'cna']
+                        important_keys = list(self._REQUIRED_SESSION_COOKIE_FIELDS) + list(self._OBSERVED_SESSION_COOKIE_FIELDS)
                         logger.info(f"【{self.pure_user_id}】关键Cookie字段检查:")
                         for key in important_keys:
                             if key in cookies_dict:
