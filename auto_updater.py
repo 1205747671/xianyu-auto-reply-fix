@@ -218,6 +218,22 @@ class AutoUpdater:
         ext = Path(file_path).suffix.lower()
         return ext in self.RESTART_REQUIRED_EXTENSIONS
 
+    def _resolve_safe_path(self, relative_path: str) -> Optional[Path]:
+        """将清单中的相对路径解析为项目内安全路径，阻止路径穿越。"""
+        try:
+            normalized = Path(str(relative_path or '').replace('\\', '/').strip())
+            if not normalized.parts or normalized.is_absolute():
+                logger.warning(f"拒绝处理非法更新路径: {relative_path}")
+                return None
+
+            candidate = (self.app_dir / normalized).resolve()
+            app_root = self.app_dir.resolve()
+            candidate.relative_to(app_root)
+            return candidate
+        except Exception:
+            logger.warning(f"拒绝处理越界更新路径: {relative_path}")
+            return None
+
     def refresh_current_version(self) -> str:
         """从本地版本文件刷新当前版本号，避免长生命周期进程读到旧版本"""
         version = self.current_version or "1.0.0"
@@ -446,7 +462,9 @@ class AutoUpdater:
                 logger.debug(f"跳过排除的删除路径: {deleted_file.path}")
                 continue
 
-            local_path = self.app_dir / deleted_file.path
+            local_path = self._resolve_safe_path(deleted_file.path)
+            if local_path is None:
+                continue
             if local_path.exists() and local_path.is_file():
                 files_to_delete.append(deleted_file)
                 logger.debug(f"需要删除旧文件: {deleted_file.path}")
@@ -580,7 +598,13 @@ class AutoUpdater:
                 self._update_progress(downloaded_bytes=downloaded_size)
                 
                 # 备份并安装
-                local_path = self.app_dir / file_update.path
+                local_path = self._resolve_safe_path(file_update.path)
+                if local_path is None:
+                    self._update_progress(
+                        status=UpdateStatus.FAILED,
+                        error=f"非法更新路径: {file_update.path}"
+                    )
+                    return False, updated_files, needs_restart
                 
                 # 备份旧文件
                 if not self._backup_file(local_path):
@@ -657,7 +681,13 @@ class AutoUpdater:
                 message=f"正在删除旧文件: {deleted_file.path}"
             )
 
-            local_path = self.app_dir / deleted_file.path
+            local_path = self._resolve_safe_path(deleted_file.path)
+            if local_path is None:
+                self._update_progress(
+                    status=UpdateStatus.FAILED,
+                    error=f"非法删除路径: {deleted_file.path}"
+                )
+                return False, deleted_paths, needs_restart
             if not local_path.exists():
                 continue
 

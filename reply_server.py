@@ -10649,15 +10649,13 @@ class UpdateResultResponse(PydanticBaseModel):
 
 
 def _is_auto_update_enabled() -> bool:
-    """自动更新总开关，默认关闭，避免线上实例被远端清单偷偷覆盖。"""
-    raw_value = str(os.getenv("AUTO_UPDATE_ENABLED", "false")).strip().lower()
-    return raw_value in {"1", "true", "yes", "on"}
+    """热更新功能已移除，始终保持关闭。"""
+    return False
 
 
 def _ensure_auto_update_enabled():
-    """自动更新关闭时直接拒绝整组更新接口。"""
-    if not _is_auto_update_enabled():
-        raise HTTPException(status_code=403, detail="自动更新已禁用")
+    """统一拦截历史热更新接口，兼容旧前端缓存页面。"""
+    raise HTTPException(status_code=403, detail="热更新功能已移除，请改为手动部署更新代码")
 
 
 @app.get('/api/update/check')
@@ -10992,12 +10990,12 @@ async def get_saved_hashes(current_user: Dict[str, Any] = Depends(get_current_us
 @app.post('/api/update/restart')
 async def restart_application(current_user: Dict[str, Any] = Depends(get_current_user)):
     """
-    重启应用（用于更新后重启）
-    
-    注意：此操作会重启整个应用
+    重启应用
+
+    注意：历史上复用了 /api/update/restart 路径，
+    但这里保留的是管理员手动重启能力，不属于热更新。
     """
     try:
-        _ensure_auto_update_enabled()
         # 只允许管理员执行
         if not current_user.get('is_admin'):
             raise HTTPException(status_code=403, detail="只有管理员可以重启应用")

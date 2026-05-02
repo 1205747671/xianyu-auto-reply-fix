@@ -226,32 +226,7 @@
               <i class="bi bi-info-circle me-1"></i>
               版本: <span id="versionNumber">加载中...</span>
             </span>
-            <div class="btn-group dashboard-hot-update-group" id="dashboardHotUpdateGroup" style="display: none;">
-              <button type="button" class="btn btn-sm dashboard-hot-update-btn d-inline-flex align-items-center" id="dashboardHotUpdateBtn" onclick="performHotUpdate()">
-                <i class="bi bi-cloud-download me-1"></i>检查更新
-              </button>
-              <button type="button" class="btn btn-sm dashboard-hot-update-menu-btn dropdown-toggle dropdown-toggle-split" id="dashboardHotUpdateMenuBtn" data-bs-toggle="dropdown" aria-expanded="false">
-                <span class="visually-hidden">切换更新菜单</span>
-              </button>
-              <ul class="dropdown-menu dropdown-menu-end shadow-sm dashboard-hot-update-dropdown">
-                <li>
-                  <button type="button" class="dropdown-item" id="dashboardHotUpdateAutoCheckToggle" onclick="toggleHotUpdateAutoCheck()">
-                    关闭自动检查
-                  </button>
-                </li>
-                <li>
-                  <button type="button" class="dropdown-item" id="dashboardClearIgnoredVersionBtn" onclick="clearIgnoredUpdateVersion()">
-                    清除忽略版本
-                  </button>
-                </li>
-                <li><hr class="dropdown-divider"></li>
-                <li>
-                  <div class="dropdown-item-text small text-muted" id="dashboardHotUpdatePreferenceHint">
-                    当前浏览器生效
-                  </div>
-                </li>
-              </ul>
-            </div>
+            <!-- 热更新入口已移除，更新改为手动部署 -->
             <!-- 最新权益功能暂时隐藏
             <span class="badge bg-gradient" id="benefitsBadge" style="cursor: pointer; background: linear-gradient(135deg, #ff6b6b, #feca57, #48dbfb) !important; color: #fff; animation: benefitsGlow 2s ease-in-out infinite;" onclick="showBenefitsModal()">
               <i class="bi bi-gift me-1"></i>

@@ -2770,9 +2770,17 @@ class XianyuLive:
         import aiohttp
         
         try:
-            # 好评接口地址
-            comment_api_url = "http://119.29.64.68:8081/comment"
-            
+            comment_api_url = (
+                (db_manager.get_system_setting('auto_comment_api_url') or '').strip()
+                or str(os.getenv('AUTO_COMMENT_API_URL') or '').strip()
+            )
+            if not comment_api_url:
+                logger.warning(f"【{self.cookie_id}】未配置自动好评辅助API地址，已阻止向未知第三方发送Cookie")
+                return {
+                    "success": False,
+                    "message": "未配置自动好评辅助API地址"
+                }
+             
             # 获取当前账号的cookie
             cookie_str = self.cookies_str
             
@@ -8595,7 +8603,14 @@ class XianyuLive:
                 return False
 
             # 构建请求URL
-            api_url = "http://36.111.68.231:3000/sendPrivateMsg"
+            api_url = (
+                (config_data.get('api_url') or '').strip()
+                or (db_manager.get_system_setting('qq_notification_api_url') or '').strip()
+                or str(os.getenv('QQ_NOTIFICATION_API_URL') or '').strip()
+            )
+            if not api_url:
+                logger.warning("📱 QQ通知 - 未配置QQ通知API地址，已跳过发送")
+                return False
             params = {
                 'qq': qq_number,
                 'msg': message

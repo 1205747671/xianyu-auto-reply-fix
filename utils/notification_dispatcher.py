@@ -222,7 +222,21 @@ async def _send_qq_notification(config_data: Dict[str, Any], message: str, *, ac
         logger.warning(f"【{account_id}】QQ通知配置为空")
         return False
 
-    api_url = 'http://36.111.68.231:3000/sendPrivateMsg'
+    api_url = (
+        (config_data.get('api_url') or '').strip()
+        or str(os.getenv('QQ_NOTIFICATION_API_URL') or '').strip()
+    )
+    if not api_url:
+        try:
+            from db_manager import db_manager
+            api_url = (db_manager.get_system_setting('qq_notification_api_url') or '').strip()
+        except Exception:
+            api_url = ''
+
+    if not api_url:
+        logger.warning(f"【{account_id}】未配置QQ通知API地址，已跳过发送")
+        return False
+
     params = {'qq': qq_number, 'msg': message}
 
     async with aiohttp.ClientSession() as session:

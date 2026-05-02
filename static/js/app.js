@@ -392,7 +392,7 @@ function handleDashboardAnnouncementAction(announcement) {
     }
 
     if (actionType === 'update') {
-        performHotUpdate();
+        notifyHotUpdateRemoved();
         return;
     }
 
@@ -5357,7 +5357,7 @@ async function checkAuth() {
 
         const dashboardHotUpdateGroup = document.getElementById('dashboardHotUpdateGroup');
         if (dashboardHotUpdateGroup) {
-        dashboardHotUpdateGroup.style.display = 'inline-flex';
+        dashboardHotUpdateGroup.style.display = 'none';
         }
 
         // 显示登录与注册设置
@@ -6239,7 +6239,7 @@ const outgoingConfigs = {
 const channelTypeConfigs = {
     qq: {
     title: 'QQ通知',
-    description: '需要添加QQ号 <code>3607695896</code> 为好友才能正常接收消息通知',
+    description: '请填写接收QQ号，并配置你自己的QQ通知中转API地址；系统不再内置第三方中转地址。',
     icon: 'bi-chat-dots-fill',
     color: 'primary',
     fields: [
@@ -6250,6 +6250,14 @@ const channelTypeConfigs = {
         placeholder: '输入QQ号码',
         required: true,
         help: '用于接收通知消息的QQ号码'
+        },
+        {
+        id: 'api_url',
+        label: 'QQ通知API地址',
+        type: 'url',
+        placeholder: '例如: http://127.0.0.1:3000/sendPrivateMsg',
+        required: false,
+        help: '选填。留空时将回退到系统设置 qq_notification_api_url 或环境变量 QQ_NOTIFICATION_API_URL'
         }
     ]
     },
@@ -13791,7 +13799,7 @@ async function loadSystemSettings() {
                 systemRestartBtn.style.display = isAdmin ? 'inline-block' : 'none';
             }
             if (dashboardHotUpdateGroup) {
-                dashboardHotUpdateGroup.style.display = isAdmin ? 'inline-flex' : 'none';
+                dashboardHotUpdateGroup.style.display = 'none';
             }
 
             // 如果是管理员，加载所有管理员设置
@@ -18019,24 +18027,21 @@ function shouldSuppressHotUpdateHint(updateInfo = remoteVersionInfo) {
     return !isHotUpdateAutoCheckEnabled() || (!!targetVersion && getIgnoredHotUpdateVersion() === targetVersion);
 }
 
+function notifyHotUpdateRemoved() {
+    showToast('热更新功能已移除，请改为手动部署更新代码', 'info');
+}
+
 function refreshHotUpdateButtonState(updateInfo = remoteVersionInfo) {
     const dashboardHotUpdateGroup = document.getElementById('dashboardHotUpdateGroup');
     const dashboardHotUpdateBtn = document.getElementById('dashboardHotUpdateBtn');
     const dashboardHotUpdateMenuBtn = document.getElementById('dashboardHotUpdateMenuBtn');
     if (!dashboardHotUpdateGroup || !dashboardHotUpdateBtn || !dashboardHotUpdateMenuBtn) return;
 
-    dashboardHotUpdateBtn.disabled = false;
-    dashboardHotUpdateBtn.innerHTML = '<i class="bi bi-cloud-download me-1"></i>检查更新';
-    dashboardHotUpdateMenuBtn.disabled = false;
+    dashboardHotUpdateGroup.style.display = 'none';
+    dashboardHotUpdateBtn.disabled = true;
+    dashboardHotUpdateBtn.innerHTML = '<i class="bi bi-slash-circle me-1"></i>热更新已移除';
+    dashboardHotUpdateMenuBtn.disabled = true;
     dashboardHotUpdateGroup.classList.remove('has-update', 'is-loading');
-
-    const hasUpdate = Boolean(updateInfo && (updateInfo.has_update || updateInfo.new_version));
-    if (!hasUpdate || shouldSuppressHotUpdateHint(updateInfo)) {
-        return;
-    }
-
-    dashboardHotUpdateGroup.classList.add('has-update');
-    dashboardHotUpdateBtn.innerHTML = `<i class="bi bi-cloud-download me-1"></i>有新版本 ${getHotUpdateTargetVersion(updateInfo)}`;
 }
 
 function updateHotUpdatePreferenceStatus(message = '', type = 'info') {
@@ -18068,16 +18073,10 @@ function refreshHotUpdatePreferencesMenu() {
 }
 
 function toggleHotUpdateAutoCheck() {
-    const nextEnabled = !isHotUpdateAutoCheckEnabled();
-    setHotUpdateAutoCheckEnabled(nextEnabled);
+    setHotUpdateAutoCheckEnabled(false);
     refreshHotUpdatePreferencesMenu();
     refreshHotUpdateButtonState();
-    updateHotUpdatePreferenceStatus(
-        nextEnabled
-            ? '自动检查更新已开启，当前浏览器进入系统时会自动检测'
-            : '自动检查更新已关闭，仍可手动点击“检查更新”',
-        'success'
-    );
+    updateHotUpdatePreferenceStatus('热更新功能已移除', 'info');
 }
 
 function clearIgnoredUpdateVersion(showFeedback = true) {
@@ -18085,7 +18084,7 @@ function clearIgnoredUpdateVersion(showFeedback = true) {
     refreshHotUpdatePreferencesMenu();
     refreshHotUpdateButtonState();
     if (showFeedback) {
-        updateHotUpdatePreferenceStatus('已清除忽略版本设置', 'success');
+        updateHotUpdatePreferenceStatus('热更新功能已移除', 'info');
     }
 }
 
@@ -18684,20 +18683,6 @@ async function loadSystemVersion() {
 
         refreshHotUpdateButtonState();
 
-        if (!isHotUpdateAutoCheckEnabled()) {
-            return;
-        }
-
-        // 调用后端检查更新（复用热更新接口）
-        try {
-            const checkResult = await checkHotUpdate();
-            if (checkResult && checkResult.has_update) {
-                refreshHotUpdateButtonState(checkResult);
-            }
-        } catch (e) {
-            console.warn('版本检查失败:', e.message);
-        }
-
     } catch (error) {
         console.error('版本加载失败:', error);
         document.getElementById('versionNumber').textContent = '未知';
@@ -18869,8 +18854,8 @@ async function showUpdateInfo(newVersion) {
                         <button type="button" class="btn" style="background: #f0f0f0; color: #666; border: none; font-size: 15px; padding: 8px 20px;" data-bs-dismiss="modal">
                             <i class="bi bi-x-lg me-1"></i>稍后再说
                         </button>
-                        <button type="button" class="btn" id="hotUpdateBtn" style="background: linear-gradient(135deg, #28a745, #20c997); color: #fff; border: none; font-size: 15px; padding: 8px 20px;" onclick="performHotUpdate()">
-                            <i class="bi bi-cloud-download me-1"></i>一键热更新
+                        <button type="button" class="btn" id="hotUpdateBtn" style="background: #e9ecef; color: #6c757d; border: none; font-size: 15px; padding: 8px 20px;" disabled>
+                            <i class="bi bi-slash-circle me-1"></i>热更新已移除
                         </button>
                     </div>
                 </div>
@@ -19083,35 +19068,8 @@ async function getBenefitsInfo() {
         return remoteVersionInfo;
     }
 
-    // 从远程获取权益信息
-    try {
-        const response = await fetch('http://116.196.116.76/version.php', {
-            method: 'GET',
-            headers: {
-                'Accept': 'application/json'
-            }
-        });
-
-        if (!response.ok) {
-            showToast('获取权益信息失败: 网络错误', 'danger');
-            return null;
-        }
-
-        const result = await response.json();
-
-        if (result.error || !result.success) {
-            showToast('获取权益信息失败: ' + (result.message || '未知错误'), 'danger');
-            return null;
-        }
-
-        remoteVersionInfo = result.data;
-        return remoteVersionInfo;
-
-    } catch (error) {
-        console.error('获取权益信息失败:', error);
-        showToast('获取权益信息失败: ' + error.message, 'danger');
-        return null;
-    }
+    // 不再请求硬编码第三方地址；仅使用当前会话里已获取到的本地版本信息。
+    return null;
 }
 
 // =============================================================================
@@ -19596,37 +19554,11 @@ async function showVersionInfo(version) {
  * 调用后端API检查是否有可用的文件更新
  */
 async function checkHotUpdate() {
-    try {
-        const response = await fetch('/api/update/check', {
-            method: 'GET',
-            headers: {
-                'Accept': 'application/json',
-                'Authorization': `Bearer ${authToken}`
-            }
-        });
-        
-        if (!response.ok) {
-            console.warn('热更新检查请求失败:', response.status);
-            return null;
-        }
-        
-        const result = await response.json();
-        
-        if (!result.success) {
-            console.warn('热更新检查返回错误:', result.message);
-            return null;
-        }
-
-        if (result.data) {
-            remoteVersionInfo = result.data;
-        }
-        
-        return result.data;
-        
-    } catch (error) {
-        console.error('热更新检查失败:', error);
-        return null;
-    }
+    return {
+        success: false,
+        has_update: false,
+        message: '热更新功能已移除'
+    };
 }
 
 /**
@@ -19634,86 +19566,8 @@ async function checkHotUpdate() {
  * 下载并安装所有可用更新
  */
 async function performHotUpdate() {
-    setHotUpdateButtonsLoading();
-    
-    try {
-        // 先检查是否有更新
-        const checkResult = await checkHotUpdate();
-        
-        if (!checkResult) {
-            showToast('检查更新失败，请稍后重试', 'danger');
-            resetHotUpdateBtn();
-            return;
-        }
-        
-        if (!checkResult.has_update) {
-            showToast('已是最新版本，无需更新', 'info');
-            resetHotUpdateBtn();
-            return;
-        }
-        
-        // 显示确认对话框
-        const dialogAction = await showHotUpdateConfirmDialog(checkResult);
-        
-        if (dialogAction !== 'confirm') {
-            if (dialogAction === 'ignore') {
-                const ignoredVersion = getHotUpdateTargetVersion(checkResult);
-                setIgnoredHotUpdateVersion(ignoredVersion);
-                refreshHotUpdatePreferencesMenu();
-                refreshHotUpdateButtonState(checkResult);
-                updateHotUpdatePreferenceStatus(`已忽略版本 ${ignoredVersion}`, 'success');
-            }
-            resetHotUpdateBtn();
-            return;
-        }
-        
-        // 显示更新进度
-        showHotUpdateProgress();
-        
-        // 执行更新
-        const response = await fetch('/api/update/apply', {
-            method: 'POST',
-            headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${authToken}`
-            }
-        });
-        
-        const result = await response.json();
-        
-        // 关闭进度弹窗
-        closeHotUpdateProgress();
-        
-        if (result.success && result.data.success) {
-            // 更新成功
-            const updateData = result.data;
-            const updatedCount = updateData.updated_files?.length || 0;
-            const deletedCount = updateData.deleted_files?.length || 0;
-            
-            if (updateData.needs_restart) {
-                // 需要重启
-                showHotUpdateRestartDialog(updateData);
-            } else {
-                // 不需要重启，刷新页面即可
-                showToast(`更新成功！更新 ${updatedCount} 个文件，删除 ${deletedCount} 个旧文件`, 'success');
-                
-                // 3秒后刷新页面
-                setTimeout(() => {
-                    window.location.reload();
-                }, 3000);
-            }
-        } else {
-            showToast('更新失败: ' + (result.detail || result.message || result.data?.message || '未知错误'), 'danger');
-        }
-        
-    } catch (error) {
-        console.error('热更新执行失败:', error);
-        showToast('更新失败: ' + error.message, 'danger');
-        closeHotUpdateProgress();
-    } finally {
-        resetHotUpdateBtn();
-    }
+    notifyHotUpdateRemoved();
+    resetHotUpdateBtn();
 }
 
 /**
@@ -19722,8 +19576,8 @@ async function performHotUpdate() {
 function resetHotUpdateBtn() {
     const hotUpdateBtn = document.getElementById('hotUpdateBtn');
     if (hotUpdateBtn) {
-        hotUpdateBtn.disabled = false;
-        hotUpdateBtn.innerHTML = '<i class="bi bi-cloud-download me-1"></i>一键热更新';
+        hotUpdateBtn.disabled = true;
+        hotUpdateBtn.innerHTML = '<i class="bi bi-slash-circle me-1"></i>热更新已移除';
     }
     refreshHotUpdateButtonState();
 }
@@ -19999,35 +19853,7 @@ function showHotUpdateRestartDialog(updateData) {
  * 重启应用
  */
 async function restartApplication() {
-    try {
-        showToast('正在重启应用...', 'info');
-        
-        const response = await fetch('/api/update/restart', {
-            method: 'POST',
-            headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${authToken}`
-            }
-        });
-        
-        const result = await response.json();
-        
-        if (result.success) {
-            showToast('应用正在重启，页面将在5秒后自动刷新...', 'success');
-            
-            // 5秒后刷新页面
-            setTimeout(() => {
-                window.location.reload();
-            }, 5000);
-        } else {
-            showToast('重启失败: ' + result.message, 'danger');
-        }
-        
-    } catch (error) {
-        console.error('重启应用失败:', error);
-        showToast('重启失败: ' + error.message, 'danger');
-    }
+    notifyHotUpdateRemoved();
 }
 
 // 添加CSS动画

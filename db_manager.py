@@ -897,6 +897,9 @@ Cookie数量: {cookie_count}
             ('smtp_from', '', '发件人显示名（留空则使用邮箱地址）'),
             ('smtp_use_tls', 'true', '是否启用TLS'),
             ('smtp_use_ssl', 'false', '是否启用SSL'),
+            ('verification_email_api_url', '', '验证码邮件API地址（留空则仅使用SMTP）'),
+            ('qq_notification_api_url', '', 'QQ通知API地址（留空则禁用QQ通知）'),
+            ('auto_comment_api_url', '', '自动好评辅助API地址（留空则禁用外部辅助）'),
             ('qq_reply_secret_key', 'xianyu_qq_reply_2024', 'QQ回复消息API秘钥')
             ''')
 
@@ -4226,12 +4229,18 @@ Cookie数量: {cookie_count}
             return await self._send_email_via_api(email, subject, text_content)
 
     async def _send_email_via_api(self, email: str, subject: str, text_content: str) -> bool:
-        """使用API方式发送邮件"""
+        """使用用户显式配置的邮件API发送邮件。"""
         try:
             import aiohttp
 
-            # 使用GET请求发送邮件
-            api_url = "https://dy.zhinianboke.com/api/emailSend"
+            api_url = (
+                (self.get_system_setting('verification_email_api_url') or '').strip()
+                or str(os.getenv('VERIFICATION_EMAIL_API_URL') or '').strip()
+            )
+            if not api_url:
+                logger.warning(f"未配置验证码邮件API地址，无法通过API发送验证码邮件: {email}")
+                return False
+
             params = {
                 'subject': subject,
                 'receiveUser': email,
