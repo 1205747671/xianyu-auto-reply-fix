@@ -2395,13 +2395,6 @@ async def xianyu_reply(req: RequestModel):
         # 如果格式化失败，返回原始内容
         send_msg = msg_template
 
-    # 如果是默认回复且开启了"只回复一次"，记录回复记录
-    if is_default_reply:
-        from db_manager import db_manager
-        default_reply_settings = db_manager.get_default_reply(req.cookie_id)
-        if default_reply_settings and default_reply_settings.get('reply_once', False):
-            db_manager.add_default_reply_record(req.cookie_id, req.chat_id)
-
     return {"code": 200, "data": {"send_msg": send_msg}}
 
 # ------------------------- 账号 / 关键字管理接口 -------------------------
