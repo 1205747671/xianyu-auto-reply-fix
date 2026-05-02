@@ -285,7 +285,7 @@ DISPLAY=:99
   - 本地运行: http://localhost:8090
 - **默认管理员账号（首次初始化且未自定义密码时）**：
   - 用户名：`admin`
-  - 密码：`admin123`
+  - 密码：`<请在部署时自定义>`
 - **API文档**：
   - Docker Compose 默认配置: http://localhost:9000/docs
   - Docker Compose 国内配置: http://localhost:8000/docs
