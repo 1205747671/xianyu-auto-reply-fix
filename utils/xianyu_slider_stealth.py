@@ -4629,9 +4629,21 @@ class XianyuSliderStealth:
         logger.success(f"【{self.pure_user_id}】✅ {scene}后Cookie获取完成，字段数: {len(cookies_dict)}")
         return cookies_dict
 
-    def _wait_for_context_login(self, context, fallback_page, max_wait_time: int = 450, check_interval: int = 10) -> Tuple[bool, Any]:
+    def _wait_for_context_login(
+        self,
+        context,
+        fallback_page,
+        max_wait_time: int = 450,
+        check_interval: int = 10,
+        verification_type: str = 'unknown',
+        verification_url: Optional[str] = None,
+        notification_callback: Optional[Callable] = None,
+        notification_scene: str = '账号密码登录',
+    ) -> Tuple[bool, Any]:
         waited_time = 0
         monitor_page = fallback_page
+        last_verification_type = verification_type or 'unknown'
+        last_verification_url = verification_url or None
 
         while waited_time < max_wait_time:
             monitor_page = self._select_monitor_page(context, monitor_page)
@@ -4640,6 +4652,33 @@ class XianyuSliderStealth:
             login_success, success_page, _ = self._probe_context_login_success(context, monitor_page)
             if login_success:
                 return True, success_page or monitor_page
+
+            has_verification, refreshed_frame = self._detect_qr_code_verification(monitor_page)
+            if has_verification and refreshed_frame:
+                refreshed_type = getattr(refreshed_frame, 'verification_type', None) or 'unknown'
+                refreshed_url = getattr(refreshed_frame, 'verify_url', None)
+                if not refreshed_url and hasattr(refreshed_frame, 'url'):
+                    refreshed_url = refreshed_frame.url
+
+                verification_changed = (
+                    refreshed_type != last_verification_type or
+                    (refreshed_url or None) != last_verification_url
+                )
+                if verification_changed:
+                    refreshed_screenshot_path = getattr(refreshed_frame, 'screenshot_path', None)
+                    logger.info(
+                        f"【{self.pure_user_id}】验证等待期间检测到验证页变化: "
+                        f"{last_verification_type}->{refreshed_type}, url={refreshed_url or 'N/A'}"
+                    )
+                    self._notify_verification_required(
+                        refreshed_type,
+                        refreshed_url,
+                        refreshed_screenshot_path,
+                        notification_callback,
+                        notification_scene,
+                    )
+                    last_verification_type = refreshed_type
+                    last_verification_url = refreshed_url or None
 
             time.sleep(check_interval)
             waited_time += check_interval
@@ -4806,6 +4845,10 @@ class XianyuSliderStealth:
                 fallback_page,
                 max_wait_time=wait_timeout,
                 check_interval=10,
+                verification_type=verification_type,
+                verification_url=frame_url,
+                notification_callback=notification_callback,
+                notification_scene=notification_scene,
             )
         finally:
             if screenshot_path:
