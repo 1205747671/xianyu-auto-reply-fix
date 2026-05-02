@@ -795,6 +795,7 @@ password_login_sessions = {}  # {session_id: {'account_id': str, 'account': str,
 password_login_locks = defaultdict(lambda: asyncio.Lock())
 manual_cookie_import_sessions = {}  # {session_id: {'account_id': str, 'status': str, 'verification_url': str, 'screenshot_path': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
 manual_cookie_import_locks = defaultdict(lambda: asyncio.Lock())
+PASSWORD_LOGIN_TERMINAL_STATUSES = {'success', 'failed', 'cancelled'}
 
 # 不再需要单独的密码初始化，由数据库初始化时处理
 
@@ -3354,15 +3355,32 @@ def _update_session_risk_log(
 def _set_password_login_session_status(session_id: str, status: str, **fields):
     session = password_login_sessions.get(session_id)
     if not session:
-        return
+        return False
+
+    current_status = str(session.get('status') or '').strip().lower()
+    next_status = str(status or '').strip().lower()
+    if current_status in PASSWORD_LOGIN_TERMINAL_STATUSES and next_status != current_status:
+        logger.info(
+            f"忽略密码登录会话终态回退: session_id={session_id}, current_status={current_status}, next_status={next_status}"
+        )
+        return False
 
     session['status'] = status
     session.update(fields)
 
-    if status in {'success', 'failed'}:
+    if next_status == 'success':
+        session['error'] = None
+        session['verification_url'] = None
+        session['screenshot_path'] = None
+        session['qr_code_url'] = None
+        session['verification_type'] = None
+
+    if next_status in PASSWORD_LOGIN_TERMINAL_STATUSES:
         session['completed_at'] = time.time()
     else:
         session['completed_at'] = None
+
+    return True
 
 
 def _set_manual_cookie_import_session_status(session_id: str, status: str, **fields):
@@ -4253,6 +4271,18 @@ async def check_password_login_status(
             ) or current_time - session['timestamp'] > 3600
         ]
         for sid in expired_sessions:
+            expired_session = password_login_sessions.get(sid)
+            if expired_session:
+                expired_screenshot_path = expired_session.get('screenshot_path')
+                if expired_screenshot_path:
+                    try:
+                        from utils.image_utils import image_manager
+                        if image_manager.delete_image(expired_screenshot_path):
+                            log_with_user('info', f"密码登录会话过期，已删除验证截图: {expired_screenshot_path}", current_user)
+                        else:
+                            log_with_user('warning', f"密码登录会话过期，但删除验证截图失败: {expired_screenshot_path}", current_user)
+                    except Exception as cleanup_err:
+                        log_with_user('error', f"清理过期密码登录截图时出错: {str(cleanup_err)}", current_user)
             if sid in password_login_sessions:
                 del password_login_sessions[sid]
         
@@ -4281,21 +4311,6 @@ async def check_password_login_status(
                 'message': f'需要{verification_type}，请查看验证截图' if screenshot_path else f'需要{verification_type}，请点击验证链接'
             }
         elif status == 'success':
-            # 登录成功
-            # 删除截图（如果存在）
-            screenshot_path = session.get('screenshot_path')
-            if screenshot_path:
-                try:
-                    from utils.image_utils import image_manager
-                    if image_manager.delete_image(screenshot_path):
-                        log_with_user('info', f"验证成功后已删除截图: {screenshot_path}", current_user)
-                    else:
-                        log_with_user('warning', f"删除截图失败: {screenshot_path}", current_user)
-                except Exception as e:
-                    log_with_user('error', f"删除截图时出错: {str(e)}", current_user)
-                finally:
-                    session['screenshot_path'] = None
-            
             return {
                 'status': 'success',
                 'message': f'账号 {session["account_id"]} 登录成功',
@@ -4304,27 +4319,17 @@ async def check_password_login_status(
                 'cookie_count': session.get('cookie_count', 0)
             }
         elif status == 'failed':
-            # 登录失败
-            # 删除截图（如果存在）
-            screenshot_path = session.get('screenshot_path')
-            if screenshot_path:
-                try:
-                    from utils.image_utils import image_manager
-                    if image_manager.delete_image(screenshot_path):
-                        log_with_user('info', f"验证失败后已删除截图: {screenshot_path}", current_user)
-                    else:
-                        log_with_user('warning', f"删除截图失败: {screenshot_path}", current_user)
-                except Exception as e:
-                    log_with_user('error', f"删除截图时出错: {str(e)}", current_user)
-                finally:
-                    session['screenshot_path'] = None
-            
             error_msg = session.get('error', '登录失败')
             log_with_user('info', f"返回登录失败状态: {session_id}, 错误消息: {error_msg}", current_user)  # 添加日志
             return {
                 'status': 'failed',
                 'message': error_msg,
                 'error': error_msg  # 也包含error字段，确保前端能获取到
+            }
+        elif status == 'cancelled':
+            return {
+                'status': 'cancelled',
+                'message': session.get('error') or '登录已取消'
             }
         else:
             # 处理中
@@ -4336,6 +4341,51 @@ async def check_password_login_status(
     except Exception as e:
         log_with_user('error', f"检查账号密码登录状态异常: {str(e)}", current_user)
         return {'status': 'error', 'message': str(e)}
+
+
+@app.post("/password-login/cancel/{session_id}")
+async def cancel_password_login(
+    session_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """取消账号密码登录/刷新 Cookie 会话，避免前端反复弹出验证窗口。"""
+    try:
+        session = password_login_sessions.get(session_id)
+        if not session:
+            return {'success': False, 'status': 'not_found', 'message': '会话不存在或已过期'}
+
+        if session['user_id'] != current_user['user_id']:
+            return {'success': False, 'status': 'forbidden', 'message': '无权限访问该会话'}
+
+        current_status = str(session.get('status') or '').strip().lower()
+        if current_status in PASSWORD_LOGIN_TERMINAL_STATUSES:
+            return {
+                'success': True,
+                'status': current_status,
+                'message': session.get('error') or '会话已结束'
+            }
+
+        _set_password_login_session_status(session_id, 'cancelled', error='用户取消登录')
+        _update_session_risk_log(session_id, 'failed', error_message='用户取消登录')
+
+        slider_instance = session.get('slider_instance')
+        if slider_instance:
+            try:
+                slider_instance.close_browser()
+                log_with_user('info', f"已关闭密码登录浏览器实例: {session_id}", current_user)
+            except Exception as close_err:
+                log_with_user('warning', f"关闭密码登录浏览器实例失败: {session_id}, 错误: {close_err}", current_user)
+
+        return {
+            'success': True,
+            'status': 'cancelled',
+            'message': '登录已取消'
+        }
+    except Exception as exc:
+        log_with_user('error', f"取消账号密码登录异常: {str(exc)}", current_user)
+        import traceback
+        logger.error(traceback.format_exc())
+        return {'success': False, 'status': 'error', 'message': str(exc)}
 
 
 # ========================= 人脸验证截图相关接口 =========================

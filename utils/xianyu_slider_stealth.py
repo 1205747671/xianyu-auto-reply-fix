@@ -1379,12 +1379,41 @@ class XianyuSliderStealth:
             return None
         return f"{match.group(1)},{match.group(2)}"
 
+    def _extract_relaxed_learning_profile_group(self, profile_id: Optional[str]) -> Optional[str]:
+        normalized = str(profile_id or "").strip().lower()
+        match = re.match(r'^(win_chrome)_(\d+)_(\d+)x(\d+)$', normalized)
+        if not match:
+            return None
+        if match.group(3) != "1600" or match.group(4) != "900":
+            return None
+        return f"{match.group(1)}_{match.group(3)}x{match.group(4)}"
+
+    def _canonical_learning_profile_id(self, profile_id: Optional[str]) -> str:
+        normalized = str(profile_id or "").strip()
+        if not normalized:
+            return ""
+        if self.headless and self._is_password_login_scene() and self._use_headless_stable_profile():
+            relaxed_group = self._extract_relaxed_learning_profile_group(normalized)
+            if relaxed_group:
+                return relaxed_group
+        return normalized
+
+    def _is_learning_profile_compatible(self, record_profile_id: Optional[str]) -> bool:
+        if not self.profile_id:
+            return True
+        current_profile = self._canonical_learning_profile_id(self.profile_id)
+        target_profile = self._canonical_learning_profile_id(record_profile_id)
+        if not target_profile:
+            return True
+        return current_profile == target_profile
+
     def _allow_small_sample_learning(self, history: List[Dict[str, Any]],
                                      reference_distance: Optional[float] = None) -> bool:
         if len(history) < 2:
             return False
 
         profile_ids = set()
+        canonical_profile_ids = set()
         distances = []
         for record in history:
             if not isinstance(record, dict) or not record.get("success"):
@@ -1398,14 +1427,17 @@ class XianyuSliderStealth:
             ).strip()
             if record_profile_id:
                 profile_ids.add(record_profile_id)
+                canonical_profile_ids.add(self._canonical_learning_profile_id(record_profile_id))
 
             distance_value = record.get("distance")
             if isinstance(distance_value, (int, float)):
                 distances.append(float(distance_value))
 
-        if self.profile_id and profile_ids and profile_ids != {self.profile_id}:
+        if self.profile_id and profile_ids and any(
+            not self._is_learning_profile_compatible(profile_id) for profile_id in profile_ids
+        ):
             return False
-        if len(profile_ids) > 1:
+        if len({profile_id for profile_id in canonical_profile_ids if profile_id}) > 1:
             return False
         if reference_distance is None:
             return False
@@ -2522,7 +2554,7 @@ class XianyuSliderStealth:
                             or verification_result.get("profile_id")
                             or ""
                         ).strip()
-                        if self.profile_id and record_profile_id and record_profile_id != self.profile_id:
+                        if self.profile_id and record_profile_id and not self._is_learning_profile_compatible(record_profile_id):
                             continue
 
                         distance_value = record.get("distance")
@@ -3000,7 +3032,13 @@ class XianyuSliderStealth:
                 if steps_max - steps_min < 5:
                     steps_min = max(20, steps_median - 2)
                     steps_max = min(40, steps_median + 3)
-                
+
+                # 防御性兜底：历史样本中位数可能超过上限，导致区间反转
+                if steps_min > steps_max:
+                    clamped_median = min(40, max(20, steps_median))
+                    steps_min = max(20, clamped_median - 3)
+                    steps_max = min(40, max(steps_min + 2, clamped_median))
+
                 learned_steps = (steps_min, steps_max)
                 logger.info(f"【{self.pure_user_id}】📚 学习到最优步数: {steps_min}-{steps_max}步 "
                            f"(中位数:{steps_median}步)")
@@ -3513,9 +3551,39 @@ class XianyuSliderStealth:
                 verify_page.goto(verification_url, wait_until="domcontentloaded", timeout=30000)
                 time.sleep(2)
 
+                recovered_slider_detected = self._page_has_slider(verify_page)
+                recovered_purecaptcha_detected = any(
+                    token in verification_url.lower()
+                    for token in ('purecaptcha=', 'action=captcha', 'punish?', 'x5step=2')
+                )
+                if recovered_slider_detected or recovered_purecaptcha_detected:
+                    logger.info(
+                        f"【{self.pure_user_id}】半登录态恢复页命中"
+                        f"{'滑块' if recovered_slider_detected else 'pureCaptcha'}特征，优先尝试自动续解"
+                    )
+                    solved = self._attempt_solve_slider_on_page(verify_page)
+                    if solved:
+                        login_success, active_page, _ = self._probe_context_login_success(context, verify_page)
+                        if login_success:
+                            logger.success(f"【{self.pure_user_id}】✅ 半登录态恢复页滑块续解后已确认登录成功")
+                            return self._finalize_logged_in_cookies(
+                                context,
+                                active_page or verify_page,
+                                scene="半登录态恢复页自动续解",
+                                notification_callback=notification_callback,
+                                notification_scene=notification_scene,
+                            )
+                        logger.warning(
+                            f"【{self.pure_user_id}】半登录态恢复页滑块已处理，但暂未确认登录成功，继续走验证识别流程"
+                        )
+                    else:
+                        logger.warning(
+                            f"【{self.pure_user_id}】半登录态恢复页自动续解未成功，继续判断是否需要人工验证"
+                        )
+
                 verification_type = self._detect_verification_type(verify_page)
                 if verification_type == 'unknown' and 'identity_verify' in verification_url.lower():
-                    verification_type = 'qr_verify'
+                    verification_type = 'face_verify'
 
                 verification_screenshot = self._capture_verification_screenshot(verify_page)
                 verification_wrapper = VerificationFrameWrapper(
@@ -3552,6 +3620,23 @@ class XianyuSliderStealth:
             return self._fail_login(
                 "检测到二次身份校验未完成，请按通知中的验证链接完成验证后重试"
             )
+
+        missing_required_fields = [
+            key for key in self._REQUIRED_SESSION_COOKIE_FIELDS
+            if not cookies_dict.get(key)
+        ]
+        if not missing_required_fields:
+            fallback_cookies = dict(cookies_dict)
+            cleared_pending_markers = [
+                key for key in self._IDENTITY_VERIFY_PENDING_COOKIE_FIELDS
+                if fallback_cookies.pop(key, None) is not None
+            ]
+            logger.warning(
+                f"【{self.pure_user_id}】半登录态未恢复出新的验证页，但当前核心会话字段已齐全；"
+                f"回退为受保护Cookie交接，待上层合并补齐缺失字段。"
+                f"已清理待确认标记: {cleared_pending_markers}"
+            )
+            return fallback_cookies
 
         return self._fail_login(
             "检测到二次身份校验未完成，当前仅形成前端登录态，服务端会话未建立"
@@ -4237,7 +4322,7 @@ class XianyuSliderStealth:
             pass
 
         try:
-            content_text = frame.content()
+            content_text = frame.text_content('body', timeout=1500)
             if content_text:
                 text_candidates.append(str(content_text))
         except Exception:
@@ -4513,6 +4598,7 @@ class XianyuSliderStealth:
             if warmed_cookies:
                 cookies_dict = warmed_cookies
 
+        pending_identity_error_before = self.last_login_error
         pending_identity_result = self._handle_pending_identity_verification_state(
             context,
             target_page,
@@ -4522,6 +4608,8 @@ class XianyuSliderStealth:
         )
         if pending_identity_result is not None:
             return pending_identity_result
+        if self.last_login_error and self.last_login_error != pending_identity_error_before:
+            return None
 
         missing_required_fields = [
             key for key in self._REQUIRED_SESSION_COOKIE_FIELDS
@@ -4720,10 +4808,13 @@ class XianyuSliderStealth:
                 check_interval=10,
             )
         finally:
-            if self.keep_verification_screenshots:
+            if screenshot_path:
+                logger.info(
+                    f"【{self.pure_user_id}】验证流程结束后暂不自动删除验证截图，"
+                    f"改由会话过期或手动清理: {screenshot_path}"
+                )
+            elif self.keep_verification_screenshots:
                 logger.info(f"【{self.pure_user_id}】保留验证截图供后续调试")
-            else:
-                self._cleanup_verification_screenshots()
 
         if not login_success:
             logger.error(f"【{self.pure_user_id}】❌ 等待验证超时（{wait_timeout}秒）")
@@ -5309,6 +5400,14 @@ class XianyuSliderStealth:
         )
 
         learned_steps = optimized_params.get("learned_steps_range", (22, 30))
+        learned_steps = (
+            max(20, min(40, int(learned_steps[0]))),
+            max(20, min(40, int(learned_steps[1]))),
+        )
+        if learned_steps[0] > learned_steps[1]:
+            learned_steps = (learned_steps[1], learned_steps[0])
+        if learned_steps[1] - learned_steps[0] < 2:
+            learned_steps = (learned_steps[0], min(40, learned_steps[0] + 2))
 
         return {
             "overshoot": learned_overshoot,
@@ -7895,8 +7994,8 @@ class XianyuSliderStealth:
                             
                     # 也检查页面HTML中是否包含错误文本
                     try:
-                        content = frame.content()
-                        if '账密错误' in content or '账号密码错误' in content or '用户名或密码错误' in content:
+                        detection_text = self._read_frame_text_for_detection(frame)
+                        if '账密错误' in detection_text or '账号密码错误' in detection_text or '用户名或密码错误' in detection_text:
                             logger.error(f"【{self.pure_user_id}】❌ 页面内容中检测到账密错误")
                             return True, "账密错误"
                     except PasswordLoginVerificationError:
@@ -7941,19 +8040,19 @@ class XianyuSliderStealth:
                 logger.info(f"【{self.pure_user_id}】检测到验证类型: 短信验证")
                 return 'sms_verify'
 
-            # 3. 检查是否是二维码验证
-            qr_keywords = ['扫码', '二维码', '扫一扫', '手机淘宝', '手机扫码']
-            for keyword in qr_keywords:
-                if keyword in detection_text:
-                    logger.info(f"【{self.pure_user_id}】检测到验证类型: 二维码验证 (关键词: {keyword})")
-                    return 'qr_verify'
-
-            # 4. 检查是否是人脸验证
+            # 3. 检查是否是人脸验证
             face_keywords = ['人脸', '刷脸', '面部', '拍摄脸部', '刷脸验证', '人脸验证']
             for keyword in face_keywords:
                 if keyword in detection_text_lower:
                     logger.info(f"【{self.pure_user_id}】检测到验证类型: 人脸验证 (关键词: {keyword})")
                     return 'face_verify'
+
+            # 4. 检查是否是二维码验证
+            qr_keywords = ['扫码', '二维码', '扫一扫', '手机淘宝', '手机扫码']
+            for keyword in qr_keywords:
+                if keyword in detection_text:
+                    logger.info(f"【{self.pure_user_id}】检测到验证类型: 二维码验证 (关键词: {keyword})")
+                    return 'qr_verify'
 
             # 5. 检查 URL 特征
             frame_url = ""
@@ -7966,13 +8065,17 @@ class XianyuSliderStealth:
                 logger.info(f"【{self.pure_user_id}】检测到验证类型: 短信验证 (URL特征)")
                 return 'sms_verify'
 
-            if 'qrcode' in frame_url.lower() or 'scan' in frame_url.lower():
-                logger.info(f"【{self.pure_user_id}】检测到验证类型: 二维码验证 (URL特征)")
-                return 'qr_verify'
-
             if any(token in frame_url.lower() for token in ('face_verify', 'faceverify', 'liveness')):
                 logger.info(f"【{self.pure_user_id}】检测到验证类型: 人脸验证 (URL特征)")
                 return 'face_verify'
+
+            if 'identity_verify' in frame_url.lower():
+                logger.info(f"【{self.pure_user_id}】检测到验证类型: 人脸验证 (identity_verify URL特征)")
+                return 'face_verify'
+
+            if 'qrcode' in frame_url.lower() or 'scan' in frame_url.lower():
+                logger.info(f"【{self.pure_user_id}】检测到验证类型: 二维码验证 (URL特征)")
+                return 'qr_verify'
 
             # 默认当作未知验证类型
             logger.info(f"【{self.pure_user_id}】无法确定验证类型，标记为未知")
@@ -8345,18 +8448,18 @@ class XianyuSliderStealth:
                     # 人脸验证的关键词（更精确）
                     face_keywords = ['拍摄脸部', '人脸验证', '人脸识别', '面部验证', '请进行人脸验证', '请完成人脸识别']
                     try:
-                        frame_content = frame.content()
+                        frame_text = self._read_frame_text_for_detection(frame)
                         # 检查是否包含人脸验证关键词，但不包含滑块相关关键词
                         has_face_keyword = False
                         for keyword in face_keywords:
-                            if keyword in frame_content:
+                            if keyword in frame_text:
                                 has_face_keyword = True
                                 break
                         
                         # 如果包含人脸验证关键词，且不包含滑块关键词，则认为是人脸验证
                         if has_face_keyword:
                             slider_keywords = ['滑块', '拖动', 'nc_', 'nc-container']
-                            has_slider_keyword = any(keyword in frame_content for keyword in slider_keywords)
+                            has_slider_keyword = any(keyword in frame_text for keyword in slider_keywords)
                             
                             if not has_slider_keyword:
                                 logger.info(f"【{self.pure_user_id}】✅ 在Frame {idx} 检测到人脸验证")
@@ -8519,6 +8622,14 @@ class XianyuSliderStealth:
             self.last_login_error = ""
             previous_slider_refresh_mode = getattr(self, '_slider_refresh_mode', False)
             self._slider_refresh_mode = force_clean_context
+            previous_risk_trigger_scene = getattr(self, 'risk_trigger_scene', None)
+            inferred_risk_trigger_scene = 'manual_password_refresh' if force_clean_context else 'password_login'
+            if not previous_risk_trigger_scene:
+                self.risk_trigger_scene = inferred_risk_trigger_scene
+                logger.info(f"【{self.pure_user_id}】密码登录流程自动补齐 risk_trigger_scene={self.risk_trigger_scene}")
+            else:
+                logger.info(f"【{self.pure_user_id}】密码登录流程沿用 risk_trigger_scene={previous_risk_trigger_scene}")
+            self._password_slider_runtime_hardened = False
 
             # 检查日期有效性
             if not self._check_date_validity():
@@ -9330,6 +9441,68 @@ class XianyuSliderStealth:
                                 error_message=self._get_slider_failure_message("滑块验证失败，请稍后重试"),
                                 extra_meta={'detection_source': 'login_with_password_playwright_post_login'},
                             )
+                            fallback_page = locals().get('active_page') or page
+                            monitor_page = self._select_monitor_page(context, fallback_page) or fallback_page
+                            qr_handoff_frame = None
+                            qr_markers = ('扫码', '扫一扫', '安全登录', '二维码')
+                            qr_selectors = (
+                                'img[src*=\"qrcode\"]',
+                                'canvas[class*=\"qrcode\"]',
+                                '.qr-code',
+                                '#qr-code',
+                                '[class*=\"qr-code\"]',
+                                '[id*=\"qr-code\"]',
+                            )
+                            for qr_candidate in [monitor_page] + list(monitor_page.frames):
+                                try:
+                                    frame_text = qr_candidate.text_content('body') or ''
+                                except Exception:
+                                    frame_text = ''
+                                marker_hit = any(marker in frame_text for marker in qr_markers)
+                                selector_hit = False
+                                for qr_selector in qr_selectors:
+                                    try:
+                                        qr_element = qr_candidate.query_selector(qr_selector)
+                                        if qr_element and qr_element.is_visible():
+                                            selector_hit = True
+                                            break
+                                    except Exception:
+                                        continue
+                                if marker_hit or selector_hit:
+                                    qr_handoff_frame = qr_candidate
+                                    break
+                            if qr_handoff_frame is not None:
+                                screenshot_path = self._capture_verification_screenshot(
+                                    monitor_page,
+                                    frame=(None if qr_handoff_frame == monitor_page else qr_handoff_frame),
+                                )
+                                qr_frame = VerificationFrameWrapper(
+                                    qr_handoff_frame,
+                                    verification_type='qr_verify',
+                                    verify_url=(
+                                        qr_handoff_frame.url
+                                        if hasattr(qr_handoff_frame, 'url')
+                                        else getattr(monitor_page, 'url', None)
+                                    ),
+                                    screenshot_path=screenshot_path,
+                                )
+                                logger.warning(
+                                    f"【{self.pure_user_id}】滑块多次失败后检测到可扫码验证，转为二维码验证接管"
+                                )
+                                self._finish_password_login_slider_risk_log(
+                                    slider_risk_log,
+                                    success=False,
+                                    verification_url=(getattr(search_frame, 'url', None) if 'search_frame' in locals() else getattr(page, 'url', None)),
+                                    processing_result='滑块失败后检测到可扫码验证，已转交二维码验证流程',
+                                    extra_meta={'detection_source': 'login_with_password_playwright_post_login_qr_handoff'},
+                                )
+                                return self._process_verification_requirement(
+                                    context,
+                                    monitor_page,
+                                    qr_frame,
+                                    notification_callback,
+                                    '账号密码登录',
+                                )
                             return self._fail_login(self._get_slider_failure_message("滑块验证失败，请稍后重试"))
                     else:
                         logger.info(f"【{self.pure_user_id}】未检测到滑块验证")
@@ -9498,6 +9671,7 @@ class XianyuSliderStealth:
                             if stabilized_cookies:
                                 cookies_dict = stabilized_cookies
 
+                        pending_identity_error_before = self.last_login_error
                         pending_identity_result = self._handle_pending_identity_verification_state(
                             context,
                             active_page or page,
@@ -9507,6 +9681,8 @@ class XianyuSliderStealth:
                         )
                         if pending_identity_result is not None:
                             return pending_identity_result
+                        if self.last_login_error and self.last_login_error != pending_identity_error_before:
+                            return None
                         
                         logger.info(f"【{self.pure_user_id}】成功获取Cookie，包含 {len(cookies_dict)} 个字段")
                         
@@ -9541,26 +9717,47 @@ class XianyuSliderStealth:
                     self.playwright = original_playwright
             
             finally:
-                # 关闭浏览器
+                # 关闭浏览器。这里不能无限阻塞，否则上层会话会一直卡在 processing。
                 try:
-                    if context:
-                        context.close()
-                    if force_clean_context and browser:
+                    close_errors = []
+
+                    def _close_runtime_resources():
                         try:
-                            browser.close()
-                        except Exception:
-                            pass
-                    playwright.stop()
-                    if force_clean_context:
+                            if context:
+                                context.close()
+                        except Exception as close_context_err:
+                            close_errors.append(f"context.close: {close_context_err}")
+
+                        if force_clean_context and browser:
+                            try:
+                                browser.close()
+                            except Exception as close_browser_err:
+                                close_errors.append(f"browser.close: {close_browser_err}")
+
+                        try:
+                            if playwright:
+                                playwright.stop()
+                        except Exception as stop_playwright_err:
+                            close_errors.append(f"playwright.stop: {stop_playwright_err}")
+
+                    close_thread = threading.Thread(
+                        target=_close_runtime_resources,
+                        name=f"pwd-login-close-{self.pure_user_id}",
+                        daemon=True,
+                    )
+                    close_thread.start()
+                    close_thread.join(timeout=8)
+
+                    if close_thread.is_alive():
+                        logger.warning(f"【{self.pure_user_id}】关闭浏览器超时，改为后台继续清理，避免阻塞密码登录会话收尾")
+                    elif close_errors:
+                        logger.warning(f"【{self.pure_user_id}】关闭浏览器时出现异常: {close_errors}")
+                    elif force_clean_context:
                         logger.info(f"【{self.pure_user_id}】浏览器已关闭，干净上下文已销毁")
                     else:
                         logger.info(f"【{self.pure_user_id}】浏览器已关闭，缓存已保存")
                 except Exception as e:
                     logger.warning(f"【{self.pure_user_id}】关闭浏览器时出错: {e}")
-                    try:
-                        playwright.stop()
-                    except:
-                        pass
 
                 # 释放并发槽位（防止槽位泄漏导致后续任务永远等待）
                 try:
@@ -9580,6 +9777,8 @@ class XianyuSliderStealth:
             return self._fail_login(error_message if error_message else "密码登录流程异常")
         finally:
             self._slider_refresh_mode = previous_slider_refresh_mode
+            self._password_slider_runtime_hardened = False
+            self.risk_trigger_scene = previous_risk_trigger_scene
             # 最外层 finally：确保任何退出路径都释放并发槽位
             try:
                 concurrency_manager.unregister_instance(self.user_id)

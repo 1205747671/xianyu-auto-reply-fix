@@ -12115,13 +12115,18 @@ function startRefreshCookiePolling(sessionId, cookieId) {
                     loadCookies();
                     break;
                 case 'failed':
+                case 'cancelled':
                 case 'error':
                 case 'not_found':
                 case 'forbidden':
                     stopRefreshCookiePolling(sessionId);
                     closePasswordLoginQRModal();
                     toggleLoading(false);
-                    showToast(`刷新失败: ${data.message || data.error || '未知错误'}`, 'danger');
+                    if (data.status === 'cancelled') {
+                        showToast(data.message || '刷新Cookie已取消', 'info');
+                    } else {
+                        showToast(`刷新失败: ${data.message || data.error || '未知错误'}`, 'danger');
+                    }
                     break;
             }
         } catch (error) {
@@ -12145,6 +12150,11 @@ let passwordLoginPollingState = {
     sessionId: null,
     inFlight: false,
     completed: false
+};
+let passwordLoginQRModalEventsBound = false;
+let passwordLoginQRModalState = {
+    systemClosing: false,
+    cancelInFlight: false
 };
 
 // 处理账号密码登录表单提交
@@ -12263,6 +12273,13 @@ async function checkPasswordLoginStatus() {
                     clearPasswordLoginCheck();
                     handlePasswordLoginFailure(data);
                     break;
+                case 'cancelled':
+                    passwordLoginPollingState.completed = true;
+                    clearPasswordLoginCheck();
+                    closePasswordLoginQRModal();
+                    showToast(data.message || '登录已取消', 'info');
+                    resetPasswordLoginForm();
+                    break;
                 case 'not_found':
                 case 'forbidden':
                 case 'error':
@@ -12316,6 +12333,74 @@ function getPasswordLoginVerificationTypeLabel(verificationType) {
     return labelMap[normalized] || normalized || '身份验证';
 }
 
+async function cancelPasswordLoginSession(sessionId, flowLabel = '登录') {
+    if (!sessionId || passwordLoginQRModalState.cancelInFlight) {
+        return;
+    }
+
+    passwordLoginQRModalState.cancelInFlight = true;
+    try {
+        const response = await fetch(`${apiBase}/password-login/cancel/${sessionId}`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data.success === false) {
+            console.warn(`${flowLabel}取消请求返回异常:`, data);
+            showToast(data.message || `已停止当前${flowLabel}轮询`, 'warning');
+            return;
+        }
+        showToast(data.message || `${flowLabel}已取消`, 'info');
+    } catch (error) {
+        console.error(`取消${flowLabel}会话失败:`, error);
+        showToast(`已停止当前${flowLabel}轮询，请稍后重试`, 'warning');
+    } finally {
+        passwordLoginQRModalState.cancelInFlight = false;
+    }
+}
+
+function bindPasswordLoginQRModalEvents(modalElement) {
+    if (!modalElement || passwordLoginQRModalEventsBound) {
+        return;
+    }
+
+    modalElement.addEventListener('hidden.bs.modal', function () {
+        if (passwordLoginQRModalState.systemClosing) {
+            passwordLoginQRModalState.systemClosing = false;
+            return;
+        }
+
+        if (passwordLoginPollingState.sessionId && !passwordLoginPollingState.completed) {
+            const activeSessionId = passwordLoginPollingState.sessionId;
+            passwordLoginPollingState.completed = true;
+            passwordLoginPollingState.inFlight = false;
+            resetPasswordLoginForm();
+            void cancelPasswordLoginSession(activeSessionId, '登录');
+            return;
+        }
+
+        if (refreshCookiePollingState.sessionId && !refreshCookiePollingState.completed) {
+            const activeSessionId = refreshCookiePollingState.sessionId;
+            stopRefreshCookiePolling(activeSessionId);
+            refreshCookiePollingState.inFlight = false;
+            toggleLoading(false);
+            void cancelPasswordLoginSession(activeSessionId, '刷新Cookie');
+            return;
+        }
+
+        if (manualCookieImportPollingState.sessionId && !manualCookieImportPollingState.completed) {
+            manualCookieImportPollingState.completed = true;
+            manualCookieImportPollingState.inFlight = false;
+            resetManualCookieImportForm();
+            showToast('已停止当前导入验证流程', 'info');
+        }
+    });
+
+    passwordLoginQRModalEventsBound = true;
+}
+
 // 显示账号密码登录验证
 function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationType) {
     // 使用现有的二维码登录模态框
@@ -12325,6 +12410,7 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationTy
         createPasswordLoginQRModal();
         modal = document.getElementById('passwordLoginQRModal');
     }
+    bindPasswordLoginQRModalEvents(modal);
     
     // 更新模态框标题
     const modalTitle = document.getElementById('passwordLoginQRModalLabel');
@@ -12403,6 +12489,7 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationTy
 function closePasswordLoginQRModal() {
     const modalElement = document.getElementById('passwordLoginQRModal');
     if (!modalElement) {
+        passwordLoginQRModalState.systemClosing = false;
         return;
     }
 
@@ -12429,8 +12516,11 @@ function closePasswordLoginQRModal() {
     }
 
     const modalInstance = bootstrap.Modal.getInstance(modalElement);
-    if (modalInstance) {
+    if (modalInstance && modalElement.classList.contains('show')) {
+        passwordLoginQRModalState.systemClosing = true;
         modalInstance.hide();
+    } else {
+        passwordLoginQRModalState.systemClosing = false;
     }
 }
 
@@ -12484,6 +12574,7 @@ function createPasswordLoginQRModal() {
     `;
     
     document.body.insertAdjacentHTML('beforeend', modalHtml);
+    bindPasswordLoginQRModalEvents(document.getElementById('passwordLoginQRModal'));
 }
 
 // 处理账号密码登录成功
