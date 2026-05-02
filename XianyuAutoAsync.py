@@ -13310,6 +13310,33 @@ class XianyuLive:
                 if self.active_message_tasks % 100 == 0 and self.active_message_tasks > 0:
                     logger.info(f"【{self.cookie_id}】当前活跃消息处理任务数: {self.active_message_tasks}")
 
+    def _unwrap_message_for_dedupe(self, message_data: dict) -> dict:
+        """将同步包还原为内部消息结构，便于统一提取 messageId / createTime。"""
+        if not isinstance(message_data, dict):
+            return None
+
+        if "1" in message_data:
+            return message_data
+
+        try:
+            if not self.is_sync_package(message_data):
+                return None
+
+            sync_list = (((message_data.get("body") or {}).get("syncPushPackage") or {}).get("data") or [])
+            if not sync_list:
+                return None
+
+            raw_data = sync_list[0].get("data")
+            if not raw_data:
+                return None
+
+            decoded = base64.b64decode(raw_data).decode("utf-8")
+            parsed = json.loads(decoded)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception as e:
+            logger.debug(f"【{self.cookie_id}】同步包去重解析失败: {self._safe_str(e)}")
+            return None
+
     def _extract_message_id(self, message_data: dict) -> str:
         """
         从消息数据中提取消息ID，用于去重
@@ -13321,9 +13348,11 @@ class XianyuLive:
             消息ID字符串，如果无法提取则返回None
         """
         try:
+            normalized_message = self._unwrap_message_for_dedupe(message_data)
+
             # 尝试从 message['1']['10']['bizTag'] 中提取 messageId
-            if isinstance(message_data, dict) and "1" in message_data:
-                message_1 = message_data.get("1")
+            if isinstance(normalized_message, dict) and "1" in normalized_message:
+                message_1 = normalized_message.get("1")
                 if isinstance(message_1, dict) and "10" in message_1:
                     message_10 = message_1.get("10")
                     if isinstance(message_10, dict) and "bizTag" in message_10:
@@ -13375,10 +13404,11 @@ class XianyuLive:
         # 如果没有 messageId，使用备用标识（chat_id + send_message + 时间戳）
         if not message_id:
             try:
+                normalized_message = self._unwrap_message_for_dedupe(message_data) or {}
                 # 尝试从消息数据中提取时间戳
                 create_time = 0
-                if isinstance(message_data, dict) and "1" in message_data:
-                    message_1 = message_data.get("1")
+                if isinstance(normalized_message, dict) and "1" in normalized_message:
+                    message_1 = normalized_message.get("1")
                     if isinstance(message_1, dict):
                         create_time = message_1.get("5", 0)
                 # 使用组合键作为备用标识
