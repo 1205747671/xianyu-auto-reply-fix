@@ -8602,6 +8602,72 @@ class XianyuSliderStealth:
             import traceback
             logger.debug(traceback.format_exc())
             return None
+
+    def _is_profile_in_use_launch_error(self, error: Exception) -> bool:
+        error_text = str(error or "").lower()
+        lock_markers = (
+            "profile appears to be in use",
+            "process_singleton",
+            "chromium has locked the profile",
+            "user data directory is already in use",
+        )
+        return any(marker in error_text for marker in lock_markers)
+
+    def _launch_clean_cookie_seeded_context(
+        self,
+        playwright,
+        launch_options: Dict[str, Any],
+        browser_features: Dict[str, Any],
+    ) -> Tuple[Any, Any]:
+        browser = playwright.chromium.launch(**launch_options)
+        context = browser.new_context(
+            viewport={'width': browser_features['viewport_width'], 'height': browser_features['viewport_height']},
+            user_agent=browser_features['user_agent'],
+            locale=browser_features['locale'],
+            accept_downloads=True,
+            ignore_https_errors=True,
+            extra_http_headers={
+                'Accept-Language': browser_features['accept_lang']
+            }
+        )
+        try:
+            cookies_to_inject = self._build_initial_cookie_payload()
+            cookie_str = ''
+            if not cookies_to_inject:
+                from db_manager import db_manager as _db
+                cookie_info = _db.get_cookie_details(self.pure_user_id)
+                if cookie_info and cookie_info.get('value'):
+                    cookie_str = cookie_info['value']
+            if cookie_str:
+                cookies_to_inject = []
+                for pair in cookie_str.split(';'):
+                    pair = pair.strip()
+                    if '=' in pair:
+                        name, value = pair.split('=', 1)
+                        name = name.strip()
+                        value = value.strip()
+                        if name:
+                            cookies_to_inject.append({
+                                'name': name,
+                                'value': value,
+                                'domain': '.goofish.com',
+                                'path': '/',
+                            })
+                            if name in ('_m_h5_tk', '_m_h5_tk_enc', 'cookie2', 'sgcookie', 'unb', 't', 'cna'):
+                                cookies_to_inject.append({
+                                    'name': name,
+                                    'value': value,
+                                    'domain': '.taobao.com',
+                                    'path': '/',
+                                })
+            if cookies_to_inject:
+                context.add_cookies(cookies_to_inject)
+                logger.info(f"【{self.pure_user_id}】已注入 {len(cookies_to_inject)} 个历史 Cookie 到干净上下文")
+            else:
+                logger.info(f"【{self.pure_user_id}】未找到可注入的历史 Cookie，继续使用全新上下文")
+        except Exception as inject_e:
+            logger.warning(f"【{self.pure_user_id}】注入历史 Cookie 失败（不影响继续登录）: {inject_e}")
+        return browser, context
     
     def login_with_password_playwright(self, account: str, password: str, show_browser: bool = False,
                                       notification_callback: Optional[Callable] = None,
@@ -8718,6 +8784,7 @@ class XianyuSliderStealth:
             playwright_factory = self._get_sync_playwright_factory()
             playwright = playwright_factory().start()
             browser = None
+            used_profile_lock_fallback = False
             launch_options: Dict[str, Any] = {
                 'headless': not show_browser,
                 'ignore_default_args': ['--enable-automation'],
@@ -8732,74 +8799,39 @@ class XianyuSliderStealth:
             if self.executable_path:
                 launch_options['executable_path'] = self.executable_path
             if force_clean_context:
-                browser = playwright.chromium.launch(**launch_options)
-                context = browser.new_context(
-                    viewport={'width': browser_features['viewport_width'], 'height': browser_features['viewport_height']},
-                    user_agent=browser_features['user_agent'],
-                    locale=browser_features['locale'],
-                    accept_downloads=True,
-                    ignore_https_errors=True,
-                    extra_http_headers={
-                        'Accept-Language': browser_features['accept_lang']
-                    }
+                browser, context = self._launch_clean_cookie_seeded_context(
+                    playwright,
+                    launch_options,
+                    browser_features,
                 )
-                # 注入已有 Cookie（让浏览器不是全新空白状态，降低风控检测风险）
-                try:
-                    _cookies_to_inject = self._build_initial_cookie_payload()
-                    _cookie_str = ''
-                    if not _cookies_to_inject:
-                        from db_manager import db_manager as _db
-                        _cookie_info = _db.get_cookie_details(self.pure_user_id)
-                        if _cookie_info and _cookie_info.get('value'):
-                            _cookie_str = _cookie_info['value']
-                    if _cookie_str:
-                        _cookies_to_inject = []
-                        for pair in _cookie_str.split(';'):
-                            pair = pair.strip()
-                            if '=' in pair:
-                                name, value = pair.split('=', 1)
-                                name = name.strip()
-                                value = value.strip()
-                                if name:
-                                    _cookies_to_inject.append({
-                                        'name': name,
-                                        'value': value,
-                                        'domain': '.goofish.com',
-                                        'path': '/',
-                                    })
-                                    # 同时注入 taobao 域（部分 Cookie 需要跨域）
-                                    if name in ('_m_h5_tk', '_m_h5_tk_enc', 'cookie2', 'sgcookie', 'unb', 't', 'cna'):
-                                        _cookies_to_inject.append({
-                                            'name': name,
-                                            'value': value,
-                                            'domain': '.taobao.com',
-                                            'path': '/',
-                                        })
-                        if _cookies_to_inject:
-                            context.add_cookies(_cookies_to_inject)
-                            logger.info(f"【{self.pure_user_id}】已注入 {len(_cookies_to_inject)} 个历史 Cookie 到干净上下文")
-                        else:
-                            logger.warning(f"【{self.pure_user_id}】历史 Cookie 为空，使用全新上下文")
-                    elif _cookies_to_inject:
-                        context.add_cookies(_cookies_to_inject)
-                        logger.info(f"【{self.pure_user_id}】已注入 {len(_cookies_to_inject)} 个传入 Cookie 到干净上下文")
-                    else:
-                        logger.info(f"【{self.pure_user_id}】未找到历史 Cookie，使用全新上下文")
-                except Exception as inject_e:
-                    logger.warning(f"【{self.pure_user_id}】注入历史 Cookie 失败（不影响登录）: {inject_e}")
             else:
-                context = playwright.chromium.launch_persistent_context(
-                    user_data_dir,
-                    **launch_options,
-                    viewport={'width': browser_features['viewport_width'], 'height': browser_features['viewport_height']},
-                    user_agent=browser_features['user_agent'],
-                    locale=browser_features['locale'],
-                    accept_downloads=True,
-                    ignore_https_errors=True,
-                    extra_http_headers={
-                        'Accept-Language': browser_features['accept_lang']
-                    }
-                )
+                try:
+                    context = playwright.chromium.launch_persistent_context(
+                        user_data_dir,
+                        **launch_options,
+                        viewport={'width': browser_features['viewport_width'], 'height': browser_features['viewport_height']},
+                        user_agent=browser_features['user_agent'],
+                        locale=browser_features['locale'],
+                        accept_downloads=True,
+                        ignore_https_errors=True,
+                        extra_http_headers={
+                            'Accept-Language': browser_features['accept_lang']
+                        }
+                    )
+                except Exception as persistent_launch_error:
+                    if not self._is_profile_in_use_launch_error(persistent_launch_error):
+                        raise
+                    used_profile_lock_fallback = True
+                    logger.warning(
+                        f"【{self.pure_user_id}】持久化浏览器目录被其他 Chromium 进程占用，"
+                        f"自动切换到干净上下文兜底登录: {persistent_launch_error}"
+                    )
+                    browser, context = self._launch_clean_cookie_seeded_context(
+                        playwright,
+                        launch_options,
+                        browser_features,
+                    )
+            effective_clean_context = force_clean_context or used_profile_lock_fallback
             logger.info(f"【{self.pure_user_id}】已设置浏览器语言为中文（zh-CN）")
 
             if not browser:
@@ -9007,7 +9039,7 @@ class XianyuSliderStealth:
                         if has_slider:
                             # 设置检测到的frame，供solve_slider使用
                             self._detected_slider_frame = detected_slider_frame
-                            if force_clean_context:
+                            if effective_clean_context:
                                 logger.info(f"【{self.pure_user_id}】干净上下文检测到前置风控滑块，尝试自动处理...")
 
                             logger.warning(f"【{self.pure_user_id}】检测到滑块验证，开始处理...")
@@ -9164,7 +9196,7 @@ class XianyuSliderStealth:
 
                         # 🔧 刷新模式下验证 session 是否真的有效
                         # 注入旧 Cookie 可能让前端显示"已登录"，但服务端 session 已过期
-                        if force_clean_context:
+                        if effective_clean_context:
                             logger.info(f"【{self.pure_user_id}】刷新模式：验证服务端Session是否有效...")
                             try:
                                 verify_page = context.new_page()
@@ -9232,7 +9264,7 @@ class XianyuSliderStealth:
                     else:
                         # 持久化上下文可能因浏览器缓存导致页面处于"半登录"状态
                         # 既没有登录 iframe，也没有已登录元素
-                        if not force_clean_context:
+                        if not effective_clean_context:
                             logger.warning(
                                 f"【{self.pure_user_id}】持久化上下文页面状态异常（无iframe、无已登录态），"
                                 f"清除Cookie和缓存后重新加载..."
@@ -9728,7 +9760,7 @@ class XianyuSliderStealth:
                         except Exception as close_context_err:
                             close_errors.append(f"context.close: {close_context_err}")
 
-                        if force_clean_context and browser:
+                        if effective_clean_context and browser:
                             try:
                                 browser.close()
                             except Exception as close_browser_err:
@@ -9752,7 +9784,7 @@ class XianyuSliderStealth:
                         logger.warning(f"【{self.pure_user_id}】关闭浏览器超时，改为后台继续清理，避免阻塞密码登录会话收尾")
                     elif close_errors:
                         logger.warning(f"【{self.pure_user_id}】关闭浏览器时出现异常: {close_errors}")
-                    elif force_clean_context:
+                    elif effective_clean_context:
                         logger.info(f"【{self.pure_user_id}】浏览器已关闭，干净上下文已销毁")
                     else:
                         logger.info(f"【{self.pure_user_id}】浏览器已关闭，缓存已保存")
@@ -9772,6 +9804,8 @@ class XianyuSliderStealth:
             import traceback
             logger.error(traceback.format_exc())
             error_message = str(e)
+            if self._is_profile_in_use_launch_error(e):
+                return self._fail_login("浏览器用户目录正被其他登录流程占用，请稍后重试")
             if "Target page, context or browser has been closed" in error_message:
                 return self._fail_login("页面会话已失效，请重新尝试刷新Cookie")
             return self._fail_login(error_message if error_message else "密码登录流程异常")
