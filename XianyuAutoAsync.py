@@ -6881,7 +6881,7 @@ class XianyuLive:
             )
             slider.risk_session_id = risk_session_id
             slider.risk_trigger_scene = trigger_scene
-            result = await asyncio.to_thread(
+            result = await slider._run_sync_method_on_fresh_thread(
                 slider.login_with_password_playwright,
                 account=username,
                 password=password,
