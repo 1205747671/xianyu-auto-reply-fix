@@ -18,6 +18,7 @@ import uvicorn
 import pandas as pd
 import io
 import asyncio
+import concurrent.futures
 import queue
 from collections import defaultdict
 
@@ -3415,6 +3416,8 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
     manual_refresh_acquired = False
     manual_refresh_owner = f"password_login:{session_id}"
     login_thread_started = False
+    manual_refresh_preflight_timeout = 45.0
+    request_loop = asyncio.get_running_loop()
     try:
         log_with_user('info', f"开始执行账号密码登录任务: {session_id}, 账号: {account_id}", current_user)
 
@@ -3667,7 +3670,17 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                             user_id=user_id,
                             register_instance=False,
                         )
-                        asyncio.run(temp_xianyu.preflight_token_after_manual_refresh())
+                        preflight_future = asyncio.run_coroutine_threadsafe(
+                            temp_xianyu.preflight_token_after_manual_refresh(),
+                            request_loop,
+                        )
+                        try:
+                            preflight_future.result(timeout=manual_refresh_preflight_timeout)
+                        except concurrent.futures.TimeoutError as timeout_err:
+                            preflight_future.cancel()
+                            raise TimeoutError(
+                                f"手动刷新后的Token预检在 {manual_refresh_preflight_timeout:.0f} 秒内未完成"
+                            ) from timeout_err
                         cookies_str = temp_xianyu.cookies_str
                         merged_cookies_dict = trans_cookies(cookies_str)
                         log_with_user('info', f"刷新模式Token预检通过，将使用预检后的Cookie继续交接: {account_id}", current_user)
@@ -3870,8 +3883,8 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 # 清理实例（释放并发槽位）
                 try:
                     from utils.xianyu_slider_stealth import concurrency_manager
-                    concurrency_manager.unregister_instance(account_id)
-                    log_with_user('debug', f"已释放并发槽位: {account_id}", current_user)
+                    if concurrency_manager.unregister_instance(account_id, slider_instance):
+                        log_with_user('debug', f"已释放并发槽位: {account_id}", current_user)
                 except Exception as cleanup_e:
                     log_with_user('warning', f"清理实例时出错: {str(cleanup_e)}", current_user)
 
@@ -3997,7 +4010,7 @@ async def _execute_manual_cookie_import(
             finally:
                 try:
                     from utils.xianyu_slider_stealth import concurrency_manager
-                    concurrency_manager.unregister_instance(account_id)
+                    concurrency_manager.unregister_instance(account_id, slider_instance)
                 except Exception:
                     pass
 

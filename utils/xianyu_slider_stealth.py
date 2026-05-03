@@ -779,14 +779,23 @@ class SliderConcurrencyManager:
                 self.waiting_queue.remove(user_id)
             return True
     
-    def unregister_instance(self, user_id: str):
-        """注销实例"""
+    def unregister_instance(self, user_id: str, instance=None):
+        """注销实例；如果提供 instance，则仅在实例归属匹配时释放。"""
         with self.instance_lock:
-            if user_id in self.active_instances:
-                del self.active_instances[user_id]
-                # 提取纯用户ID用于日志显示
+            active_entry = self.active_instances.get(user_id)
+            if not active_entry:
+                return False
+
+            if instance is not None and active_entry.get('instance') is not instance:
                 pure_user_id = self._extract_pure_user_id(user_id)
-                logger.info(f"【{pure_user_id}】实例已注销，当前活跃: {len(self.active_instances)}")
+                logger.debug(f"【{pure_user_id}】跳过注销实例：当前活跃实例已切换，避免误释放新槽位")
+                return False
+
+            del self.active_instances[user_id]
+            # 提取纯用户ID用于日志显示
+            pure_user_id = self._extract_pure_user_id(user_id)
+            logger.info(f"【{pure_user_id}】实例已注销，当前活跃: {len(self.active_instances)}")
+            return True
     
     def _extract_pure_user_id(self, user_id: str) -> str:
         """提取纯用户ID（移除时间戳部分）"""
@@ -989,6 +998,7 @@ class XianyuSliderStealth:
                 elif detected_channel:
                     self.browser_channel = detected_channel
         self.playwright = None
+        self._concurrency_slot_registered = False
         
         # 提取纯用户ID（移除时间戳部分）
         self.pure_user_id = concurrency_manager._extract_pure_user_id(user_id)
@@ -1011,6 +1021,7 @@ class XianyuSliderStealth:
         # 注册实例
         if not concurrency_manager.register_instance(self.user_id, self):
             raise Exception(f"【{self.pure_user_id}】同账号已有滑块任务正在执行，请稍后重试")
+        self._concurrency_slot_registered = True
         stats = concurrency_manager.get_stats()
         logger.info(f"【{self.pure_user_id}】实例已注册，当前并发: {stats['active_count']}/{stats['max_concurrent']}")
         
@@ -7857,9 +7868,62 @@ class XianyuSliderStealth:
         
         return False
     
+    def _release_concurrency_slot(self, reason: str = "") -> bool:
+        """幂等释放并发槽位，避免清理过程卡死导致后续账号永远排队。"""
+        if not getattr(self, '_concurrency_slot_registered', False):
+            return False
+        try:
+            concurrency_manager.unregister_instance(self.user_id, self)
+            self._concurrency_slot_registered = False
+            stats = concurrency_manager.get_stats()
+            reason_suffix = f"（{reason}）" if reason else ""
+            logger.info(
+                f"【{self.pure_user_id}】已释放并发槽位{reason_suffix}，当前并发: "
+                f"{stats['active_count']}/{stats['max_concurrent']}，等待队列: {stats['queue_length']}"
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"【{self.pure_user_id}】释放并发槽位时出错: {e}")
+            return False
+
+    def _stop_playwright_with_timeout(self, timeout_seconds: float = 5.0) -> bool:
+        """best-effort 停止 Playwright，避免 stop() 卡死把整个清理链拖住。"""
+        if not getattr(self, 'playwright', None):
+            return True
+
+        errors = []
+
+        def _stop_target():
+            try:
+                self.playwright.stop()
+            except Exception as exc:
+                errors.append(exc)
+
+        stop_thread = threading.Thread(
+            target=_stop_target,
+            name=f"slider-playwright-stop-{self.pure_user_id}",
+            daemon=True,
+        )
+        stop_thread.start()
+        stop_thread.join(timeout_seconds)
+
+        if stop_thread.is_alive():
+            logger.warning(
+                f"【{self.pure_user_id}】Playwright.stop() 超过 {timeout_seconds:.1f} 秒仍未返回，"
+                f"跳过阻塞等待，避免并发槽位泄漏"
+            )
+            return False
+
+        if errors:
+            raise errors[0]
+        return True
+
     def close_browser(self):
         """安全关闭浏览器并清理资源"""
         logger.info(f"【{self.pure_user_id}】开始清理资源...")
+
+        # 先释放槽位，避免后续任一清理步骤卡死把同账号任务永久堵住。
+        self._release_concurrency_slot("close_browser开始")
         
         # 清理页面
         try:
@@ -7891,8 +7955,11 @@ class XianyuSliderStealth:
         # 【修复】同步停止Playwright，确保资源真正释放
         try:
             if hasattr(self, 'playwright') and self.playwright:
-                self.playwright.stop()  # 直接同步停止，不使用异步任务
-                logger.info(f"【{self.pure_user_id}】Playwright已停止")
+                stopped = self._stop_playwright_with_timeout()
+                if stopped:
+                    logger.info(f"【{self.pure_user_id}】Playwright已停止")
+                else:
+                    logger.warning(f"【{self.pure_user_id}】Playwright停止超时，已跳过阻塞等待")
                 self.playwright = None
         except Exception as e:
             logger.warning(f"【{self.pure_user_id}】停止Playwright时出错: {e}")
@@ -7906,13 +7973,8 @@ class XianyuSliderStealth:
         except Exception as e:
             logger.warning(f"【{self.pure_user_id}】清理临时目录时出错: {e}")
         
-        # 注销实例（最后执行，确保其他清理完成）
-        try:
-            concurrency_manager.unregister_instance(self.user_id)
-            stats = concurrency_manager.get_stats()
-            logger.info(f"【{self.pure_user_id}】实例已注销，当前并发: {stats['active_count']}/{stats['max_concurrent']}，等待队列: {stats['queue_length']}")
-        except Exception as e:
-            logger.warning(f"【{self.pure_user_id}】注销实例时出错: {e}")
+        # 再兜底释放一次，兼容前面提前释放失败的极端情况。
+        self._release_concurrency_slot("close_browser收尾")
         
         logger.info(f"【{self.pure_user_id}】资源清理完成")
     
@@ -9815,9 +9877,7 @@ class XianyuSliderStealth:
 
                 # 释放并发槽位（防止槽位泄漏导致后续任务永远等待）
                 try:
-                    concurrency_manager.unregister_instance(self.user_id)
-                    stats = concurrency_manager.get_stats()
-                    logger.info(f"【{self.pure_user_id}】密码登录结束，已释放并发槽位，当前并发: {stats['active_count']}/{stats['max_concurrent']}")
+                    self._release_concurrency_slot("密码登录结束")
                 except Exception as e:
                     logger.warning(f"【{self.pure_user_id}】释放并发槽位时出错: {e}")
         
@@ -9837,7 +9897,7 @@ class XianyuSliderStealth:
             self.risk_trigger_scene = previous_risk_trigger_scene
             # 最外层 finally：确保任何退出路径都释放并发槽位
             try:
-                concurrency_manager.unregister_instance(self.user_id)
+                self._release_concurrency_slot("密码登录finally兜底")
             except Exception:
                 pass
     
