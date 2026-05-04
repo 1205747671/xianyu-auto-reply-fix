@@ -1266,6 +1266,30 @@ class XianyuSliderStealth:
             return f"滑块验证失败：{feedback_message}"
         return default_message
 
+    def _should_abort_token_refresh_slider_flow_after_failure(self) -> Tuple[bool, str]:
+        """识别 token_refresh 场景下的已知硬拒绝，尽快交给外层走账密恢复。"""
+        if getattr(self, "risk_trigger_scene", None) != "token_refresh":
+            return False, ""
+
+        feedback = self.last_verification_feedback or {}
+        fail_code = str(feedback.get("fail_code") or "").strip().lower()
+        message_parts = [
+            str(feedback.get("message") or "").strip(),
+            str(feedback.get("dom_error_text") or "").strip(),
+        ]
+        message_text = " ".join(part for part in message_parts if part)
+
+        has_retry_failure_message = "验证失败，点击框体重试" in message_text
+        has_error_code = bool(fail_code) or ("error:" in message_text.lower())
+        if has_retry_failure_message and has_error_code:
+            fail_code_note = fail_code or "unknown"
+            return True, f"token_refresh 场景命中已知 hard reject({fail_code_note})，提前结束当前滑块流程"
+
+        return False, ""
+
+    def _should_abort_slider_retry_after_failure(self) -> Tuple[bool, str]:
+        return self._should_abort_token_refresh_slider_flow_after_failure()
+
     def _capture_verification_screenshot(self, page, frame=None, iframe_selector: Optional[str] = None) -> Optional[str]:
         """截取验证页面截图，多种方式逐级回退"""
         try:
@@ -7027,7 +7051,7 @@ class XianyuSliderStealth:
             page_text_lower = str(page_text or '').lower()
 
             has_slider_button = False
-            for selector in ("#nc_1_n1z", ".btn_slide", ".sm-btn", ".sm-btn-wrapper", ".nc_scale"):
+            for selector in ("#nc_1_n1z", ".btn_slide", ".sm-btn", ".nc_scale"):
                 try:
                     element = target_page.query_selector(selector)
                     if element and element.is_visible():
@@ -7036,8 +7060,10 @@ class XianyuSliderStealth:
                 except Exception:
                     continue
 
+            # `#nocaptcha` / `.sm-btn-wrapper` 常只是处罚页的外壳容器；
+            # 只有真正的轨道/按钮出现时，才算“仍可操作的滑块”。
             has_slider_track = False
-            for selector in ("#nc_1_n1t", ".nc_scale", ".sm-btn-wrapper", "#nocaptcha"):
+            for selector in ("#nc_1_n1t", ".nc_scale"):
                 try:
                     element = target_page.query_selector(selector)
                     if element and element.is_visible():
@@ -8220,6 +8246,7 @@ class XianyuSliderStealth:
 
         failure_records = []
         current_strategy = 'ultra_fast_optimized'  # 优化后的极速策略
+        last_attempt = 0
 
         def finalize_slider_success(
             attempt_no: int,
@@ -8268,6 +8295,7 @@ class XianyuSliderStealth:
 
         for attempt in range(1, max_retries + 1):
             try:
+                last_attempt = attempt
                 logger.info(f"【{self.pure_user_id}】开始处理滑块验证... (第{attempt}/{max_retries}次尝试)")
 
                 current_block = self._detect_special_captcha_block(self.page)
@@ -8485,6 +8513,19 @@ class XianyuSliderStealth:
                         failure_info = self._analyze_failure(attempt, slide_distance, self.current_trajectory_data)
                         failure_records.append(failure_info)
                         self._save_failure_record(self.current_trajectory_data, failure_info)
+
+                    abort_retry, abort_reason = self._should_abort_slider_retry_after_failure()
+                    if abort_retry:
+                        logger.warning(f"【{self.pure_user_id}】{abort_reason}")
+                        if hasattr(self, 'current_trajectory_data'):
+                            self._update_current_result_meta(
+                                "failure",
+                                attempt=attempt,
+                                cookie_refresh_confirmed=False,
+                                soft_success=False,
+                                note="token_refresh_hard_reject_abort_retry",
+                            )
+                        break
                     
                     # 如果不是最后一次尝试，继续
                     if attempt < max_retries:
@@ -8496,7 +8537,8 @@ class XianyuSliderStealth:
                     continue
         
         # 所有尝试都失败了
-        logger.error(f"【{self.pure_user_id}】滑块验证失败，已尝试{max_retries}次")
+        attempts_used = max(last_attempt, len(failure_records))
+        logger.error(f"【{self.pure_user_id}】滑块验证失败，已尝试{attempts_used}次")
         
         # 输出失败分析摘要
         if failure_records:
@@ -10988,6 +11030,11 @@ class XianyuSliderStealth:
                         logger.warning(f"【{self.pure_user_id}】获取cookie时出错: {str(e)}")
                 else:
                     logger.warning(f"【{self.pure_user_id}】滑块验证失败")
+                    abort_flow, abort_reason = self._should_abort_token_refresh_slider_flow_after_failure()
+                    if abort_flow:
+                        logger.warning(f"【{self.pure_user_id}】{abort_reason}，停止后续验证页接管，交由外层恢复链路处理")
+                        self._save_debug_snapshot("run_failed", getattr(self, "_detected_slider_frame", None))
+                        return False, None
                     monitor_page = self._select_monitor_page(self.context, self.page) or self.page
                     has_qr, qr_frame = self._detect_qr_code_verification(monitor_page)
                     if has_qr:

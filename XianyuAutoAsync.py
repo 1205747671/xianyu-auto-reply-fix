@@ -6326,6 +6326,7 @@ class XianyuLive:
                     initial_cookies=self.cookies_str,
                     proxy=self.proxy_config,
                 )
+                slider_stealth.risk_trigger_scene = 'token_refresh'
 
                 # 直接使用异步方法执行滑块验证（避免 ThreadPoolExecutor 导致的 Playwright 初始化问题）
                 success, cookies = await slider_stealth.async_run(verification_url)
