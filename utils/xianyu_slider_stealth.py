@@ -1078,6 +1078,7 @@ class XianyuSliderStealth:
         self.last_verification_feedback = {}
         self.last_login_error = ""
         self.last_browser_cookie_warmup_verification_hint = None
+        self.last_browser_cookie_warmup_session_unready = False
         self._slider_refresh_mode = False
         self.risk_session_id = None
         self.risk_trigger_scene = None
@@ -2379,7 +2380,8 @@ class XianyuSliderStealth:
                     logger.info(f"【{self.pure_user_id}】检测到滑块错误态，已点击重试元素: {selector}")
                     clicked = True
                     break
-                except Exception:
+                except Exception as selector_error:
+                    _mark_detached_runtime(selector_error)
                     continue
 
             if not clicked and slider_container:
@@ -2617,7 +2619,7 @@ class XianyuSliderStealth:
                     for record in raw_records:
                         if not isinstance(record, dict) or not record.get("success"):
                             continue
-                        if not self._is_password_scene_success_sample(history_path, record):
+                        if not self._is_learning_sample_scene_compatible(history_path, record):
                             continue
 
                         verification_result = record.get("verification_result", {}) or {}
@@ -2664,6 +2666,82 @@ class XianyuSliderStealth:
             logger.debug(f"【{self.pure_user_id}】加载全局成功样本失败: {e}")
 
         return history
+
+    def _normalize_learning_scene(self, trigger_scene: Optional[str] = None) -> str:
+        scene = str(trigger_scene or getattr(self, "risk_trigger_scene", None) or "").strip().lower()
+        if scene in {"password_login", "manual_password_refresh"}:
+            return "password"
+        if scene == "token_refresh":
+            return "token_refresh"
+        if scene == "auto_cookie_refresh":
+            return "cookie"
+        return scene or "generic"
+
+    def _infer_success_sample_scene(self, history_path: str, record: Optional[Dict[str, Any]] = None) -> str:
+        explicit_scene = ""
+        if isinstance(record, dict):
+            explicit_scene = str(
+                record.get("trigger_scene")
+                or record.get("risk_trigger_scene")
+                or ""
+            ).strip().lower()
+        normalized_explicit_scene = self._normalize_learning_scene(explicit_scene) if explicit_scene else ""
+        if normalized_explicit_scene and normalized_explicit_scene != "generic":
+            return normalized_explicit_scene
+
+        parts = [os.path.basename(str(history_path or ""))]
+        if isinstance(record, dict):
+            parts.extend(
+                [
+                    str(record.get("user_id") or ""),
+                    str(record.get("page_url") or ""),
+                    str(record.get("page_title") or ""),
+                ]
+            )
+
+        sample_text = " ".join(parts).lower()
+        if not sample_text:
+            return "generic"
+
+        token_refresh_tokens = (
+            "token_refresh",
+            "keepalive",
+            "session_keepalive",
+            "captcha_verification_failed",
+        )
+        if any(token in sample_text for token in token_refresh_tokens):
+            return "token_refresh"
+
+        if any(token in sample_text for token in ("password", "pwd")):
+            return "password"
+
+        cookie_tokens = (
+            "ui_cookie",
+            "import_user_cookie",
+            "manual_cookie",
+            "cookie_import",
+            "manual_import",
+            "cookie_flow",
+            "cookie_run",
+            "cookie_headless",
+        )
+        if any(token in sample_text for token in cookie_tokens):
+            return "cookie"
+
+        if "refresh" in sample_text and "password" not in sample_text and "pwd" not in sample_text:
+            return "token_refresh"
+
+        return "generic"
+
+    def _is_learning_sample_scene_compatible(self, history_path: str, record: Optional[Dict[str, Any]] = None) -> bool:
+        current_scene = self._normalize_learning_scene()
+        if current_scene == "generic":
+            return self._is_password_scene_success_sample(history_path, record)
+
+        sample_scene = self._infer_success_sample_scene(history_path, record)
+        if sample_scene == "generic":
+            return False
+        return sample_scene == current_scene
 
     def _get_password_scene_final_retry_template(self, effective_ranges: Dict[str, Tuple[float, float]],
                                                  bounds: Dict[str, Any]) -> Dict[str, Tuple[float, float]]:
@@ -2719,6 +2797,7 @@ class XianyuSliderStealth:
                 "timestamp": time.time(),
                 "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "user_id": self.pure_user_id,
+                "trigger_scene": getattr(self, "risk_trigger_scene", None),
                 "distance": trajectory_data.get("distance", 0),
                 "total_steps": trajectory_data.get("total_steps", 0),
                 "model": trajectory_data.get("model", "unknown"),
@@ -2744,6 +2823,7 @@ class XianyuSliderStealth:
                     "delay_variation": slide_behavior.get("delay_variation", (0.9, 1.1)),
                     "pre_up_pause": slide_behavior.get("pre_up_pause", 0),
                     "post_up_pause": slide_behavior.get("post_up_pause", 0),
+                    "server_judge_wait": slide_behavior.get("server_judge_wait", 0),
                     "total_elapsed_time": slide_behavior.get("total_elapsed_time", 0),
                 },
                 # 保留旧字段以兼容旧版本
@@ -2816,6 +2896,7 @@ class XianyuSliderStealth:
                 "timestamp": time.time(),
                 "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "user_id": self.pure_user_id,
+                "trigger_scene": getattr(self, "risk_trigger_scene", None),
                 "attempt": failure_info.get("attempt", 0),
                 "distance": trajectory_data.get("distance", 0),
                 "slide_distance": failure_info.get("slide_distance", 0),
@@ -2845,6 +2926,7 @@ class XianyuSliderStealth:
                     "pre_up_pause": slide_behavior.get("pre_up_pause", 0),
                     "post_up_pause": slide_behavior.get("post_up_pause", 0),
                     "delay_variation": slide_behavior.get("delay_variation", (0.9, 1.1)),
+                    "server_judge_wait": slide_behavior.get("server_judge_wait", 0),
                     "total_elapsed_time": slide_behavior.get("total_elapsed_time", 0),
                 },
                 "verification_feedback": verification_feedback,
@@ -3247,7 +3329,18 @@ class XianyuSliderStealth:
                         pause_min = max(0.01, median - 0.025)
                         pause_max = min(0.25, median + 0.025)
                     learned_behavior["post_down_pause"] = (pause_min, pause_max)
-                
+
+                server_wait_list = [b.get("server_judge_wait", 0) for b in slide_behaviors if b.get("server_judge_wait")]
+                if server_wait_list:
+                    median = safe_percentile(server_wait_list, 0.5)
+                    std = safe_std(server_wait_list)
+                    wait_min = max(0.8, median - max(std * 0.4, 0.3))
+                    wait_max = min(15.0, median + max(std * 0.4, 0.3))
+                    if wait_max - wait_min < 0.6:
+                        wait_min = max(0.8, median - 0.3)
+                        wait_max = min(15.0, median + 0.3)
+                    learned_behavior["server_judge_wait"] = (wait_min, wait_max)
+
                 logger.info(f"【{self.pure_user_id}】📚 成功学习{len(learned_behavior)}个滑动行为参数")
             
             # 基于完整轨迹数据的学习
@@ -3977,6 +4070,7 @@ class XianyuSliderStealth:
                         "FAIL_SYS_SESSION_EXPIRED" in summary or
                         "FAIL_SYS_USER_VALIDATE" in summary
                     ):
+                        self.last_browser_cookie_warmup_session_unready = True
                         logger.warning(
                             f"【{self.pure_user_id}】{scene}浏览器业务预热[{probe_name}]仍提示服务端Session未就绪"
                         )
@@ -4096,6 +4190,28 @@ class XianyuSliderStealth:
             'ret': ret_values,
             'summary': ret_summary,
         }
+
+    def _infer_browser_cookie_warmup_risk_trigger_scene(
+        self,
+        verification_hint: Optional[Dict[str, Any]],
+        verification_url: str,
+    ) -> Optional[str]:
+        if not isinstance(verification_hint, dict):
+            return None
+
+        source = str(verification_hint.get('source') or '').strip().lower()
+        if source != 'browser_cookie_warmup':
+            return None
+
+        probe_name = str(verification_hint.get('probe_name') or '').strip().lower()
+        verification_url_lower = str(verification_url or '').strip().lower()
+        if (
+            probe_name == 'login_token_fetch' or
+            'mtop.taobao.idlemessage.pc.login.token' in verification_url_lower
+        ):
+            return 'token_refresh'
+
+        return None
 
     def _execute_browser_cookie_warmup_probe(
         self,
@@ -4244,7 +4360,20 @@ class XianyuSliderStealth:
         )
 
         verify_page = None
+        override_risk_trigger_scene = self._infer_browser_cookie_warmup_risk_trigger_scene(
+            verification_hint,
+            verification_url,
+        )
+        previous_risk_trigger_scene = getattr(self, 'risk_trigger_scene', None)
         try:
+            if override_risk_trigger_scene:
+                if override_risk_trigger_scene != previous_risk_trigger_scene:
+                    logger.info(
+                        f"【{self.pure_user_id}】浏览器业务预热验证页临时切换 risk_trigger_scene="
+                        f"{override_risk_trigger_scene}（from {previous_risk_trigger_scene or 'unset'}）"
+                    )
+                self.risk_trigger_scene = override_risk_trigger_scene
+
             verify_page = context.new_page()
             verify_page.goto(verification_url, wait_until="domcontentloaded", timeout=30000)
             time.sleep(2)
@@ -4299,6 +4428,9 @@ class XianyuSliderStealth:
                     verify_page.close()
             except Exception:
                 pass
+        finally:
+            if override_risk_trigger_scene:
+                self.risk_trigger_scene = previous_risk_trigger_scene
         return None
 
     def _safe_page_url(self, page) -> str:
@@ -4405,7 +4537,8 @@ class XianyuSliderStealth:
                     element = page.query_selector(selector)
                     if element and element.is_visible():
                         return True
-                except Exception:
+                except Exception as selector_error:
+                    _mark_detached_runtime(selector_error)
                     continue
         except Exception:
             pass
@@ -4884,6 +5017,19 @@ class XianyuSliderStealth:
 
         return False
 
+    def _looks_like_verification_title(self, title: str) -> bool:
+        current_title = str(title or '')
+        current_title_lower = current_title.lower()
+        title_tokens = (
+            'captcha',
+            'intercept',
+            'punish',
+            '验证',
+            '拦截',
+            '验证码',
+        )
+        return any(token in current_title_lower or token in current_title for token in title_tokens)
+
     def _select_monitor_page(self, context=None, fallback_page=None):
         pages = self._get_context_pages(context, fallback_page)
         if not pages:
@@ -5121,6 +5267,7 @@ class XianyuSliderStealth:
         if not target_page:
             target_page = self._select_monitor_page(context, page)
 
+        self.last_browser_cookie_warmup_session_unready = False
         cookies_dict = self._snapshot_context_cookies(context, page=target_page)
         if extra_cookie_updates:
             merged_from_network = dict(cookies_dict)
@@ -5203,6 +5350,20 @@ class XianyuSliderStealth:
         if self.last_login_error and self.last_login_error != pending_identity_error_before:
             return None
 
+        missing_protected_fields = [
+            key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
+            if not cookies_dict.get(key)
+        ]
+        if missing_protected_fields and getattr(self, 'last_browser_cookie_warmup_session_unready', False):
+            self._log_cookie_snapshot_integrity(cookies_dict, f"{scene}完成后")
+            logger.error(
+                f"【{self.pure_user_id}】❌ {scene}后关键Cookie仍未齐全，且浏览器业务预热仍提示服务端Session未就绪: "
+                f"{missing_protected_fields}"
+            )
+            return self._fail_login(
+                f"{scene}后关键Cookie仍未齐全，服务端Session仍未就绪: {', '.join(missing_protected_fields)}"
+            )
+
         missing_required_fields = [
             key for key in self._REQUIRED_SESSION_COOKIE_FIELDS
             if not cookies_dict.get(key)
@@ -5252,19 +5413,28 @@ class XianyuSliderStealth:
         while waited_time < max_wait_time:
             monitor_page = self._select_monitor_page(context, monitor_page)
             self._attempt_solve_slider_on_page(monitor_page)
+            has_verification, refreshed_frame = self._detect_qr_code_verification(monitor_page)
 
             login_success, success_page, success_cookies = self._probe_context_login_success(context, monitor_page)
             if login_success:
                 pending_identity_markers = self._detect_pending_identity_verification_cookie_state(success_cookies or {})
+                missing_protected_fields = [
+                    key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
+                    if not (success_cookies or {}).get(key)
+                ]
                 if pending_identity_markers:
                     logger.warning(
                         f"【{self.pure_user_id}】验证等待期间虽然检测到页面已登录，"
                         f"但待确认Cookie标记仍存在，继续等待后续验证完成: {pending_identity_markers}"
                     )
+                elif has_verification and missing_protected_fields:
+                    logger.warning(
+                        f"【{self.pure_user_id}】验证等待期间验证页仍存在，且关键Cookie仍未齐全，"
+                        f"继续等待后续验证完成: {missing_protected_fields}"
+                    )
                 else:
                     return True, success_page or monitor_page
 
-            has_verification, refreshed_frame = self._detect_qr_code_verification(monitor_page)
             if has_verification and refreshed_frame:
                 refreshed_type = getattr(refreshed_frame, 'verification_type', None) or 'unknown'
                 refreshed_url = getattr(refreshed_frame, 'verify_url', None)
@@ -6256,7 +6426,9 @@ class XianyuSliderStealth:
                 overshoot_ratio = max(1.01, min(bounds.get("max_overshoot_ratio", 1.18), overshoot_ratio))
 
                 steps_min = max(24, effective_ranges["steps"][0])
-                steps_max = min(38, max(steps_min + 2, effective_ranges["steps"][1] + 5))
+                steps_max = min(40, max(steps_min + 2, effective_ranges["steps"][1] + 5))
+                if steps_max < steps_min:
+                    steps_max = min(40, steps_min)
                 steps = random.randint(steps_min, steps_max)
 
                 delay_min = max(0.007, effective_ranges["delay"][0] * 1.10)
@@ -6884,8 +7056,20 @@ class XianyuSliderStealth:
                 time.sleep(post_up_pause * _tempo(7))
 
                 # 等待服务端验证判定（关键：阿里滑块验证是异步的，需要给服务端足够时间返回结果）
-                server_wait_range = (1.25, 2.10) if stable_headless_profile else (1.0, 2.0)
-                server_judge_wait = random.uniform(*server_wait_range) * _tempo(8)
+                if "server_judge_wait" in learned_behavior:
+                    wait_range = learned_behavior["server_judge_wait"]
+                    server_wait_range = (
+                        max(0.8, float(wait_range[0])),
+                        max(float(wait_range[0]) + 0.1, float(wait_range[1])),
+                    )
+                    server_wait_tempo = max(1.0, min(1.2, _tempo(8)))
+                elif getattr(self, "risk_trigger_scene", None) == "token_refresh":
+                    server_wait_range = (2.2, 4.2) if stable_headless_profile else (2.0, 3.6)
+                    server_wait_tempo = max(1.0, min(1.2, _tempo(8)))
+                else:
+                    server_wait_range = (1.25, 2.10) if stable_headless_profile else (1.0, 2.0)
+                    server_wait_tempo = _tempo(8)
+                server_judge_wait = random.uniform(*server_wait_range) * server_wait_tempo
                 slide_behavior['server_judge_wait'] = server_judge_wait
                 logger.debug(f"【{self.pure_user_id}】等待服务端判定: {server_judge_wait:.2f}秒")
                 time.sleep(server_judge_wait)
@@ -6968,6 +7152,16 @@ class XianyuSliderStealth:
 
         try:
             special_block = self._detect_special_captcha_block(target_page)
+            special_block = self._wait_for_punish_slider_dom_ready_if_needed(
+                target_page,
+                special_block,
+                "初始页面拦截判定",
+            )
+            special_block = self._recover_punish_slider_shell_if_possible(
+                target_page,
+                special_block,
+                "初始页面拦截判定",
+            )
             if special_block:
                 return True
 
@@ -7026,6 +7220,16 @@ class XianyuSliderStealth:
             return None
 
         try:
+            detached_runtime = False
+
+            def _mark_detached_runtime(error: Exception) -> bool:
+                nonlocal detached_runtime
+                error_text = str(error).lower()
+                if 'detached' in error_text or 'disconnected' in error_text:
+                    detached_runtime = True
+                    return True
+                return False
+
             try:
                 current_url = str(getattr(target_page, 'url', '') or '')
             except Exception:
@@ -7036,17 +7240,20 @@ class XianyuSliderStealth:
             try:
                 raw_title = target_page.title() if callable(getattr(target_page, 'title', None)) else getattr(target_page, 'title', '')
                 current_title = str(raw_title or '')
-            except Exception:
+            except Exception as title_error:
+                _mark_detached_runtime(title_error)
                 current_title = ''
             current_title_lower = current_title.lower()
 
             page_text = ''
             try:
                 page_text = target_page.inner_text('body', timeout=1500) or ''
-            except Exception:
+            except Exception as text_error:
+                _mark_detached_runtime(text_error)
                 try:
                     page_text = target_page.content() or ''
-                except Exception:
+                except Exception as content_error:
+                    _mark_detached_runtime(content_error)
                     page_text = ''
             page_text_lower = str(page_text or '').lower()
 
@@ -7073,6 +7280,12 @@ class XianyuSliderStealth:
                     continue
 
             has_operable_slider = has_slider_button or has_slider_track
+            if detached_runtime and not page_text and not has_operable_slider:
+                logger.debug(
+                    f"【{self.pure_user_id}】检测验证码处罚页时目标已分离，忽略旧 frame 残留状态: "
+                    f"{current_url or 'unknown'}"
+                )
+                return None
 
             punish_tokens = (
                 'punish?x5secdata',
@@ -7131,7 +7344,189 @@ class XianyuSliderStealth:
             return None
 
         return None
-    
+
+    def _has_recoverable_punish_slider_shell(self, target) -> bool:
+        """识别 pureCaptcha 壳页里仍可被点活的滑块容器。"""
+        if not target:
+            return False
+
+        shell_selectors = (
+            ".errloading",
+            "[data-nc-status='error']",
+            "#nocaptcha",
+            ".nc-container",
+            ".nc_wrapper",
+            ".nc_scale",
+            ".sm-btn-wrapper",
+            "#baxia-dialog-content",
+        )
+        for selector in shell_selectors:
+            try:
+                element = target.query_selector(selector)
+                if not element:
+                    continue
+                try:
+                    if element.is_visible():
+                        return True
+                except Exception:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _has_ready_punish_slider_dom(self, target) -> bool:
+        """处罚页经常先出壳子、后出真滑块，这里只看关键DOM是否已出现。"""
+        if not target:
+            return False
+
+        button_selectors = (
+            "#nc_1_n1z",
+            ".btn_slide",
+            ".sm-btn",
+        )
+        track_selectors = (
+            "#nc_1_n1t",
+            ".nc_scale",
+        )
+        text_selectors = (
+            "#nc_1__scale_text",
+            ".captcha-tips",
+        )
+
+        has_button = False
+        has_track = False
+        has_text = False
+
+        for selector in button_selectors:
+            try:
+                if target.query_selector(selector):
+                    has_button = True
+                    break
+            except Exception:
+                continue
+
+        for selector in track_selectors:
+            try:
+                if target.query_selector(selector):
+                    has_track = True
+                    break
+            except Exception:
+                continue
+
+        for selector in text_selectors:
+            try:
+                element = target.query_selector(selector)
+                if element and str(element.text_content() or "").strip():
+                    has_text = True
+                    break
+            except Exception:
+                continue
+
+        return has_button and (has_track or has_text)
+
+    def _wait_for_punish_slider_dom_ready_if_needed(
+        self,
+        target,
+        current_block: Optional[Dict[str, Any]],
+        context_label: str,
+        max_wait_seconds: float = 1.2,
+        poll_interval: float = 0.25,
+    ) -> Optional[Dict[str, Any]]:
+        """pureCaptcha 页面真实滑块会晚一点挂出来，先给一小段收敛窗口，别太早判死刑。"""
+        if not current_block or current_block.get("kind") != "punish_captcha":
+            return current_block
+
+        if self._has_ready_punish_slider_dom(target):
+            logger.info(f"【{self.pure_user_id}】{context_label} 检测到处罚页真实滑块DOM已就绪，继续按正常滑块处理")
+            return None
+
+        deadline = time.time() + max(0.0, max_wait_seconds)
+        refreshed_block = current_block
+        while time.time() < deadline:
+            time.sleep(max(0.05, poll_interval))
+            if self._has_ready_punish_slider_dom(target):
+                logger.info(f"【{self.pure_user_id}】{context_label} 处罚页真实滑块DOM已延迟出现，继续按正常滑块处理")
+                return None
+            refreshed_block = self._detect_special_captcha_block(target)
+            if not refreshed_block:
+                logger.info(f"【{self.pure_user_id}】{context_label} 处罚页状态已恢复，继续按正常滑块处理")
+                return None
+
+        return refreshed_block
+
+    def _click_first_activation_target(self, target, selectors: List[Tuple[str, str]], context_label: str) -> bool:
+        """在指定 page/frame 中点击第一个可用激活区域。"""
+        if not target:
+            return False
+
+        for selector, desc in selectors:
+            try:
+                element = target.query_selector(selector)
+                if not element:
+                    continue
+                try:
+                    if not element.is_visible():
+                        continue
+                except Exception:
+                    pass
+
+                try:
+                    box = element.bounding_box()
+                except Exception:
+                    box = None
+
+                try:
+                    if box and getattr(self, "page", None):
+                        click_x = box["x"] + box["width"] / 2
+                        click_y = box["y"] + box["height"] / 2
+                        self.page.mouse.click(click_x, click_y)
+                    else:
+                        element.click(timeout=1000)
+                    logger.info(f"【{self.pure_user_id}】已点击{context_label}激活区域[{desc}]: {selector}")
+                    return True
+                except Exception as click_err:
+                    logger.debug(f"【{self.pure_user_id}】点击{context_label}激活区域[{desc}]失败: {click_err}")
+                    continue
+            except Exception as find_err:
+                logger.debug(f"【{self.pure_user_id}】查找{context_label}激活区域[{desc}]失败: {find_err}")
+                continue
+        return False
+
+    def _recover_punish_slider_shell_if_possible(
+        self,
+        target,
+        current_block: Optional[Dict[str, Any]],
+        context_label: str,
+    ) -> Optional[Dict[str, Any]]:
+        """对可恢复的 pureCaptcha 壳页先尝试点活，再重新探测。"""
+        if not current_block or current_block.get("kind") != "punish_captcha":
+            return current_block
+        if not self._has_recoverable_punish_slider_shell(target):
+            return current_block
+
+        activation_selectors = [
+            (".errloading", "错误提示区"),
+            ("[data-nc-status='error']", "NC错误状态"),
+            (".nc-container", "滑块容器"),
+            ("#nocaptcha", "NoCaptcha容器"),
+            (".nc_wrapper", "滑块包装器"),
+            (".nc_scale", "滑块轨道"),
+            (".sm-btn-wrapper", "滑块按钮包装器"),
+            ("#baxia-dialog-content", "验证码对话框"),
+        ]
+        if not self._click_first_activation_target(target, activation_selectors, context_label):
+            return current_block
+
+        time.sleep(0.8)
+        refreshed_block = self._detect_special_captcha_block(target)
+        if refreshed_block:
+            logger.info(
+                f"【{self.pure_user_id}】{context_label} pureCaptcha 壳页点活后仍是硬拦截[{refreshed_block.get('kind')}]"
+            )
+        else:
+            logger.info(f"【{self.pure_user_id}】{context_label} pureCaptcha 壳页已点活，继续按正常滑块处理")
+        return refreshed_block
+
     def find_slider_elements(self, fast_mode=False):
         """查找滑块元素（支持在主页面和所有frame中查找）
         
@@ -7144,6 +7539,16 @@ class XianyuSliderStealth:
                 time.sleep(0.1)
 
             current_block = self._detect_special_captcha_block(self.page)
+            current_block = self._wait_for_punish_slider_dom_ready_if_needed(
+                self.page,
+                current_block,
+                "主页面滑块探测",
+            )
+            current_block = self._recover_punish_slider_shell_if_possible(
+                self.page,
+                current_block,
+                "主页面滑块探测",
+            )
             if current_block:
                 logger.error(
                     f"【{self.pure_user_id}】当前页面命中高风险验证码页[{current_block['kind']}]: "
@@ -7168,6 +7573,16 @@ class XianyuSliderStealth:
                 for idx, frame in enumerate(frames):
                     try:
                         frame_block = self._detect_special_captcha_block(frame)
+                        frame_block = self._wait_for_punish_slider_dom_ready_if_needed(
+                            frame,
+                            frame_block,
+                            f"Frame {idx} 滑块探测",
+                        )
+                        frame_block = self._recover_punish_slider_shell_if_possible(
+                            frame,
+                            frame_block,
+                            f"Frame {idx} 滑块探测",
+                        )
                         if frame_block:
                             logger.error(
                                 f"【{self.pure_user_id}】Frame {idx} 命中高风险验证码页[{frame_block['kind']}]: "
@@ -7864,6 +8279,12 @@ class XianyuSliderStealth:
                     error_msg = str(frame_check_error).lower()
                     # 如果frame被分离（detached），说明验证成功，容器已消失
                     if 'detached' in error_msg or 'disconnected' in error_msg:
+                        current_block = self._detect_post_slider_blocking_state(self.page)
+                        if current_block:
+                            logger.warning(
+                                f"【{self.pure_user_id}】Frame已分离，但当前命中[{current_block['kind']}]，按验证失败处理"
+                            )
+                            return False
                         logger.info(f"【{self.pure_user_id}】✓ Frame已被分离，验证成功")
                         self.last_verification_feedback = {"status": "success", "source": "frame_detached", "message": "Frame已被分离"}
                         return True
@@ -7925,6 +8346,12 @@ class XianyuSliderStealth:
             
             # 如果容器不存在或不可见，直接返回成功
             if not container_exists or not container_visible:
+                current_block = self._detect_post_slider_blocking_state(target_frame)
+                if current_block:
+                    logger.warning(
+                        f"【{self.pure_user_id}】滑块容器已消失，但当前命中[{current_block['kind']}]，按验证失败处理"
+                    )
+                    return False
                 logger.info(f"【{self.pure_user_id}】✓ 滑块容器已消失（不存在或不可见），验证成功")
                 self.last_verification_feedback = {"status": "success", "source": "container_missing", "message": "滑块容器已消失"}
                 return True
@@ -7938,6 +8365,12 @@ class XianyuSliderStealth:
             
             # 如果容器消失了，返回成功
             if not container_exists or not container_visible:
+                current_block = self._detect_post_slider_blocking_state(target_frame)
+                if current_block:
+                    logger.warning(
+                        f"【{self.pure_user_id}】滑块容器二次检查已消失，但当前命中[{current_block['kind']}]，按验证失败处理"
+                    )
+                    return False
                 logger.info(f"【{self.pure_user_id}】✓ 滑块容器已消失，验证成功")
                 self.last_verification_feedback = {"status": "success", "source": "container_missing", "message": "滑块容器已消失"}
                 return True
@@ -7954,6 +8387,12 @@ class XianyuSliderStealth:
             container_exists, container_visible = check_container_status()
             
             if not container_exists or not container_visible:
+                current_block = self._detect_post_slider_blocking_state(target_frame)
+                if current_block:
+                    logger.warning(
+                        f"【{self.pure_user_id}】滑块容器末次检查已消失，但当前命中[{current_block['kind']}]，按验证失败处理"
+                    )
+                    return False
                 logger.info(f"【{self.pure_user_id}】✓ 滑块容器已消失，验证成功")
                 self.last_verification_feedback = {"status": "success", "source": "container_missing", "message": "滑块容器已消失"}
                 return True
@@ -7994,6 +8433,43 @@ class XianyuSliderStealth:
             self.last_verification_feedback = {"status": "error", "source": "exception", "message": str(e)}
             self._merge_runtime_feedback(target_frame if 'target_frame' in locals() else None)
             return False
+
+    def _detect_post_slider_blocking_state(self, primary_target=None):
+        """滑块动作后兜底探测处罚页/硬拒绝，避免把容器切换误判成成功。"""
+        targets = []
+        for candidate in (
+            primary_target,
+            getattr(self, '_detected_slider_frame', None),
+            self.page,
+        ):
+            if candidate is None:
+                continue
+            if any(candidate is existing for existing in targets):
+                continue
+            targets.append(candidate)
+
+        for target in targets:
+            try:
+                current_block = self._detect_special_captcha_block(target)
+            except Exception:
+                current_block = None
+            if not current_block:
+                continue
+
+            self.last_verification_feedback = {
+                "status": "hard_block",
+                "source": current_block["kind"],
+                "message": current_block["message"],
+                "url": current_block.get("url") or "",
+                "title": current_block.get("title") or "",
+            }
+            try:
+                self._merge_runtime_feedback(target)
+            except Exception:
+                pass
+            return current_block
+
+        return None
     
     def check_page_changed(self):
         """检查页面是否改变"""
@@ -8001,22 +8477,21 @@ class XianyuSliderStealth:
             # 检查页面标题是否改变
             current_title = self.page.title()
             logger.info(f"【{self.pure_user_id}】当前页面标题: {current_title}")
-            
-            # 如果标题不再是验证码相关，说明页面已改变
-            if "captcha" not in current_title.lower() and "验证" not in current_title and "拦截" not in current_title:
-                logger.info(f"【{self.pure_user_id}】页面标题已改变，验证成功")
-                return True
-            
+
+            if self._looks_like_verification_title(current_title):
+                logger.info(f"【{self.pure_user_id}】页面标题仍像验证页，暂不判定成功")
+                return False
+
             # 检查URL是否改变
             current_url = self.page.url
             logger.info(f"【{self.pure_user_id}】当前页面URL: {current_url}")
-            
-            # 如果URL不再包含验证码相关参数，说明页面已改变
-            if "captcha" not in current_url.lower() and "action=captcha" not in current_url:
-                logger.info(f"【{self.pure_user_id}】页面URL已改变，验证成功")
-                return True
-            
-            return False
+
+            if self._looks_like_verification_url(current_url):
+                logger.info(f"【{self.pure_user_id}】页面URL仍处于验证链路，暂不判定成功")
+                return False
+
+            logger.info(f"【{self.pure_user_id}】页面已脱离验证链路，判定验证成功")
+            return True
             
         except Exception as e:
             logger.warning(f"【{self.pure_user_id}】检查页面改变时出错: {e}")
@@ -8299,6 +8774,16 @@ class XianyuSliderStealth:
                 logger.info(f"【{self.pure_user_id}】开始处理滑块验证... (第{attempt}/{max_retries}次尝试)")
 
                 current_block = self._detect_special_captcha_block(self.page)
+                current_block = self._wait_for_punish_slider_dom_ready_if_needed(
+                    self.page,
+                    current_block,
+                    f"滑块第{attempt}次尝试起始页",
+                )
+                current_block = self._recover_punish_slider_shell_if_possible(
+                    self.page,
+                    current_block,
+                    f"滑块第{attempt}次尝试起始页",
+                )
                 if current_block:
                     logger.error(
                         f"【{self.pure_user_id}】当前页面命中高风险验证码页[{current_block['kind']}]: "

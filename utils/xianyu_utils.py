@@ -1,7 +1,6 @@
 import base64
 import json
 import subprocess
-from functools import partial
 import time
 import hashlib
 import struct
@@ -11,7 +10,6 @@ from typing import Any, Dict, List
 import blackboxprotobuf
 from loguru import logger
 
-subprocess.Popen = partial(subprocess.Popen, encoding="utf-8")
 import execjs
 
 def get_js_path():
@@ -45,7 +43,13 @@ except Exception as e:
         # 尝试检测系统中的JavaScript运行时
         import subprocess
         try:
-            result = subprocess.run(['node', '--version'], capture_output=True, text=True)
+            result = subprocess.run(
+                ['node', '--version'],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+            )
             if result.returncode == 0:
                 logger.info(f"检测到Node.js版本: {result.stdout.strip()}")
             else:

@@ -1,8 +1,8 @@
-# 闲鱼账号密码登录 / Cookie 导入链路统一整理（截至 2026-05-04）
+# 闲鱼账号认证 / Cookie / 保活链路修复总日志（截至 2026-05-05）
 
 ## 结论
 
-截至 **2026-05-04**，这套链路可以明确分成两段来看：
+截至 **2026-05-05**，这套账号链路可以明确分成几块来看：
 
 1. **登录前半段已经打通**
    - 手动 Cookie 导入：正式前端、正式接口、真实浏览器验证链路已经对齐。
@@ -12,11 +12,22 @@
    - 某些账号会在滑块后进入二维码/人脸验证。
    - 这不等于“滑块没过”，也不等于“账密链路坏了”，很多时候就是账号本身被要求继续做人工验证。
 
-3. **本轮最新修复（2026-05-04）已经把最烦的坑收住了**
+3. **验证页承接这块已经收得比之前规整多了**
    - 验证截图会随着当前会话持续刷新，不再老拿历史旧图糊弄前端。
    - 超时/失效页不会再把可用验证图覆盖成废图。
    - 半登录态不会再被误判成成功。
    - 风控日志、登录会话、验证截图接口的状态收口更一致。
+
+4. **保活 / `token_refresh` 这条恢复链也已经补上关键收口**
+   - Token 刷新会优先沿用当前内存里的新认证 Cookie 和当前账号代理。
+   - 命中 `idlemessage.pc.login.token -> punish` 时，不再把处罚页壳子当真滑块死磕。
+   - 一旦出现“验证失败，点击框体重试(error:xxxx)”这类硬拒绝，当前滑块流程会尽快结束并回退到账密恢复。
+
+5. **2026-05-05 已把“本地通、Linux 不通”的运行时差异钉死并对齐**
+   - 根因不是源码逻辑跑偏，而是 Linux 容器里的项目浏览器仍落在 `/ms-playwright/chromium-1208/...`，实际画像还是 Chrome 145。
+   - 本地成功环境实际是 `playwright 1.59.0 + chromium-1217 / Chrome 147`，所以把 `requirements.txt` 锁到 `playwright==1.59.0` 后，远端 Docker 也回到了同一套画像。
+   - 2026-05-05 02:02 远端账号 1 已重新稳定跑到 `face_verify`，截图 `face_verify_1_20260505_020248.jpg`、`face_verify_1_20260505_020259.jpg` 持续刷新。
+   - **结合 2026-05-05 02:06 之后的远端日志推断**，用户手动完成人脸后账号 1 已重新进入正常运行态：心跳持续正常、`GET /api/orders` 成功返回 6 条记录、前端连续拉取 `cookies/details` / `items` / `keywords` 都正常。
 
 一句话说透：
 
@@ -26,14 +37,19 @@
 
 ## 本文整合来源
 
-这份文档吸收并重整了下面 4 份历史总结里的有效信息：
+这份文档已经把下面这些历史资料和最近相关提交一起并进来了，后续**根目录只保留本文**作为账号链路修复日志入口：
 
 - `SLIDER_HEADLESS_FIX_SUMMARY_20260501.md`
 - `PASSWORD_LOGIN_HEADLESS_FIX_SUMMARY_20260501.md`
 - `FORMAL_COOKIE_PASSWORD_FLOW_ALIGNMENT_20260501.md`
 - `PASSWORD_LOGIN_VERIFICATION_FLOW_FIX_SUMMARY_20260504.md`
+- `c3f74db` `fix refresh preflight timeout and slot ownership cleanup`
+- `247070d` `fix password verification refresh and timeout handling`
+- `2a2d07e` `fix manual cookie import verification precheck`
+- `216168a` `fix token refresh session proxy handling`
+- `1ebe946` `fix token refresh punish fallback`
 
-老文档先保留，避免历史验证细节丢失；本文件作为**统一入口**。
+老文档里的有效信息已经吸进本文，旧账号修复文档也已经从根目录移走，别再翻四五份看得脑瓜子疼。
 
 ---
 
@@ -75,6 +91,49 @@
 
 - 老图不刷新的根因被确认并修掉。
 - 超时页、失效页、待处理风控日志、半登录误判成功这些脏边角，被集中收口。
+
+### 2026-05-04 晚间补充：把 `token_refresh / punish / 保活恢复` 这条链收住
+
+主要结论：
+
+- 手动 Cookie 正式导入增加了 `verification_url` 预检，避免“假导入成功，后面后台自己撞风控”。
+- `token_refresh` 会优先使用**当前内存中的新认证 Cookie + 当前账号代理**，避免恢复链路拿错代理或旧 Cookie。
+- `token_refresh -> mtop.taobao.idlemessage.pc.login.token -> punish` 这类处罚页，不再被当成 fresh login 真滑块死磕。
+- 如果页面命中：
+  - `验证失败，点击框体重试`
+  - 且带 `fail_code / error:xxxx`
+  - 并且页面实际上没有可操作滑块
+  那就**第一次失败直接收口**，并交给外层走账密恢复。
+- `run()` 失败后不再继续把这种处罚页接力成二维码/验证页二次接管，避免原地鬼打墙。
+
+### 2026-05-05：把本地与 Linux 远端运行时彻底对齐
+
+主要结论：
+
+- 这次 Linux “账号密码登录又过不去滑块” 的根因，不是代码逻辑没同步，而是**项目实际使用的 Playwright 浏览器版本没同步**。
+- 远端容器系统自带 `/usr/bin/chromium` 虽然已经是 `147.0.7727.55`，但账密链路会优先走：
+  - `/ms-playwright/chromium-1208/chrome-linux64/chrome`
+  - 实际版本还是 `145.0.7632.6`
+- 本地成功环境对应的是：
+  - `playwright 1.59.0`
+  - `.playwright-browsers/chromium-1217`
+  - `Chrome 147`
+- 因此本轮把 `requirements.txt` 从：
+  - `playwright>=1.40.0`
+  改成：
+  - `playwright==1.59.0`
+  然后重建远端 Docker。
+- 重建后远端项目浏览器回到：
+  - `chromium-1217`
+  - `Google Chrome for Testing 147.0.7727.15`
+- 2026-05-05 02:02，账号 1 在远端重新实测：
+  - 第 2 次尝试滑块成功；
+  - 检测到 `face_verify`；
+  - 截图 `face_verify_1_20260505_020248.jpg`、`face_verify_1_20260505_020259.jpg` 持续刷新。
+- **结合 2026-05-05 02:06 之后的线上日志推断**，用户手动完成人脸后账号 1 已恢复：
+  - 心跳持续正常；
+  - `GET /api/orders` 成功返回 6 条记录；
+  - 前端连续读取 `cookies/details`、`keywords`、`items` 正常。
 
 ---
 
@@ -139,6 +198,43 @@
 ≠ 前半段链路没通
 ```
 
+### 3. 保活 / `token_refresh` / 浏览器 Cookie 刷新恢复链路
+
+核心入口：
+
+- `_refresh_token_impl(...)`
+- `_handle_captcha_verification(...)`
+- `_try_password_login_refresh(...)`
+- `_refresh_cookies_via_browser(...)`
+
+正式行为：
+
+1. 实例周期性进入 `token_refresh`，优先用**当前内存里的认证 Cookie**和**当前账号代理**请求：
+   - `mtop.taobao.idlemessage.pc.login.token`
+2. 如果 Token 刷新成功：
+   - 重置消息接收时间标识；
+   - 必要时继续做浏览器 Cookie 稳定化 / 业务预热。
+3. 如果服务端返回：
+   - `FAIL_SYS_USER_VALIDATE`
+   - `identity_verify`
+   - `punish`
+   则进入 `_handle_captcha_verification(...)`，创建 `XianyuSliderStealth` 接管验证。
+4. 这条链会显式打上：
+   - `risk_trigger_scene = 'token_refresh'`
+   用来把它和 fresh login / 手动 Cookie / 账密滑块区分开。
+5. 如果页面其实只是处罚页壳子，且出现：
+   - `验证失败，点击框体重试(error:xxxx)`
+   - 没有真实滑块按钮/轨道
+   那就**第一次失败直接停止当前滑块重试**，也不再继续二维码页二次接管。
+6. 外层随后回退：
+   - `_try_password_login_refresh(...)`
+   重新拿一份可用认证态，再继续保活。
+7. 后续 `_refresh_cookies_via_browser(...)` 会补：
+   - 受保护 Cookie 合并
+   - 网页登录态校验
+   - 图片上传 API 校验
+   避免拿一坨半残 Cookie 继续跑。
+
 ---
 
 ## 三、几个必须记住的注意事项
@@ -178,7 +274,19 @@
 
 现在这块已经按“当前会话优先”重做了。
 
-### 4. 半登录态不能当成功
+### 4. `token_refresh` 的处罚页别当真滑块死磕
+
+这块最近最容易把人带沟里。
+
+- `...login.token/.../punish?action=captcha&pureCaptcha=` 更多是**保活恢复场景**，不是 fresh login。
+- 页面上看到 `#nocaptcha`、`.sm-btn-wrapper` 这种壳子，不等于就还有真滑块给你拖。
+- 如果页面只有处罚壳，没有真实按钮/轨道，再怎么重试也基本是在给风控做俯卧撑。
+
+这种场景正确处理是：
+
+> 尽快结束当前滑块流程，回退到账密恢复，而不是在处罚页原地绕圈。
+
+### 5. 半登录态不能当成功
 
 只看到某个页面元素、某个 URL、某张 Cookie 快照，就直接宣布成功，这种事之前干过，结论就是坑人。
 
@@ -358,6 +466,29 @@
 - 后续账号任务会不会因为槽位泄漏一直排队；
 - 清理旧实例时会不会误伤新实例。
 
+#### 1.9 `token_refresh` 处罚页快速收口
+
+这块对应最近的保活恢复补丁，关键点是：
+
+- `token_refresh` 场景创建 `XianyuSliderStealth` 时会显式标记：
+  - `risk_trigger_scene = 'token_refresh'`
+- 新增：
+  - `_should_abort_token_refresh_slider_flow_after_failure(...)`
+- 判定口径不再只盯某一个错误码，而是统一看：
+  - `验证失败，点击框体重试`
+  - `fail_code`
+  - `dom_error_text / error:xxxx`
+- 远端已实际见过的失败码包括：
+  - `4zgv4`
+  - `a2904`
+  - `bry4N4`
+  - `RuZU44`
+  - `YN1D4`
+- 命中这类 hard reject 后：
+  - `solve_slider()` 第一次失败就停止重试；
+  - `run()` 不再继续 `_detect_qr_code_verification()` 二次接管；
+  - 外层尽快回退到账密恢复。
+
 ### 2. `reply_server.py`
 
 这轮重点补了 4 块：
@@ -390,6 +521,13 @@
 - `await slider._run_sync_method_on_fresh_thread(...)`
 
 这不是花活，是为了减少 greenlet / thread mismatch。
+
+另外，保活恢复这条链补了两件事：
+
+- `_handle_captcha_verification(...)` 创建滑块实例时，会显式标记：
+  - `risk_trigger_scene = 'token_refresh'`
+- `token_refresh` 碰到处罚页 hard reject 后，会尽快退出当前滑块链，把恢复权交回：
+  - `_try_password_login_refresh(...)`
 
 ---
 
@@ -450,6 +588,66 @@ python -m py_compile XianyuAutoAsync.py reply_server.py utils\xianyu_slider_stea
 - `检测到验证等待期间检测到验证页变化`
 - `准备发送验证通知，截图路径: ...`
 - 连续变化的截图文件名，例如 `...004920.jpg`、`...004936.jpg`、`...005000.jpg`
+
+### 5. `token_refresh punish` 远端实测证据
+
+这轮远端已经抓到过多份 `logs/slider_debug/*.json`，共同特征很统一：
+
+- 页面标题：
+  - `验证码拦截`
+- URL：
+  - `.../mtop.taobao.idlemessage.pc.login.token/.../punish?...&action=captcha&pureCaptcha=`
+- 运行时特征：
+  - `hasNocaptcha=true`
+  - `hasSliderButton=false`
+  - `hasSliderTrack=false`
+- 失败文案：
+  - `验证失败，点击框体重试(error:xxxx)`
+
+这说明这玩意儿很多时候根本不是“还能继续拖的真滑块”，而是处罚页壳子。
+
+远端已经实测到的错误码包括：
+
+- `4zgv4`
+- `a2904`
+- `bry4N4`
+- `RuZU44`
+- `YN1D4`
+
+所以这轮修复才会把规则从“只盯 `4zgv4`”升级成“`token_refresh` 场景下，凡是命中固定失败文案 + 错误码的处罚页，都尽快收口”。
+
+### 6. 2026-05-05 账密 / 人脸 / 线上恢复补充证据
+
+本地直接调试命令：
+
+```powershell
+.\.venv\Scripts\python.exe .\debug_manual_password_login.py --account-id 1 --account 212225791@qq.com --password qwe1205747671 --force-clean-context --automation-backend playwright --max-retries 4 --verification-wait-timeout 25 --keep-verification-screenshot
+```
+
+本地结论：
+
+- 滑块已成功；
+- 后续稳定进入 `face_verify`；
+- 由于本地没做人脸，25 秒超时退出是预期行为，不是链路失败。
+
+远端 2026-05-05 02:02 关键日志：
+
+- `【1】✅ 滑块验证成功！`
+- `【1】检测到验证类型: face_verify`
+- `【1】等待二维码/人脸验证完成... (timeout=450s)`
+- `【1】✅ 验证截图已保存: static/uploads/images/face_verify_1_20260505_020248.jpg`
+- `【1】✅ 验证截图已保存: static/uploads/images/face_verify_1_20260505_020259.jpg`
+
+远端 2026-05-05 02:06 之后运行态证据：
+
+- `【1】心跳响应正常`
+- `【admin#1】用户订单查询成功，共 6 条记录`
+- `GET /cookies/details`、`GET /keywords-with-item-id/1`、`GET /items/1` 均持续返回 `200`
+
+这组证据连起来说明两件事：
+
+1. **前半段账密 + 滑块链路已经重新稳定。**
+2. **结合后续心跳和订单查询日志推断，用户手动完成人脸后账号 1 已重新回到可用态。**
 
 ---
 
@@ -529,19 +727,37 @@ python -m py_compile XianyuAutoAsync.py reply_server.py utils\xianyu_slider_stea
 - `XianyuAutoAsync.py`
 - `reply_server.py`
 - `utils/xianyu_utils.py`
+- `requirements.txt`
 - `static/js/app.js`
 - `static/index.html`
 - `debug_manual_cookie_slider.py`
 - `debug_manual_password_login.py`
+- `tests/test_manual_cookie_import_precheck.py`
+- `tests/test_reply_server_manual_cookie_import_flow.py`
+- `tests/test_xianyu_token_refresh_request.py`
 - `.gitignore`
+- `AGENTS.md`
 
-历史参考文档：
+已并入本文、并已从根目录移走的历史文档：
 
 - `SLIDER_HEADLESS_FIX_SUMMARY_20260501.md`
 - `PASSWORD_LOGIN_HEADLESS_FIX_SUMMARY_20260501.md`
 - `FORMAL_COOKIE_PASSWORD_FLOW_ALIGNMENT_20260501.md`
 
 ---
+
+## 十、最近相关提交（已并入本文）
+
+按时间顺序看，最近跟账号链路直接相关的提交大致是这些：
+
+| 日期 | Commit | 说明 |
+| --- | --- | --- |
+| 2026-05-03 | `c3f74db` | 手动刷新预检加超时，并发槽位释放增加实例归属校验，避免会话卡死和误释放。 |
+| 2026-05-04 | `247070d` | 验证截图刷新、超时页恢复、半登录态判定、风控日志和会话状态收口补齐。 |
+| 2026-05-04 | `143790c` | 把之前分散的账号链路文档先收成一个统一入口。 |
+| 2026-05-04 | `2a2d07e` | 手动 Cookie 正式导入加 `verification_url` 预检，避免假成功。 |
+| 2026-05-04 | `216168a` | `token_refresh` 优先使用当前内存认证 Cookie 和当前代理，避免恢复链路拿错上下文。 |
+| 2026-05-04 | `1ebe946` | `token_refresh -> punish` 命中处罚页 hard reject 时，第一次失败直接收口并回退到账密恢复。 |
 
 ## 最终判断
 
@@ -551,6 +767,8 @@ python -m py_compile XianyuAutoAsync.py reply_server.py utils\xianyu_slider_stea
 2. **无头账密登录的前半段（登录页 + 滑块）已经打通。**
 3. **当前主要矛盾已经转移到滑块后的人工验证承接与账号风控本身。**
 4. **2026-05-04 这轮修复已经把“老图不刷新、超时页乱回退、半登录误判成功、风控日志一直处理中”这几类关键坑补上。**
+5. **`token_refresh` 场景下的处罚页死循环，也已经从“反复撞滑块”改成“识别硬拒绝后尽快回退到账密恢复”。**
+6. **2026-05-05 已确认 Linux 远端的真正问题是 Playwright/Chromium 运行时版本落后；对齐到 `playwright 1.59.0 + chromium-1217 / Chrome 147` 后，账号 1 已重新打通到人脸验证，并在用户手动处理后恢复线上可用。**
 
 所以后面如果再看见账号卡住，优先排查顺序应该是：
 
