@@ -5697,15 +5697,20 @@ class XianyuLive:
             # 详细调试信息（仅debug级别）
             logger.debug(f"【{self.cookie_id}】Token刷新参数: timestamp={params['t']}, sign={sign[:16]}...")
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
+            if not self.session:
+                await self.create_session()
+            request_kwargs = {}
+            if getattr(self, '_http_proxy_url', None):
+                request_kwargs['proxy'] = self._http_proxy_url
+            async with self.session.post(
                     api_url,
                     params=params,
                     data=data,
                     headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=30)
+                    timeout=aiohttp.ClientTimeout(total=30),
+                    **request_kwargs,
                 ) as response:
-                    res_json = await response.json()
+                    res_json = await response.json(content_type=None)
                     # 简化日志输出
                     ret_info = res_json.get('ret', [])
                     logger.debug(f"【{self.cookie_id}】Token刷新响应: status={response.status}, ret={ret_info}")
