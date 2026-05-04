@@ -1167,6 +1167,8 @@ async def health_check():
 
         return status
 
+    except HTTPException:
+        raise
     except Exception as e:
         return {
             "status": "unhealthy",
@@ -3940,49 +3942,18 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 else:
                     log_with_user('error', f"保存账号信息失败: {account_id}", current_user)
                 
-                # 添加到或更新cookie_manager（注意：不要在这里调用add_cookie或update_cookie，因为它们会覆盖账号密码）
-                # 账号密码已经在上面通过update_cookie_account_info保存了
-                # 这里只需要更新内存中的cookie值，不保存到数据库（避免覆盖账号密码）
+                # 统一走 CookieManager，确保任务登记、实例切换和运行态一致
                 if cookie_manager.manager:
-                    if is_refresh_mode and not is_new_account:
-                        try:
-                            cookie_manager.manager.update_cookie(account_id, cookies_str, save_to_db=False)
-                            log_with_user('info', f"刷新模式已更新cookie_manager并重启任务: {account_id}", current_user)
-                        except Exception as manager_err:
-                            log_with_user('warning', f"刷新模式更新cookie_manager失败: {account_id}, 错误: {str(manager_err)}", current_user)
-                    else:
-                        # 更新内存中的cookie值
-                        cookie_manager.manager.cookies[account_id] = cookies_str
-                        log_with_user('info', f"已更新cookie_manager中的Cookie（内存）: {account_id}", current_user)
-                        
-                        # 如果是新账号，需要启动任务
+                    try:
                         if is_new_account:
-                            # 使用异步方式启动任务，但不保存到数据库（避免覆盖账号密码）
-                            try:
-                                import asyncio
-                                loop = cookie_manager.manager.loop
-                                if loop:
-                                    # 确保关键词列表存在
-                                    if account_id not in cookie_manager.manager.keywords:
-                                        cookie_manager.manager.keywords[account_id] = []
-                                    
-                                    # 在后台启动任务（使用线程安全的方式，因为run_login是在后台线程中运行的）
-                                    try:
-                                        # 尝试使用run_coroutine_threadsafe，这是线程安全的方式
-                                        fut = asyncio.run_coroutine_threadsafe(
-                                            cookie_manager.manager._run_xianyu(account_id, cookies_str, user_id),
-                                            loop
-                                        )
-                                        # 不等待结果，让它在后台运行
-                                        log_with_user('info', f"已启动新账号任务: {account_id}", current_user)
-                                    except RuntimeError as e:
-                                        # 如果事件循环未运行，记录警告但不影响登录成功
-                                        log_with_user('warning', f"事件循环未运行，无法启动新账号任务: {account_id}, 错误: {str(e)}", current_user)
-                                        log_with_user('info', f"账号已保存，将在系统重启后自动启动任务: {account_id}", current_user)
-                            except Exception as task_err:
-                                log_with_user('warning', f"启动新账号任务失败: {account_id}, 错误: {str(task_err)}", current_user)
-                                import traceback
-                                logger.error(traceback.format_exc())
+                            cookie_manager.manager.add_cookie(account_id, cookies_str, user_id=user_id)
+                            log_with_user('info', f"已将新账号加入cookie_manager并启动任务: {account_id}", current_user)
+                        else:
+                            cookie_manager.manager.update_cookie(account_id, cookies_str, save_to_db=False)
+                            log_with_user('info', f"已更新cookie_manager并重启任务: {account_id}", current_user)
+                    except Exception as manager_err:
+                        action_desc = '启动新账号任务' if is_new_account else '切换账号任务'
+                        log_with_user('warning', f"{action_desc}失败: {account_id}, 错误: {str(manager_err)}", current_user)
                 
                 if is_refresh_mode:
                     log_with_user('info', f"刷新模式已完成Token预检，直接切换到通过预检的新Cookie: {account_id}", current_user)
@@ -4149,7 +4120,10 @@ async def _execute_manual_cookie_import(
     current_user: Dict[str, Any],
 ):
     try:
-        from utils.xianyu_slider_stealth import XianyuSliderStealth, resolve_verification_url_from_cookie
+        from utils.xianyu_slider_stealth import (
+            XianyuSliderStealth,
+            probe_cookie_verification_from_cookie,
+        )
         from XianyuAutoAsync import XianyuLive
 
         existing_cookie_info = db_manager.get_cookie_details(account_id) or {}
@@ -4170,62 +4144,184 @@ async def _execute_manual_cookie_import(
         )
         manual_cookie_import_sessions[session_id]['slider_instance'] = slider_instance
 
+        def merge_cookie_dicts_for_import(incoming_cookie_dict: Optional[Dict[str, Any]], source_label: str) -> Dict[str, Any]:
+            existing_cookie_dict = trans_cookies(cookie_value)
+            merge_result = XianyuLive.protected_merge_cookie_dicts(
+                existing_cookie_dict,
+                incoming_cookie_dict or {},
+            )
+            if merge_result['incoming_missing_protected_fields']:
+                log_with_user(
+                    'warning',
+                    (
+                        f"导入 Cookie {source_label}快照缺少关键字段，执行保护性合并: "
+                        f"{', '.join(merge_result['incoming_missing_protected_fields'])}"
+                    ),
+                    current_user,
+                )
+            if merge_result['preserved_protected_fields']:
+                log_with_user(
+                    'warning',
+                    f"导入 Cookie 保护性保留旧字段: {', '.join(merge_result['preserved_protected_fields'])}",
+                    current_user,
+                )
+            return merge_result['merged_cookies_dict']
+
+        def persist_manual_cookie_import_success(merged_cookies_dict: Dict[str, Any], source_label: str):
+            if not merged_cookies_dict:
+                raise ValueError(f"手动导入 Cookie {source_label}后未获取到有效 Cookie")
+
+            cookies_str = '; '.join([f"{k}={v}" for k, v in merged_cookies_dict.items()])
+            existing_same_user_cookie = db_manager.get_all_cookies(user_id)
+            is_new_account = account_id not in existing_same_user_cookie
+            if is_new_account:
+                db_manager.save_cookie(account_id, cookies_str, user_id)
+                if cookie_manager.manager:
+                    cookie_manager.manager.add_cookie(account_id, cookies_str, user_id=user_id)
+            else:
+                db_manager.update_cookie_account_info(account_id, cookie_value=cookies_str)
+                if cookie_manager.manager:
+                    if account_id in getattr(cookie_manager.manager, 'cookies', {}):
+                        cookie_manager.manager.update_cookie(account_id, cookies_str, save_to_db=False)
+                    else:
+                        cookie_manager.manager.add_cookie(account_id, cookies_str, user_id=user_id)
+
+            _set_manual_cookie_import_session_status(
+                session_id,
+                'success',
+                account_id=account_id,
+                is_new_account=is_new_account,
+                cookie_count=len(merged_cookies_dict),
+            )
+            log_with_user(
+                'info',
+                (
+                    f"手动导入 Cookie {source_label}成功并已保存: "
+                    f"{account_id}, cookie_count={len(merged_cookies_dict)}"
+                ),
+                current_user,
+            )
+
+        def notification_callback(
+            message: str,
+            screenshot_path: str = None,
+            verification_url: str = None,
+            screenshot_path_new: str = None,
+            verification_type: str = None,
+        ):
+            """手动导入 Cookie 的验证通知回调。"""
+            try:
+                import threading
+
+                actual_screenshot_path = screenshot_path_new if screenshot_path_new else screenshot_path
+                if actual_screenshot_path and not os.path.exists(actual_screenshot_path):
+                    actual_screenshot_path = None
+
+                verification_type_label = resolve_verification_type_label(
+                    verification_type,
+                    message,
+                    verification_url,
+                )
+                _set_manual_cookie_import_session_status(
+                    session_id,
+                    'verification_required',
+                    verification_url=verification_url or None,
+                    screenshot_path=actual_screenshot_path,
+                    verification_type=verification_type_label,
+                )
+
+                if actual_screenshot_path:
+                    log_with_user(
+                        'info',
+                        f"手动导入 Cookie 验证截图已保存: {session_id}, 路径: {actual_screenshot_path}",
+                        current_user,
+                    )
+                elif verification_url:
+                    log_with_user(
+                        'info',
+                        f"手动导入 Cookie 验证链接已保存: {session_id}, URL: {verification_url}",
+                        current_user,
+                    )
+                else:
+                    log_with_user(
+                        'warning',
+                        f"手动导入 Cookie 检测到{verification_type_label}，但未获取到可用的截图或验证链接: {session_id}",
+                        current_user,
+                    )
+
+                def send_verification_notification():
+                    try:
+                        notification_message = build_face_verify_notification(
+                            account_id=account_id,
+                            time_text=time.strftime('%Y-%m-%d %H:%M:%S'),
+                            verification_type=verification_type_label,
+                            verification_url=verification_url or '',
+                            error_message=message,
+                            has_screenshot=bool(actual_screenshot_path),
+                        )
+                        notification_sent = dispatch_account_notifications_sync(
+                            account_id,
+                            notification_message,
+                            title='闲鱼账号需要验证',
+                            notification_type='face_verification',
+                            attachment_path=actual_screenshot_path,
+                        )
+                        if notification_sent:
+                            log_with_user('info', f"已发送手动导入 Cookie 验证通知: {account_id}", current_user)
+                        else:
+                            log_with_user('warning', f"手动导入 Cookie 验证通知未发送成功: {account_id}", current_user)
+                    except Exception as notify_err:
+                        log_with_user(
+                            'warning',
+                            f"发送手动导入 Cookie 验证通知失败: {account_id}, 错误: {str(notify_err)}",
+                            current_user,
+                        )
+
+                notification_thread = threading.Thread(target=send_verification_notification, daemon=True)
+                notification_thread.start()
+            except Exception as callback_err:
+                log_with_user(
+                    'warning',
+                    f"处理手动导入 Cookie 验证回调失败: {account_id}, 错误: {str(callback_err)}",
+                    current_user,
+                )
+
         def run_import():
             try:
-                target_url = resolve_verification_url_from_cookie(cookie_value, proxy_config)
+                probe_result = probe_cookie_verification_from_cookie(cookie_value, proxy_config)
+                if probe_result.get('status') == 'cookie_valid':
+                    merged_cookies_dict = merge_cookie_dicts_for_import(
+                        probe_result.get('session_cookies'),
+                        '预检直通',
+                    )
+                    log_with_user(
+                        'info',
+                        f"手动导入 Cookie 预检已确认当前 Cookie 直接有效，跳过浏览器验证: {account_id}",
+                        current_user,
+                    )
+                    persist_manual_cookie_import_success(merged_cookies_dict, '预检直通')
+                    return
+
+                target_url = probe_result.get('verification_url')
+                if not target_url:
+                    raise RuntimeError(
+                        f"未拿到最新 verification_url: {probe_result.get('payload') or probe_result}"
+                    )
                 log_with_user('info', f"手动导入 Cookie 已解析 verification_url: {account_id}", current_user)
 
-                success, cookies_dict = slider_instance.run(target_url)
+                success, cookies_dict = slider_instance.run(
+                    target_url,
+                    notification_callback=notification_callback,
+                    notification_scene='手动导入 Cookie',
+                )
                 if not success or not cookies_dict:
                     failure_message = slider_instance._get_slider_failure_message('滑块验证失败，请稍后重试')
                     _set_manual_cookie_import_session_status(session_id, 'failed', error=failure_message)
                     log_with_user('error', f"手动导入 Cookie 验证失败: {account_id}, 错误: {failure_message}", current_user)
                     return
 
-                existing_cookie_dict = trans_cookies(cookie_value)
-                merge_result = XianyuLive.protected_merge_cookie_dicts(existing_cookie_dict, cookies_dict)
-                if merge_result['incoming_missing_protected_fields']:
-                    log_with_user(
-                        'warning',
-                        f"导入 Cookie 浏览器快照缺少关键字段，执行保护性合并: {', '.join(merge_result['incoming_missing_protected_fields'])}",
-                        current_user,
-                    )
-                if merge_result['preserved_protected_fields']:
-                    log_with_user(
-                        'warning',
-                        f"导入 Cookie 保护性保留旧字段: {', '.join(merge_result['preserved_protected_fields'])}",
-                        current_user,
-                    )
-
-                merged_cookies_dict = merge_result['merged_cookies_dict']
-                cookies_str = '; '.join([f"{k}={v}" for k, v in merged_cookies_dict.items()])
-
-                existing_same_user_cookie = db_manager.get_all_cookies(user_id)
-                is_new_account = account_id not in existing_same_user_cookie
-                if is_new_account:
-                    db_manager.save_cookie(account_id, cookies_str, user_id)
-                    if cookie_manager.manager:
-                        cookie_manager.manager.add_cookie(account_id, cookies_str, user_id=user_id)
-                else:
-                    db_manager.update_cookie_account_info(account_id, cookie_value=cookies_str)
-                    if cookie_manager.manager:
-                        if account_id in getattr(cookie_manager.manager, 'cookies', {}):
-                            cookie_manager.manager.update_cookie(account_id, cookies_str, save_to_db=False)
-                        else:
-                            cookie_manager.manager.add_cookie(account_id, cookies_str, user_id=user_id)
-
-                _set_manual_cookie_import_session_status(
-                    session_id,
-                    'success',
-                    account_id=account_id,
-                    is_new_account=is_new_account,
-                    cookie_count=len(merged_cookies_dict),
-                )
-                log_with_user(
-                    'info',
-                    f"手动导入 Cookie 验证成功并已保存: {account_id}, cookie_count={len(merged_cookies_dict)}",
-                    current_user,
-                )
+                merged_cookies_dict = merge_cookie_dicts_for_import(cookies_dict, '浏览器验证')
+                persist_manual_cookie_import_success(merged_cookies_dict, '浏览器验证')
             except Exception as exc:
                 error_message = str(exc)
                 _set_manual_cookie_import_session_status(session_id, 'failed', error=error_message)
@@ -5381,8 +5477,8 @@ async def reset_qr_cookie_refresh_cooldown(
             return {'success': False, 'message': '账号不存在'}
 
         # 如果cookie_manager中有对应的实例，直接重置
-        if cookie_manager.manager and cookie_id in cookie_manager.manager.instances:
-            instance = cookie_manager.manager.instances[cookie_id]
+        instance = cookie_manager.manager.get_xianyu_instance(cookie_id) if cookie_manager.manager else None
+        if instance:
             remaining_time_before = instance.get_qr_cookie_refresh_remaining_time()
             instance.reset_qr_cookie_refresh_flag()
 
@@ -5421,8 +5517,8 @@ async def get_qr_cookie_refresh_cooldown_status(
             return {'success': False, 'message': '账号不存在'}
 
         # 如果cookie_manager中有对应的实例，获取冷却状态
-        if cookie_manager.manager and cookie_id in cookie_manager.manager.instances:
-            instance = cookie_manager.manager.instances[cookie_id]
+        instance = cookie_manager.manager.get_xianyu_instance(cookie_id) if cookie_manager.manager else None
+        if instance:
             remaining_time = instance.get_qr_cookie_refresh_remaining_time()
             cooldown_duration = instance.qr_cookie_refresh_cooldown
             last_refresh_time = instance.last_qr_cookie_refresh_time
