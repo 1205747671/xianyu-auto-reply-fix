@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import re
 import sys
+import socket
 from datetime import datetime
 from urllib.parse import parse_qs, urlparse, urlencode, quote_plus
 from playwright.sync_api import sync_playwright as playwright_sync_playwright, ElementHandle
@@ -968,7 +969,8 @@ class XianyuSliderStealth:
     def __init__(self, user_id: str = "default", enable_learning: bool = True, headless: bool = True,
                  initial_cookies: Optional[str] = None, proxy: Optional[Dict[str, Any]] = None,
                  browser_channel: Optional[str] = None, executable_path: Optional[str] = None,
-                 slider_max_retries: int = 3):
+                 slider_max_retries: int = 3, use_account_persistent_profile: bool = False,
+                 account_persistent_profile_dir: Optional[str] = None):
         self.user_id = user_id
         self.enable_learning = enable_learning
         self.headless = headless  # 是否使用无头模式
@@ -1086,6 +1088,8 @@ class XianyuSliderStealth:
         self.browser_features = {}
         self.browser_identity = {}
         self.profile_id = "unassigned"
+        self.use_account_persistent_profile = bool(use_account_persistent_profile)
+        self.account_persistent_profile_dir = str(account_persistent_profile_dir or "").strip() or None
         self.trajectory_params = {
             "total_steps_range": [5, 8],  # 极速：5-8步（超快滑动）
             "base_delay_range": [0.0002, 0.0005],  # 极速：0.2-0.5ms延迟
@@ -2292,6 +2296,38 @@ class XianyuSliderStealth:
             proxy_settings["password"] = proxy_pass
         return proxy_settings
 
+    def _should_use_account_persistent_profile(self) -> bool:
+        return bool(getattr(self, "use_account_persistent_profile", False))
+
+    def _resolve_account_persistent_profile_dir(self) -> str:
+        profile_dir = str(getattr(self, "account_persistent_profile_dir", None) or "").strip()
+        if not profile_dir:
+            profile_dir = os.path.join(os.getcwd(), 'browser_data', f'user_{self.pure_user_id}')
+        os.makedirs(profile_dir, exist_ok=True)
+        return profile_dir
+
+    def _build_playwright_context_options(self, browser_features: Dict[str, Any]) -> Dict[str, Any]:
+        context_options: Dict[str, Any] = {
+            'user_agent': browser_features['user_agent'],
+            'locale': browser_features['locale'],
+            'timezone_id': browser_features['timezone_id'],
+            'color_scheme': browser_features['color_scheme'],
+            'extra_http_headers': {
+                'Accept-Language': browser_features['accept_lang']
+            },
+        }
+        if not self.headless:
+            context_options['no_viewport'] = True
+        else:
+            context_options.update({
+                'viewport': {'width': browser_features['viewport_width'], 'height': browser_features['viewport_height']},
+                'screen': {'width': browser_features['viewport_width'], 'height': browser_features['viewport_height']},
+                'device_scale_factor': browser_features['device_scale_factor'],
+                'is_mobile': browser_features['is_mobile'],
+                'has_touch': browser_features['has_touch'],
+            })
+        return context_options
+
     def _build_initial_cookie_payload(self) -> List[Dict[str, Any]]:
         if not self.initial_cookies:
             return []
@@ -2449,56 +2485,79 @@ class XianyuSliderStealth:
             if self.executable_path:
                 launch_options["executable_path"] = self.executable_path
                 logger.info(f"【{self.pure_user_id}】滑块浏览器使用本机可执行文件: {self.executable_path}")
-            try:
-                self.browser = self.playwright.chromium.launch(**launch_options)
-            except Exception as launch_error:
-                if self.headless and (launch_options.get("executable_path") or launch_options.get("channel")):
-                    fallback_options = dict(launch_options)
-                    fallback_options.pop("executable_path", None)
-                    fallback_options.pop("channel", None)
-                    logger.warning(
-                        f"【{self.pure_user_id}】指定浏览器无头启动失败，回退到 Playwright Chromium: {launch_error}"
-                    )
-                    self.browser = self.playwright.chromium.launch(**fallback_options)
-                else:
-                    raise
-            
-            # 验证浏览器已启动
-            if not self.browser or not self.browser.is_connected():
-                raise Exception("浏览器启动失败或连接已断开")
-            logger.info(f"【{self.pure_user_id}】浏览器启动成功，已连接: {self.browser.is_connected()}")
-            
-            # 创建上下文，使用随机特征
-            logger.info(f"【{self.pure_user_id}】创建浏览器上下文...")
-            
-            # 🔑 关键优化：添加更多真实浏览器特征
-            # 这里不要在 headless 下额外强塞 sec-ch-ua / CDP UA 覆写。
-            # 实测阿里 nocaptcha 会在本地阶段直接失败，而同一套轨迹在去掉这些覆写后可通过。
-            extra_headers = {'Accept-Language': browser_features['accept_lang']}
+            context_options = self._build_playwright_context_options(browser_features)
+            launched_with_persistent_profile = False
 
-            context_options = {
-                'user_agent': browser_features['user_agent'],
-                'locale': browser_features['locale'],
-                'timezone_id': browser_features['timezone_id'],
-                'color_scheme': browser_features['color_scheme'],
-                'extra_http_headers': extra_headers,
-            }
-            
-            # 根据模式配置viewport和no_viewport
-            if not self.headless:
-                # 有头模式：使用 no_viewport=True 支持窗口最大化
-                # 注意：使用no_viewport时，不能设置device_scale_factor、is_mobile、has_touch
-                context_options['no_viewport'] = True  # 移除viewport限制，支持--start-maximized
-                self.context = self.browser.new_context(**context_options)
-            else:
-                # 无头模式：使用固定viewport
-                context_options.update({
-                    'viewport': {'width': browser_features['viewport_width'], 'height': browser_features['viewport_height']},
-                    'screen': {'width': browser_features['viewport_width'], 'height': browser_features['viewport_height']},
-                    'device_scale_factor': browser_features['device_scale_factor'],
-                    'is_mobile': browser_features['is_mobile'],
-                    'has_touch': browser_features['has_touch'],
+            if self._should_use_account_persistent_profile():
+                user_data_dir = self._resolve_account_persistent_profile_dir()
+                persistent_launch_options = dict(launch_options)
+                persistent_launch_options.update(context_options)
+                persistent_launch_options.update({
+                    'accept_downloads': True,
+                    'ignore_https_errors': True,
                 })
+                logger.info(f"【{self.pure_user_id}】token_refresh滑块优先复用账号级浏览器目录: {user_data_dir}")
+                try:
+                    self.context = self.playwright.chromium.launch_persistent_context(
+                        user_data_dir,
+                        **persistent_launch_options,
+                    )
+                    launched_with_persistent_profile = True
+                    self.browser = None
+                except Exception as persistent_launch_error:
+                    if not self._is_profile_in_use_launch_error(persistent_launch_error):
+                        raise
+                    cleaned_stale_lock = self._try_cleanup_stale_chromium_singleton_lock(user_data_dir)
+                    if cleaned_stale_lock:
+                        logger.warning(
+                            f"【{self.pure_user_id}】检测到账号级 profile 疑似残留 stale Chromium 锁，"
+                            f"已清理并重试 persistent context: {user_data_dir}"
+                        )
+                        try:
+                            self.context = self.playwright.chromium.launch_persistent_context(
+                                user_data_dir,
+                                **persistent_launch_options,
+                            )
+                            launched_with_persistent_profile = True
+                            self.browser = None
+                        except Exception as retry_launch_error:
+                            if not self._is_profile_in_use_launch_error(retry_launch_error):
+                                raise
+                            logger.warning(
+                                f"【{self.pure_user_id}】清理 stale Chromium 锁后仍提示 profile 被占用，"
+                                f"回退临时上下文链路: {retry_launch_error}"
+                            )
+                    else:
+                        logger.warning(
+                            f"【{self.pure_user_id}】账号级浏览器目录被占用，且无法证明是 stale Chromium 锁，"
+                            f"回退临时上下文链路: {persistent_launch_error}"
+                        )
+
+            if not launched_with_persistent_profile:
+                try:
+                    self.browser = self.playwright.chromium.launch(**launch_options)
+                except Exception as launch_error:
+                    if self.headless and (launch_options.get("executable_path") or launch_options.get("channel")):
+                        fallback_options = dict(launch_options)
+                        fallback_options.pop("executable_path", None)
+                        fallback_options.pop("channel", None)
+                        logger.warning(
+                            f"【{self.pure_user_id}】指定浏览器无头启动失败，回退到 Playwright Chromium: {launch_error}"
+                        )
+                        self.browser = self.playwright.chromium.launch(**fallback_options)
+                    else:
+                        raise
+            
+            if launched_with_persistent_profile:
+                logger.info(f"【{self.pure_user_id}】账号级 persistent browser context 启动成功")
+            else:
+                # 验证浏览器已启动
+                if not self.browser or not self.browser.is_connected():
+                    raise Exception("浏览器启动失败或连接已断开")
+                logger.info(f"【{self.pure_user_id}】浏览器启动成功，已连接: {self.browser.is_connected()}")
+                
+                # 创建上下文，使用随机特征
+                logger.info(f"【{self.pure_user_id}】创建浏览器上下文...")
                 self.context = self.browser.new_context(**context_options)
             
             # 验证上下文已创建
@@ -9872,6 +9931,119 @@ class XianyuSliderStealth:
             "user data directory is already in use",
         )
         return any(marker in error_text for marker in lock_markers)
+
+    def _get_current_hostname(self) -> str:
+        try:
+            return str(socket.gethostname() or "").strip()
+        except Exception:
+            return ""
+
+    def _looks_like_docker_container_hostname(self, hostname: str) -> bool:
+        normalized = str(hostname or "").strip().lower()
+        return bool(re.fullmatch(r"[0-9a-f]{12}", normalized))
+
+    def _is_process_alive(self, pid: int) -> bool:
+        try:
+            normalized_pid = int(pid)
+        except (TypeError, ValueError):
+            return False
+        if normalized_pid <= 0:
+            return False
+        try:
+            os.kill(normalized_pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _parse_chromium_singleton_lock(self, profile_dir: str) -> Optional[Dict[str, Any]]:
+        lock_path = os.path.join(profile_dir, "SingletonLock")
+        if not os.path.islink(lock_path):
+            return None
+        try:
+            target = os.readlink(lock_path)
+        except OSError as read_error:
+            logger.warning(f"【{self.pure_user_id}】读取 Chromium SingletonLock 失败: {read_error}")
+            return None
+
+        target_name = os.path.basename(str(target or "").rstrip("/\\"))
+        if "-" not in target_name:
+            return {
+                "lock_path": lock_path,
+                "target": target,
+                "host": None,
+                "pid": None,
+            }
+
+        lock_host, pid_text = target_name.rsplit("-", 1)
+        if not lock_host or not pid_text.isdigit():
+            return {
+                "lock_path": lock_path,
+                "target": target,
+                "host": None,
+                "pid": None,
+            }
+
+        return {
+            "lock_path": lock_path,
+            "target": target,
+            "host": lock_host,
+            "pid": int(pid_text),
+        }
+
+    def _try_cleanup_stale_chromium_singleton_lock(self, profile_dir: str) -> bool:
+        lock_info = self._parse_chromium_singleton_lock(profile_dir)
+        if not lock_info:
+            logger.info(f"【{self.pure_user_id}】未发现可判定的 Chromium SingletonLock，跳过自动清理")
+            return False
+
+        current_host = self._get_current_hostname()
+        lock_host = str(lock_info.get("host") or "").strip()
+        lock_pid = lock_info.get("pid")
+        if not current_host or not lock_host or lock_pid is None:
+            logger.warning(
+                f"【{self.pure_user_id}】SingletonLock 信息不足，无法证明是 stale 锁，保持原有 fallback: "
+                f"host={lock_host or 'unknown'}, pid={lock_pid}"
+            )
+            return False
+
+        same_host = lock_host == current_host
+        same_docker_host_rollover = (
+            not same_host and
+            self._looks_like_docker_container_hostname(lock_host) and
+            self._looks_like_docker_container_hostname(current_host)
+        )
+        if not same_host and not same_docker_host_rollover:
+            logger.warning(
+                f"【{self.pure_user_id}】SingletonLock 指向其他宿主机，拒绝自动清理: "
+                f"lock_host={lock_host}, current_host={current_host}, pid={lock_pid}"
+            )
+            return False
+        if same_docker_host_rollover:
+            logger.warning(
+                f"【{self.pure_user_id}】检测到 Docker 容器 hostname 漂移导致的 stale SingletonLock，"
+                f"允许按失效锁清理: lock_host={lock_host}, current_host={current_host}, pid={lock_pid}"
+            )
+
+        if self._is_process_alive(lock_pid):
+            logger.info(f"【{self.pure_user_id}】SingletonLock 对应进程仍存活(pid={lock_pid})，跳过自动清理")
+            return False
+
+        removed_any = False
+        for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            lock_path = os.path.join(profile_dir, lock_name)
+            try:
+                if os.path.lexists(lock_path):
+                    os.unlink(lock_path)
+                    removed_any = True
+                    logger.warning(f"【{self.pure_user_id}】已清理 stale Chromium 锁文件: {lock_path}")
+            except OSError as cleanup_error:
+                logger.warning(f"【{self.pure_user_id}】清理 stale Chromium 锁文件失败({lock_path}): {cleanup_error}")
+
+        return removed_any
 
     def _launch_clean_cookie_seeded_context(
         self,

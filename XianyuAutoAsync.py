@@ -6325,6 +6325,7 @@ class XianyuLive:
                     headless=not show_browser,
                     initial_cookies=self.cookies_str,
                     proxy=self.proxy_config,
+                    use_account_persistent_profile=True,
                 )
                 slider_stealth.risk_trigger_scene = 'token_refresh'
 

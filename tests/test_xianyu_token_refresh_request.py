@@ -136,6 +136,44 @@ class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(created_sliders), 1)
         self.assertEqual(created_sliders[0].risk_trigger_scene, "token_refresh")
 
+    async def test_handle_captcha_verification_enables_account_persistent_profile_for_token_refresh(self):
+        created_sliders = []
+
+        class _FakeSlider:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+                self.risk_trigger_scene = None
+                created_sliders.append(self)
+
+            async def async_run(self, verification_url):
+                self.verification_url = verification_url
+                return False, None
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = "token_refresh_persistent_profile_test"
+        live.cookies_str = "_m_h5_tk=test_token_12345; cookie2=dummy_cookie2"
+        live.proxy_config = {}
+        live.connection_state = ConnectionState.DISCONNECTED
+        live.ws = None
+        live._safe_str = lambda exc: str(exc)
+
+        async def fake_send_notification(*_args, **_kwargs):
+            return None
+
+        live.send_token_refresh_notification = fake_send_notification
+
+        with mock.patch("XianyuAutoAsync.db_manager.get_cookie_details", return_value={}), \
+             mock.patch("XianyuAutoAsync.log_captcha_event"), \
+             mock.patch("utils.xianyu_slider_stealth.XianyuSliderStealth", _FakeSlider):
+            result = await live._handle_captcha_verification(
+                {"data": {"url": "https://example.com/punish?action=captcha"}}
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(len(created_sliders), 1)
+        self.assertTrue(created_sliders[0].kwargs.get("use_account_persistent_profile"))
+
 
 if __name__ == "__main__":
     unittest.main()

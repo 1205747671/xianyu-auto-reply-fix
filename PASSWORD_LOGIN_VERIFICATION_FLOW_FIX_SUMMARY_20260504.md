@@ -22,6 +22,10 @@
    - Token 刷新会优先沿用当前内存里的新认证 Cookie 和当前账号代理。
    - 命中 `idlemessage.pc.login.token -> punish` 时，不再把处罚页壳子当真滑块死磕。
    - 一旦出现“验证失败，点击框体重试(error:xxxx)”这类硬拒绝，当前滑块流程会尽快结束并回退到账密恢复。
+   - **2026-05-05 补充**：`token_refresh` 自动滑块现在会优先复用 `browser_data/user_<account_id>` 的账号级 hydrated persistent profile；只有 profile 被占用时，才回退到旧的临时上下文链路。
+   - **多账号边界**：每个账号只会碰自己的 `browser_data/user_<account_id>`，不会共用浏览器状态；同账号已有滑块任务在跑时，沿用现有并发保护排队，不会自己抢自己的 profile。
+   - **影响范围边界**：这次 persistent profile 优先逻辑只挂在 `token_refresh` 的自动滑块恢复链上，不会把正常消息监听、订单处理、手动导入 Cookie 等主链统一切到这套路径。
+   - **2026-05-05 stale lock 补充**：如果账号级 profile 里残留的是“当前宿主机 + 已失效 PID”的 Chromium `SingletonLock`，或 Docker 容器 hostname 漂移留下的旧容器 ID 锁，程序会先安全清理 `SingletonLock` / `SingletonCookie` / `SingletonSocket`，然后只重试一次 persistent context；拿不准就不删，继续走旧 fallback。
 
 5. **2026-05-05 已把“本地通、Linux 不通”的运行时差异钉死并对齐**
    - 根因不是源码逻辑跑偏，而是 Linux 容器里的项目浏览器仍落在 `/ms-playwright/chromium-1208/...`，实际画像还是 Chrome 145。
@@ -222,14 +226,21 @@
 4. 这条链会显式打上：
    - `risk_trigger_scene = 'token_refresh'`
    用来把它和 fresh login / 手动 Cookie / 账密滑块区分开。
-5. 如果页面其实只是处罚页壳子，且出现：
+5. `token_refresh` 滑块接管时，会优先复用：
+   - `browser_data/user_<account_id>`
+   这套账号级持久浏览器目录，把已有 Cookie、localStorage、站点状态和历史风控信任一起带上。
+   每个账号只会使用自己的目录，不会跨账号共用；同账号如果已有滑块任务占着槽位，也会先走现有并发保护而不是再起一个实例抢同一个 profile。
+   如果只是 profile 锁冲突，才会回退到旧的 `launch(...) + new_context() + add_cookies()` 临时上下文兜底。
+   如果锁冲突能进一步证明只是当前宿主机残留的 stale Chromium singleton 锁，则会先安全清理锁文件，再重试一次 persistent context。
+   这套 persistent profile 优先逻辑只作用在 `token_refresh` 这条恢复链，不会把正常消息监听、订单处理、手动导入 Cookie 主链整体改成持久 profile 模式。
+6. 如果页面其实只是处罚页壳子，且出现：
    - `验证失败，点击框体重试(error:xxxx)`
    - 没有真实滑块按钮/轨道
    那就**第一次失败直接停止当前滑块重试**，也不再继续二维码页二次接管。
-6. 外层随后回退：
+7. 外层随后回退：
    - `_try_password_login_refresh(...)`
    重新拿一份可用认证态，再继续保活。
-7. 后续 `_refresh_cookies_via_browser(...)` 会补：
+8. 后续 `_refresh_cookies_via_browser(...)` 会补：
    - 受保护 Cookie 合并
    - 网页登录态校验
    - 图片上传 API 校验

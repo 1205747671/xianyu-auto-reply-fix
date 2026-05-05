@@ -311,6 +311,11 @@ DISPLAY=:99
 - 输入账号 ID 和 Cookie 信息
 - 可按需配置用户名、密码、备注和显示浏览器
 - 保存后即可启用或刷新账号
+- `token_refresh` 命中滑块时，程序会优先复用 `browser_data/user_<账号ID>` 下的账号级浏览器画像和站点状态
+- 各账号各用各的 `browser_data/user_<账号ID>` 目录，不共享浏览器状态；同账号如果同时撞上滑块，会按现有并发保护排队，不会自己跟自己抢 profile
+- 这套账号级 persistent profile 优先策略目前只挂在 `token_refresh` 的滑块恢复链上，不会把正常消息监听、订单处理、手动导入 Cookie 主链一锅端改掉
+- `browser_data/` 属于运行期状态目录，别手贱一把清空；旧 Cookie 的自动滑块恢复很吃这里面的持久化状态
+- 如果账号级 profile 因异常退出残留了 Chromium `SingletonLock`，程序只会在确认它是“当前宿主机 + 已失效 PID”，或“Docker 容器 hostname 漂移导致的旧容器 ID 锁”时自动清理并重试；拿不准就继续走旧 fallback，不乱删锁
 
 ### 3. 使用商品擦亮
 - 在账号管理页可直接执行一键擦亮，批量处理当前账号在售商品
