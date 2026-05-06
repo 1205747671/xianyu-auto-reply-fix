@@ -3820,7 +3820,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
             from db_manager import db_manager  # 在函数开头导入，避免作用域问题
             from XianyuAutoAsync import XianyuLive
             try:
-                cookies_dict = slider_instance.login_with_password_playwright(
+                cookies_dict = slider_instance.login_with_password_browser(
                     account=account,
                     password=password,
                     show_browser=show_browser,

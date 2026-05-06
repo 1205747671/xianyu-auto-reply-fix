@@ -25,8 +25,6 @@ def main() -> int:
     parser.add_argument("--headless", action="store_true", help="强制无头。默认有头，方便本地盯着看")
     parser.add_argument("--browser-channel", help="例如 msedge / chrome")
     parser.add_argument("--browser-path", help="指定本机浏览器 executable_path")
-    parser.add_argument("--automation-backend", choices=["auto", "patchright", "playwright"], default="auto",
-                        help="浏览器自动化后端")
     parser.add_argument("--stealth-mode", choices=["auto", "off", "lite", "full"], default="auto",
                         help="init_script 注入模式")
     parser.add_argument("--max-retries", type=int, default=4, help="单次真实浏览器调试时的最大滑块尝试次数，默认 4")
@@ -48,8 +46,6 @@ def main() -> int:
         "proxy_pass": args.proxy_pass,
     }
 
-    if args.automation_backend != "auto":
-        os.environ["XY_SLIDER_AUTOMATION_BACKEND"] = args.automation_backend
     if args.stealth_mode != "auto":
         os.environ["XY_SLIDER_STEALTH_MODE"] = args.stealth_mode
 
@@ -62,7 +58,7 @@ def main() -> int:
     print(f"headless={args.headless}")
     print(f"browser_channel={args.browser_channel or ''}")
     print(f"browser_path={args.browser_path or ''}")
-    print(f"automation_backend={os.environ.get('XY_SLIDER_AUTOMATION_BACKEND', 'auto')}")
+    print("browser_provider=cloakbrowser")
     print(f"stealth_mode={os.environ.get('XY_SLIDER_STEALTH_MODE', 'auto')}")
     print(f"max_retries={args.max_retries}")
     print(f"open_only={args.open_only}")

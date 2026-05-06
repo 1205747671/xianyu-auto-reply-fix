@@ -19,7 +19,6 @@ def main() -> int:
     parser.add_argument("--headless", action="store_true", help="run in headless mode")
     parser.add_argument("--show-browser", action="store_true", help="force headed mode")
     parser.add_argument("--force-clean-context", action="store_true", help="use clean browser context instead of persistent profile")
-    parser.add_argument("--automation-backend", choices=["auto", "patchright", "playwright"], default="auto")
     parser.add_argument("--stealth-mode", choices=["auto", "off", "lite", "full"], default="auto")
     parser.add_argument("--max-retries", type=int, default=1, help="slider retries for this manual run")
     parser.add_argument("--initial-cookie", help="optional initial cookie string")
@@ -35,8 +34,6 @@ def main() -> int:
     parser.add_argument("--keep-verification-screenshot", action="store_true", help="do not delete verification screenshot after the run")
     args = parser.parse_args()
 
-    if args.automation_backend != "auto":
-        os.environ["XY_SLIDER_AUTOMATION_BACKEND"] = args.automation_backend
     if args.stealth_mode != "auto":
         os.environ["XY_SLIDER_STEALTH_MODE"] = args.stealth_mode
     os.environ["XY_VERIFICATION_WAIT_TIMEOUT"] = str(max(5, args.verification_wait_timeout))
@@ -62,7 +59,7 @@ def main() -> int:
     headless = True if args.headless else not args.show_browser
     print(f"account_id={args.account_id}")
     print(f"headless={headless}")
-    print(f"automation_backend={os.environ.get('XY_SLIDER_AUTOMATION_BACKEND', 'auto')}")
+    print("browser_provider=cloakbrowser")
     print(f"stealth_mode={os.environ.get('XY_SLIDER_STEALTH_MODE', 'auto')}")
     print(f"force_clean_context={args.force_clean_context}")
     print(f"max_retries={args.max_retries}")
@@ -95,10 +92,10 @@ def main() -> int:
         print(f"verification_screenshot={actual_screenshot_path}")
         print(f"verification_url={verification_url or ''}")
 
-    result = slider.login_with_password_playwright(
+    result = slider.login_with_password_browser(
         account=args.account,
         password=args.password,
-        show_browser=not headless,
+        show_browser=args.show_browser,
         force_clean_context=args.force_clean_context,
         notification_callback=verification_callback,
     )

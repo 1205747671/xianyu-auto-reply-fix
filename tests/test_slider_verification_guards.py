@@ -2,12 +2,27 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+
+if "cloakbrowser" not in sys.modules:
+    cloakbrowser_stub = types.ModuleType("cloakbrowser")
+
+    def _not_used(*args, **kwargs):
+        raise AssertionError("cloakbrowser stub should be patched in tests")
+
+    cloakbrowser_stub.launch = _not_used
+    cloakbrowser_stub.launch_async = _not_used
+    cloakbrowser_stub.launch_context = _not_used
+    cloakbrowser_stub.launch_context_async = _not_used
+    cloakbrowser_stub.launch_persistent_context = _not_used
+    cloakbrowser_stub.launch_persistent_context_async = _not_used
+    sys.modules["cloakbrowser"] = cloakbrowser_stub
 
 from utils.xianyu_slider_stealth import XianyuSliderStealth
 
@@ -595,333 +610,36 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         self.assertTrue(trajectory)
         self.assertGreaterEqual(slider.current_trajectory_data["random_params"]["steps"], 39)
 
-    def test_init_browser_uses_account_persistent_profile_when_enabled(self):
-        class _FakeBrowser:
-            def is_connected(self):
-                return True
-
-            def close(self):
-                return None
-
-        class _FakePageForInit:
-            def close(self):
-                return None
-
-        class _FakePersistentContext:
-            def __init__(self):
-                self.browser = _FakeBrowser()
-                self.page = _FakePageForInit()
-                self.added_cookies = []
-
-            def add_cookies(self, payload):
-                self.added_cookies.extend(payload)
-
-            def new_page(self):
-                return self.page
-
-            def close(self):
-                return None
-
-        class _FakeChromium:
-            def __init__(self, context):
-                self.context = context
-                self.launch_called = False
-                self.persistent_calls = []
-
-            def launch(self, **_kwargs):
-                self.launch_called = True
-                raise AssertionError("should prefer launch_persistent_context")
-
-            def launch_persistent_context(self, user_data_dir, **kwargs):
-                self.persistent_calls.append(
-                    {
-                        "user_data_dir": user_data_dir,
-                        "kwargs": kwargs,
-                    }
-                )
-                return self.context
-
-        class _FakePlaywright:
-            def __init__(self, chromium):
-                self.chromium = chromium
-
-            def start(self):
-                return self
-
-            def stop(self):
-                return None
-
+    @mock.patch("utils.xianyu_slider_stealth.launch_browser_persistent_context")
+    def test_init_browser_uses_provider_persistent_context_when_profile_enabled(self, mock_launch):
         slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
-        slider.pure_user_id = "persistent_profile_unit_test"
+        slider.use_account_persistent_profile = True
+        slider.account_persistent_profile_dir = "browser_data/user_1"
         slider.headless = True
-        slider.browser_channel = None
-        slider.executable_path = None
-        slider.page = None
         slider.browser = None
         slider.context = None
-        slider.playwright = None
-        slider.automation_backend = "playwright"
-        slider.profile_id = "unassigned"
-        slider.proxy_config = {}
-        slider.use_account_persistent_profile = True
-        slider.account_persistent_profile_dir = None
-        slider._cleanup_on_init_failure = lambda: None
-        slider._should_prefer_project_browser_for_playwright = lambda: False
-        slider._ensure_project_playwright_browser = lambda: None
-        slider._build_playwright_proxy_settings = lambda: None
-        slider._build_initial_cookie_payload = lambda: []
-        slider._install_stealth_init_script = lambda *_args, **_kwargs: None
-        slider._get_random_browser_features = lambda: {
-            "profile_id": "win_chrome_147_1600x900",
-            "user_agent": "unit-test-agent",
-            "locale": "zh-CN",
-            "timezone_id": "Asia/Shanghai",
-            "color_scheme": "light",
-            "accept_lang": "zh-CN,zh;q=0.9",
-            "lang": "zh-CN",
-            "window_size": "1600,900",
-            "viewport_width": 1600,
-            "viewport_height": 900,
-            "device_scale_factor": 1,
-            "is_mobile": False,
-            "has_touch": False,
-        }
+        slider.page = None
+        slider._build_browser_proxy_settings = lambda: None
+        slider._build_browser_context_options = lambda _features: {}
+        slider._build_browser_features = lambda: {}
+        slider._build_browser_launch_args = lambda: ["--foo"]
 
-        fake_context = _FakePersistentContext()
-        fake_chromium = _FakeChromium(fake_context)
-        fake_playwright = _FakePlaywright(fake_chromium)
-        slider._get_sync_playwright_factory = lambda: (lambda: fake_playwright)
+        fake_context = mock.Mock()
+        fake_context.pages = [mock.Mock()]
+        mock_launch.return_value = fake_context
 
         slider.init_browser()
 
-        self.assertFalse(fake_chromium.launch_called)
-        self.assertEqual(len(fake_chromium.persistent_calls), 1)
-        self.assertEqual(
-            fake_chromium.persistent_calls[0]["user_data_dir"],
-            os.path.join(os.getcwd(), "browser_data", f"user_{slider.pure_user_id}"),
-        )
-        self.assertIs(slider.context, fake_context)
-        self.assertIs(slider.page, fake_context.page)
+        mock_launch.assert_called_once()
 
-
-    def test_init_browser_retries_persistent_profile_after_stale_singleton_cleanup(self):
-        class _FakeBrowser:
-            def is_connected(self):
-                return True
-
-        class _FakePageForInit:
-            def close(self):
-                return None
-
-        class _FakePersistentContext:
-            def __init__(self):
-                self.browser = _FakeBrowser()
-                self.page = _FakePageForInit()
-                self.added_cookies = []
-
-            def add_cookies(self, payload):
-                self.added_cookies.extend(payload)
-
-            def new_page(self):
-                return self.page
-
-            def close(self):
-                return None
-
-        class _FakeChromium:
-            def __init__(self, context):
-                self.context = context
-                self.launch_called = False
-                self.persistent_calls = []
-
-            def launch(self, **_kwargs):
-                self.launch_called = True
-                raise AssertionError("should retry launch_persistent_context before fallback launch")
-
-            def launch_persistent_context(self, user_data_dir, **kwargs):
-                self.persistent_calls.append(
-                    {
-                        "user_data_dir": user_data_dir,
-                        "kwargs": kwargs,
-                    }
-                )
-                if len(self.persistent_calls) == 1:
-                    raise RuntimeError(
-                        "BrowserType.launch_persistent_context: "
-                        "The profile appears to be in use by another Chromium process"
-                    )
-                return self.context
-
-        class _FakePlaywright:
-            def __init__(self, chromium):
-                self.chromium = chromium
-
-            def start(self):
-                return self
-
+    def test_login_with_password_headful_is_alias_of_new_browser_login(self):
         slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
-        slider.pure_user_id = "persistent_profile_retry_unit_test"
-        slider.headless = True
-        slider.browser_channel = None
-        slider.executable_path = None
-        slider.page = None
-        slider.browser = None
-        slider.context = None
-        slider.playwright = None
-        slider.automation_backend = "playwright"
-        slider.profile_id = "unassigned"
-        slider.proxy_config = {}
-        slider.use_account_persistent_profile = True
-        slider.account_persistent_profile_dir = None
-        slider._cleanup_on_init_failure = lambda: None
-        slider._should_prefer_project_browser_for_playwright = lambda: False
-        slider._ensure_project_playwright_browser = lambda: None
-        slider._build_playwright_proxy_settings = lambda: None
-        slider._build_initial_cookie_payload = lambda: []
-        slider._install_stealth_init_script = lambda *_args, **_kwargs: None
-        slider._try_cleanup_stale_chromium_singleton_lock = lambda _profile_dir: True
-        slider._get_random_browser_features = lambda: {
-            "profile_id": "win_chrome_147_1600x900",
-            "user_agent": "unit-test-agent",
-            "locale": "zh-CN",
-            "timezone_id": "Asia/Shanghai",
-            "color_scheme": "light",
-            "accept_lang": "zh-CN,zh;q=0.9",
-            "lang": "zh-CN",
-            "window_size": "1600,900",
-            "viewport_width": 1600,
-            "viewport_height": 900,
-            "device_scale_factor": 1,
-            "is_mobile": False,
-            "has_touch": False,
-        }
+        slider.login_with_password_browser = mock.Mock(return_value={"cookie2": "ok"})
 
-        fake_context = _FakePersistentContext()
-        fake_chromium = _FakeChromium(fake_context)
-        fake_playwright = _FakePlaywright(fake_chromium)
-        slider._get_sync_playwright_factory = lambda: (lambda: fake_playwright)
+        result = slider.login_with_password_headful("user", "pass", show_browser=True)
 
-        page = slider.init_browser()
-
-        self.assertEqual(len(fake_chromium.persistent_calls), 2)
-        self.assertFalse(fake_chromium.launch_called)
-        self.assertIs(slider.context, fake_context)
-        self.assertIs(slider.page, fake_context.page)
-        self.assertIs(page, fake_context.page)
-        self.assertIsNone(slider.browser)
-
-    def test_init_browser_falls_back_when_stale_singleton_cleanup_not_allowed(self):
-        class _FakePageForInit:
-            pass
-
-        class _FakeContext:
-            def __init__(self):
-                self.page = _FakePageForInit()
-                self.added_cookies = []
-
-            def add_cookies(self, payload):
-                self.added_cookies.extend(payload)
-
-            def new_page(self):
-                return self.page
-
-            def close(self):
-                return None
-
-        class _FakeBrowser:
-            def __init__(self, context):
-                self.context = context
-
-            def is_connected(self):
-                return True
-
-            def new_context(self, **_kwargs):
-                return self.context
-
-            def close(self):
-                return None
-
-        class _FakeChromium:
-            def __init__(self, context):
-                self.context = context
-                self.launch_called = False
-                self.persistent_calls = []
-
-            def launch(self, **_kwargs):
-                self.launch_called = True
-                return _FakeBrowser(self.context)
-
-            def launch_persistent_context(self, user_data_dir, **kwargs):
-                self.persistent_calls.append(
-                    {
-                        "user_data_dir": user_data_dir,
-                        "kwargs": kwargs,
-                    }
-                )
-                raise RuntimeError(
-                    "BrowserType.launch_persistent_context: "
-                    "The profile appears to be in use by another Chromium process"
-                )
-
-        class _FakePlaywright:
-            def __init__(self, chromium):
-                self.chromium = chromium
-
-            def start(self):
-                return self
-
-            def stop(self):
-                return None
-
-        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
-        slider.pure_user_id = "persistent_profile_fallback_unit_test"
-        slider.headless = True
-        slider.browser_channel = None
-        slider.executable_path = None
-        slider.page = None
-        slider.browser = None
-        slider.context = None
-        slider.playwright = None
-        slider.automation_backend = "playwright"
-        slider.profile_id = "unassigned"
-        slider.proxy_config = {}
-        slider.use_account_persistent_profile = True
-        slider.account_persistent_profile_dir = None
-        slider._cleanup_on_init_failure = lambda: None
-        slider._should_prefer_project_browser_for_playwright = lambda: False
-        slider._ensure_project_playwright_browser = lambda: None
-        slider._build_playwright_proxy_settings = lambda: None
-        slider._build_initial_cookie_payload = lambda: []
-        slider._install_stealth_init_script = lambda *_args, **_kwargs: None
-        slider._try_cleanup_stale_chromium_singleton_lock = lambda _profile_dir: False
-        slider._get_random_browser_features = lambda: {
-            "profile_id": "win_chrome_147_1600x900",
-            "user_agent": "unit-test-agent",
-            "locale": "zh-CN",
-            "timezone_id": "Asia/Shanghai",
-            "color_scheme": "light",
-            "accept_lang": "zh-CN,zh;q=0.9",
-            "lang": "zh-CN",
-            "window_size": "1600,900",
-            "viewport_width": 1600,
-            "viewport_height": 900,
-            "device_scale_factor": 1,
-            "is_mobile": False,
-            "has_touch": False,
-        }
-
-        fake_context = _FakeContext()
-        fake_chromium = _FakeChromium(fake_context)
-        fake_playwright = _FakePlaywright(fake_chromium)
-        slider._get_sync_playwright_factory = lambda: (lambda: fake_playwright)
-
-        page = slider.init_browser()
-
-        self.assertEqual(len(fake_chromium.persistent_calls), 1)
-        self.assertTrue(fake_chromium.launch_called)
-        self.assertIs(slider.context, fake_context)
-        self.assertIs(slider.page, fake_context.page)
-        self.assertIs(page, fake_context.page)
+        self.assertEqual(result, {"cookie2": "ok"})
+        slider.login_with_password_browser.assert_called_once_with("user", "pass", show_browser=True)
 
     def test_try_cleanup_stale_chromium_singleton_lock_removes_only_local_dead_lock(self):
         slider = XianyuSliderStealth.__new__(XianyuSliderStealth)

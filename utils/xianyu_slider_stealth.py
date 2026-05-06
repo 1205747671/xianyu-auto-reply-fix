@@ -21,16 +21,37 @@ import sys
 import socket
 from datetime import datetime
 from urllib.parse import parse_qs, urlparse, urlencode, quote_plus
-from playwright.sync_api import sync_playwright as playwright_sync_playwright, ElementHandle
-try:
-    from patchright.sync_api import sync_playwright as patchright_sync_playwright
-except ImportError:
-    patchright_sync_playwright = None
-from playwright.async_api import async_playwright
 import asyncio
+import logging
 from typing import Optional, Tuple, List, Dict, Any, Callable
-from loguru import logger
 from collections import defaultdict
+from utils.browser_provider import launch_browser, launch_browser_persistent_context
+
+ElementHandle = Any
+
+try:
+    from loguru import logger
+except ImportError:
+    class _FallbackLogger:
+        def __init__(self):
+            self._logger = logging.getLogger(__name__)
+
+        def debug(self, *args, **kwargs):
+            self._logger.debug(*args, **kwargs)
+
+        def info(self, *args, **kwargs):
+            self._logger.info(*args, **kwargs)
+
+        def warning(self, *args, **kwargs):
+            self._logger.warning(*args, **kwargs)
+
+        def error(self, *args, **kwargs):
+            self._logger.error(*args, **kwargs)
+
+        def success(self, *args, **kwargs):
+            self._logger.info(*args, **kwargs)
+
+    logger = _FallbackLogger()
 
 _PLAYWRIGHT_BROWSER_INSTALL_LOCK = threading.Lock()
 
@@ -1014,11 +1035,7 @@ class XianyuSliderStealth:
             # Docker 无头容器里空白上下文更容易被风控直接判死，默认保留一次轻量预热；
             # 桌面环境继续维持原来的“默认跳过预热”策略，避免把已有可用上下文搞脏。
             self.disable_headless_warmup = not self.is_docker_env
-        backend_env = os.environ.get("XY_SLIDER_AUTOMATION_BACKEND", "").strip().lower()
-        if backend_env in {"patchright", "playwright"}:
-            self.automation_backend = backend_env
-        else:
-            self.automation_backend = "playwright"
+        self.automation_backend = "cloakbrowser"
         self.stealth_mode_override = os.environ.get("XY_SLIDER_STEALTH_MODE", "").strip().lower()
         self.active_stealth_mode = "auto"
         self.browser = None
@@ -1943,20 +1960,17 @@ class XianyuSliderStealth:
         return "chrome"
 
     def _should_prefer_project_browser_for_playwright(self) -> bool:
-        if self.automation_backend != "playwright":
+        if getattr(self, "automation_backend", "cloakbrowser") != "cloakbrowser":
             return False
-        if self._browser_channel_explicit or self._browser_path_explicit:
+        if not hasattr(self, "playwright_browser_name"):
+            return False
+        if getattr(self, "_browser_channel_explicit", False) or getattr(self, "_browser_path_explicit", False):
             return False
         current_source = str((getattr(self, "local_browser_info", None) or {}).get("source") or "").strip().lower()
         return current_source in {"", "local_system"}
 
     def _should_prefer_project_browser_for_headless_playwright(self) -> bool:
         return self.headless and self._should_prefer_project_browser_for_playwright()
-
-    def _get_sync_playwright_factory(self):
-        if self.automation_backend == "patchright" and patchright_sync_playwright is not None:
-            return patchright_sync_playwright
-        return playwright_sync_playwright
 
     def _resolve_stealth_mode(self) -> str:
         override = str(self.stealth_mode_override or "").strip().lower()
@@ -1965,7 +1979,7 @@ class XianyuSliderStealth:
 
         # Docker 无头 Playwright 在落到系统兜底浏览器时，full 改写容易把风控打醒。
         # 但如果已经锁定到项目内浏览器缓存/显式浏览器路径，full 模式反而更稳定。
-        if self.headless and self.is_docker_env and self.automation_backend == "playwright":
+        if self.headless and self.is_docker_env and self.automation_backend == "cloakbrowser":
             local_browser_info = getattr(self, "local_browser_info", None) or {}
             if (
                 str(local_browser_info.get("source") or "") == "project_playwright_cache"
@@ -1974,10 +1988,6 @@ class XianyuSliderStealth:
             ):
                 return "full"
             return "lite"
-
-        # Patchright 的 init_script 是通过路由注入的，额外脚本越多越容易把自己暴露出去。
-        if self.headless and self.automation_backend == "patchright":
-            return "off"
 
         return "full"
 
@@ -1991,7 +2001,7 @@ class XianyuSliderStealth:
     def _should_prefer_docker_conservative_profile(self, has_learning: bool) -> bool:
         if has_learning:
             return False
-        if not (self.headless and self.is_docker_env and self.automation_backend == "playwright"):
+        if not (self.headless and self.is_docker_env and self.automation_backend == "cloakbrowser"):
             return False
         if not self._use_headless_stable_profile():
             return False
@@ -2296,6 +2306,33 @@ class XianyuSliderStealth:
             proxy_settings["password"] = proxy_pass
         return proxy_settings
 
+    def _build_browser_proxy_settings(self) -> Optional[Dict[str, str]]:
+        return self._build_playwright_proxy_settings()
+
+    def _build_browser_features(self) -> Dict[str, Any]:
+        return self._get_random_browser_features()
+
+    def _build_browser_launch_args(self) -> List[str]:
+        browser_features = getattr(self, "browser_features", None) or {}
+        window_size = browser_features.get("window_size", "1600,900")
+        lang = browser_features.get("lang", "zh-CN")
+        accept_lang = browser_features.get("accept_lang", "zh-CN,zh;q=0.9")
+        return [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--no-first-run",
+            f"--window-size={window_size}",
+            f"--lang={lang}",
+            f"--accept-lang={accept_lang}",
+            "--disable-blink-features=AutomationControlled",
+            "--mute-audio",
+            "--no-default-browser-check",
+            "--force-color-profile=srgb",
+            "--password-store=basic",
+            "--use-mock-keychain",
+        ]
+
     def _should_use_account_persistent_profile(self) -> bool:
         return bool(getattr(self, "use_account_persistent_profile", False))
 
@@ -2327,6 +2364,9 @@ class XianyuSliderStealth:
                 'has_touch': browser_features['has_touch'],
             })
         return context_options
+
+    def _build_browser_context_options(self, browser_features: Dict[str, Any]) -> Dict[str, Any]:
+        return self._build_playwright_context_options(browser_features)
 
     def _build_initial_cookie_payload(self) -> List[Dict[str, Any]]:
         if not self.initial_cookies:
@@ -2437,158 +2477,49 @@ class XianyuSliderStealth:
 
     def init_browser(self):
         """初始化浏览器 - 增强反检测版本"""
+        user_label = getattr(self, "pure_user_id", "unknown")
         try:
             if self._should_prefer_project_browser_for_playwright():
                 self._ensure_project_playwright_browser()
 
-            # 启动 Playwright
-            playwright_factory = self._get_sync_playwright_factory()
-            logger.info(f"【{self.pure_user_id}】启动浏览器自动化后端: {self.automation_backend}")
-            self.playwright = playwright_factory().start()
-            logger.info(f"【{self.pure_user_id}】{self.automation_backend} 启动成功")
-            
-            # 为账号加载稳定浏览器画像
-            browser_features = self._get_random_browser_features()
+            browser_features = self._build_browser_features()
             self.browser_features = browser_features
             self.profile_id = browser_features.get("profile_id", "unknown")
-            
-            # 启动浏览器，使用稳定特征
-            logger.info(
-                f"【{self.pure_user_id}】启动浏览器，headless模式: {self.headless}, "
-                f"画像: {self.profile_id}, UA: {browser_features['user_agent']}"
-            )
+            self.playwright = None
+            context_options = self._build_browser_context_options(browser_features)
             launch_options: Dict[str, Any] = {
                 "headless": self.headless,
-                "ignore_default_args": ["--enable-automation"],
-                "args": [
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--no-first-run",
-                    f"--window-size={browser_features['window_size']}",
-                    f"--lang={browser_features['lang']}",
-                    f"--accept-lang={browser_features['accept_lang']}",
-                    "--disable-blink-features=AutomationControlled",
-                    "--mute-audio",
-                    "--no-default-browser-check",
-                    "--force-color-profile=srgb",
-                    "--password-store=basic",
-                    "--use-mock-keychain",
-                ],
+                "proxy": self._build_browser_proxy_settings(),
+                "args": self._build_browser_launch_args(),
             }
-            proxy_settings = self._build_playwright_proxy_settings()
-            if proxy_settings:
-                launch_options["proxy"] = proxy_settings
-                logger.info(f"【{self.pure_user_id}】滑块浏览器启用代理: {proxy_settings['server']}")
-            if self.browser_channel:
+            if getattr(self, "browser_channel", None):
                 launch_options["channel"] = self.browser_channel
-            if self.executable_path:
+            if getattr(self, "executable_path", None):
                 launch_options["executable_path"] = self.executable_path
-                logger.info(f"【{self.pure_user_id}】滑块浏览器使用本机可执行文件: {self.executable_path}")
-            context_options = self._build_playwright_context_options(browser_features)
-            launched_with_persistent_profile = False
 
             if self._should_use_account_persistent_profile():
-                user_data_dir = self._resolve_account_persistent_profile_dir()
-                persistent_launch_options = dict(launch_options)
-                persistent_launch_options.update(context_options)
-                persistent_launch_options.update({
-                    'accept_downloads': True,
-                    'ignore_https_errors': True,
-                })
-                logger.info(f"【{self.pure_user_id}】token_refresh滑块优先复用账号级浏览器目录: {user_data_dir}")
-                try:
-                    self.context = self.playwright.chromium.launch_persistent_context(
-                        user_data_dir,
-                        **persistent_launch_options,
-                    )
-                    launched_with_persistent_profile = True
-                    self.browser = None
-                except Exception as persistent_launch_error:
-                    if not self._is_profile_in_use_launch_error(persistent_launch_error):
-                        raise
-                    cleaned_stale_lock = self._try_cleanup_stale_chromium_singleton_lock(user_data_dir)
-                    if cleaned_stale_lock:
-                        logger.warning(
-                            f"【{self.pure_user_id}】检测到账号级 profile 疑似残留 stale Chromium 锁，"
-                            f"已清理并重试 persistent context: {user_data_dir}"
-                        )
-                        try:
-                            self.context = self.playwright.chromium.launch_persistent_context(
-                                user_data_dir,
-                                **persistent_launch_options,
-                            )
-                            launched_with_persistent_profile = True
-                            self.browser = None
-                        except Exception as retry_launch_error:
-                            if not self._is_profile_in_use_launch_error(retry_launch_error):
-                                raise
-                            logger.warning(
-                                f"【{self.pure_user_id}】清理 stale Chromium 锁后仍提示 profile 被占用，"
-                                f"回退临时上下文链路: {retry_launch_error}"
-                            )
-                    else:
-                        logger.warning(
-                            f"【{self.pure_user_id}】账号级浏览器目录被占用，且无法证明是 stale Chromium 锁，"
-                            f"回退临时上下文链路: {persistent_launch_error}"
-                        )
+                user_data_dir = (
+                    str(getattr(self, "account_persistent_profile_dir", None) or "").strip()
+                    or self._resolve_account_persistent_profile_dir()
+                )
+                self.context = launch_browser_persistent_context(
+                    user_data_dir=user_data_dir,
+                    **launch_options,
+                )
+                self.browser = getattr(self.context, "browser", None)
+                pages = list(getattr(self.context, "pages", []) or [])
+                self.page = pages[0] if pages else self.context.new_page()
+                return self.page
 
-            if not launched_with_persistent_profile:
-                try:
-                    self.browser = self.playwright.chromium.launch(**launch_options)
-                except Exception as launch_error:
-                    if self.headless and (launch_options.get("executable_path") or launch_options.get("channel")):
-                        fallback_options = dict(launch_options)
-                        fallback_options.pop("executable_path", None)
-                        fallback_options.pop("channel", None)
-                        logger.warning(
-                            f"【{self.pure_user_id}】指定浏览器无头启动失败，回退到 Playwright Chromium: {launch_error}"
-                        )
-                        self.browser = self.playwright.chromium.launch(**fallback_options)
-                    else:
-                        raise
-            
-            if launched_with_persistent_profile:
-                logger.info(f"【{self.pure_user_id}】账号级 persistent browser context 启动成功")
-            else:
-                # 验证浏览器已启动
-                if not self.browser or not self.browser.is_connected():
-                    raise Exception("浏览器启动失败或连接已断开")
-                logger.info(f"【{self.pure_user_id}】浏览器启动成功，已连接: {self.browser.is_connected()}")
-                
-                # 创建上下文，使用随机特征
-                logger.info(f"【{self.pure_user_id}】创建浏览器上下文...")
-                self.context = self.browser.new_context(**context_options)
-            
-            # 验证上下文已创建
-            if not self.context:
-                raise Exception("浏览器上下文创建失败")
-            logger.info(f"【{self.pure_user_id}】浏览器上下文创建成功")
-
-            initial_cookie_payload = self._build_initial_cookie_payload()
-            if initial_cookie_payload:
-                self.context.add_cookies(initial_cookie_payload)
-                logger.info(f"【{self.pure_user_id}】已向滑块上下文注入 {len(initial_cookie_payload)} 个初始Cookie")
-            
-            # 创建新页面
-            logger.info(f"【{self.pure_user_id}】创建新页面...")
+            self.browser = launch_browser(**launch_options)
+            self.context = self.browser.new_context(**context_options)
             self.page = self.context.new_page()
-            
-            # 验证页面已创建
-            if not self.page:
-                raise Exception("页面创建失败")
-            logger.info(f"【{self.pure_user_id}】页面创建成功（{'最大化窗口模式' if not self.headless else '无头模式'}）")
-            
-            # 添加增强反检测脚本
-            logger.info(f"【{self.pure_user_id}】添加反检测脚本...")
-            self._install_stealth_init_script(self.page, browser_features)
-            logger.info(f"【{self.pure_user_id}】浏览器初始化完成")
-            
+
             return self.page
         except Exception as e:
-            logger.error(f"【{self.pure_user_id}】初始化浏览器失败: {e}")
+            logger.error(f"【{user_label}】初始化浏览器失败: {e}")
             import traceback
-            logger.error(f"【{self.pure_user_id}】详细错误堆栈: {traceback.format_exc()}")
+            logger.error(f"【{user_label}】详细错误堆栈: {traceback.format_exc()}")
             # 确保在异常时也清理已创建的资源
             self._cleanup_on_init_failure()
             raise
@@ -9210,14 +9141,15 @@ class XianyuSliderStealth:
     
     def __del__(self):
         """析构函数，确保资源释放（保险机制）"""
+        user_label = getattr(self, "pure_user_id", "unknown")
         try:
             # 检查是否有未关闭的浏览器
             if hasattr(self, 'browser') and self.browser:
-                logger.warning(f"【{self.pure_user_id}】析构函数检测到未关闭的浏览器，执行清理")
+                logger.warning(f"【{user_label}】析构函数检测到未关闭的浏览器，执行清理")
                 self.close_browser()
         except Exception as e:
             # 析构函数中不要抛出异常
-            logger.debug(f"【{self.pure_user_id}】析构函数清理时出错: {e}")
+            logger.debug(f"【{user_label}】析构函数清理时出错: {e}")
     
     # ==================== Playwright 登录辅助方法 ====================
     
@@ -10047,11 +9979,10 @@ class XianyuSliderStealth:
 
     def _launch_clean_cookie_seeded_context(
         self,
-        playwright,
         launch_options: Dict[str, Any],
         browser_features: Dict[str, Any],
     ) -> Tuple[Any, Any]:
-        browser = playwright.chromium.launch(**launch_options)
+        browser = launch_browser(**launch_options)
         context = browser.new_context(
             viewport={'width': browser_features['viewport_width'], 'height': browser_features['viewport_height']},
             user_agent=browser_features['user_agent'],
@@ -10101,10 +10032,10 @@ class XianyuSliderStealth:
             logger.warning(f"【{self.pure_user_id}】注入历史 Cookie 失败（不影响继续登录）: {inject_e}")
         return browser, context
     
-    def login_with_password_playwright(self, account: str, password: str, show_browser: bool = False,
-                                      notification_callback: Optional[Callable] = None,
-                                      force_clean_context: bool = False) -> dict:
-        """使用Playwright进行密码登录（新方法，替代DrissionPage）
+    def _login_with_browser_flow(self, account: str, password: str, show_browser: bool = False,
+                                 notification_callback: Optional[Callable] = None,
+                                 force_clean_context: bool = False) -> dict:
+        """使用浏览器 provider 进行密码登录
         
         Args:
             account: 登录账号（必填）
@@ -10144,7 +10075,7 @@ class XianyuSliderStealth:
             
             browser_mode = "有头" if show_browser else "无头"
             notification_scene = "手动刷新Cookie" if force_clean_context else "账号密码登录"
-            logger.info(f"【{self.pure_user_id}】开始{browser_mode}模式密码登录流程（使用Playwright）...")
+            logger.info(f"【{self.pure_user_id}】开始{browser_mode}模式密码登录流程（使用浏览器 provider）...")
             logger.info(f"【{self.pure_user_id}】账号: {account}")
             logger.info("=" * 60)
             
@@ -10213,16 +10144,14 @@ class XianyuSliderStealth:
             if self._should_prefer_project_browser_for_playwright():
                 self._ensure_project_playwright_browser()
 
-            playwright_factory = self._get_sync_playwright_factory()
-            playwright = playwright_factory().start()
+            playwright = None
             browser = None
             used_profile_lock_fallback = False
             launch_options: Dict[str, Any] = {
                 'headless': not show_browser,
-                'ignore_default_args': ['--enable-automation'],
                 'args': browser_args,
             }
-            proxy_settings = self._build_playwright_proxy_settings()
+            proxy_settings = self._build_browser_proxy_settings()
             if proxy_settings:
                 launch_options['proxy'] = proxy_settings
                 logger.info(f"【{self.pure_user_id}】密码登录浏览器启用代理: {proxy_settings['server']}")
@@ -10232,14 +10161,13 @@ class XianyuSliderStealth:
                 launch_options['executable_path'] = self.executable_path
             if force_clean_context:
                 browser, context = self._launch_clean_cookie_seeded_context(
-                    playwright,
                     launch_options,
                     browser_features,
                 )
             else:
                 try:
-                    context = playwright.chromium.launch_persistent_context(
-                        user_data_dir,
+                    context = launch_browser_persistent_context(
+                        user_data_dir=user_data_dir,
                         **launch_options,
                         viewport={'width': browser_features['viewport_width'], 'height': browser_features['viewport_height']},
                         user_agent=browser_features['user_agent'],
@@ -10259,7 +10187,6 @@ class XianyuSliderStealth:
                         f"自动切换到干净上下文兜底登录: {persistent_launch_error}"
                     )
                     browser, context = self._launch_clean_cookie_seeded_context(
-                        playwright,
                         launch_options,
                         browser_features,
                     )
@@ -11194,8 +11121,16 @@ class XianyuSliderStealth:
                 self._release_concurrency_slot("密码登录finally兜底")
             except Exception:
                 pass
-    
+
+    def login_with_password_browser(self, account: str, password: str, show_browser: bool = False, **kwargs):
+        return self._login_with_browser_flow(account, password, show_browser=show_browser, **kwargs)
+
+    def login_with_password_playwright(self, account: str, password: str, show_browser: bool = False, **kwargs):
+        return self.login_with_password_browser(account, password, show_browser=show_browser, **kwargs)
+
     def login_with_password_headful(self, account: str = None, password: str = None, show_browser: bool = False):
+        return self.login_with_password_browser(account, password, show_browser=True)
+
         """通过浏览器进行密码登录并获取Cookie (使用DrissionPage)
         
         Args:
