@@ -742,6 +742,58 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         slider._install_stealth_init_script.assert_called_once_with(fake_page, {"user_agent": "fallback-agent"})
 
     @mock.patch("utils.xianyu_slider_stealth.launch_browser")
+    def test_init_browser_headless_falls_back_when_explicit_browser_launch_fails(self, mock_launch_browser):
+        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
+        slider.use_account_persistent_profile = False
+        slider.headless = True
+        slider.browser_channel = "msedge"
+        slider.executable_path = "C:/Browsers/msedge.exe"
+        slider.browser = None
+        slider.context = None
+        slider.page = None
+        slider._build_browser_proxy_settings = lambda: {"server": "http://127.0.0.1:8888"}
+        slider._build_browser_context_options = lambda _features: {"locale": "zh-CN"}
+        slider._build_browser_features = lambda: {"user_agent": "fallback-browser-agent"}
+        slider._build_browser_launch_args = lambda: ["--foo"]
+        slider._build_initial_cookie_payload = lambda: []
+        slider._install_stealth_init_script = mock.Mock()
+        slider._should_prefer_project_browser_for_playwright = lambda: False
+        slider._cleanup_on_init_failure = lambda: None
+
+        fake_page = mock.Mock()
+        fake_context = mock.Mock()
+        fake_context.pages = []
+        fake_context.new_page.return_value = fake_page
+        fake_browser = mock.Mock()
+        fake_browser.new_context.return_value = fake_context
+        mock_launch_browser.side_effect = [
+            RuntimeError("explicit browser launch failed"),
+            fake_browser,
+        ]
+
+        slider.init_browser()
+
+        self.assertEqual(mock_launch_browser.call_count, 2)
+        self.assertEqual(
+            mock_launch_browser.call_args_list[0].kwargs,
+            {
+                "headless": True,
+                "proxy": {"server": "http://127.0.0.1:8888"},
+                "args": ["--foo"],
+                "channel": "msedge",
+                "executable_path": "C:/Browsers/msedge.exe",
+            },
+        )
+        self.assertEqual(
+            mock_launch_browser.call_args_list[1].kwargs,
+            {
+                "headless": True,
+                "proxy": {"server": "http://127.0.0.1:8888"},
+                "args": ["--foo"],
+            },
+        )
+
+    @mock.patch("utils.xianyu_slider_stealth.launch_browser")
     def test_init_browser_non_persistent_injects_initial_cookies_and_stealth(self, mock_launch_browser):
         slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
         slider.use_account_persistent_profile = False
@@ -781,6 +833,20 @@ class SliderVerificationGuardsTest(unittest.TestCase):
 
         self.assertEqual(result, {"cookie2": "ok"})
         slider.login_with_password_browser.assert_called_once_with("user", "pass", show_browser=True)
+
+    def test_login_with_password_playwright_is_alias_of_new_browser_login(self):
+        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
+        slider.login_with_password_browser = mock.Mock(return_value={"cookie2": "ok"})
+
+        result = slider.login_with_password_playwright("user", "pass", show_browser=False, force_clean_context=True)
+
+        self.assertEqual(result, {"cookie2": "ok"})
+        slider.login_with_password_browser.assert_called_once_with(
+            "user",
+            "pass",
+            show_browser=False,
+            force_clean_context=True,
+        )
 
     def test_login_with_password_headful_has_no_legacy_drissionpage_body(self):
         source = inspect.getsource(XianyuSliderStealth.login_with_password_headful)

@@ -2536,7 +2536,16 @@ class XianyuSliderStealth:
                         self.context = self.browser.new_context(**context_options)
 
             if not launched_with_persistent_profile and not self.context:
-                self.browser = launch_browser(**launch_options)
+                try:
+                    self.browser = launch_browser(**launch_options)
+                except Exception:
+                    if self.headless and (launch_options.get("channel") or launch_options.get("executable_path")):
+                        fallback_options = dict(launch_options)
+                        fallback_options.pop("channel", None)
+                        fallback_options.pop("executable_path", None)
+                        self.browser = launch_browser(**fallback_options)
+                    else:
+                        raise
                 self.context = self.browser.new_context(**context_options)
 
             pages = list(getattr(self.context, "pages", []) or [])
