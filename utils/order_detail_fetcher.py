@@ -8,12 +8,12 @@ import time
 import sys
 import os
 from typing import Optional, Dict, Any, Tuple, List
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from loguru import logger
 import re
 import json
 from threading import Lock
 from collections import defaultdict
+from utils.browser_provider import BrowserContextLike, BrowserLike, PageLike, launch_browser_async
 from utils.time_utils import parse_local_datetime_text_to_db_utc
 
 # 修复Docker环境中的asyncio事件循环策略问题
@@ -82,9 +82,9 @@ class OrderDetailFetcher:
     _order_locks = defaultdict(lambda: asyncio.Lock())
 
     def __init__(self, cookie_string: str = None, headless: bool = True, cookie_id_for_log: str = "unknown"):
-        self.browser: Optional[Browser] = None
-        self.context: Optional[BrowserContext] = None
-        self.page: Optional[Page] = None
+        self.browser: Optional[BrowserLike] = None
+        self.context: Optional[BrowserContextLike] = None
+        self.page: Optional[PageLike] = None
         self.headless = headless  # 保存headless设置
         self.cookie_id_for_log = cookie_id_for_log or "unknown"
         self._last_order_status_source = 'unknown'
@@ -123,7 +123,6 @@ class OrderDetailFetcher:
 
             logger.info(f"开始初始化浏览器，headless模式: {headless}")
 
-            playwright = await async_playwright().start()
 
             # 启动浏览器（Docker环境优化）
             browser_args = [
@@ -185,7 +184,7 @@ class OrderDetailFetcher:
                 ])
 
             logger.info(f"启动浏览器，参数: {browser_args}")
-            self.browser = await playwright.chromium.launch(
+            self.browser = await launch_browser_async(
                 headless=headless,
                 args=browser_args
             )

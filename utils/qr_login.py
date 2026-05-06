@@ -18,6 +18,7 @@ from loguru import logger
 import hashlib
 from urllib.parse import urlparse
 
+from utils.browser_provider import launch_browser_async
 from utils.image_utils import image_manager
 
 
@@ -263,17 +264,14 @@ class QRLoginManager:
         if not session or not session.verification_url:
             return
 
-        playwright = None
         browser = None
         context = None
         page = None
 
         try:
-            from playwright.async_api import async_playwright
 
             logger.info(f"开始打开扫码登录验证页面: {session_id}")
-            playwright = await async_playwright().start()
-            browser = await playwright.chromium.launch(
+            browser = await launch_browser_async(
                 headless=True,
                 args=[
                     '--no-sandbox',
@@ -350,12 +348,6 @@ class QRLoginManager:
                     await browser.close()
             except Exception:
                 pass
-            try:
-                if playwright:
-                    await playwright.stop()
-            except Exception:
-                pass
-
             latest_session = self.sessions.get(session_id)
             if latest_session:
                 latest_session.verification_task = None

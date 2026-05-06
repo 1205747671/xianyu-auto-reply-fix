@@ -32,11 +32,15 @@ if os.getenv('DOCKER_ENV'):
         logger.warning(f"设置SelectorEventLoop失败: {e}")
 
 try:
-    from playwright.async_api import async_playwright
+    from utils.browser_provider import launch_browser_persistent_context_async as _launch_browser_persistent_context_async
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
     logger.warning("Playwright 未安装，将使用模拟数据")
+async def launch_browser_persistent_context_async(*args, **kwargs):
+    if args:
+        kwargs.setdefault("user_data_dir", args[0])
+    return await _launch_browser_persistent_context_async(**kwargs)
 
 
 class XianyuSearcher:
@@ -688,7 +692,6 @@ class XianyuSearcher:
             raise Exception("Playwright 未安装，无法使用真实搜索功能")
 
         if not self.browser:
-            playwright = await async_playwright().start()
             
             # 设置持久化数据目录（保存缓存、cookies等）
             import tempfile
@@ -722,7 +725,7 @@ class XianyuSearcher:
             
             # 使用 launch_persistent_context 实现跨会话的缓存持久化
             # 这样通过一次滑块验证后，下次搜索可以复用缓存，避免再次出现滑块
-            self.context = await playwright.chromium.launch_persistent_context(
+            self.context = await launch_browser_persistent_context_async(
                 user_data_dir,  # 第一个参数是用户数据目录，用于持久化
                 headless=True,  # 无头模式，后台运行
                 args=browser_args,
@@ -1630,6 +1633,3 @@ async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1) -> Di
         'total': 0,
         'error': "未知错误"
     }
-
-
-

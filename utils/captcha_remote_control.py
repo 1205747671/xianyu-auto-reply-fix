@@ -8,7 +8,6 @@ import base64
 import json
 from typing import Optional, Dict, Any
 from loguru import logger
-from playwright.async_api import Page
 
 
 class CaptchaRemoteController:
@@ -18,7 +17,7 @@ class CaptchaRemoteController:
         self.active_sessions: Dict[str, Dict[str, Any]] = {}
         self.websocket_connections: Dict[str, Any] = {}
     
-    async def create_session(self, session_id: str, page: Page) -> Dict[str, str]:
+    async def create_session(self, session_id: str, page: Any) -> Dict[str, str]:
         """
         创建远程控制会话
         
@@ -63,7 +62,7 @@ class CaptchaRemoteController:
             'viewport': self.active_sessions[session_id]['viewport']
         }
     
-    async def _screenshot_captcha_area(self, page: Page, captcha_info: Dict[str, Any]) -> bytes:
+    async def _screenshot_captcha_area(self, page: Any, captcha_info: Dict[str, Any]) -> bytes:
         """截取整个验证码容器区域"""
         try:
             if captcha_info and 'x' in captcha_info:
@@ -95,7 +94,7 @@ class CaptchaRemoteController:
             logger.warning(f"截取滑块区域失败，使用全页面: {e}")
             return await page.screenshot(type='jpeg', quality=75, full_page=False)
     
-    async def _get_captcha_info(self, page: Page) -> Dict[str, Any]:
+    async def _get_captcha_info(self, page: Any) -> Dict[str, Any]:
         """获取滑块验证码信息（查找整个容器）"""
         try:
             # 优先查找整个验证码容器（不是按钮）
@@ -365,4 +364,3 @@ class CaptchaRemoteController:
 
 # 全局实例
 captcha_controller = CaptchaRemoteController()
-
