@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import types
+import inspect
 import unittest
 from unittest import mock
 
@@ -640,6 +641,12 @@ class SliderVerificationGuardsTest(unittest.TestCase):
 
         self.assertEqual(result, {"cookie2": "ok"})
         slider.login_with_password_browser.assert_called_once_with("user", "pass", show_browser=True)
+
+    def test_login_with_password_headful_has_no_legacy_drissionpage_body(self):
+        source = inspect.getsource(XianyuSliderStealth.login_with_password_headful)
+
+        self.assertNotIn("DrissionPage", source)
+        self.assertLessEqual(len([line for line in source.splitlines() if line.strip()]), 6)
 
     def test_try_cleanup_stale_chromium_singleton_lock_removes_only_local_dead_lock(self):
         slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
