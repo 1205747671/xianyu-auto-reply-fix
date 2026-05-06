@@ -159,8 +159,7 @@ cache/
 *.cache
 
 # 浏览器相关
-.playwright/
-playwright-report/
+.playwright-browsers/
 test-results/
 
 # 示例和演示文件
@@ -204,12 +203,8 @@ utils/*.dist/
 *.onefile-build/
 
 # 浏览器数据和缓存
-DrissionPage/
-.drission/
 selenium/
 webdriver/
-.playwright/.browsers/
-playwright-state/
 
 # 统计和监控数据
 user_stats.txt

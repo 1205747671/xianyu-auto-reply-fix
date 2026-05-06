@@ -25,7 +25,11 @@ import asyncio
 import logging
 from typing import Optional, Tuple, List, Dict, Any, Callable
 from collections import defaultdict
-from utils.browser_provider import launch_browser, launch_browser_persistent_context
+from utils.browser_provider import (
+    build_download_proxy_env,
+    launch_browser,
+    launch_browser_persistent_context,
+)
 
 ElementHandle = Any
 
@@ -1738,62 +1742,18 @@ class XianyuSliderStealth:
         return {}
 
     def _configure_playwright_browser_env(self, env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-        target_env = env if env is not None else os.environ
-        target_env["PLAYWRIGHT_BROWSERS_PATH"] = self.playwright_browser_cache_dir
+        target_env = dict(env) if env is not None else dict(os.environ)
+        proxy_url = str(getattr(self, "playwright_download_proxy", "") or "").strip()
+        target_env = build_download_proxy_env(proxy_url, target_env)
+        if proxy_url:
+            target_env.setdefault("ALL_PROXY", proxy_url)
         return target_env
 
     def _find_project_browser_executable(self, browser_name: Optional[str] = None) -> Optional[str]:
-        browser_name = str(browser_name or self.playwright_browser_name or "chromium").strip().lower()
-        browser_root = self.playwright_browser_cache_dir
-        if not os.path.isdir(browser_root):
-            return None
-
-        if sys.platform.startswith("win"):
-            search_rules = {
-                "chromium": [
-                    ("chromium-*", os.path.join("chrome-win64", "chrome.exe")),
-                    ("chromium-*", os.path.join("chrome-win", "chrome.exe")),
-                ],
-                "chrome": [
-                    ("chrome-*", os.path.join("chrome-win64", "chrome.exe")),
-                    ("chrome-*", os.path.join("chrome-win", "chrome.exe")),
-                ],
-                "msedge": [("msedge-*", os.path.join("msedge-win", "msedge.exe"))],
-                "firefox": [("firefox-*", os.path.join("firefox", "firefox.exe"))],
-                "webkit": [("webkit-*", os.path.join("Playwright.exe"))],
-            }
-        elif sys.platform.startswith("linux"):
-            search_rules = {
-                "chromium": [
-                    ("chromium-*", os.path.join("chrome-linux64", "chrome")),
-                    ("chromium-*", os.path.join("chrome-linux", "chrome")),
-                    ("chromium_headless_shell-*", os.path.join("chrome-headless-shell-linux64", "chrome-headless-shell")),
-                    ("chromium-*", os.path.join("chrome-linux", "headless_shell")),
-                ],
-                "chrome": [
-                    ("chrome-*", os.path.join("chrome-linux64", "chrome")),
-                    ("chrome-*", os.path.join("chrome-linux", "chrome")),
-                ],
-                "msedge": [("msedge-*", os.path.join("msedge-linux", "msedge"))],
-                "firefox": [("firefox-*", os.path.join("firefox", "firefox"))],
-                "webkit": [("webkit-*", os.path.join("pw_run.sh"))],
-            }
-        else:
-            search_rules = {
-                "chromium": [("chromium-*", os.path.join("chrome-mac", "Chromium.app", "Contents", "MacOS", "Chromium"))],
-                "chrome": [("chrome-*", os.path.join("chrome-mac", "Google Chrome for Testing.app", "Contents", "MacOS", "Google Chrome for Testing"))],
-                "msedge": [("msedge-*", os.path.join("msedge-mac", "Microsoft Edge.app", "Contents", "MacOS", "Microsoft Edge"))],
-                "firefox": [("firefox-*", os.path.join("firefox", "Nightly.app", "Contents", "MacOS", "firefox"))],
-                "webkit": [("webkit-*", os.path.join("pw_run.sh"))],
-            }
-
-        for folder_pattern, relative_binary in search_rules.get(browser_name, []):
-            for folder_name in sorted(os.listdir(browser_root), reverse=True):
-                if not re.fullmatch(folder_pattern.replace("*", ".*"), folder_name):
-                    continue
-                candidate = os.path.join(browser_root, folder_name, relative_binary)
-                if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
-                    return candidate
+        runtime_info = self._get_cloakbrowser_runtime_info()
+        binary_path = str(runtime_info.get("binary") or "").strip()
+        if binary_path and os.path.isfile(binary_path) and os.path.getsize(binary_path) > 0:
+            return binary_path
         return None
 
     def _apply_project_browser_runtime_info(self, executable_path: str, browser_name: Optional[str] = None) -> Optional[str]:
@@ -1807,7 +1767,7 @@ class XianyuSliderStealth:
             "version": version_text,
             "major_version": (version_text.split(".", 1)[0] if version_text else ""),
             "family": browser_family,
-            "source": "project_playwright_cache",
+            "source": "cloakbrowser_runtime",
         }
         return version_text
 
@@ -1817,70 +1777,85 @@ class XianyuSliderStealth:
             return cleaned
         return cleaned[-limit:]
 
+    def _run_cloakbrowser_cli(
+        self,
+        *args: str,
+        env: Optional[Dict[str, str]] = None,
+        timeout: int = 60,
+    ) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-m", "cloakbrowser", *args],
+            env=env,
+            timeout=timeout,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+    def _get_cloakbrowser_runtime_info(self, env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        info: Dict[str, str] = {}
+        try:
+            result = self._run_cloakbrowser_cli("info", env=env, timeout=60)
+        except Exception as info_error:
+            logger.debug(f"【{self.pure_user_id}】读取 CloakBrowser runtime 信息失败: {info_error}")
+            return info
+
+        if result.returncode != 0:
+            logger.debug(
+                f"【{self.pure_user_id}】CloakBrowser info 返回非零状态，stdout: "
+                f"{self._summarize_subprocess_output(result.stdout)}"
+            )
+            logger.debug(
+                f"【{self.pure_user_id}】CloakBrowser info 返回非零状态，stderr: "
+                f"{self._summarize_subprocess_output(result.stderr)}"
+            )
+            return info
+
+        for line in (result.stdout or "").splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            info[key.strip().lower()] = value.strip()
+        return info
+
     def _ensure_project_playwright_browser(self) -> Optional[str]:
         browser_name = str(self.playwright_browser_name or "chromium").strip().lower()
-        self._configure_playwright_browser_env()
-        os.makedirs(self.playwright_browser_cache_dir, exist_ok=True)
+        runtime_env = self._configure_playwright_browser_env(os.environ.copy())
 
         existing_executable = self._find_project_browser_executable(browser_name)
         if existing_executable:
             self._apply_project_browser_runtime_info(existing_executable, browser_name)
-            logger.info(f"【{self.pure_user_id}】复用项目内 Playwright 浏览器: {existing_executable}")
+            logger.info(f"【{self.pure_user_id}】复用 CloakBrowser runtime: {existing_executable}")
             return existing_executable
 
         with _PLAYWRIGHT_BROWSER_INSTALL_LOCK:
             existing_executable = self._find_project_browser_executable(browser_name)
             if existing_executable:
                 self._apply_project_browser_runtime_info(existing_executable, browser_name)
-                logger.info(f"【{self.pure_user_id}】复用已下载的 Playwright 浏览器: {existing_executable}")
+                logger.info(f"【{self.pure_user_id}】复用已安装的 CloakBrowser runtime: {existing_executable}")
                 return existing_executable
 
-            try:
-                has_cached_entries = any(os.scandir(self.playwright_browser_cache_dir))
-            except Exception:
-                has_cached_entries = False
-            if has_cached_entries:
-                logger.warning(
-                    f"【{self.pure_user_id}】Playwright 浏览器目录已存在但未直接解析到可执行文件，"
-                    f"保留 Playwright 默认查找逻辑: {self.playwright_browser_cache_dir}"
-                )
-                return None
-
-            install_env = self._configure_playwright_browser_env(os.environ.copy())
             proxy_url = str(self.playwright_download_proxy or "").strip()
-            if proxy_url:
-                install_env.setdefault("HTTP_PROXY", proxy_url)
-                install_env.setdefault("HTTPS_PROXY", proxy_url)
-                install_env.setdefault("ALL_PROXY", proxy_url)
-
-            install_cmd = [sys.executable, "-m", "playwright", "install", browser_name]
             logger.info(
-                f"【{self.pure_user_id}】项目内未发现 Playwright 浏览器，开始自动下载: "
-                f"{browser_name}, cache={self.playwright_browser_cache_dir}, proxy={proxy_url or 'none'}"
+                f"【{self.pure_user_id}】CloakBrowser runtime 未就绪，开始自动安装，"
+                f"proxy={proxy_url or 'none'}"
             )
-            install_result = subprocess.run(
-                install_cmd,
-                env=install_env,
-                timeout=900,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
+            install_result = self._run_cloakbrowser_cli("install", env=runtime_env, timeout=900)
             if install_result.returncode != 0:
                 stdout_text = self._summarize_subprocess_output(install_result.stdout)
                 stderr_text = self._summarize_subprocess_output(install_result.stderr)
-                logger.error(f"【{self.pure_user_id}】Playwright 浏览器自动下载失败，stdout: {stdout_text}")
-                logger.error(f"【{self.pure_user_id}】Playwright 浏览器自动下载失败，stderr: {stderr_text}")
-                raise RuntimeError(f"Playwright 浏览器自动下载失败: {browser_name}")
+                logger.error(f"【{self.pure_user_id}】CloakBrowser runtime 自动安装失败，stdout: {stdout_text}")
+                logger.error(f"【{self.pure_user_id}】CloakBrowser runtime 自动安装失败，stderr: {stderr_text}")
+                raise RuntimeError("CloakBrowser runtime 自动安装失败，请执行: python -m cloakbrowser install")
 
             existing_executable = self._find_project_browser_executable(browser_name)
             if not existing_executable:
-                raise RuntimeError(f"Playwright 浏览器下载完成但未找到可执行文件: {browser_name}")
+                raise RuntimeError("CloakBrowser runtime 安装完成但未找到可执行文件，请执行: python -m cloakbrowser info")
 
             self._apply_project_browser_runtime_info(existing_executable, browser_name)
-            logger.info(f"【{self.pure_user_id}】Playwright 浏览器下载完成: {existing_executable}")
+            logger.info(f"【{self.pure_user_id}】CloakBrowser runtime 已就绪: {existing_executable}")
             return existing_executable
 
     def _read_local_browser_version(self, browser_path: str) -> Optional[str]:
@@ -1982,7 +1957,7 @@ class XianyuSliderStealth:
         if self.headless and self.is_docker_env and self.automation_backend == "cloakbrowser":
             local_browser_info = getattr(self, "local_browser_info", None) or {}
             if (
-                str(local_browser_info.get("source") or "") == "project_playwright_cache"
+                str(local_browser_info.get("source") or "") == "cloakbrowser_runtime"
                 or bool(local_browser_info.get("version"))
                 or bool(self.executable_path)
             ):
@@ -2007,7 +1982,7 @@ class XianyuSliderStealth:
             return False
         local_browser_info = getattr(self, "local_browser_info", None) or {}
         return bool(
-            str(local_browser_info.get("source") or "") == "project_playwright_cache"
+            str(local_browser_info.get("source") or "") == "cloakbrowser_runtime"
             or bool(local_browser_info.get("version"))
             or bool(self.executable_path)
         )

@@ -19,7 +19,7 @@
 - **数据库**: SQLite 3 + 多用户数据隔离 + 自动迁移
 - **前端**: Bootstrap 5 + Vanilla JavaScript + Chart.js + 响应式设计
 - **通信协议**: WebSocket + SSE + RESTful API + 实时通信
-- **自动化能力**: Playwright + DrissionPage + 浏览器自动化
+- **自动化能力**: CloakBrowser + 浏览器自动化
 - **部署方式**: Docker + Docker Compose + Nginx（可选）+ 一键部署
 - **日志系统**: Loguru + 文件轮转 + 实时收集
 - **安全认证**: Bearer Token + 图形验证码 + 邮箱验证 + 权限控制
@@ -112,7 +112,7 @@ chmod +x docker-deploy.sh
 
 脚本会自动检查依赖、创建目录、构建镜像并启动服务。  
 默认访问地址：
-- `docker-compose.yml`：`http://localhost:9000`
+- `docker-compose.yml`：`http://localhost:9020`
 - `docker-compose-cn.yml`：`http://localhost:8000`
 
 </details>
@@ -130,7 +130,7 @@ docker-deploy.bat
 ```
 
 默认访问地址：
-- `docker-compose.yml`：`http://localhost:9000`
+- `docker-compose.yml`：`http://localhost:9020`
 - `docker-compose-cn.yml`：`http://localhost:8000`
 
 </details>
@@ -147,7 +147,7 @@ cd xianyu-auto-reply-fix
 docker compose up -d --build
 
 # 3. 访问系统
-# http://localhost:9000
+# http://localhost:9020
 ```
 
 #### 国内构建配置
@@ -179,9 +179,8 @@ source venv/bin/activate  # Linux/macOS
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# 4. 安装 Playwright 浏览器
-playwright install chromium
-playwright install-deps chromium  # 仅 Linux 需要
+# 4. 安装 CloakBrowser runtime
+python -m cloakbrowser install
 
 # 5. 启动系统
 python Start.py
@@ -200,7 +199,7 @@ python Start.py
 - **架构**: x86_64 (amd64) / ARM64 (aarch64)
 - **Docker**: 20.10+（Docker 部署）
 - **Docker Compose**: 2.0+（Docker 部署）
-- **浏览器依赖**: Playwright Chromium（本地运行需要安装）
+- **浏览器依赖**: CloakBrowser runtime（本地运行首次部署需要安装）
 - **资源建议**: 建议 2GB+ 内存，预留 10GB+ 存储空间
 
 ### 🖥️ 多架构支持
@@ -280,18 +279,18 @@ DISPLAY=:99
 部署完成后，您可以通过以下方式访问系统：
 
 - **Web管理界面**：
-  - Docker Compose 默认配置: http://localhost:9000
+  - Docker Compose 默认配置: http://localhost:9020
   - Docker Compose 国内配置: http://localhost:8000
   - 本地运行: http://localhost:8090
 - **默认管理员账号（首次初始化且未自定义密码时）**：
   - 用户名：`admin`
   - 密码：`<请在部署时自定义>`
 - **API文档**：
-  - Docker Compose 默认配置: http://localhost:9000/docs
+  - Docker Compose 默认配置: http://localhost:9020/docs
   - Docker Compose 国内配置: http://localhost:8000/docs
   - 本地运行: http://localhost:8090/docs
 - **健康检查**：
-  - Docker Compose 默认配置: http://localhost:9000/health
+  - Docker Compose 默认配置: http://localhost:9020/health
   - Docker Compose 国内配置: http://localhost:8000/health
   - 本地运行: http://localhost:8090/health
 

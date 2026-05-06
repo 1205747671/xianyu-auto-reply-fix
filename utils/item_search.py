@@ -914,7 +914,7 @@ class XianyuSearcher:
                     'items': data_list,
                     'total': total_count,
                     'is_real_data': True,
-                    'source': 'playwright'
+                    'source': 'cloakbrowser'
                 }
 
             finally:
@@ -926,7 +926,7 @@ class XianyuSearcher:
 
             # 检查是否是浏览器安装问题
             if "Executable doesn't exist" in error_msg or "playwright install" in error_msg:
-                error_msg = "浏览器未安装。请在Docker容器中运行: playwright install chromium"
+                error_msg = "浏览器未安装。请先执行: python -m cloakbrowser install"
             elif "BrowserType.launch" in error_msg:
                 error_msg = "浏览器启动失败。请确保Docker容器有足够的权限和资源"
 
@@ -1434,7 +1434,7 @@ class XianyuSearcher:
                     'items': all_data_list,
                     'total': total_count,
                     'is_real_data': True,
-                    'source': 'playwright'
+                    'source': 'cloakbrowser'
                 }
 
             finally:
@@ -1452,7 +1452,7 @@ class XianyuSearcher:
 
             # 检查是否是浏览器相关问题
             if "Executable doesn't exist" in error_msg or "playwright install" in error_msg:
-                error_msg = "浏览器未安装。请在Docker容器中运行: playwright install chromium"
+                error_msg = "浏览器未安装。请先执行: python -m cloakbrowser install"
             elif "BrowserType.launch" in error_msg:
                 error_msg = "浏览器启动失败。请确保Docker容器有足够的权限和资源"
             elif "Target page, context or browser has been closed" in error_msg:

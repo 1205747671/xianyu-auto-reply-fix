@@ -517,10 +517,6 @@ utils/*.dist/
 *.pyi
 !utils/xianyu_slider_stealth.pyi
 
-# DrissionPage浏览器缓存
-DrissionPage/
-.drission/
-
 # 其他浏览器数据
 selenium/
 webdriver/
@@ -701,16 +697,6 @@ tmp/**
 *.db-shm
 *.sqlite
 *.sqlite3
-
-# 浏览器数据完整覆盖
-.playwright/**
-.playwright-mcp/**
-DrissionPage/**
-.drission/**
-playwright-report/**
-test-results/**
-playwright/.browsers/**
-playwright-state/**
 
 # 统计数据完整覆盖
 user_stats.txt

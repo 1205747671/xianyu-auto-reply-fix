@@ -1356,15 +1356,16 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】清理实例缓存时出错: {self._safe_str(e)}")
     
     async def _cleanup_playwright_cache(self):
-        """清理Playwright浏览器临时文件和缓存（Docker环境专用）"""
+        """清理浏览器运行时临时文件和缓存（Docker环境专用）"""
         try:
             import shutil
             import glob
             
             # 定义需要清理的临时目录路径
             temp_paths = [
-                '/tmp/playwright-*',  # Playwright临时会话
+                '/tmp/playwright-*',  # 兼容旧运行时残留
                 '/tmp/chromium-*',    # Chromium临时文件
+                '/root/.cloakbrowser/*/Cache',  # CloakBrowser缓存
                 '/ms-playwright/chromium-*/Default/Cache',  # 浏览器缓存
                 '/ms-playwright/chromium-*/Default/Code Cache',  # 代码缓存
                 '/ms-playwright/chromium-*/Default/GPUCache',  # GPU缓存
@@ -1399,12 +1400,12 @@ class XianyuLive:
                     logger.warning(f"匹配路径 {pattern} 时出错: {e}")
             
             if total_cleaned > 0:
-                logger.info(f"【{self.cookie_id}】Playwright缓存清理完成: 删除了 {total_cleaned} 个文件/目录，释放 {total_size_mb:.2f} MB")
+                logger.info(f"【{self.cookie_id}】浏览器运行时缓存清理完成: 删除了 {total_cleaned} 个文件/目录，释放 {total_size_mb:.2f} MB")
             else:
-                logger.warning(f"【{self.cookie_id}】Playwright缓存清理: 没有需要清理的临时文件")
+                logger.warning(f"【{self.cookie_id}】浏览器运行时缓存清理: 没有需要清理的临时文件")
                 
         except Exception as e:
-            logger.warning(f"【{self.cookie_id}】清理Playwright缓存时出错: {self._safe_str(e)}")
+            logger.warning(f"【{self.cookie_id}】清理浏览器运行时缓存时出错: {self._safe_str(e)}")
 
     async def _cleanup_old_logs(self, retention_days: int = 7):
         """清理过期的日志文件
@@ -6453,7 +6454,7 @@ class XianyuLive:
 
             except ImportError as import_e:
                 logger.error(f"【{self.cookie_id}】XianyuSliderStealth导入失败: {import_e}")
-                logger.error(f"【{self.cookie_id}】请安装Playwright库: pip install playwright")
+                logger.error(f"【{self.cookie_id}】请安装 CloakBrowser 运行时: python -m cloakbrowser install")
 
                 # 记录导入失败到日志文件
                 log_captcha_event(self.cookie_id, "XianyuSliderStealth导入失败", False,
