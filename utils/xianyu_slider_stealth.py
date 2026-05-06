@@ -2486,6 +2486,17 @@ class XianyuSliderStealth:
                 return launch_browser(**fallback_options)
             raise
 
+    def _sanitize_provider_launch_options(self, launch_options: Dict[str, Any]) -> Dict[str, Any]:
+        sanitized_options = dict(launch_options)
+        explicit_path = str(sanitized_options.pop("executable_path", "") or "").strip()
+        if explicit_path and not getattr(self, "_cloakbrowser_ignored_explicit_path_logged", False):
+            user_label = getattr(self, "pure_user_id", "unknown")
+            logger.warning(
+                f"【{user_label}】CloakBrowser 使用内置 Chromium，忽略显式 executable_path: {explicit_path}"
+            )
+            self._cloakbrowser_ignored_explicit_path_logged = True
+        return sanitized_options
+
     def init_browser(self):
         """初始化浏览器 - 增强反检测版本"""
         user_label = getattr(self, "pure_user_id", "unknown")
@@ -2507,6 +2518,7 @@ class XianyuSliderStealth:
                 launch_options["channel"] = self.browser_channel
             if getattr(self, "executable_path", None):
                 launch_options["executable_path"] = self.executable_path
+            launch_options = self._sanitize_provider_launch_options(launch_options)
 
             launched_with_persistent_profile = False
             if self._should_use_account_persistent_profile():
@@ -10203,6 +10215,7 @@ class XianyuSliderStealth:
                 launch_options['channel'] = self.browser_channel
             if self.executable_path:
                 launch_options['executable_path'] = self.executable_path
+            launch_options = self._sanitize_provider_launch_options(launch_options)
             if force_clean_context:
                 browser, context = self._launch_clean_cookie_seeded_context(
                     launch_options,
@@ -11174,7 +11187,7 @@ class XianyuSliderStealth:
 
     def login_with_password_headful(self, account: str = None, password: str = None, show_browser: bool = False):
         """兼容旧入口，转发到 `login_with_password_browser()`。"""
-        return self.login_with_password_browser(account, password, show_browser=True)
+        return self.login_with_password_browser(account, password, show_browser=show_browser)
 
     def run(
         self,

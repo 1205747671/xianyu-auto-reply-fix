@@ -796,7 +796,6 @@ class SliderVerificationGuardsTest(unittest.TestCase):
                 "proxy": {"server": "http://127.0.0.1:8888"},
                 "args": ["--foo"],
                 "channel": "msedge",
-                "executable_path": "C:/Browsers/msedge.exe",
             },
         )
         self.assertEqual(
@@ -849,7 +848,6 @@ class SliderVerificationGuardsTest(unittest.TestCase):
                 "proxy": {"server": "http://127.0.0.1:8888"},
                 "args": ["--foo"],
                 "channel": "msedge",
-                "executable_path": "C:/Browsers/msedge.exe",
             },
         )
         self.assertEqual(
@@ -897,10 +895,10 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
         slider.login_with_password_browser = mock.Mock(return_value={"cookie2": "ok"})
 
-        result = slider.login_with_password_headful("user", "pass", show_browser=True)
+        result = slider.login_with_password_headful("user", "pass", show_browser=False)
 
         self.assertEqual(result, {"cookie2": "ok"})
-        slider.login_with_password_browser.assert_called_once_with("user", "pass", show_browser=True)
+        slider.login_with_password_browser.assert_called_once_with("user", "pass", show_browser=False)
 
     def test_login_with_password_playwright_is_alias_of_new_browser_login(self):
         slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
