@@ -790,6 +790,7 @@ qr_screenshots/
 update_backup/
 logs/
 .ace-tool/
+.worktrees/
 
 # 前端预览文件
 static/control-tower-preview.html
