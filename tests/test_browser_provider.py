@@ -1,39 +1,124 @@
+import importlib
+import sys
+import types
 import unittest
 from unittest import IsolatedAsyncioTestCase, mock
 
 
-class BrowserProviderTest(unittest.TestCase):
-    def test_build_download_proxy_env_sets_http_and_https(self):
-        from utils.browser_provider import build_download_proxy_env
+class BrowserProviderImportTest(unittest.TestCase):
+    def tearDown(self):
+        sys.modules.pop("cloakbrowser", None)
+        sys.modules.pop("utils.browser_provider", None)
 
-        env = build_download_proxy_env("http://127.0.0.1:1081", {"PATH": "x"})
+    def _load_provider_with_fake_cloakbrowser(self):
+        fake_module = types.ModuleType("cloakbrowser")
+        fake_module.launch = mock.Mock(return_value="browser")
+        fake_module.launch_async = mock.AsyncMock(return_value="browser-async")
+        fake_module.launch_context = mock.Mock(return_value="context")
+        fake_module.launch_context_async = mock.AsyncMock(return_value="context-async")
+        fake_module.launch_persistent_context = mock.Mock(return_value="persistent-context")
+        fake_module.launch_persistent_context_async = mock.AsyncMock(
+            return_value="persistent-context-async"
+        )
+        sys.modules["cloakbrowser"] = fake_module
+
+        provider = importlib.import_module("utils.browser_provider")
+        provider = importlib.reload(provider)
+        return provider, fake_module
+
+    def test_import_requires_real_cloakbrowser_module(self):
+        with self.assertRaises(ModuleNotFoundError):
+            importlib.import_module("utils.browser_provider")
+
+    def test_build_download_proxy_env_sets_http_and_https(self):
+        provider, _ = self._load_provider_with_fake_cloakbrowser()
+
+        env = provider.build_download_proxy_env("http://127.0.0.1:1081", {"PATH": "x"})
 
         self.assertEqual(env["HTTP_PROXY"], "http://127.0.0.1:1081")
         self.assertEqual(env["HTTPS_PROXY"], "http://127.0.0.1:1081")
         self.assertEqual(env["PATH"], "x")
 
-    @mock.patch("utils.browser_provider.cloak_launch")
-    def test_launch_browser_delegates_to_cloakbrowser_launch(self, mock_launch):
-        from utils.browser_provider import launch_browser
+    def test_launch_browser_delegates_to_cloakbrowser_launch(self):
+        provider, fake_module = self._load_provider_with_fake_cloakbrowser()
 
-        launch_browser(headless=True, args=["--foo"])
+        result = provider.launch_browser(headless=True, args=["--foo"])
 
-        mock_launch.assert_called_once_with(headless=True, args=["--foo"])
+        fake_module.launch.assert_called_once_with(headless=True, args=["--foo"])
+        self.assertEqual(result, "browser")
+
+    def test_launch_browser_context_delegates_to_cloakbrowser_launch_context(self):
+        provider, fake_module = self._load_provider_with_fake_cloakbrowser()
+
+        result = provider.launch_browser_context(locale="zh-CN")
+
+        fake_module.launch_context.assert_called_once_with(locale="zh-CN")
+        self.assertEqual(result, "context")
+
+    def test_launch_browser_persistent_context_delegates(self):
+        provider, fake_module = self._load_provider_with_fake_cloakbrowser()
+
+        result = provider.launch_browser_persistent_context(
+            user_data_dir="browser_data/user_1",
+            headless=False,
+        )
+
+        fake_module.launch_persistent_context.assert_called_once_with(
+            user_data_dir="browser_data/user_1",
+            headless=False,
+        )
+        self.assertEqual(result, "persistent-context")
 
 
 class BrowserProviderAsyncTest(IsolatedAsyncioTestCase):
-    @mock.patch("utils.browser_provider.cloak_launch_persistent_context_async")
-    async def test_launch_browser_persistent_context_async_delegates(self, mock_launch):
-        from utils.browser_provider import launch_browser_persistent_context_async
+    def tearDown(self):
+        sys.modules.pop("cloakbrowser", None)
+        sys.modules.pop("utils.browser_provider", None)
 
-        await launch_browser_persistent_context_async(
+    def _load_provider_with_fake_cloakbrowser(self):
+        fake_module = types.ModuleType("cloakbrowser")
+        fake_module.launch = mock.Mock(return_value="browser")
+        fake_module.launch_async = mock.AsyncMock(return_value="browser-async")
+        fake_module.launch_context = mock.Mock(return_value="context")
+        fake_module.launch_context_async = mock.AsyncMock(return_value="context-async")
+        fake_module.launch_persistent_context = mock.Mock(return_value="persistent-context")
+        fake_module.launch_persistent_context_async = mock.AsyncMock(
+            return_value="persistent-context-async"
+        )
+        sys.modules["cloakbrowser"] = fake_module
+
+        provider = importlib.import_module("utils.browser_provider")
+        provider = importlib.reload(provider)
+        return provider, fake_module
+
+    async def test_launch_browser_async_delegates_to_cloakbrowser_launch_async(self):
+        provider, fake_module = self._load_provider_with_fake_cloakbrowser()
+
+        result = await provider.launch_browser_async(headless=True)
+
+        fake_module.launch_async.assert_awaited_once_with(headless=True)
+        self.assertEqual(result, "browser-async")
+
+    async def test_launch_browser_context_async_delegates(self):
+        provider, fake_module = self._load_provider_with_fake_cloakbrowser()
+
+        result = await provider.launch_browser_context_async(locale="zh-CN")
+
+        fake_module.launch_context_async.assert_awaited_once_with(locale="zh-CN")
+        self.assertEqual(result, "context-async")
+
+    async def test_launch_browser_persistent_context_async_delegates(self):
+        provider, fake_module = self._load_provider_with_fake_cloakbrowser()
+
+        result = await provider.launch_browser_persistent_context_async(
             user_data_dir="browser_data/user_1",
             headless=True,
             args=["--bar"],
         )
 
-        mock_launch.assert_awaited_once_with(
+        fake_module.launch_persistent_context_async.assert_awaited_once_with(
             user_data_dir="browser_data/user_1",
             headless=True,
             args=["--bar"],
         )
+        self.assertEqual(result, "persistent-context-async")

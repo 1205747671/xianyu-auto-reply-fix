@@ -2,33 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-try:
-    from cloakbrowser import (
-        launch as cloak_launch,
-        launch_async as cloak_launch_async,
-        launch_context as cloak_launch_context,
-        launch_context_async as cloak_launch_context_async,
-        launch_persistent_context as cloak_launch_persistent_context,
-        launch_persistent_context_async as cloak_launch_persistent_context_async,
-    )
-except ImportError:  # pragma: no cover - test env may not have cloakbrowser installed yet
-    def cloak_launch(*args, **kwargs):
-        raise ImportError("cloakbrowser is required")
-
-    async def cloak_launch_async(*args, **kwargs):
-        raise ImportError("cloakbrowser is required")
-
-    def cloak_launch_context(*args, **kwargs):
-        raise ImportError("cloakbrowser is required")
-
-    async def cloak_launch_context_async(*args, **kwargs):
-        raise ImportError("cloakbrowser is required")
-
-    def cloak_launch_persistent_context(*args, **kwargs):
-        raise ImportError("cloakbrowser is required")
-
-    async def cloak_launch_persistent_context_async(*args, **kwargs):
-        raise ImportError("cloakbrowser is required")
+from cloakbrowser import (
+    launch as cloak_launch,
+    launch_async as cloak_launch_async,
+    launch_context as cloak_launch_context,
+    launch_context_async as cloak_launch_context_async,
+    launch_persistent_context as cloak_launch_persistent_context,
+    launch_persistent_context_async as cloak_launch_persistent_context_async,
+)
 
 BrowserLike = Any
 BrowserContextLike = Any
