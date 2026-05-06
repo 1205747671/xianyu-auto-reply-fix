@@ -1,16 +1,27 @@
 import importlib
+import importlib.util
 import sys
 import types
 import unittest
 from unittest import IsolatedAsyncioTestCase, mock
 
 
-class BrowserProviderImportTest(unittest.TestCase):
+WRAPPER_EXPORT_NAMES = [
+    "launch_browser",
+    "launch_browser_async",
+    "launch_browser_context",
+    "launch_browser_context_async",
+    "launch_browser_persistent_context",
+    "launch_browser_persistent_context_async",
+]
+
+
+class BrowserProviderTestMixin:
     def tearDown(self):
         sys.modules.pop("cloakbrowser", None)
         sys.modules.pop("utils.browser_provider", None)
 
-    def _load_provider_with_fake_cloakbrowser(self):
+    def _create_fake_cloakbrowser_module(self):
         fake_module = types.ModuleType("cloakbrowser")
         fake_module.launch = mock.Mock(return_value="browser")
         fake_module.launch_async = mock.AsyncMock(return_value="browser-async")
@@ -20,15 +31,32 @@ class BrowserProviderImportTest(unittest.TestCase):
         fake_module.launch_persistent_context_async = mock.AsyncMock(
             return_value="persistent-context-async"
         )
+        return fake_module
+
+    def _load_provider_with_fake_cloakbrowser(self):
+        fake_module = self._create_fake_cloakbrowser_module()
         sys.modules["cloakbrowser"] = fake_module
 
         provider = importlib.import_module("utils.browser_provider")
         provider = importlib.reload(provider)
         return provider, fake_module
 
+
+class BrowserProviderImportTest(BrowserProviderTestMixin, unittest.TestCase):
     def test_import_requires_real_cloakbrowser_module(self):
+        sys.modules["cloakbrowser"] = None
+
         with self.assertRaises(ModuleNotFoundError):
             importlib.import_module("utils.browser_provider")
+
+    def test_import_uses_installed_cloakbrowser_when_available(self):
+        if importlib.util.find_spec("cloakbrowser") is None:
+            self.skipTest("cloakbrowser is not installed in current environment")
+
+        provider = importlib.import_module("utils.browser_provider")
+
+        for name in WRAPPER_EXPORT_NAMES:
+            self.assertTrue(hasattr(provider, name), msg=name)
 
     def test_build_download_proxy_env_sets_http_and_https(self):
         provider, _ = self._load_provider_with_fake_cloakbrowser()
@@ -70,27 +98,7 @@ class BrowserProviderImportTest(unittest.TestCase):
         self.assertEqual(result, "persistent-context")
 
 
-class BrowserProviderAsyncTest(IsolatedAsyncioTestCase):
-    def tearDown(self):
-        sys.modules.pop("cloakbrowser", None)
-        sys.modules.pop("utils.browser_provider", None)
-
-    def _load_provider_with_fake_cloakbrowser(self):
-        fake_module = types.ModuleType("cloakbrowser")
-        fake_module.launch = mock.Mock(return_value="browser")
-        fake_module.launch_async = mock.AsyncMock(return_value="browser-async")
-        fake_module.launch_context = mock.Mock(return_value="context")
-        fake_module.launch_context_async = mock.AsyncMock(return_value="context-async")
-        fake_module.launch_persistent_context = mock.Mock(return_value="persistent-context")
-        fake_module.launch_persistent_context_async = mock.AsyncMock(
-            return_value="persistent-context-async"
-        )
-        sys.modules["cloakbrowser"] = fake_module
-
-        provider = importlib.import_module("utils.browser_provider")
-        provider = importlib.reload(provider)
-        return provider, fake_module
-
+class BrowserProviderAsyncTest(BrowserProviderTestMixin, IsolatedAsyncioTestCase):
     async def test_launch_browser_async_delegates_to_cloakbrowser_launch_async(self):
         provider, fake_module = self._load_provider_with_fake_cloakbrowser()
 
