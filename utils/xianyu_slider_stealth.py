@@ -2475,6 +2475,17 @@ class XianyuSliderStealth:
             logger.debug(f"【{self.pure_user_id}】重置滑块错误态失败: {e}")
         return False
 
+    def _launch_browser_with_headless_explicit_fallback(self, launch_options: Dict[str, Any]):
+        try:
+            return launch_browser(**launch_options)
+        except Exception:
+            if self.headless and (launch_options.get("channel") or launch_options.get("executable_path")):
+                fallback_options = dict(launch_options)
+                fallback_options.pop("channel", None)
+                fallback_options.pop("executable_path", None)
+                return launch_browser(**fallback_options)
+            raise
+
     def init_browser(self):
         """初始化浏览器 - 增强反检测版本"""
         user_label = getattr(self, "pure_user_id", "unknown")
@@ -2532,20 +2543,11 @@ class XianyuSliderStealth:
                             if not self._is_profile_in_use_launch_error(retry_launch_error):
                                 raise
                     if not launched_with_persistent_profile:
-                        self.browser = launch_browser(**launch_options)
+                        self.browser = self._launch_browser_with_headless_explicit_fallback(launch_options)
                         self.context = self.browser.new_context(**context_options)
 
             if not launched_with_persistent_profile and not self.context:
-                try:
-                    self.browser = launch_browser(**launch_options)
-                except Exception:
-                    if self.headless and (launch_options.get("channel") or launch_options.get("executable_path")):
-                        fallback_options = dict(launch_options)
-                        fallback_options.pop("channel", None)
-                        fallback_options.pop("executable_path", None)
-                        self.browser = launch_browser(**fallback_options)
-                    else:
-                        raise
+                self.browser = self._launch_browser_with_headless_explicit_fallback(launch_options)
                 self.context = self.browser.new_context(**context_options)
 
             pages = list(getattr(self.context, "pages", []) or [])
