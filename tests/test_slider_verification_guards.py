@@ -620,10 +620,20 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         slider.browser = None
         slider.context = None
         slider.page = None
-        slider._build_browser_proxy_settings = lambda: None
-        slider._build_browser_context_options = lambda _features: {}
-        slider._build_browser_features = lambda: {}
+        slider._build_browser_proxy_settings = lambda: {"server": "http://127.0.0.1:8888"}
+        slider._build_browser_context_options = lambda _features: {
+            "user_agent": "unit-test-agent",
+            "locale": "zh-CN",
+            "timezone_id": "Asia/Shanghai",
+            "viewport": {"width": 1600, "height": 900},
+            "extra_http_headers": {"Accept-Language": "zh-CN,zh;q=0.9"},
+        }
+        slider._build_browser_features = lambda: {"user_agent": "unit-test-agent"}
         slider._build_browser_launch_args = lambda: ["--foo"]
+        slider._build_initial_cookie_payload = lambda: [{"name": "cookie2", "value": "ok", "domain": ".goofish.com", "path": "/"}]
+        slider._install_stealth_init_script = mock.Mock()
+        slider._should_prefer_project_browser_for_playwright = lambda: False
+        slider._cleanup_on_init_failure = lambda: None
 
         fake_context = mock.Mock()
         fake_context.pages = [mock.Mock()]
@@ -631,7 +641,137 @@ class SliderVerificationGuardsTest(unittest.TestCase):
 
         slider.init_browser()
 
-        mock_launch.assert_called_once()
+        mock_launch.assert_called_once_with(
+            user_data_dir="browser_data/user_1",
+            headless=True,
+            proxy={"server": "http://127.0.0.1:8888"},
+            args=["--foo"],
+            user_agent="unit-test-agent",
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            viewport={"width": 1600, "height": 900},
+            extra_http_headers={"Accept-Language": "zh-CN,zh;q=0.9"},
+            accept_downloads=True,
+            ignore_https_errors=True,
+        )
+        fake_context.add_cookies.assert_called_once_with(
+            [{"name": "cookie2", "value": "ok", "domain": ".goofish.com", "path": "/"}]
+        )
+        slider._install_stealth_init_script.assert_called_once_with(fake_context.pages[0], {"user_agent": "unit-test-agent"})
+
+    @mock.patch("utils.xianyu_slider_stealth.launch_browser")
+    @mock.patch("utils.xianyu_slider_stealth.launch_browser_persistent_context")
+    def test_init_browser_retries_persistent_context_after_stale_lock_cleanup(self, mock_launch_persistent, mock_launch_browser):
+        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
+        slider.use_account_persistent_profile = True
+        slider.account_persistent_profile_dir = "browser_data/user_retry"
+        slider.headless = True
+        slider.browser = None
+        slider.context = None
+        slider.page = None
+        slider._build_browser_proxy_settings = lambda: None
+        slider._build_browser_context_options = lambda _features: {"locale": "zh-CN"}
+        slider._build_browser_features = lambda: {"user_agent": "retry-agent"}
+        slider._build_browser_launch_args = lambda: ["--foo"]
+        slider._build_initial_cookie_payload = lambda: []
+        slider._install_stealth_init_script = mock.Mock()
+        slider._should_prefer_project_browser_for_playwright = lambda: False
+        slider._cleanup_on_init_failure = lambda: None
+        slider._is_profile_in_use_launch_error = lambda exc: "profile appears to be in use" in str(exc).lower()
+        slider._try_cleanup_stale_chromium_singleton_lock = mock.Mock(return_value=True)
+
+        fake_context = mock.Mock()
+        fake_context.pages = [mock.Mock()]
+        mock_launch_persistent.side_effect = [
+            RuntimeError("BrowserType.launch_persistent_context: The profile appears to be in use by another Chromium process"),
+            fake_context,
+        ]
+
+        slider.init_browser()
+
+        self.assertEqual(mock_launch_persistent.call_count, 2)
+        slider._try_cleanup_stale_chromium_singleton_lock.assert_called_once_with("browser_data/user_retry")
+        mock_launch_browser.assert_not_called()
+        slider._install_stealth_init_script.assert_called_once_with(fake_context.pages[0], {"user_agent": "retry-agent"})
+
+    @mock.patch("utils.xianyu_slider_stealth.launch_browser")
+    @mock.patch("utils.xianyu_slider_stealth.launch_browser_persistent_context")
+    def test_init_browser_falls_back_to_temporary_context_when_stale_lock_cleanup_not_allowed(self, mock_launch_persistent, mock_launch_browser):
+        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
+        slider.use_account_persistent_profile = True
+        slider.account_persistent_profile_dir = "browser_data/user_fallback"
+        slider.headless = True
+        slider.browser = None
+        slider.context = None
+        slider.page = None
+        slider._build_browser_proxy_settings = lambda: {"server": "http://127.0.0.1:8888"}
+        slider._build_browser_context_options = lambda _features: {"locale": "zh-CN", "timezone_id": "Asia/Shanghai"}
+        slider._build_browser_features = lambda: {"user_agent": "fallback-agent"}
+        slider._build_browser_launch_args = lambda: ["--foo"]
+        slider._build_initial_cookie_payload = lambda: [{"name": "x5sec", "value": "v", "domain": ".goofish.com", "path": "/"}]
+        slider._install_stealth_init_script = mock.Mock()
+        slider._should_prefer_project_browser_for_playwright = lambda: False
+        slider._cleanup_on_init_failure = lambda: None
+        slider._is_profile_in_use_launch_error = lambda exc: "profile appears to be in use" in str(exc).lower()
+        slider._try_cleanup_stale_chromium_singleton_lock = mock.Mock(return_value=False)
+
+        fake_page = mock.Mock()
+        fake_context = mock.Mock()
+        fake_context.pages = []
+        fake_context.new_page.return_value = fake_page
+        fake_browser = mock.Mock()
+        fake_browser.new_context.return_value = fake_context
+        mock_launch_persistent.side_effect = RuntimeError(
+            "BrowserType.launch_persistent_context: The profile appears to be in use by another Chromium process"
+        )
+        mock_launch_browser.return_value = fake_browser
+
+        slider.init_browser()
+
+        mock_launch_persistent.assert_called_once()
+        slider._try_cleanup_stale_chromium_singleton_lock.assert_called_once_with("browser_data/user_fallback")
+        mock_launch_browser.assert_called_once_with(
+            headless=True,
+            proxy={"server": "http://127.0.0.1:8888"},
+            args=["--foo"],
+        )
+        fake_browser.new_context.assert_called_once_with(locale="zh-CN", timezone_id="Asia/Shanghai")
+        fake_context.add_cookies.assert_called_once_with(
+            [{"name": "x5sec", "value": "v", "domain": ".goofish.com", "path": "/"}]
+        )
+        slider._install_stealth_init_script.assert_called_once_with(fake_page, {"user_agent": "fallback-agent"})
+
+    @mock.patch("utils.xianyu_slider_stealth.launch_browser")
+    def test_init_browser_non_persistent_injects_initial_cookies_and_stealth(self, mock_launch_browser):
+        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
+        slider.use_account_persistent_profile = False
+        slider.headless = True
+        slider.browser = None
+        slider.context = None
+        slider.page = None
+        slider._build_browser_proxy_settings = lambda: None
+        slider._build_browser_context_options = lambda _features: {"locale": "zh-CN"}
+        slider._build_browser_features = lambda: {"user_agent": "plain-agent"}
+        slider._build_browser_launch_args = lambda: ["--foo"]
+        slider._build_initial_cookie_payload = lambda: [{"name": "cookie2", "value": "ok", "domain": ".goofish.com", "path": "/"}]
+        slider._install_stealth_init_script = mock.Mock()
+        slider._should_prefer_project_browser_for_playwright = lambda: False
+        slider._cleanup_on_init_failure = lambda: None
+
+        fake_page = mock.Mock()
+        fake_context = mock.Mock()
+        fake_context.pages = []
+        fake_context.new_page.return_value = fake_page
+        fake_browser = mock.Mock()
+        fake_browser.new_context.return_value = fake_context
+        mock_launch_browser.return_value = fake_browser
+
+        slider.init_browser()
+
+        fake_context.add_cookies.assert_called_once_with(
+            [{"name": "cookie2", "value": "ok", "domain": ".goofish.com", "path": "/"}]
+        )
+        slider._install_stealth_init_script.assert_called_once_with(fake_page, {"user_agent": "plain-agent"})
 
     def test_login_with_password_headful_is_alias_of_new_browser_login(self):
         slider = XianyuSliderStealth.__new__(XianyuSliderStealth)

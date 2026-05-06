@@ -2497,23 +2497,56 @@ class XianyuSliderStealth:
             if getattr(self, "executable_path", None):
                 launch_options["executable_path"] = self.executable_path
 
+            launched_with_persistent_profile = False
             if self._should_use_account_persistent_profile():
                 user_data_dir = (
                     str(getattr(self, "account_persistent_profile_dir", None) or "").strip()
                     or self._resolve_account_persistent_profile_dir()
                 )
-                self.context = launch_browser_persistent_context(
-                    user_data_dir=user_data_dir,
-                    **launch_options,
-                )
-                self.browser = getattr(self.context, "browser", None)
-                pages = list(getattr(self.context, "pages", []) or [])
-                self.page = pages[0] if pages else self.context.new_page()
-                return self.page
+                persistent_launch_options = dict(launch_options)
+                persistent_launch_options.update(context_options)
+                persistent_launch_options.update({
+                    "accept_downloads": True,
+                    "ignore_https_errors": True,
+                })
+                try:
+                    self.context = launch_browser_persistent_context(
+                        user_data_dir=user_data_dir,
+                        **persistent_launch_options,
+                    )
+                    launched_with_persistent_profile = True
+                    self.browser = getattr(self.context, "browser", None)
+                except Exception as persistent_launch_error:
+                    if not self._is_profile_in_use_launch_error(persistent_launch_error):
+                        raise
+                    cleaned_stale_lock = self._try_cleanup_stale_chromium_singleton_lock(user_data_dir)
+                    if cleaned_stale_lock:
+                        try:
+                            self.context = launch_browser_persistent_context(
+                                user_data_dir=user_data_dir,
+                                **persistent_launch_options,
+                            )
+                            launched_with_persistent_profile = True
+                            self.browser = getattr(self.context, "browser", None)
+                        except Exception as retry_launch_error:
+                            if not self._is_profile_in_use_launch_error(retry_launch_error):
+                                raise
+                    if not launched_with_persistent_profile:
+                        self.browser = launch_browser(**launch_options)
+                        self.context = self.browser.new_context(**context_options)
 
-            self.browser = launch_browser(**launch_options)
-            self.context = self.browser.new_context(**context_options)
-            self.page = self.context.new_page()
+            if not launched_with_persistent_profile and not self.context:
+                self.browser = launch_browser(**launch_options)
+                self.context = self.browser.new_context(**context_options)
+
+            pages = list(getattr(self.context, "pages", []) or [])
+            self.page = pages[0] if pages else self.context.new_page()
+
+            initial_cookie_payload = self._build_initial_cookie_payload()
+            if initial_cookie_payload:
+                self.context.add_cookies(initial_cookie_payload)
+
+            self._install_stealth_init_script(self.page, browser_features)
 
             return self.page
         except Exception as e:
