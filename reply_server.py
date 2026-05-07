@@ -3518,6 +3518,54 @@ def _set_password_login_session_status(session_id: str, status: str, **fields):
     return True
 
 
+def _wait_threadsafe_future_result(
+    thread_future: concurrent.futures.Future,
+    timeout: float,
+    timeout_message: str,
+):
+    try:
+        return thread_future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError as timeout_err:
+        thread_future.cancel()
+        raise TimeoutError(timeout_message) from timeout_err
+
+
+def _build_verification_required_status_payload(
+    session: Dict[str, Any],
+    *,
+    include_qr_code_url: bool = False,
+    pending_completion_message: Optional[str] = None,
+) -> Dict[str, Any]:
+    screenshot_path = session.get('screenshot_path')
+    verification_url = session.get('verification_url')
+    verification_type = session.get('verification_type') or '身份验证'
+    qr_code_url = session.get('qr_code_url')
+
+    if screenshot_path and not os.path.exists(screenshot_path):
+        screenshot_path = None
+        session['screenshot_path'] = None
+
+    verification_material_ready = bool(screenshot_path or verification_url or qr_code_url)
+    if screenshot_path:
+        message = f'需要{verification_type}，请查看验证截图'
+    elif verification_url:
+        message = f'需要{verification_type}，请点击验证链接'
+    else:
+        message = pending_completion_message or f'{verification_type}已提交，正在等待当前流程完成，请勿关闭当前页面'
+
+    payload = {
+        'status': 'verification_required',
+        'verification_url': verification_url,
+        'screenshot_path': screenshot_path,
+        'verification_type': verification_type,
+        'verification_material_ready': verification_material_ready,
+        'message': message,
+    }
+    if include_qr_code_url:
+        payload['qr_code_url'] = qr_code_url
+    return payload
+
+
 def _finalize_password_login_session_failure(
     session_id: str,
     error_message: str,
@@ -3558,6 +3606,82 @@ def _finalize_password_login_session_failure(
         event_meta=event_meta,
     )
     return True
+
+
+def _stabilize_password_login_cookies_after_login(
+    *,
+    cookies_str: str,
+    account_id: str,
+    user_id: int,
+    current_user: Dict[str, Any],
+    request_loop: asyncio.AbstractEventLoop,
+    preflight_timeout: float,
+    browser_refresh_timeout: float = 90.0,
+) -> Tuple[str, Dict[str, Any]]:
+    from XianyuAutoAsync import XianyuLive
+
+    log_with_user('info', f"密码登录成功后开始执行Token预检，优先确认新Cookie可直接交接: {account_id}", current_user)
+    temp_xianyu = XianyuLive(
+        cookies_str=cookies_str,
+        cookie_id=account_id,
+        user_id=user_id,
+        register_instance=False,
+    )
+
+    try:
+        preflight_future = asyncio.run_coroutine_threadsafe(
+            temp_xianyu.preflight_token_after_password_login(),
+            request_loop,
+        )
+        _wait_threadsafe_future_result(
+            preflight_future,
+            preflight_timeout,
+            f"密码登录后的Token预检在 {preflight_timeout:.0f} 秒内未完成",
+        )
+        log_with_user('info', f"密码登录后的Token预检通过，将使用预热后的Cookie继续交接: {account_id}", current_user)
+        return temp_xianyu.cookies_str, {
+            'token_prewarmed': True,
+            'real_cookie_refreshed': False,
+            'fallback_reason': None,
+        }
+    except Exception as preflight_err:
+        fallback_reason = str(preflight_err)
+        log_with_user(
+            'warning',
+            f"密码登录后的Token预检失败，降级到浏览器Cookie稳定化: {account_id}, 原因: {fallback_reason}",
+            current_user,
+        )
+
+    temp_xianyu = XianyuLive(
+        cookies_str=cookies_str,
+        cookie_id=account_id,
+        user_id=user_id,
+        register_instance=False,
+    )
+    try:
+        temp_xianyu.reset_qr_cookie_refresh_flag()
+        log_with_user('info', f"已重置扫码登录Cookie刷新冷却标志，允许立即执行浏览器稳定化: {account_id}", current_user)
+    except Exception as reset_err:
+        log_with_user('debug', f"重置扫码登录Cookie刷新冷却标志失败（不影响后续稳定化）: {str(reset_err)}", current_user)
+
+    refresh_future = asyncio.run_coroutine_threadsafe(
+        temp_xianyu._refresh_cookies_via_browser(triggered_by_refresh_token=False),
+        request_loop,
+    )
+    refresh_success = _wait_threadsafe_future_result(
+        refresh_future,
+        browser_refresh_timeout,
+        f"密码登录后的浏览器Cookie稳定化在 {browser_refresh_timeout:.0f} 秒内未完成",
+    )
+    if not refresh_success:
+        raise RuntimeError("密码登录后的浏览器Cookie稳定化失败")
+
+    log_with_user('info', f"密码登录后的浏览器Cookie稳定化成功，将使用稳定化后的Cookie继续交接: {account_id}", current_user)
+    return temp_xianyu.cookies_str, {
+        'token_prewarmed': False,
+        'real_cookie_refreshed': True,
+        'fallback_reason': fallback_reason,
+    }
 
 
 def _get_latest_password_login_session_for_account(
@@ -3966,6 +4090,12 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     )
                     return
 
+                stabilization_meta = {
+                    'token_prewarmed': False,
+                    'real_cookie_refreshed': False,
+                    'fallback_reason': None,
+                }
+
                 if is_refresh_mode:
                     try:
                         log_with_user('info', f"刷新模式开始执行Token预检，确认新实例可直接恢复: {account_id}", current_user)
@@ -3980,15 +4110,14 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                             temp_xianyu.preflight_token_after_manual_refresh(),
                             request_loop,
                         )
-                        try:
-                            preflight_future.result(timeout=manual_refresh_preflight_timeout)
-                        except concurrent.futures.TimeoutError as timeout_err:
-                            preflight_future.cancel()
-                            raise TimeoutError(
-                                f"手动刷新后的Token预检在 {manual_refresh_preflight_timeout:.0f} 秒内未完成"
-                            ) from timeout_err
+                        _wait_threadsafe_future_result(
+                            preflight_future,
+                            manual_refresh_preflight_timeout,
+                            f"手动刷新后的Token预检在 {manual_refresh_preflight_timeout:.0f} 秒内未完成",
+                        )
                         cookies_str = temp_xianyu.cookies_str
                         merged_cookies_dict = trans_cookies(cookies_str)
+                        stabilization_meta['token_prewarmed'] = True
                         log_with_user('info', f"刷新模式Token预检通过，将使用预检后的Cookie继续交接: {account_id}", current_user)
                     except Exception as preflight_err:
                         error_message = f"刷新模式认证预检失败，任务未切换: {str(preflight_err)}"
@@ -3997,6 +4126,27 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                             session_id,
                             error_message,
                             result_code='manual_refresh_preflight_failed',
+                            event_meta={'account_id': account_id},
+                        )
+                        return
+                else:
+                    try:
+                        cookies_str, stabilization_meta = _stabilize_password_login_cookies_after_login(
+                            cookies_str=cookies_str,
+                            account_id=account_id,
+                            user_id=user_id,
+                            current_user=current_user,
+                            request_loop=request_loop,
+                            preflight_timeout=manual_refresh_preflight_timeout,
+                        )
+                        merged_cookies_dict = trans_cookies(cookies_str)
+                    except Exception as stabilization_err:
+                        error_message = f"密码登录后Cookie稳定化失败，任务未切换: {str(stabilization_err)}"
+                        log_with_user('error', f"{error_message}: {account_id}", current_user)
+                        _finalize_password_login_session_failure(
+                            session_id,
+                            error_message,
+                            result_code='password_login_post_stabilization_failed',
                             event_meta={'account_id': account_id},
                         )
                         return
@@ -4036,70 +4186,10 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 
                 if is_refresh_mode:
                     log_with_user('info', f"刷新模式已完成Token预检，直接切换到通过预检的新Cookie: {account_id}", current_user)
+                elif stabilization_meta.get('real_cookie_refreshed'):
+                    log_with_user('info', f"密码登录已通过浏览器Cookie稳定化完成交接: {account_id}", current_user)
                 else:
-                    # 登录成功后，调用_refresh_cookies_via_browser刷新Cookie
-                    try:
-                        log_with_user('info', f"开始调用_refresh_cookies_via_browser刷新Cookie: {account_id}", current_user)
-                        
-                        # 创建临时的XianyuLive实例来刷新Cookie
-                        temp_xianyu = XianyuLive(
-                            cookies_str=cookies_str,
-                            cookie_id=account_id,
-                            user_id=user_id,
-                            register_instance=False,
-                        )
-                        
-                        # 重置扫码登录Cookie刷新标志，确保账号密码登录后能立即刷新
-                        try:
-                            temp_xianyu.reset_qr_cookie_refresh_flag()
-                            log_with_user('info', f"已重置扫码登录Cookie刷新标志: {account_id}", current_user)
-                        except Exception as reset_err:
-                            log_with_user('debug', f"重置扫码登录Cookie刷新标志失败（不影响刷新）: {str(reset_err)}", current_user)
-                        
-                        # 在后台异步执行刷新（不阻塞主流程）
-                        async def refresh_cookies_task():
-                            try:
-                                refresh_success = await temp_xianyu._refresh_cookies_via_browser(triggered_by_refresh_token=False)
-                                if refresh_success:
-                                    log_with_user('info', f"Cookie刷新成功: {account_id}", current_user)
-                                    # 刷新成功后，从数据库获取更新后的Cookie
-                                    updated_cookie_info = db_manager.get_cookie_details(account_id)
-                                    if updated_cookie_info:
-                                        refreshed_cookies = updated_cookie_info.get('value', '')
-                                        if refreshed_cookies:
-                                            # 更新cookie_manager中的Cookie
-                                            if cookie_manager.manager:
-                                                cookie_manager.manager.update_cookie(account_id, refreshed_cookies, save_to_db=False)
-                                            log_with_user('info', f"已更新刷新后的Cookie到cookie_manager: {account_id}", current_user)
-                                else:
-                                    log_with_user('warning', f"Cookie刷新失败或跳过: {account_id}", current_user)
-                            except Exception as refresh_e:
-                                log_with_user('error', f"刷新Cookie时出错: {account_id}, 错误: {str(refresh_e)}", current_user)
-                                import traceback
-                                logger.error(traceback.format_exc())
-                        
-                        # 在后台线程中运行异步任务
-                        # 由于run_login是在线程中运行的，需要创建新的事件循环
-                        def run_async_refresh():
-                            try:
-                                import asyncio
-                                # 创建新的事件循环
-                                new_loop = asyncio.new_event_loop()
-                                asyncio.set_event_loop(new_loop)
-                                try:
-                                    new_loop.run_until_complete(refresh_cookies_task())
-                                finally:
-                                    new_loop.close()
-                            except Exception as e:
-                                log_with_user('error', f"运行异步刷新任务失败: {account_id}, 错误: {str(e)}", current_user)
-                        
-                        # 在后台线程中执行刷新任务
-                        refresh_thread = threading.Thread(target=run_async_refresh, daemon=True)
-                        refresh_thread.start()
-                        
-                    except Exception as refresh_err:
-                        log_with_user('warning', f"调用_refresh_cookies_via_browser失败: {account_id}, 错误: {str(refresh_err)}", current_user)
-                        # 刷新失败不影响登录成功
+                    log_with_user('info', f"密码登录已通过Token预检完成交接，无需额外浏览器Cookie刷新: {account_id}", current_user)
                 
                 # 更新会话状态
                 _set_password_login_session_status(
@@ -4107,18 +4197,27 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     'success',
                     account_id=account_id,
                     is_new_account=is_new_account,
-                    cookie_count=len(merged_cookies_dict)
+                    cookie_count=len(merged_cookies_dict),
+                    token_prewarmed=stabilization_meta.get('token_prewarmed', False),
+                    real_cookie_refreshed=stabilization_meta.get('real_cookie_refreshed', False),
+                    fallback_reason=stabilization_meta.get('fallback_reason'),
                 )
                 _close_password_login_pending_verification_risk_logs(
                     session_id,
                     'success',
                     processing_result='人工验证已完成，登录流程已成功收尾',
                 )
+                if is_refresh_mode:
+                    stabilization_result_text = '刷新模式Token预检通过'
+                elif stabilization_meta.get('real_cookie_refreshed'):
+                    stabilization_result_text = '密码登录后浏览器Cookie稳定化成功'
+                else:
+                    stabilization_result_text = '密码登录后Token预检通过'
                 # 更新风控日志状态
                 _update_session_risk_log(
                     session_id,
                     'success',
-                    processing_result='Cookie刷新成功，认证预检通过' if is_refresh_mode else 'Cookie刷新成功'
+                    processing_result=stabilization_result_text,
                 )
 
                 # 发送登录成功通知（使用模板系统）
@@ -4542,16 +4641,10 @@ async def check_manual_cookie_import_status(
                         'error': error_message,
                     }
 
-            screenshot_path = session.get('screenshot_path')
-            verification_url = session.get('verification_url')
-            verification_type = session.get('verification_type') or '身份验证'
-            return {
-                'status': 'verification_required',
-                'verification_url': verification_url,
-                'screenshot_path': screenshot_path,
-                'verification_type': verification_type,
-                'message': f'需要{verification_type}，请查看验证截图' if screenshot_path else f'需要{verification_type}，请点击验证链接',
-            }
+            return _build_verification_required_status_payload(
+                session,
+                pending_completion_message='验证状态已更新，正在等待Cookie导入完成，请勿关闭当前页面',
+            )
         if status == 'success':
             return {
                 'status': 'success',
@@ -4736,25 +4829,21 @@ async def check_password_login_status(
         status = session['status']
         
         if status == 'verification_required':
-            # 需要身份验证
-            screenshot_path = session.get('screenshot_path')
-            verification_url = session.get('verification_url')
-            verification_type = session.get('verification_type') or '身份验证'
-            return {
-                'status': 'verification_required',
-                'verification_url': verification_url,
-                'screenshot_path': screenshot_path,
-                'qr_code_url': session.get('qr_code_url'),  # 保留兼容性
-                'verification_type': verification_type,
-                'message': f'需要{verification_type}，请查看验证截图' if screenshot_path else f'需要{verification_type}，请点击验证链接'
-            }
+            return _build_verification_required_status_payload(
+                session,
+                include_qr_code_url=True,
+                pending_completion_message='验证已提交，正在等待登录完成，请勿关闭当前页面',
+            )
         elif status == 'success':
             return {
                 'status': 'success',
                 'message': f'账号 {session["account_id"]} 登录成功',
                 'account_id': session['account_id'],
                 'is_new_account': session.get('is_new_account', False),
-                'cookie_count': session.get('cookie_count', 0)
+                'cookie_count': session.get('cookie_count', 0),
+                'token_prewarmed': session.get('token_prewarmed', False),
+                'real_cookie_refreshed': session.get('real_cookie_refreshed', False),
+                'fallback_reason': session.get('fallback_reason'),
             }
         elif status == 'failed':
             error_msg = session.get('error', '登录失败')

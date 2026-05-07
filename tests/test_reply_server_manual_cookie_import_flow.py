@@ -528,5 +528,258 @@ class ReplyServerProcessQrLoginCookiesTest(unittest.TestCase):
         )
 
 
+class _FakePasswordLoginSlider:
+    def __init__(self):
+        self.last_login_error = ""
+
+    def login_with_password_browser(self, **_kwargs):
+        return {
+            "unb": "test_user",
+            "_m_h5_tk": "raw_token_12345",
+            "cookie2": "raw_cookie2",
+        }
+
+
+class _FakePasswordLoginPreflightSuccessLive:
+    preflight_calls = 0
+    browser_refresh_calls = 0
+    reset_calls = 0
+
+    def __init__(self, cookies_str, cookie_id, user_id, register_instance=False, **kwargs):
+        self.cookies_str = cookies_str
+        self.cookie_id = cookie_id
+        self.user_id = user_id
+        self.register_instance = register_instance
+        self.kwargs = kwargs
+
+    @classmethod
+    def reset_state(cls):
+        cls.preflight_calls = 0
+        cls.browser_refresh_calls = 0
+        cls.reset_calls = 0
+
+    @staticmethod
+    def protected_merge_cookie_dicts(existing_cookie_dict, incoming_cookie_dict):
+        merged = dict(existing_cookie_dict or {})
+        merged.update(incoming_cookie_dict or {})
+        return {
+            "incoming_missing_protected_fields": [],
+            "preserved_protected_fields": [],
+            "merged_cookies_dict": merged,
+            "missing_required_fields": [],
+            "account_switched": False,
+            "incoming_count": len(incoming_cookie_dict or {}),
+            "existing_count": len(existing_cookie_dict or {}),
+            "merged_count": len(merged),
+            "would_remove_fields": [],
+        }
+
+    async def preflight_token_after_password_login(self):
+        type(self).preflight_calls += 1
+        self.cookies_str = "unb=test_user; _m_h5_tk=prewarmed_token_12345; cookie2=prewarmed_cookie2"
+        return "prewarmed_token_12345"
+
+    def reset_qr_cookie_refresh_flag(self):
+        type(self).reset_calls += 1
+
+    async def _refresh_cookies_via_browser(self, triggered_by_refresh_token=False):
+        _ = triggered_by_refresh_token
+        type(self).browser_refresh_calls += 1
+        return True
+
+
+class _FakePasswordLoginFallbackLive(_FakePasswordLoginPreflightSuccessLive):
+    async def preflight_token_after_password_login(self):
+        type(self).preflight_calls += 1
+        raise RuntimeError("preflight failed")
+
+    async def _refresh_cookies_via_browser(self, triggered_by_refresh_token=False):
+        _ = triggered_by_refresh_token
+        type(self).browser_refresh_calls += 1
+        self.cookies_str = (
+            "unb=test_user; _m_h5_tk=browser_refreshed_token_12345; "
+            "cookie2=browser_refreshed_cookie2"
+        )
+        return True
+
+
+class ReplyServerPasswordLoginStatusTest(unittest.TestCase):
+    def setUp(self):
+        self._original_sessions = reply_server.password_login_sessions
+        reply_server.password_login_sessions = {}
+
+    def tearDown(self):
+        reply_server.password_login_sessions = self._original_sessions
+
+    def test_check_password_login_status_clears_stale_screenshot_after_verification_cleanup(self):
+        session_id = "password_login_stale_screenshot_session"
+        reply_server.password_login_sessions[session_id] = {
+            "account_id": "stale_screenshot_account",
+            "account": "test_user",
+            "show_browser": False,
+            "refresh_mode": False,
+            "risk_control_log_id": None,
+            "risk_session_id": session_id,
+            "status": "verification_required",
+            "verification_url": None,
+            "screenshot_path": "C:\\does-not-exist\\face_verify_latest.jpg",
+            "qr_code_url": None,
+            "verification_type": "face_verify",
+            "slider_instance": None,
+            "task": None,
+            "timestamp": time.time(),
+            "completed_at": None,
+            "user_id": 1,
+        }
+
+        result = asyncio.run(
+            reply_server.check_password_login_status(
+                session_id,
+                current_user={"user_id": 1, "username": "admin"},
+            )
+        )
+
+        self.assertEqual(result["status"], "verification_required")
+        self.assertIsNone(result["screenshot_path"])
+        self.assertFalse(result["verification_material_ready"])
+        self.assertIn("等待登录完成", result["message"])
+        self.assertIsNone(
+            reply_server.password_login_sessions[session_id]["screenshot_path"]
+        )
+
+
+class ReplyServerPasswordLoginExecutionTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._original_sessions = reply_server.password_login_sessions
+        reply_server.password_login_sessions = {}
+
+    def tearDown(self):
+        reply_server.password_login_sessions = self._original_sessions
+
+    async def _wait_for_password_login_status(self, session_id, expected_status, timeout=2.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            current_status = reply_server.password_login_sessions[session_id]["status"]
+            if current_status == expected_status:
+                return
+            await asyncio.sleep(0.01)
+        self.fail(
+            f"password login session {session_id} did not reach {expected_status}, "
+            f"last status: {reply_server.password_login_sessions[session_id]['status']}"
+        )
+
+    def _build_password_login_session(self, session_id):
+        reply_server.password_login_sessions[session_id] = {
+            "account_id": "test_user",
+            "account": "test_account",
+            "show_browser": False,
+            "refresh_mode": False,
+            "risk_control_log_id": None,
+            "risk_session_id": session_id,
+            "status": "processing",
+            "verification_url": None,
+            "screenshot_path": None,
+            "qr_code_url": None,
+            "verification_type": None,
+            "slider_instance": None,
+            "task": None,
+            "timestamp": time.time(),
+            "completed_at": None,
+            "user_id": 1,
+        }
+
+    async def test_execute_password_login_prefers_token_preflight_before_browser_refresh(self):
+        session_id = "password_login_preflight_first_session"
+        self._build_password_login_session(session_id)
+        _FakePasswordLoginPreflightSuccessLive.reset_state()
+
+        fake_manager = SimpleNamespace(
+            cookies={},
+            add_cookie=mock.Mock(),
+            update_cookie=mock.Mock(),
+        )
+        fake_slider = _FakePasswordLoginSlider()
+
+        with mock.patch("utils.xianyu_slider_stealth.XianyuSliderStealth", return_value=fake_slider), \
+             mock.patch("utils.xianyu_slider_stealth.concurrency_manager.unregister_instance", return_value=True), \
+             mock.patch("XianyuAutoAsync.XianyuLive", _FakePasswordLoginPreflightSuccessLive), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_details", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_proxy_config", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_all_cookies", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "update_cookie_account_info", return_value=True) as update_cookie_mock, \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "dispatch_account_notifications_sync", return_value=False), \
+             mock.patch.object(reply_server, "render_notification_template", return_value="login ok"), \
+             mock.patch.object(reply_server, "_close_password_login_pending_verification_risk_logs"), \
+             mock.patch.object(reply_server, "_update_session_risk_log"), \
+             mock.patch.object(reply_server, "log_with_user"):
+            await reply_server._execute_password_login(
+                session_id=session_id,
+                account_id="test_user",
+                account="test_account",
+                password="test_password",
+                show_browser=False,
+                user_id=1,
+                current_user={"user_id": 1, "username": "admin"},
+            )
+            await self._wait_for_password_login_status(session_id, "success")
+
+        session = reply_server.password_login_sessions[session_id]
+        self.assertEqual(session["status"], "success")
+        self.assertEqual(_FakePasswordLoginPreflightSuccessLive.preflight_calls, 1)
+        self.assertEqual(_FakePasswordLoginPreflightSuccessLive.browser_refresh_calls, 0)
+        self.assertEqual(_FakePasswordLoginPreflightSuccessLive.reset_calls, 0)
+        fake_manager.add_cookie.assert_called_once()
+        saved_cookie_value = update_cookie_mock.call_args.kwargs["cookie_value"]
+        self.assertIn("_m_h5_tk=prewarmed_token_12345", saved_cookie_value)
+        self.assertIn("cookie2=prewarmed_cookie2", saved_cookie_value)
+
+    async def test_execute_password_login_falls_back_to_browser_refresh_when_token_preflight_fails(self):
+        session_id = "password_login_browser_refresh_fallback_session"
+        self._build_password_login_session(session_id)
+        _FakePasswordLoginFallbackLive.reset_state()
+
+        fake_manager = SimpleNamespace(
+            cookies={},
+            add_cookie=mock.Mock(),
+            update_cookie=mock.Mock(),
+        )
+        fake_slider = _FakePasswordLoginSlider()
+
+        with mock.patch("utils.xianyu_slider_stealth.XianyuSliderStealth", return_value=fake_slider), \
+             mock.patch("utils.xianyu_slider_stealth.concurrency_manager.unregister_instance", return_value=True), \
+             mock.patch("XianyuAutoAsync.XianyuLive", _FakePasswordLoginFallbackLive), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_details", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_proxy_config", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_all_cookies", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "update_cookie_account_info", return_value=True) as update_cookie_mock, \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "dispatch_account_notifications_sync", return_value=False), \
+             mock.patch.object(reply_server, "render_notification_template", return_value="login ok"), \
+             mock.patch.object(reply_server, "_close_password_login_pending_verification_risk_logs"), \
+             mock.patch.object(reply_server, "_update_session_risk_log"), \
+             mock.patch.object(reply_server, "log_with_user"):
+            await reply_server._execute_password_login(
+                session_id=session_id,
+                account_id="test_user",
+                account="test_account",
+                password="test_password",
+                show_browser=False,
+                user_id=1,
+                current_user={"user_id": 1, "username": "admin"},
+            )
+            await self._wait_for_password_login_status(session_id, "success")
+
+        session = reply_server.password_login_sessions[session_id]
+        self.assertEqual(session["status"], "success")
+        self.assertEqual(_FakePasswordLoginFallbackLive.preflight_calls, 1)
+        self.assertEqual(_FakePasswordLoginFallbackLive.browser_refresh_calls, 1)
+        self.assertEqual(_FakePasswordLoginFallbackLive.reset_calls, 1)
+        fake_manager.add_cookie.assert_called_once()
+        saved_cookie_value = update_cookie_mock.call_args.kwargs["cookie_value"]
+        self.assertIn("_m_h5_tk=browser_refreshed_token_12345", saved_cookie_value)
+        self.assertIn("cookie2=browser_refreshed_cookie2", saved_cookie_value)
+
+
 if __name__ == "__main__":
     unittest.main()

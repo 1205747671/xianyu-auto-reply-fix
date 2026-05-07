@@ -11801,7 +11801,8 @@ async function checkManualCookieImportStatus() {
                     showPasswordLoginQRCode(
                         data.screenshot_path || data.verification_url,
                         data.screenshot_path,
-                        data.verification_type
+                        data.verification_type,
+                        data.message
                     );
                     break;
                 case 'success':
@@ -12104,7 +12105,8 @@ function startRefreshCookiePolling(sessionId, cookieId) {
                     showPasswordLoginQRCode(
                         data.screenshot_path || data.verification_url || data.qr_code_url,
                         data.screenshot_path,
-                        data.verification_type
+                        data.verification_type,
+                        data.message
                     );
                     break;
                 case 'success':
@@ -12265,7 +12267,8 @@ async function checkPasswordLoginStatus() {
                     showPasswordLoginQRCode(
                         data.screenshot_path || data.verification_url || data.qr_code_url,
                         data.screenshot_path,
-                        data.verification_type
+                        data.verification_type,
+                        data.message
                     );
                     // 继续监控（人脸认证后需要继续等待登录完成）
                     break;
@@ -12410,7 +12413,7 @@ function bindPasswordLoginQRModalEvents(modalElement) {
 }
 
 // 显示账号密码登录验证
-function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationType) {
+function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationType, statusMessage = '') {
     // 使用现有的二维码登录模态框
     let modal = document.getElementById('passwordLoginQRModal');
     if (!modal) {
@@ -12444,10 +12447,22 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationTy
     const linkButton = document.getElementById('passwordLoginVerificationLink');
     const statusText = document.getElementById('passwordLoginQRStatusText');
     const verificationTypeLabel = getPasswordLoginVerificationTypeLabel(verificationType);
+    const fallbackWaitingMessage = statusMessage || '验证已提交，正在等待服务端完成登录，请勿关闭当前窗口';
     
     if (screenshotPath) {
         // 显示截图
         if (screenshotImg) {
+            screenshotImg.onerror = function () {
+                this.onerror = null;
+                this.src = '';
+                this.style.display = 'none';
+                if (linkButton) {
+                    linkButton.style.display = 'none';
+                }
+                if (statusText && !passwordLoginPollingState.completed) {
+                    statusText.textContent = fallbackWaitingMessage;
+                }
+            };
             screenshotImg.src = `${normalizeStaticAssetPath(screenshotPath)}?t=${new Date().getTime()}`;
             screenshotImg.style.display = 'block';
             screenshotImg.alt = `${verificationTypeLabel}截图`;
@@ -12460,13 +12475,14 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationTy
         
         // 更新状态文本
         if (statusText) {
-            statusText.textContent = verificationTypeLabel === '二维码验证'
+            statusText.textContent = statusMessage || (verificationTypeLabel === '二维码验证'
                 ? '需要闲鱼二维码验证，请使用手机闲鱼APP扫描下方二维码完成验证'
-                : `需要闲鱼${verificationTypeLabel}，请根据下方验证信息在手机闲鱼APP中完成操作`;
+                : `需要闲鱼${verificationTypeLabel}，请根据下方验证信息在手机闲鱼APP中完成操作`);
         }
     } else if (verificationUrl) {
         // 隐藏截图
         if (screenshotImg) {
+            screenshotImg.src = '';
             screenshotImg.style.display = 'none';
         }
         
@@ -12478,18 +12494,20 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationTy
         
         // 更新状态文本
         if (statusText) {
-            statusText.textContent = `服务端已保持原始会话；如${verificationTypeLabel}入口暂未显示，可使用下方兜底入口`;
+            statusText.textContent = statusMessage || `服务端已保持原始会话；如${verificationTypeLabel}入口暂未显示，可使用下方兜底入口`;
         }
     } else {
         // 都没有，显示等待
         if (screenshotImg) {
+            screenshotImg.src = '';
             screenshotImg.style.display = 'none';
         }
         if (linkButton) {
+            linkButton.href = '#';
             linkButton.style.display = 'none';
         }
         if (statusText) {
-            statusText.textContent = `需要闲鱼${verificationTypeLabel}，请等待验证信息...`;
+            statusText.textContent = fallbackWaitingMessage;
         }
     }
 }
