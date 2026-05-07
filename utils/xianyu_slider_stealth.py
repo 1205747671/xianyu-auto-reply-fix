@@ -5566,9 +5566,57 @@ class XianyuSliderStealth:
             self._attempt_solve_slider_on_page(monitor_page)
             has_verification, refreshed_frame = self._detect_qr_code_verification(monitor_page)
 
+            hard_block = None
+            hard_block_target = None
+            hard_block_url = verification_url or ""
+            for candidate_target in (
+                getattr(refreshed_frame, '_original_frame', None) if refreshed_frame else None,
+                refreshed_frame,
+                monitor_page,
+            ):
+                if candidate_target is None:
+                    continue
+                if hard_block_target is not None and candidate_target is hard_block_target:
+                    continue
+                hard_block = self._detect_special_captcha_block(candidate_target)
+                if hard_block:
+                    hard_block_target = candidate_target
+                    hard_block_url = (
+                        hard_block.get("url")
+                        or getattr(refreshed_frame, 'verify_url', None)
+                        or getattr(refreshed_frame, 'url', None)
+                        or hard_block_url
+                    )
+                    break
+
+            if hard_block:
+                self.last_verification_feedback = {
+                    "status": "hard_block",
+                    "source": hard_block.get("kind") or "feedback_block",
+                    "message": hard_block.get("message") or "当前验证页不可继续处理",
+                    "url": hard_block_url or "",
+                    "title": hard_block.get("title") or "",
+                }
+                try:
+                    self._merge_runtime_feedback(hard_block_target or monitor_page)
+                except Exception:
+                    pass
+                self.last_login_error = self._get_slider_failure_message(
+                    hard_block.get("message") or "当前验证页不可继续处理"
+                )
+                logger.warning(
+                    f"【{self.pure_user_id}】验证等待期间命中不可恢复的处罚/反馈页，停止继续等待: "
+                    f"{self.last_login_error}"
+                )
+                return False, monitor_page
+
             login_success, success_page, success_cookies = self._probe_context_login_success(context, monitor_page)
             if login_success:
                 pending_identity_markers = self._detect_pending_identity_verification_cookie_state(success_cookies or {})
+                missing_required_fields = [
+                    key for key in self._REQUIRED_SESSION_COOKIE_FIELDS
+                    if not (success_cookies or {}).get(key)
+                ]
                 missing_protected_fields = [
                     key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
                     if not (success_cookies or {}).get(key)
@@ -5578,12 +5626,17 @@ class XianyuSliderStealth:
                         f"【{self.pure_user_id}】验证等待期间虽然检测到页面已登录，"
                         f"但待确认Cookie标记仍存在，继续等待后续验证完成: {pending_identity_markers}"
                     )
-                elif has_verification and missing_protected_fields:
+                elif has_verification and missing_required_fields:
                     logger.warning(
-                        f"【{self.pure_user_id}】验证等待期间验证页仍存在，且关键Cookie仍未齐全，"
-                        f"继续等待后续验证完成: {missing_protected_fields}"
+                        f"【{self.pure_user_id}】验证等待期间验证页仍存在，且核心Cookie仍未齐全，"
+                        f"继续等待后续验证完成: {missing_required_fields}"
                     )
                 else:
+                    if has_verification and missing_protected_fields:
+                        logger.info(
+                            f"【{self.pure_user_id}】验证页仍存在，但核心Cookie已齐全；"
+                            f"当前仅缺少观察/保护字段，按已登录处理: {missing_protected_fields}"
+                        )
                     return True, success_page or monitor_page
 
             if has_verification and refreshed_frame:
@@ -5842,6 +5895,43 @@ class XianyuSliderStealth:
                 timeout_message = self._build_timed_out_verification_message(verification_type)
                 logger.warning(f"【{self.pure_user_id}】{timeout_message}")
                 return self._fail_login(timeout_message)
+
+        hard_block = None
+        hard_block_target = None
+        for candidate_target in (
+            getattr(qr_frame, '_original_frame', None) if qr_frame else None,
+            qr_frame,
+            fallback_page,
+        ):
+            if candidate_target is None:
+                continue
+            if hard_block_target is not None and candidate_target is hard_block_target:
+                continue
+            hard_block = self._detect_special_captcha_block(candidate_target)
+            if hard_block:
+                hard_block_target = candidate_target
+                break
+
+        if hard_block:
+            self.last_verification_feedback = {
+                "status": "hard_block",
+                "source": hard_block.get("kind") or "feedback_block",
+                "message": hard_block.get("message") or "当前验证页不可继续处理",
+                "url": hard_block.get("url") or frame_url or "",
+                "title": hard_block.get("title") or "",
+            }
+            try:
+                self._merge_runtime_feedback(hard_block_target or fallback_page)
+            except Exception:
+                pass
+            self.last_login_error = self._get_slider_failure_message(
+                hard_block.get("message") or "当前验证页不可继续处理"
+            )
+            logger.warning(
+                f"【{self.pure_user_id}】进入验证等待前命中不可恢复的处罚/反馈页，停止继续处理: "
+                f"{self.last_login_error}"
+            )
+            return self._fail_login(self.last_login_error)
 
         logger.warning(f"【{self.pure_user_id}】⚠️ 检测到{type_name}")
         logger.info(f"【{self.pure_user_id}】请在浏览器中完成{type_name}")
@@ -7389,8 +7479,23 @@ class XianyuSliderStealth:
                 "抱歉，页面访问出现了问题",
                 "页面访问出现了问题",
                 "点我反馈",
+                "亲，访问被拒绝",
+                "亲,访问被拒绝",
+                "访问被拒绝",
+                "被挤爆啦",
+                "被挤爆",
             ]
             keyword_hit = any(keyword in page_text for keyword in hard_block_keywords)
+            access_denied_text_hit = any(
+                keyword in page_text
+                for keyword in (
+                    "亲，访问被拒绝",
+                    "亲,访问被拒绝",
+                    "访问被拒绝",
+                    "被挤爆啦",
+                    "被挤爆",
+                )
+            )
 
             has_qrcode = False
             has_feedback_link = False
@@ -7420,7 +7525,7 @@ class XianyuSliderStealth:
                 except Exception:
                     continue
 
-            if keyword_hit and (has_qrcode or has_feedback_link) and not has_slider_button:
+            if ((keyword_hit and (has_qrcode or has_feedback_link)) or access_denied_text_hit) and not has_slider_button:
                 return True
         except Exception:
             pass
@@ -7527,8 +7632,23 @@ class XianyuSliderStealth:
                 "抱歉，页面访问出现了问题",
                 "页面访问出现了问题",
                 "点我反馈",
+                "亲，访问被拒绝",
+                "亲,访问被拒绝",
+                "访问被拒绝",
+                "被挤爆啦",
+                "被挤爆",
             ]
             keyword_hit = any(keyword in page_text for keyword in hard_block_keywords)
+            access_denied_text_hit = any(
+                keyword in page_text
+                for keyword in (
+                    "亲，访问被拒绝",
+                    "亲,访问被拒绝",
+                    "访问被拒绝",
+                    "被挤爆啦",
+                    "被挤爆",
+                )
+            )
             has_qrcode = False
             has_feedback_link = False
             for selector in (
@@ -7547,7 +7667,7 @@ class XianyuSliderStealth:
                 except Exception:
                     continue
 
-            if keyword_hit and (has_qrcode or has_feedback_link) and not has_operable_slider:
+            if ((keyword_hit and (has_qrcode or has_feedback_link)) or access_denied_text_hit) and not has_operable_slider:
                 return {
                     'kind': 'feedback_block',
                     'url': current_url,
@@ -9523,11 +9643,17 @@ class XianyuSliderStealth:
                     return 'face_verify'
 
             # 5. 检查是否是二维码验证
-            qr_keywords = ['扫码', '二维码', '扫一扫', '手机淘宝', '手机扫码']
+            qr_keywords = ['扫码', '扫码登录', '二维码', '扫一扫', '扫描二维码', '手机扫码']
             for keyword in qr_keywords:
                 if keyword in detection_text:
                     logger.info(f"【{self.pure_user_id}】检测到验证类型: 二维码验证 (关键词: {keyword})")
                     return 'qr_verify'
+
+            if '手机淘宝' in detection_text and any(
+                token in detection_text for token in ('确认登录', '请确认', '重新扫码', '二维码已失效')
+            ):
+                logger.info(f"【{self.pure_user_id}】检测到验证类型: 二维码验证 (手机淘宝确认文案)")
+                return 'qr_verify'
 
             # 6. 检查 URL 特征
             frame_url = ""
@@ -10086,7 +10212,17 @@ class XianyuSliderStealth:
             "chromium has locked the profile",
             "user data directory is already in use",
         )
-        return any(marker in error_text for marker in lock_markers)
+        if any(marker in error_text for marker in lock_markers):
+            return True
+
+        # 某些 CloakBrowser / Playwright 组合在 profile 被占用时不会抛出明确锁文案，
+        # 只会留下 launch_persistent_context + TargetClosedError + exitCode=21。
+        return (
+            "launch_persistent_context" in error_text
+            and "target page, context or browser has been closed" in error_text
+            and "exitcode=21" in error_text
+            and "--user-data-dir=" in error_text
+        )
 
     def _get_current_hostname(self) -> str:
         try:
@@ -10302,9 +10438,13 @@ class XianyuSliderStealth:
             if force_clean_context:
                 logger.warning(f"【{self.pure_user_id}】刷新模式启用干净上下文，不复用历史浏览器会话")
             else:
-                user_data_dir = os.path.join(os.getcwd(), 'browser_data', f'user_{self.pure_user_id}')
-                os.makedirs(user_data_dir, exist_ok=True)
-                logger.info(f"【{self.pure_user_id}】使用用户数据目录: {user_data_dir}")
+                if self._should_use_account_persistent_profile():
+                    user_data_dir = self._resolve_account_persistent_profile_dir()
+                    logger.info(f"【{self.pure_user_id}】使用账号持久化画像目录: {user_data_dir}")
+                else:
+                    user_data_dir = os.path.join(os.getcwd(), 'browser_data', f'user_{self.pure_user_id}')
+                    os.makedirs(user_data_dir, exist_ok=True)
+                    logger.info(f"【{self.pure_user_id}】使用用户数据目录: {user_data_dir}")
             
             # 在启动Playwright之前，重新检查和设置浏览器路径
             # 确保使用正确的浏览器版本（避免版本不匹配问题）

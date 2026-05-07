@@ -27,7 +27,7 @@ from config import (
 import sys
 import aiohttp
 from collections import defaultdict, deque
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from db_manager import db_manager
 from utils.notification_dispatcher import (
     dispatch_account_notifications,
@@ -36,7 +36,10 @@ from utils.notification_dispatcher import (
     guess_verification_type,
     render_notification_template,
 )
-from utils.browser_provider import launch_browser_async
+from utils.browser_provider import (
+    launch_browser_async,
+    launch_browser_persistent_context_async,
+)
 
 
 DELIVERY_BATCH_MAX_UNITS = 10
@@ -1293,17 +1296,23 @@ class XianyuLive:
 
     def _calculate_retry_delay(self, error_msg: str) -> int:
         """根据错误类型和失败次数计算重试延迟"""
+        failure_count = max(
+            1,
+            int(getattr(self, "connection_failures", 0) or 0),
+            int(getattr(self, "init_auth_failures", 0) or 0),
+        )
+
         # WebSocket意外断开 - 短延迟
         if "no close frame received or sent" in error_msg:
-            return min(3 * self.connection_failures, 15)
+            return min(3 * failure_count, 15)
         
         # 网络连接问题 - 长延迟
         elif "Connection refused" in error_msg or "timeout" in error_msg.lower():
-            return min(10 * self.connection_failures, 60)
+            return min(10 * failure_count, 60)
         
         # 其他未知错误 - 中等延迟
         else:
-            return min(5 * self.connection_failures, 30)
+            return min(5 * failure_count, 30)
 
     def _cleanup_instance_caches(self):
         """清理实例级别的缓存，防止内存泄漏"""
@@ -6429,10 +6438,13 @@ class XianyuLive:
                     return cookies_str
                 else:
                     logger.error(f"【{self.cookie_id}】滑块验证失败")
+                    slider_error = getattr(slider_stealth, 'last_login_error', '') or "滑块验证失败，未获取到新Cookie"
+                    self.last_token_refresh_status = "captcha_verification_failed"
+                    self.last_token_refresh_error_message = slider_error
 
                     # 记录滑块验证失败到日志文件
                     log_captcha_event(self.cookie_id, "滑块验证失败", False,
-                        f"XianyuSliderStealth执行失败, 环境: {'Docker' if os.getenv('DOCKER_ENV') else '本地'}")
+                        f"{slider_error}, 环境: {'Docker' if os.getenv('DOCKER_ENV') else '本地'}")
 
                     # 发送通知（检查WebSocket连接状态）
                     # 只有在WebSocket未连接时才发送通知，已连接说明可能是暂时性问题
@@ -6469,6 +6481,8 @@ class XianyuLive:
 
             except Exception as stealth_e:
                 logger.error(f"【{self.cookie_id}】滑块验证异常: {self._safe_str(stealth_e)}")
+                self.last_token_refresh_status = "captcha_execution_error"
+                self.last_token_refresh_error_message = self._safe_str(stealth_e)
 
                 # 记录异常到日志文件
                 log_captcha_event(self.cookie_id, "滑块验证异常", False,
@@ -6835,6 +6849,7 @@ class XianyuLive:
             # 检查是否配置了用户名和密码
             if not username or not password:
                 logger.warning(f"【{self.cookie_id}】未配置用户名或密码，跳过密码登录刷新")
+                self.last_token_refresh_status = "no_credentials"
                 self.last_token_refresh_error_message = "未配置用户名或密码，无法自动刷新Cookie"
                 await self.send_token_refresh_notification(
                     f"检测到{trigger_reason}，但未配置用户名或密码，无法自动刷新Cookie",
@@ -6872,22 +6887,29 @@ class XianyuLive:
             
             # 在单独的线程中运行同步的登录方法
             import asyncio
+            reuse_account_persistent_profile = bool(self.get_qr_login_grace(self.cookie_id))
             slider = XianyuSliderStealth(
                 user_id=self.cookie_id,
                 enable_learning=True,
                 headless=not show_browser,
                 initial_cookies=self.cookies_str,
                 proxy=self.proxy_config,
+                use_account_persistent_profile=reuse_account_persistent_profile,
+                account_persistent_profile_dir=self._resolve_account_browser_profile_dir(),
             )
             slider.risk_session_id = risk_session_id
             slider.risk_trigger_scene = trigger_scene
+            if reuse_account_persistent_profile:
+                logger.warning(
+                    f"【{self.cookie_id}】扫码登录缓冲期内触发密码恢复，优先复用账号持久化画像，禁用干净上下文"
+                )
             result = await slider._run_sync_method_on_fresh_thread(
                 slider.login_with_password_browser,
                 account=username,
                 password=password,
                 show_browser=show_browser,
                 notification_callback=notification_callback_wrapper,
-                force_clean_context=True,
+                force_clean_context=not reuse_account_persistent_profile,
             )
             
             if result:
@@ -11809,17 +11831,8 @@ class XianyuLive:
             else:
                 logger.info(f"【{target_cookie_id}】复用上游传入的浏览器上下文获取真实Cookie，刷新时不主动关闭该上游会话")
 
-            # 设置扫码登录获取的Cookie
-            cookies = []
-            for cookie_pair in qr_cookies_str.split('; '):
-                if '=' in cookie_pair:
-                    name, value = cookie_pair.split('=', 1)
-                    cookies.append({
-                        'name': name.strip(),
-                        'value': value.strip(),
-                        'domain': '.goofish.com',
-                        'path': '/'
-                    })
+            # 设置扫码登录获取的 Cookie，关键票据同时补到 taobao 域，避免验证页跨域丢票。
+            cookies = self._build_browser_cookie_payload(qr_cookies_str)
 
             await context.add_cookies(cookies)
             logger.info(f"【{target_cookie_id}】已设置 {len(cookies)} 个扫码Cookie到浏览器")
@@ -12071,6 +12084,65 @@ class XianyuLive:
             except Exception as cleanup_e:
                 logger.warning(f"【{target_cookie_id}】清理浏览器资源时出错: {self._safe_str(cleanup_e)}")
 
+    def _build_browser_cookie_payload(self, cookies_str: str) -> List[Dict[str, str]]:
+        """把 Cookie 文本扩成浏览器可直接注入的跨域 payload。"""
+        cross_domain_cookie_names = {
+            't',
+            'tracknick',
+            'isg',
+            'unb',
+            'cookie2',
+            '_tb_token_',
+            'sgcookie',
+            'csg',
+            'tfstk',
+            '_m_h5_tk',
+            '_m_h5_tk_enc',
+            'havana_lgc2_77',
+            '_hvn_lgc_',
+            'havana_lgc_exp',
+            'mtop_partitioned_detect',
+            '_samesite_flag_',
+            'sdkSilent',
+            'cna',
+            'x5sec',
+            'x5secdata',
+            'XSRF-TOKEN',
+            'thw',
+            'cbc',
+            'cnaui',
+            'aui',
+            'sca',
+        }
+        cookies: List[Dict[str, str]] = []
+        seen = set()
+        for cookie_pair in str(cookies_str or '').replace('\ufeff', '').split(';'):
+            cookie_pair = cookie_pair.strip()
+            if '=' not in cookie_pair:
+                continue
+            name, value = cookie_pair.split('=', 1)
+            name = name.strip()
+            value = value.strip()
+            if not name:
+                continue
+
+            domains = ['.goofish.com']
+            if name in cross_domain_cookie_names:
+                domains.append('.taobao.com')
+
+            for domain in domains:
+                dedupe_key = (name, value, domain)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                cookies.append({
+                    'name': name,
+                    'value': value,
+                    'domain': domain,
+                    'path': '/',
+                })
+        return cookies
+
     def _build_browser_refresh_launch_args(self):
         """构建浏览器型 Cookie 刷新链路的统一启动参数。"""
         browser_args = [
@@ -12116,6 +12188,19 @@ class XianyuLive:
         """让 CloakBrowser 自己接管身份，刷新链路不再额外覆盖 UA/viewport。"""
         return {}
 
+    def _resolve_account_browser_profile_dir(self, profile_key: Optional[str] = None) -> str:
+        """解析账号级浏览器画像目录，尽量让扫码验证与后续恢复复用同一画像。"""
+        resolved_key = str(
+            profile_key
+            or self.cookie_id
+            or trans_cookies(self.cookies_str or "").get('unb')
+            or 'default'
+        ).strip()
+        safe_key = re.sub(r"[^0-9A-Za-z_.-]+", "_", resolved_key)
+        profile_dir = os.path.join(os.getcwd(), 'browser_data', f'user_{safe_key}')
+        os.makedirs(profile_dir, exist_ok=True)
+        return profile_dir
+
     async def _refresh_cookies_via_browser_page(self, current_cookies_str: str, restart_on_success: bool = True):
         """使用当前cookie访问指定页面获取真实cookie并更新
         
@@ -12143,30 +12228,43 @@ class XianyuLive:
             logger.info(f"【{self.cookie_id}】当前cookie字段数: {len(current_cookies_dict)}")
 
             browser_args = self._build_browser_refresh_launch_args()
+            context_options = dict(self._build_browser_refresh_context_options())
+            qr_login_grace = self.get_qr_login_grace(self.cookie_id)
+            reuse_persistent_profile = bool(qr_login_grace)
 
-            # 使用无头浏览器
-            # 创建浏览器上下文
-            browser = await _launch_browser_safe(
-                self.cookie_id,
-                headless=True,
-                args=browser_args,
-            )
-            if not browser:
-                return False
+            if reuse_persistent_profile:
+                profile_dir = self._resolve_account_browser_profile_dir()
+                persistent_context_options = dict(context_options)
+                persistent_context_options.setdefault('accept_downloads', True)
+                persistent_context_options.setdefault('ignore_https_errors', True)
+                try:
+                    context = await launch_browser_persistent_context_async(
+                        user_data_dir=profile_dir,
+                        headless=True,
+                        args=browser_args,
+                        **persistent_context_options,
+                    )
+                    browser = getattr(context, 'browser', None)
+                    logger.info(f"【{self.cookie_id}】扫码登录缓冲期浏览器稳定化复用账号持久化画像: {profile_dir}")
+                except Exception as persistent_launch_error:
+                    logger.warning(
+                        f"【{self.cookie_id}】扫码登录缓冲期持久化画像启动失败，降级到临时上下文稳定化: "
+                        f"{self._safe_str(persistent_launch_error)}"
+                    )
 
-            context = await browser.new_context(**self._build_browser_refresh_context_options())
+            if context is None:
+                browser = await _launch_browser_safe(
+                    self.cookie_id,
+                    headless=True,
+                    args=browser_args,
+                )
+                if not browser:
+                    return False
 
-            # 设置当前的Cookie
-            cookies = []
-            for cookie_pair in current_cookies_str.split('; '):
-                if '=' in cookie_pair:
-                    name, value = cookie_pair.split('=', 1)
-                    cookies.append({
-                        'name': name.strip(),
-                        'value': value.strip(),
-                        'domain': '.goofish.com',
-                        'path': '/'
-                    })
+                context = await browser.new_context(**context_options)
+
+            # 设置当前 Cookie，补齐 taobao 域票据，避免浏览器侧验证链路缺关键票。
+            cookies = self._build_browser_cookie_payload(current_cookies_str)
 
             await context.add_cookies(cookies)
             logger.info(f"【{self.cookie_id}】已设置 {len(cookies)} 个当前Cookie到浏览器")
@@ -12378,17 +12476,8 @@ class XianyuLive:
 
             context = await browser.new_context(**self._build_browser_refresh_context_options())
 
-            # 设置当前Cookie
-            cookies = []
-            for cookie_pair in self.cookies_str.split('; '):
-                if '=' in cookie_pair:
-                    name, value = cookie_pair.split('=', 1)
-                    cookies.append({
-                        'name': name.strip(),
-                        'value': value.strip(),
-                        'domain': '.goofish.com',
-                        'path': '/'
-                    })
+            # 设置当前 Cookie，补齐 taobao 域票据，避免浏览器恢复链路跨域丢票。
+            cookies = self._build_browser_cookie_payload(self.cookies_str)
 
             await context.add_cookies(cookies)
             logger.info(f"【{self.cookie_id}】已设置 {len(cookies)} 个Cookie到浏览器")

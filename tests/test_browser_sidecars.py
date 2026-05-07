@@ -1,6 +1,42 @@
+import os
+import sys
+import types
 import typing
 import unittest
 from unittest import mock
+
+if "loguru" not in sys.modules:
+    loguru_stub = types.ModuleType("loguru")
+    loguru_stub.logger = mock.Mock()
+    sys.modules["loguru"] = loguru_stub
+
+if "cloakbrowser" not in sys.modules:
+    cloakbrowser_stub = types.ModuleType("cloakbrowser")
+
+    def _not_used(*args, **kwargs):
+        raise AssertionError("cloakbrowser stub should be patched in tests")
+
+    cloakbrowser_stub.launch = _not_used
+    cloakbrowser_stub.launch_async = _not_used
+    cloakbrowser_stub.launch_context = _not_used
+    cloakbrowser_stub.launch_context_async = _not_used
+    cloakbrowser_stub.launch_persistent_context = _not_used
+    cloakbrowser_stub.launch_persistent_context_async = _not_used
+    sys.modules["cloakbrowser"] = cloakbrowser_stub
+
+if "qrcode" not in sys.modules:
+    qrcode_stub = types.ModuleType("qrcode")
+    qrcode_stub.QRCode = object
+    qrcode_constants_stub = types.ModuleType("qrcode.constants")
+    qrcode_constants_stub.ERROR_CORRECT_L = 1
+    qrcode_stub.constants = qrcode_constants_stub
+    sys.modules["qrcode"] = qrcode_stub
+    sys.modules["qrcode.constants"] = qrcode_constants_stub
+
+if "utils.image_utils" not in sys.modules:
+    image_utils_stub = types.ModuleType("utils.image_utils")
+    image_utils_stub.image_manager = mock.Mock()
+    sys.modules["utils.image_utils"] = image_utils_stub
 
 import utils.captcha_remote_control as captcha_remote_control
 import utils.item_search as item_search
@@ -99,6 +135,19 @@ class BrowserSidecarsProviderMigrationTest(unittest.IsolatedAsyncioTestCase):
         session = qr_login.QRLoginSession("session-1")
         session.verification_url = "https://passport.goofish.com/iv/test"
         session.status = "verification_required"
+        session.cookies = {
+            "unb": "unb-value",
+            "cookie2": "cookie2-value",
+            "foo": "bar",
+        }
+        session.unb = "unb-value"
+        session.proxy_config = {
+            "proxy_type": "http",
+            "proxy_host": "127.0.0.1",
+            "proxy_port": 1081,
+            "proxy_user": "",
+            "proxy_pass": "",
+        }
         manager.sessions[session.session_id] = session
 
         fake_page = mock.Mock()
@@ -112,10 +161,7 @@ class BrowserSidecarsProviderMigrationTest(unittest.IsolatedAsyncioTestCase):
         fake_context.add_cookies = mock.AsyncMock()
         fake_context.new_page = mock.AsyncMock(return_value=fake_page)
         fake_context.close = mock.AsyncMock()
-
-        fake_browser = mock.Mock()
-        fake_browser.new_context = mock.AsyncMock(return_value=fake_context)
-        fake_browser.close = mock.AsyncMock()
+        fake_context.browser = object()
 
         async def bind_session_handles(current_session, page, context, managed_runtime=None):
             current_session.status = "success"
@@ -126,10 +172,15 @@ class BrowserSidecarsProviderMigrationTest(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.object(
             qr_login,
-            "launch_browser_async",
-            new=mock.AsyncMock(return_value=fake_browser),
+            "launch_browser_persistent_context_async",
+            new=mock.AsyncMock(return_value=fake_context),
             create=True,
-        ) as launch_browser_async, \
+        ) as launch_browser_persistent_context_async, \
+             mock.patch.object(
+                 manager,
+                 "_should_show_verification_browser",
+                 return_value=False,
+             ), \
              mock.patch.object(
                  manager,
                  "_probe_browser_login_success",
@@ -138,18 +189,47 @@ class BrowserSidecarsProviderMigrationTest(unittest.IsolatedAsyncioTestCase):
              mock.patch("utils.qr_login.image_manager.save_image", return_value="saved.png"):
             await manager._launch_verification_page(session.session_id)
 
-        launch_browser_async.assert_awaited_once()
-        fake_browser.new_context.assert_awaited_once_with(ignore_https_errors=True)
+        launch_browser_persistent_context_async.assert_awaited_once()
+        launch_kwargs = launch_browser_persistent_context_async.await_args.kwargs
+        self.assertEqual(
+            launch_kwargs["user_data_dir"],
+            os.path.join(os.getcwd(), "browser_data", "user_unb-value"),
+        )
+        self.assertTrue(launch_kwargs["headless"])
+        self.assertEqual(
+            launch_kwargs["proxy"],
+            {"server": "http://127.0.0.1:1081"},
+        )
+        self.assertEqual(launch_kwargs["locale"], "zh-CN")
+        self.assertEqual(launch_kwargs["timezone"], "Asia/Shanghai")
+        self.assertEqual(launch_kwargs["color_scheme"], "light")
+        self.assertTrue(launch_kwargs["accept_downloads"])
+        self.assertTrue(launch_kwargs["ignore_https_errors"])
+        self.assertEqual(launch_kwargs["viewport"], {"width": 1600, "height": 900})
+        injected_cookie_keys = {
+            (cookie["name"], cookie["domain"]): cookie["value"]
+            for cookie in fake_context.add_cookies.await_args.args[0]
+        }
+        self.assertEqual(injected_cookie_keys[("unb", ".goofish.com")], "unb-value")
+        self.assertEqual(injected_cookie_keys[("unb", ".taobao.com")], "unb-value")
+        self.assertEqual(injected_cookie_keys[("cookie2", ".goofish.com")], "cookie2-value")
+        self.assertEqual(injected_cookie_keys[("cookie2", ".taobao.com")], "cookie2-value")
+        self.assertEqual(injected_cookie_keys[("foo", ".goofish.com")], "bar")
+        self.assertNotIn(("foo", ".taobao.com"), injected_cookie_keys)
         fake_context.new_page.assert_awaited_once_with()
         fake_page.close.assert_not_awaited()
         fake_context.close.assert_not_awaited()
-        fake_browser.close.assert_not_awaited()
 
     async def test_qr_login_verification_page_closes_verification_tab_but_keeps_reused_session_handles(self):
         manager = qr_login.QRLoginManager()
         session = qr_login.QRLoginSession("session-1b")
         session.verification_url = "https://passport.goofish.com/iv/test"
         session.status = "verification_required"
+        session.cookies = {
+            "unb": "unb-value",
+            "cookie2": "cookie2-value",
+        }
+        session.unb = "unb-value"
         manager.sessions[session.session_id] = session
 
         verification_page = mock.Mock()
@@ -168,10 +248,7 @@ class BrowserSidecarsProviderMigrationTest(unittest.IsolatedAsyncioTestCase):
         fake_context.new_page = mock.AsyncMock(return_value=verification_page)
         fake_context.close = mock.AsyncMock()
         fake_context.pages = [verification_page, existing_page]
-
-        fake_browser = mock.Mock()
-        fake_browser.new_context = mock.AsyncMock(return_value=fake_context)
-        fake_browser.close = mock.AsyncMock()
+        fake_context.browser = object()
 
         async def bind_existing_page(current_session, page, context, managed_runtime=None):
             current_session.status = "success"
@@ -182,10 +259,15 @@ class BrowserSidecarsProviderMigrationTest(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.object(
             qr_login,
-            "launch_browser_async",
-            new=mock.AsyncMock(return_value=fake_browser),
+            "launch_browser_persistent_context_async",
+            new=mock.AsyncMock(return_value=fake_context),
             create=True,
         ), \
+             mock.patch.object(
+                 manager,
+                 "_should_show_verification_browser",
+                 return_value=False,
+             ), \
              mock.patch.object(
                  manager,
                  "_probe_browser_login_success",
@@ -196,8 +278,65 @@ class BrowserSidecarsProviderMigrationTest(unittest.IsolatedAsyncioTestCase):
 
         verification_page.close.assert_awaited_once_with()
         fake_context.close.assert_not_awaited()
-        fake_browser.close.assert_not_awaited()
         existing_page.close.assert_not_awaited()
+
+    def test_qr_login_build_cross_domain_browser_cookies_includes_taobao_for_key_tickets(self):
+        manager = qr_login.QRLoginManager()
+
+        cookies = manager._build_cross_domain_browser_cookies(
+            "https://passport.goofish.com/iv/test",
+            {
+                "unb": "unb-value",
+                "cookie2": "cookie2-value",
+                "foo": "bar",
+            },
+        )
+
+        cookie_keys = {
+            (cookie["name"], cookie["domain"]): cookie["value"]
+            for cookie in cookies
+        }
+
+        self.assertEqual(cookie_keys[("unb", ".goofish.com")], "unb-value")
+        self.assertEqual(cookie_keys[("unb", ".taobao.com")], "unb-value")
+        self.assertEqual(cookie_keys[("cookie2", ".goofish.com")], "cookie2-value")
+        self.assertEqual(cookie_keys[("cookie2", ".taobao.com")], "cookie2-value")
+        self.assertEqual(cookie_keys[("foo", ".goofish.com")], "bar")
+        self.assertNotIn(("foo", ".taobao.com"), cookie_keys)
+
+    def test_qr_login_verification_profile_dir_prefers_existing_account_profile(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession("session-existing")
+        session.unb = "unb-value"
+        session.proxy_account_id = "2095002164"
+
+        profile_dir = manager._resolve_verification_profile_dir(session)
+
+        self.assertEqual(
+            profile_dir,
+            os.path.join(os.getcwd(), "browser_data", "user_2095002164"),
+        )
+
+    def test_qr_login_build_browser_cookies_delegates_to_cross_domain_payload(self):
+        manager = qr_login.QRLoginManager()
+
+        cookies = manager._build_browser_cookies(
+            "https://passport.goofish.com/iv/test",
+            {
+                "unb": "unb-value",
+                "foo": "bar",
+            },
+        )
+
+        cookie_keys = {
+            (cookie["name"], cookie["domain"]): cookie["value"]
+            for cookie in cookies
+        }
+
+        self.assertEqual(cookie_keys[("unb", ".goofish.com")], "unb-value")
+        self.assertEqual(cookie_keys[("unb", ".taobao.com")], "unb-value")
+        self.assertEqual(cookie_keys[("foo", ".goofish.com")], "bar")
+        self.assertNotIn(("foo", ".taobao.com"), cookie_keys)
 
     async def test_qr_login_probe_browser_login_success_binds_managed_handles(self):
         manager = qr_login.QRLoginManager()

@@ -172,6 +172,43 @@ class _DetachedPunishFrame:
         raise Exception("Frame was detached")
 
 
+class _AccessDeniedPage(_FakePage):
+    def __init__(self):
+        super().__init__(
+            title="淘宝网 - 淘！我喜欢",
+            url="https://www.taobao.com/",
+        )
+
+    def inner_text(self, selector, timeout=None):
+        if selector != "body":
+            raise AssertionError(f"unexpected selector: {selector}")
+        return "亲，访问被拒绝\n点我反馈 >"
+
+    def content(self):
+        return self.inner_text("body")
+
+
+class _GenericTaobaoHomepagePage(_FakePage):
+    def __init__(self):
+        super().__init__(
+            title="淘宝网 - 淘！我喜欢",
+            url="https://www.taobao.com/",
+        )
+
+    def inner_text(self, selector, timeout=None):
+        if selector != "body":
+            raise AssertionError(f"unexpected selector: {selector}")
+        return "手机淘宝 电脑/办公/文具 工业品 家具 家装 食品 立即登录"
+
+    def content(self):
+        return self.inner_text("body")
+
+    def query_selector_all(self, selector):
+        if selector == "iframe":
+            return []
+        return []
+
+
 class SliderVerificationGuardsTest(unittest.TestCase):
     def _make_slider(self, page):
         slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
@@ -312,7 +349,6 @@ class SliderVerificationGuardsTest(unittest.TestCase):
             "sgcookie": "s",
             "cookie2": "c2",
             "_m_h5_tk": "tk",
-            "_m_h5_tk_enc": "tk_enc",
             "t": "t_cookie",
         }
         slider = self._make_slider(page)
@@ -335,6 +371,145 @@ class SliderVerificationGuardsTest(unittest.TestCase):
 
         self.assertFalse(login_success)
         self.assertIs(success_page, page)
+
+    @mock.patch("utils.xianyu_slider_stealth.time.sleep", return_value=None)
+    def test_wait_for_context_login_accepts_logged_in_context_when_only_optional_protected_cookies_missing(self, _mock_sleep):
+        page = _FakePage(title="扫码验证", url="https://www.taobao.com/")
+        verify_frame = _FakeVerificationFrame(
+            verification_type="face_verify",
+            verify_url="https://passport.goofish.com/iv/test",
+        )
+        success_cookies = {
+            "unb": "u",
+            "sgcookie": "s",
+            "cookie2": "c2",
+            "_m_h5_tk": "tk",
+            "_m_h5_tk_enc": "tk_enc",
+            "t": "t_cookie",
+            "_tb_token_": "tb_token",
+        }
+        slider = self._make_slider(page)
+        slider._select_monitor_page = lambda _context, fallback_page=None: fallback_page or page
+        slider._attempt_solve_slider_on_page = lambda _page: False
+        slider._probe_context_login_success = lambda _context, _page: (True, page, dict(success_cookies))
+        slider._detect_pending_identity_verification_cookie_state = lambda _cookies: []
+        slider._detect_qr_code_verification = lambda _page: (True, verify_frame)
+        slider._verification_target_is_timed_out = lambda _frame, fallback_page=None: False
+        slider._notify_verification_required = lambda *_args, **_kwargs: None
+
+        login_success, success_page = slider._wait_for_context_login(
+            context=object(),
+            fallback_page=page,
+            max_wait_time=1,
+            check_interval=1,
+            verification_type="face_verify",
+            verification_url=verify_frame.verify_url,
+        )
+
+        self.assertTrue(login_success)
+        self.assertIs(success_page, page)
+
+    @mock.patch("utils.xianyu_slider_stealth.time.sleep", return_value=None)
+    def test_wait_for_context_login_fails_fast_on_feedback_block_page(self, _mock_sleep):
+        page = _FakePage(title="淘宝", url="https://www.taobao.com/")
+        verify_frame = _FakeVerificationFrame(
+            verification_type="qr_verify",
+            verify_url="https://www.taobao.com/",
+        )
+        success_cookies = {
+            "unb": "u",
+            "sgcookie": "s",
+            "cookie2": "c2",
+            "_m_h5_tk": "tk",
+            "_m_h5_tk_enc": "tk_enc",
+            "t": "t_cookie",
+        }
+        slider = self._make_slider(page)
+        slider.last_login_error = ""
+        slider._select_monitor_page = lambda _context, fallback_page=None: fallback_page or page
+        slider._attempt_solve_slider_on_page = lambda _page: False
+        slider._probe_context_login_success = lambda _context, _page: (True, page, dict(success_cookies))
+        slider._detect_pending_identity_verification_cookie_state = lambda _cookies: []
+        slider._detect_qr_code_verification = lambda _page: (True, verify_frame)
+        slider._verification_target_is_timed_out = lambda _frame, fallback_page=None: False
+        slider._notify_verification_required = lambda *_args, **_kwargs: None
+        slider._merge_runtime_feedback = lambda *_args, **_kwargs: None
+        slider._detect_special_captcha_block = lambda _page=None: {
+            "kind": "feedback_block",
+            "message": "当前命中反馈二维码/处罚页，不存在可操作滑块",
+            "url": page.url,
+            "title": page.title(),
+        }
+
+        login_success, success_page = slider._wait_for_context_login(
+            context=object(),
+            fallback_page=page,
+            max_wait_time=10,
+            check_interval=1,
+            verification_type="qr_verify",
+            verification_url=verify_frame.verify_url,
+        )
+
+        self.assertFalse(login_success)
+        self.assertIs(success_page, page)
+        self.assertEqual(slider.last_login_error, "当前命中反馈二维码/处罚页，不存在可操作滑块")
+        self.assertEqual(slider.last_verification_feedback.get("status"), "hard_block")
+        self.assertEqual(slider.last_verification_feedback.get("source"), "feedback_block")
+
+    @mock.patch("utils.xianyu_slider_stealth.time.sleep", return_value=None)
+    def test_wait_for_context_login_fast_fails_on_access_denied_page_without_active_verification_frame(self, _mock_sleep):
+        page = _AccessDeniedPage()
+        slider = self._make_slider(page)
+        slider.last_login_error = ""
+        slider._select_monitor_page = lambda _context, fallback_page=None: fallback_page or page
+        slider._attempt_solve_slider_on_page = lambda _page: False
+        slider._probe_context_login_success = lambda _context, _page: (False, page, {})
+        slider._detect_qr_code_verification = lambda _page: (False, None)
+        slider._merge_runtime_feedback = lambda *_args, **_kwargs: None
+
+        login_success, success_page = slider._wait_for_context_login(
+            context=object(),
+            fallback_page=page,
+            max_wait_time=30,
+            check_interval=10,
+            verification_type="qr_verify",
+            verification_url=page.url,
+        )
+
+        self.assertFalse(login_success)
+        self.assertIs(success_page, page)
+        self.assertEqual(slider.last_verification_feedback.get("status"), "hard_block")
+        self.assertEqual(slider.last_verification_feedback.get("source"), "feedback_block")
+        self.assertIn("反馈二维码/处罚页", slider.last_login_error)
+
+    def test_detect_special_captcha_block_recognizes_access_denied_copy_without_dom_selectors(self):
+        page = _AccessDeniedPage()
+        slider = self._make_slider(page)
+
+        result = slider._detect_special_captcha_block(page)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("kind"), "feedback_block")
+        self.assertIn("反馈二维码/处罚页", result.get("message", ""))
+
+    def test_detect_verification_type_ignores_generic_taobao_homepage_copy(self):
+        page = _GenericTaobaoHomepagePage()
+        slider = self._make_slider(page)
+
+        result = slider._detect_verification_type(page)
+
+        self.assertEqual(result, "unknown")
+
+    def test_detect_qr_code_verification_ignores_generic_taobao_homepage(self):
+        page = _GenericTaobaoHomepagePage()
+        slider = self._make_slider(page)
+        slider._capture_verification_screenshot = mock.Mock(return_value="unexpected.jpg")
+
+        has_verification, verification_target = slider._detect_qr_code_verification(page)
+
+        self.assertFalse(has_verification)
+        self.assertIsNone(verification_target)
+        slider._capture_verification_screenshot.assert_not_called()
 
     @mock.patch("utils.xianyu_slider_stealth.time.sleep", return_value=None)
     def test_capture_verification_screenshot_replaces_old_file_and_reuses_last_on_timeout(self, _mock_sleep):
@@ -1106,6 +1281,17 @@ class SliderVerificationGuardsTest(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertEqual(slider.last_verification_feedback, {})
+
+    def test_is_profile_in_use_launch_error_accepts_target_closed_exit_code_21_signature(self):
+        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
+        error = RuntimeError(
+            "BrowserType.launch_persistent_context: Target page, context or browser has been closed\n"
+            "Call log:\n"
+            "  - <launching> chrome.exe --user-data-dir=C:\\\\tmp\\\\user_2095002164 --remote-debugging-pipe about:blank\n"
+            "  - [pid=12345] <process did exit: exitCode=21, signal=null>\n"
+        )
+
+        self.assertTrue(slider._is_profile_in_use_launch_error(error))
 
     @mock.patch("utils.xianyu_slider_stealth.time.sleep", return_value=None)
     def test_wait_for_context_login_fast_fails_when_browser_session_is_closed(self, _mock_sleep):

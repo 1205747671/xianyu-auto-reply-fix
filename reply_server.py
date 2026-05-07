@@ -72,6 +72,7 @@ security = HTTPBearer(auto_error=False)
 # 扫码登录检查锁 - 防止并发处理同一个session
 qr_check_locks = defaultdict(lambda: asyncio.Lock())
 qr_check_processed = {}  # 记录已处理的session: {session_id: {'processed': bool, 'timestamp': float}}
+QR_LOGIN_TOKEN_PREWARM_TIMEOUT_SECONDS = float(os.getenv("QR_LOGIN_TOKEN_PREWARM_TIMEOUT_SECONDS", "30"))
 
 # ========================= 防暴力破解配置 =========================
 # IP 登录失败记录: {ip: {'attempts': int, 'first_attempt': float, 'last_attempt': float, 'blocked_until': float}}
@@ -2847,6 +2848,26 @@ async def _run_live_instance_on_manager_loop(
         raise HTTPException(status_code=504, detail="账号处理超时，请稍后重试")
 
 
+def _get_cookie_manager_runtime_issue() -> Optional[str]:
+    """返回 CookieManager 当前不可用的原因；可用时返回 None。"""
+    manager = getattr(cookie_manager, 'manager', None)
+    if manager is None:
+        return "task_manager_uninitialized"
+
+    target_loop = getattr(manager, 'loop', None)
+    if not target_loop:
+        return "task_manager_loop_missing"
+
+    if hasattr(target_loop, 'is_closed') and target_loop.is_closed():
+        return "task_manager_loop_closed"
+
+    is_running = getattr(target_loop, 'is_running', None)
+    if callable(is_running) and not is_running():
+        return "task_manager_loop_not_running"
+
+    return None
+
+
 
 
 
@@ -4979,7 +5000,7 @@ async def generate_qr_code(current_user: Dict[str, Any] = Depends(get_current_us
     try:
         log_with_user('info', "请求生成扫码登录二维码", current_user)
 
-        result = await qr_login_manager.generate_qr_code()
+        result = await qr_login_manager.generate_qr_code(user_id=current_user.get('user_id'))
 
         if result['success']:
             log_with_user('info', f"扫码登录二维码生成成功: {result['session_id']}", current_user)
@@ -5134,6 +5155,15 @@ async def process_qr_login_cookies(
     def _build_qr_login_chain_error(message: str) -> RuntimeError:
         return RuntimeError(f"扫码登录未完成：{message}")
 
+    def _build_task_restart_warning(issue_code: Optional[str]) -> str:
+        issue_map = {
+            "task_manager_uninitialized": "真实Cookie已获取，但任务管理器未初始化，未启动账号任务",
+            "task_manager_loop_missing": "真实Cookie已获取，但账号事件循环未就绪，未启动账号任务",
+            "task_manager_loop_closed": "真实Cookie已获取，但账号事件循环已关闭，未启动账号任务",
+            "task_manager_loop_not_running": "真实Cookie已获取，但账号事件循环未运行，未启动账号任务",
+        }
+        return issue_map.get(issue_code or "", "真实Cookie已获取，但账号任务接管状态未知，未启动账号任务")
+
     try:
         user_id = current_user['user_id']
 
@@ -5233,10 +5263,17 @@ async def process_qr_login_cookies(
                     task_restarted = False
                     warning_message = None
                     final_cookies = temp_instance.cookies_str or real_cookies
+                    token_prewarm_timeout = max(
+                        0.1,
+                        float(QR_LOGIN_TOKEN_PREWARM_TIMEOUT_SECONDS or 0),
+                    )
 
                     try:
                         log_with_user('info', f"开始预热扫码登录Token: {account_id}", current_user)
-                        prewarmed_token = await temp_instance.refresh_token()
+                        prewarmed_token = await asyncio.wait_for(
+                            temp_instance.refresh_token(),
+                            timeout=token_prewarm_timeout,
+                        )
                         final_cookies = temp_instance.cookies_str or real_cookies
 
                         if prewarmed_token:
@@ -5247,27 +5284,36 @@ async def process_qr_login_cookies(
                         else:
                             warning_message = "真实Cookie已获取，但首次Token初始化未完成，将在账号任务启动后继续重试"
                             log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+                    except asyncio.TimeoutError:
+                        final_cookies = temp_instance.cookies_str or real_cookies
+                        warning_message = (
+                            f"真实Cookie已获取，但首次Token初始化超时（{token_prewarm_timeout:g}秒），"
+                            "将在账号任务启动后继续重试"
+                        )
+                        log_with_user('warning', f"{warning_message}: {account_id}", current_user)
                     except Exception as token_e:
                         final_cookies = temp_instance.cookies_str or real_cookies
                         warning_message = f"真实Cookie已获取，但首次Token初始化异常，将在账号任务启动后继续重试: {str(token_e)}"
                         log_with_user('warning', f"{warning_message}: {account_id}", current_user)
 
                     try:
-                        if cookie_manager.manager:
+                        manager_runtime_issue = _get_cookie_manager_runtime_issue()
+                        if manager_runtime_issue:
+                            warning_message = _build_task_restart_warning(manager_runtime_issue)
+                            log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+                        else:
+                            manager = cookie_manager.manager
                             if is_new_account:
-                                cookie_manager.manager.add_cookie(account_id, final_cookies, user_id=user_id)
+                                manager.add_cookie(account_id, final_cookies, user_id=user_id)
                                 log_with_user('info', f"已将真实cookie添加到cookie_manager: {account_id}", current_user)
                             else:
                                 # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
-                                cookie_manager.manager.update_cookie(account_id, final_cookies, save_to_db=False)
+                                manager.update_cookie(account_id, final_cookies, save_to_db=False)
                                 log_with_user('info', f"已更新cookie_manager中的真实cookie: {account_id}", current_user)
                             task_restarted = True
                             if not token_prewarmed:
                                 warning_message = warning_message or "真实Cookie已获取，账号任务已切换；首次Token将在后台继续初始化"
                                 log_with_user('warning', f"{warning_message}: {account_id}", current_user)
-                        else:
-                            warning_message = "真实Cookie已获取，但任务管理器未初始化，未启动账号任务"
-                            log_with_user('warning', f"{warning_message}: {account_id}", current_user)
                     except Exception as task_switch_e:
                         if token_prewarmed:
                             XianyuLive.clear_qr_prewarmed_token(account_id)
@@ -5280,7 +5326,7 @@ async def process_qr_login_cookies(
                             XianyuLive.clear_qr_prewarmed_token(account_id)
                         XianyuLive.clear_qr_login_grace(account_id)
                         if not warning_message:
-                            warning_message = "真实Cookie已获取，但任务管理器未初始化，未启动账号任务"
+                            warning_message = _build_task_restart_warning(_get_cookie_manager_runtime_issue())
                             log_with_user('warning', f"{warning_message}: {account_id}", current_user)
                         if is_new_account:
                             db_manager.delete_cookie(account_id)

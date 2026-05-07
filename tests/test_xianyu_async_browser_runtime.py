@@ -25,7 +25,21 @@ if "aiohttp" not in sys.modules:
             self.args = args
             self.kwargs = kwargs
 
+    class _ClientSession:
+        pass
+
+    class _TCPConnector:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    class _ClientError(Exception):
+        pass
+
     aiohttp_stub.ClientTimeout = _ClientTimeout
+    aiohttp_stub.ClientSession = _ClientSession
+    aiohttp_stub.TCPConnector = _TCPConnector
+    aiohttp_stub.ClientError = _ClientError
     sys.modules["aiohttp"] = aiohttp_stub
 
 if "blackboxprotobuf" not in sys.modules:
@@ -45,11 +59,15 @@ if "db_manager" not in sys.modules:
 
 if "utils.notification_dispatcher" not in sys.modules:
     notification_stub = types.ModuleType("utils.notification_dispatcher")
+    notification_stub.SUPPORTED_NOTIFICATION_TEMPLATE_TYPES = ()
+    notification_stub.build_face_verify_notification = lambda *args, **kwargs: ""
     notification_stub.dispatch_account_notifications = lambda *args, **kwargs: None
+    notification_stub.dispatch_account_notifications_sync = lambda *args, **kwargs: None
     notification_stub.format_notification_template = lambda *args, **kwargs: ""
     notification_stub.get_notification_template_text = lambda *args, **kwargs: ""
     notification_stub.guess_verification_type = lambda *args, **kwargs: None
     notification_stub.render_notification_template = lambda *args, **kwargs: ""
+    notification_stub.resolve_verification_type_label = lambda *args, **kwargs: ""
     sys.modules["utils.notification_dispatcher"] = notification_stub
 
 if "utils.browser_provider" not in sys.modules:
@@ -58,7 +76,23 @@ if "utils.browser_provider" not in sys.modules:
     async def _launch_browser_async(*args, **kwargs):
         raise AssertionError("launch_browser_async should be patched in tests")
 
+    async def _launch_browser_persistent_context_async(*args, **kwargs):
+        raise AssertionError("launch_browser_persistent_context_async should be patched in tests")
+
+    def _launch_browser(*args, **kwargs):
+        raise AssertionError("launch_browser should be patched in tests")
+
+    def _launch_browser_persistent_context(*args, **kwargs):
+        raise AssertionError("launch_browser_persistent_context should be patched in tests")
+
+    browser_provider_stub.BrowserLike = object
+    browser_provider_stub.BrowserContextLike = object
+    browser_provider_stub.PageLike = object
+    browser_provider_stub.build_download_proxy_env = lambda proxy_url, base_env=None: dict(base_env or {})
+    browser_provider_stub.launch_browser = _launch_browser
     browser_provider_stub.launch_browser_async = _launch_browser_async
+    browser_provider_stub.launch_browser_persistent_context = _launch_browser_persistent_context
+    browser_provider_stub.launch_browser_persistent_context_async = _launch_browser_persistent_context_async
     sys.modules["utils.browser_provider"] = browser_provider_stub
 
 if "cloakbrowser" not in sys.modules:
@@ -150,6 +184,41 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(context_options, {})
 
+    def test_build_browser_cookie_payload_expands_cross_domain_session_cookies(self):
+        live = XianyuLive.__new__(XianyuLive)
+
+        cookies = live._build_browser_cookie_payload(
+            "unb=user1; cookie2=cookie2v; _m_h5_tk=tkv; cna=cnav; foo=bar"
+        )
+
+        cookie_keys = {
+            (cookie["name"], cookie["domain"]): cookie["value"]
+            for cookie in cookies
+        }
+
+        self.assertEqual(cookie_keys[("unb", ".goofish.com")], "user1")
+        self.assertEqual(cookie_keys[("unb", ".taobao.com")], "user1")
+        self.assertEqual(cookie_keys[("cookie2", ".goofish.com")], "cookie2v")
+        self.assertEqual(cookie_keys[("cookie2", ".taobao.com")], "cookie2v")
+        self.assertEqual(cookie_keys[("_m_h5_tk", ".goofish.com")], "tkv")
+        self.assertEqual(cookie_keys[("_m_h5_tk", ".taobao.com")], "tkv")
+        self.assertEqual(cookie_keys[("cna", ".goofish.com")], "cnav")
+        self.assertEqual(cookie_keys[("cna", ".taobao.com")], "cnav")
+        self.assertEqual(cookie_keys[("foo", ".goofish.com")], "bar")
+        self.assertNotIn(("foo", ".taobao.com"), cookie_keys)
+
+    def test_resolve_account_browser_profile_dir_prefers_cookie_id(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = "2095002164"
+        live.cookies_str = "unb=qr-unb"
+
+        profile_dir = live._resolve_account_browser_profile_dir()
+
+        self.assertEqual(
+            profile_dir,
+            os.path.join(os.getcwd(), "browser_data", "user_2095002164"),
+        )
+
     def test_build_browser_refresh_launch_args_skip_enable_automation_in_docker(self):
         live = XianyuLive.__new__(XianyuLive)
 
@@ -161,6 +230,15 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             browser_args = live._build_browser_refresh_launch_args()
 
         self.assertNotIn("--enable-automation", browser_args)
+
+    def test_calculate_retry_delay_uses_init_auth_failures_when_connection_failures_reset(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.connection_failures = 0
+        live.init_auth_failures = 2
+
+        retry_delay = live._calculate_retry_delay("Token获取失败(status=captcha_verification_failed)")
+
+        self.assertEqual(retry_delay, 10)
 
     async def test_async_close_browser_closes_context_before_browser(self):
         close_order = []
@@ -352,6 +430,125 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         page.close.assert_awaited_once_with()
         context.close.assert_awaited_once_with()
         browser.close.assert_awaited_once_with()
+
+    async def test_refresh_cookies_via_browser_page_reuses_persistent_profile_during_qr_grace(self):
+        page = mock.Mock()
+        page.goto = mock.AsyncMock()
+        page.reload = mock.AsyncMock()
+
+        context = mock.Mock()
+        context.add_cookies = mock.AsyncMock()
+        context.new_page = mock.AsyncMock(return_value=page)
+        context.cookies = mock.AsyncMock(
+            return_value=[
+                {"name": "unb", "value": "user1"},
+                {"name": "cookie2", "value": "cookie2v"},
+                {"name": "_m_h5_tk", "value": "tokenv_123"},
+                {"name": "_m_h5_tk_enc", "value": "encv"},
+                {"name": "sgcookie", "value": "sgv"},
+                {"name": "t", "value": "tv"},
+                {"name": "cna", "value": "cnav"},
+            ]
+        )
+        context.browser = mock.Mock()
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = "2095002164"
+        live.cookies_str = "unb=user1; cookie2=old; _m_h5_tk=old_123; _m_h5_tk_enc=oldenc; sgcookie=oldsg; t=oldt"
+        live.cookies = {
+            "unb": "user1",
+            "cookie2": "old",
+            "_m_h5_tk": "old_123",
+            "_m_h5_tk_enc": "oldenc",
+            "sgcookie": "oldsg",
+            "t": "oldt",
+        }
+        live._safe_str = str
+        live._summarize_cookie_string = lambda cookie_string: cookie_string
+        live._log_protected_merge_event = mock.Mock()
+        live._log_cookie_merge_summary = mock.Mock()
+        live._set_runtime_cookie_state = mock.Mock()
+        live.update_config_cookies = mock.AsyncMock()
+        live._async_close_browser = mock.AsyncMock()
+        live.protected_merge_cookie_dicts = lambda existing, incoming: self._build_merge_result(incoming)
+        live.get_qr_login_grace = mock.Mock(return_value={"stage": "real_cookie_ready"})
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "launch_browser_persistent_context_async",
+            new=mock.AsyncMock(return_value=context),
+        ) as launch_browser_persistent_context_async, \
+             mock.patch.object(
+                 XianyuAutoAsync,
+                 "_launch_browser_safe",
+                 new=mock.AsyncMock(side_effect=AssertionError("should not launch clean browser")),
+             ):
+            success = await live._refresh_cookies_via_browser_page(
+                live.cookies_str,
+                restart_on_success=False,
+            )
+
+        self.assertTrue(success)
+        launch_kwargs = launch_browser_persistent_context_async.await_args.kwargs
+        self.assertEqual(
+            launch_kwargs["user_data_dir"],
+            os.path.join(os.getcwd(), "browser_data", "user_2095002164"),
+        )
+        self.assertTrue(launch_kwargs["headless"])
+        context.add_cookies.assert_awaited_once()
+        live.update_config_cookies.assert_awaited_once_with()
+
+    async def test_try_password_login_refresh_disables_clean_context_during_qr_grace(self):
+        captured = {}
+
+        class _FakeSlider:
+            def __init__(self, *args, **kwargs):
+                captured["init_kwargs"] = kwargs
+
+            def login_with_password_browser(self, *args, **kwargs):
+                raise AssertionError("should be invoked via _run_sync_method_on_fresh_thread")
+
+            async def _run_sync_method_on_fresh_thread(self, _func, **kwargs):
+                captured["run_kwargs"] = kwargs
+                raise RuntimeError("sentinel-slider-stop")
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = "2095002164"
+        live.cookies_str = "unb=user1; cookie2=old; _m_h5_tk=old_123; _m_h5_tk_enc=oldenc; sgcookie=oldsg; t=oldt"
+        live.proxy_config = {}
+        live.last_token_refresh_error_message = None
+        live._safe_str = str
+        live._normalize_risk_trigger_scene = XianyuLive._normalize_risk_trigger_scene.__get__(live, XianyuLive)
+        live._new_risk_session_id = mock.Mock(return_value="risk-session")
+        live._build_risk_event_meta = mock.Mock(return_value={})
+        live._create_risk_log = mock.Mock(return_value=None)
+        live._update_risk_log = mock.Mock()
+        live.send_token_refresh_notification = mock.AsyncMock()
+        live.get_qr_login_grace = mock.Mock(return_value={"stage": "real_cookie_ready"})
+
+        with mock.patch.object(XianyuAutoAsync, "log_captcha_event", mock.Mock()), \
+             mock.patch.object(XianyuAutoAsync.db_manager, "mark_stale_risk_control_logs_failed", return_value=0), \
+             mock.patch.object(XianyuAutoAsync.db_manager, "get_cookie_details", return_value={
+                 "cookie_value": live.cookies_str,
+                 "username": "user@example.com",
+                 "password": "secret",
+                 "show_browser": False,
+             }), \
+             mock.patch.object(XianyuLive, "acquire_auth_recovery_lock", return_value=(True, None)), \
+             mock.patch.object(XianyuLive, "release_auth_recovery_lock"), \
+             mock.patch.object(XianyuAutoAsync.os, "getenv", return_value=""), \
+             mock.patch.dict(sys.modules, {
+                 "utils.xianyu_slider_stealth": types.SimpleNamespace(XianyuSliderStealth=_FakeSlider),
+             }):
+            success = await live._try_password_login_refresh("滑块验证失败", trigger_scene="token_refresh")
+
+        self.assertFalse(success)
+        self.assertTrue(captured["init_kwargs"]["use_account_persistent_profile"])
+        self.assertEqual(
+            captured["init_kwargs"]["account_persistent_profile_dir"],
+            os.path.join(os.getcwd(), "browser_data", "user_2095002164"),
+        )
+        self.assertFalse(captured["run_kwargs"]["force_clean_context"])
 
     async def test_refresh_cookies_from_qr_login_reuses_managed_context_without_launching_browser(self):
         managed_runtime = mock.Mock()

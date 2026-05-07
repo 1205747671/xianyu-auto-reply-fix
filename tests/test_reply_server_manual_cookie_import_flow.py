@@ -313,6 +313,56 @@ class _FakeQrRefreshExceptionLive(_FakeQrRefreshSuccessLive):
         raise RuntimeError("refresh exploded")
 
 
+class _FakeQrRefreshHangOnTokenPrewarmLive(_FakeQrRefreshSuccessLive):
+    @staticmethod
+    def mark_qr_login_grace(*_args, **_kwargs):
+        return None
+
+    @staticmethod
+    def cache_qr_prewarmed_token(*_args, **_kwargs):
+        return None
+
+    @staticmethod
+    def clear_qr_login_grace(*_args, **_kwargs):
+        return None
+
+    @staticmethod
+    def clear_qr_prewarmed_token(*_args, **_kwargs):
+        return None
+
+    async def refresh_cookies_from_qr_login(self, **kwargs):
+        self.cookies_str = "unb=test_user; cookie2=real_cookie2"
+        return True
+
+    async def refresh_token(self, *args, **kwargs):
+        await asyncio.Event().wait()
+
+
+class _FakeQrRefreshPrewarmSuccessLive(_FakeQrRefreshSuccessLive):
+    @staticmethod
+    def mark_qr_login_grace(*_args, **_kwargs):
+        return None
+
+    @staticmethod
+    def cache_qr_prewarmed_token(*_args, **_kwargs):
+        return None
+
+    @staticmethod
+    def clear_qr_login_grace(*_args, **_kwargs):
+        return None
+
+    @staticmethod
+    def clear_qr_prewarmed_token(*_args, **_kwargs):
+        return None
+
+    async def refresh_cookies_from_qr_login(self, **kwargs):
+        self.cookies_str = "unb=test_user; cookie2=real_cookie2"
+        return True
+
+    async def refresh_token(self, *args, **kwargs):
+        return "prewarmed_token"
+
+
 class ReplyServerProcessQrLoginCookiesTest(unittest.TestCase):
     def test_process_qr_login_cookies_raises_and_never_saves_raw_cookie_when_real_cookie_flow_fails(self):
         current_user = {"user_id": 1, "username": "admin"}
@@ -373,6 +423,109 @@ class ReplyServerProcessQrLoginCookiesTest(unittest.TestCase):
                 fake_manager.update_cookie.assert_not_called()
                 fake_manager.add_cookie.reset_mock()
                 fake_manager.update_cookie.reset_mock()
+
+    def test_process_qr_login_cookies_continues_when_token_prewarm_hangs_and_starts_account_task(self):
+        current_user = {"user_id": 1, "username": "admin"}
+        fake_loop = SimpleNamespace(
+            is_closed=mock.Mock(return_value=False),
+            is_running=mock.Mock(return_value=True),
+        )
+        fake_manager = SimpleNamespace(
+            cookies={},
+            add_cookie=mock.Mock(),
+            update_cookie=mock.Mock(),
+            loop=fake_loop,
+        )
+
+        async def invoke():
+            return await asyncio.wait_for(
+                reply_server.process_qr_login_cookies(
+                    "unb=test_user; cookie2=test_cookie2",
+                    "test_user",
+                    current_user,
+                ),
+                timeout=0.2,
+            )
+
+        with mock.patch("XianyuAutoAsync.XianyuLive", _FakeQrRefreshHangOnTokenPrewarmLive), \
+             mock.patch.object(reply_server.db_manager, "get_all_cookies", return_value={}), \
+             mock.patch.object(
+                 reply_server.db_manager,
+                 "get_cookie_by_id",
+                 return_value={"cookies_str": "unb=test_user; cookie2=real_cookie2"},
+             ), \
+             mock.patch.object(reply_server.db_manager, "add_risk_control_log", return_value=None), \
+             mock.patch.object(reply_server.db_manager, "update_risk_control_log"), \
+             mock.patch.object(reply_server.db_manager, "delete_cookie") as delete_cookie_mock, \
+             mock.patch.object(reply_server.db_manager, "update_cookie_account_info") as update_cookie_mock, \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "QR_LOGIN_TOKEN_PREWARM_TIMEOUT_SECONDS", 0.01, create=True), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertEqual(result["account_id"], "test_user")
+        self.assertTrue(result["task_restarted"])
+        self.assertFalse(result["token_prewarmed"])
+        self.assertIn("首次Token初始化超时", result["warning_message"])
+        fake_manager.add_cookie.assert_called_once_with(
+            "test_user",
+            "unb=test_user; cookie2=real_cookie2",
+            user_id=1,
+        )
+        fake_manager.update_cookie.assert_not_called()
+        delete_cookie_mock.assert_not_called()
+        update_cookie_mock.assert_not_called()
+
+    def test_process_qr_login_cookies_rolls_back_when_manager_loop_is_not_running(self):
+        current_user = {"user_id": 1, "username": "admin"}
+        fake_loop = SimpleNamespace(
+            is_closed=mock.Mock(return_value=False),
+            is_running=mock.Mock(return_value=False),
+        )
+        fake_manager = SimpleNamespace(
+            cookies={"test_user": "unb=test_user; cookie2=old_cookie2"},
+            add_cookie=mock.Mock(),
+            update_cookie=mock.Mock(),
+            loop=fake_loop,
+        )
+
+        async def invoke():
+            return await reply_server.process_qr_login_cookies(
+                "unb=test_user; cookie2=test_cookie2",
+                "test_user",
+                current_user,
+            )
+
+        with mock.patch("XianyuAutoAsync.XianyuLive", _FakeQrRefreshPrewarmSuccessLive), \
+             mock.patch.object(
+                 reply_server.db_manager,
+                 "get_all_cookies",
+                 return_value={"test_user": "unb=test_user; cookie2=old_cookie2"},
+             ), \
+             mock.patch.object(
+                 reply_server.db_manager,
+                 "get_cookie_by_id",
+                 return_value={"cookies_str": "unb=test_user; cookie2=real_cookie2"},
+             ), \
+             mock.patch.object(reply_server.db_manager, "add_risk_control_log", return_value=None), \
+             mock.patch.object(reply_server.db_manager, "update_risk_control_log"), \
+             mock.patch.object(reply_server.db_manager, "delete_cookie") as delete_cookie_mock, \
+             mock.patch.object(reply_server.db_manager, "update_cookie_account_info") as update_cookie_mock, \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertEqual(result["account_id"], "test_user")
+        self.assertFalse(result["task_restarted"])
+        self.assertTrue(result["token_prewarmed"])
+        self.assertIn("账号事件循环未运行", result["warning_message"])
+        fake_manager.add_cookie.assert_not_called()
+        fake_manager.update_cookie.assert_not_called()
+        delete_cookie_mock.assert_not_called()
+        update_cookie_mock.assert_called_once_with(
+            "test_user",
+            cookie_value="unb=test_user; cookie2=old_cookie2",
+        )
 
 
 if __name__ == "__main__":

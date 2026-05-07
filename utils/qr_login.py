@@ -9,6 +9,7 @@ import time
 import uuid
 import json
 import re
+import os
 from random import random
 from typing import Optional, Dict, Any
 import httpx
@@ -18,8 +19,41 @@ from loguru import logger
 import hashlib
 from urllib.parse import urlparse
 
-from utils.browser_provider import launch_browser_async
+from utils.browser_provider import (
+    launch_browser_async,
+    launch_browser_persistent_context_async,
+)
 from utils.image_utils import image_manager
+
+
+QR_CROSS_DOMAIN_COOKIE_NAMES = {
+    "t",
+    "tracknick",
+    "isg",
+    "unb",
+    "cookie2",
+    "_tb_token_",
+    "sgcookie",
+    "csg",
+    "tfstk",
+    "_m_h5_tk",
+    "_m_h5_tk_enc",
+    "havana_lgc2_77",
+    "_hvn_lgc_",
+    "havana_lgc_exp",
+    "mtop_partitioned_detect",
+    "_samesite_flag_",
+    "sdkSilent",
+    "cna",
+    "x5sec",
+    "x5secdata",
+    "XSRF-TOKEN",
+    "thw",
+    "cbc",
+    "cnaui",
+    "aui",
+    "sca",
+}
 
 
 def generate_headers():
@@ -53,8 +87,9 @@ class NotLoginError(Exception):
 class QRLoginSession:
     """二维码登录会话"""
 
-    def __init__(self, session_id: str):
+    def __init__(self, session_id: str, user_id: Optional[int] = None):
         self.session_id = session_id
+        self.user_id = user_id
         self.status = 'waiting'  # waiting, scanned, success, expired, cancelled, verification_required
         self.qr_code_url = None
         self.qr_content = None
@@ -71,6 +106,9 @@ class QRLoginSession:
         self.managed_context = None
         self.managed_page = None
         self.last_active_probe_time = 0.0
+        self.proxy_config = {}
+        self.proxy_url = None
+        self.proxy_account_id = None
 
     def is_expired(self) -> bool:
         """检查是否过期"""
@@ -111,22 +149,236 @@ class QRLoginManager:
         return "; ".join([f"{k}={v}" for k, v in cookies.items()])
 
     def _build_browser_cookies(self, target_url: str, cookies: Dict[str, str]) -> list[Dict[str, Any]]:
-        """将API会话中的Cookie转换为Playwright可用格式"""
+        """兼容旧调用，统一走跨域 Cookie 注入格式。"""
+        return self._build_cross_domain_browser_cookies(target_url, cookies)
+
+    def _build_cross_domain_browser_cookies(self, target_url: str, cookies: Dict[str, str]) -> list[Dict[str, Any]]:
+        """把 API 会话中的 Cookie 转成浏览器可用的跨域注入格式。"""
         browser_cookies = []
         parsed = urlparse(target_url or self.host)
-        target_origin = f"{parsed.scheme or 'https'}://{parsed.netloc or 'passport.goofish.com'}"
+        target_host = str(parsed.netloc or 'passport.goofish.com').strip().lower()
+        target_domains = ['.goofish.com']
+        if target_host.endswith('taobao.com'):
+            target_domains = ['.taobao.com']
 
+        seen = set()
         for name, value in (cookies or {}).items():
             if not name or value is None:
                 continue
-            browser_cookies.append({
-                'name': name,
-                'value': str(value),
-                'url': target_origin,
-                'path': '/',
-            })
+
+            domains = list(target_domains)
+            if name in QR_CROSS_DOMAIN_COOKIE_NAMES:
+                for cross_domain in ('.goofish.com', '.taobao.com'):
+                    if cross_domain not in domains:
+                        domains.append(cross_domain)
+
+            for domain in domains:
+                dedupe_key = (str(name), str(value), domain)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                browser_cookies.append({
+                    'name': str(name),
+                    'value': str(value),
+                    'domain': domain,
+                    'path': '/',
+                })
 
         return browser_cookies
+
+    def _build_proxy_url(self, proxy_config: Optional[Dict[str, Any]]) -> Optional[str]:
+        normalized_proxy = dict(proxy_config or {})
+        proxy_type = str(normalized_proxy.get('proxy_type') or '').strip().lower()
+        proxy_host = str(normalized_proxy.get('proxy_host') or '').strip()
+        proxy_port = normalized_proxy.get('proxy_port')
+        if proxy_type in {'', 'none'} or not proxy_host or not proxy_port:
+            return None
+
+        auth = ''
+        proxy_user = str(normalized_proxy.get('proxy_user') or '').strip()
+        proxy_pass = str(normalized_proxy.get('proxy_pass') or '').strip()
+        if proxy_user:
+            auth = proxy_user
+            if proxy_pass:
+                auth += f":{proxy_pass}"
+            auth += '@'
+
+        return f"{proxy_type}://{auth}{proxy_host}:{proxy_port}"
+
+    def _build_browser_proxy_settings(self, proxy_config: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+        normalized_proxy = dict(proxy_config or {})
+        proxy_type = str(normalized_proxy.get('proxy_type') or '').strip().lower()
+        proxy_host = str(normalized_proxy.get('proxy_host') or '').strip()
+        proxy_port = normalized_proxy.get('proxy_port')
+        if proxy_type in {'', 'none'} or not proxy_host or not proxy_port:
+            return None
+
+        proxy_settings: Dict[str, str] = {
+            'server': f"{proxy_type}://{proxy_host}:{proxy_port}",
+        }
+        proxy_user = str(normalized_proxy.get('proxy_user') or '').strip()
+        proxy_pass = str(normalized_proxy.get('proxy_pass') or '').strip()
+        if proxy_user:
+            proxy_settings['username'] = proxy_user
+        if proxy_pass:
+            proxy_settings['password'] = proxy_pass
+        return proxy_settings
+
+    def _resolve_existing_account_proxy_config(self, session: QRLoginSession) -> Dict[str, Any]:
+        if not session:
+            return {}
+
+        if session.proxy_config:
+            return dict(session.proxy_config)
+
+        if not session.user_id or not session.unb:
+            return {}
+
+        try:
+            from db_manager import db_manager
+            from utils.xianyu_utils import trans_cookies
+
+            existing_cookies = db_manager.get_all_cookies(session.user_id) or {}
+            matched_account_id = None
+            for account_id, cookie_value in existing_cookies.items():
+                try:
+                    existing_cookie_dict = trans_cookies(cookie_value)
+                except Exception:
+                    continue
+                if str(existing_cookie_dict.get('unb') or '').strip() == str(session.unb or '').strip():
+                    matched_account_id = account_id
+                    break
+
+            if not matched_account_id:
+                return {}
+
+            proxy_config = dict(db_manager.get_cookie_proxy_config(matched_account_id) or {})
+            session.proxy_account_id = matched_account_id
+            proxy_type = str(proxy_config.get('proxy_type') or '').strip().lower()
+            if proxy_type in {'', 'none'}:
+                logger.info(f"扫码登录验证链路未匹配到可用代理，沿用直连: {matched_account_id}")
+                return {}
+
+            session.proxy_config = proxy_config
+            session.proxy_url = self._build_proxy_url(proxy_config)
+            logger.info(
+                f"扫码登录验证链路复用账号代理: {matched_account_id}, "
+                f"server: {proxy_type}://{proxy_config.get('proxy_host')}:{proxy_config.get('proxy_port')}"
+            )
+            return dict(proxy_config)
+        except Exception as proxy_error:
+            logger.warning(f"解析扫码登录验证链路代理配置失败，忽略代理复用: {proxy_error}")
+            return {}
+
+    def _resolve_session_proxy_url(self, session: Optional[QRLoginSession]) -> Optional[str]:
+        if session and session.proxy_url:
+            return session.proxy_url
+
+        if session:
+            self._resolve_existing_account_proxy_config(session)
+            if session.proxy_url:
+                return session.proxy_url
+
+        return self.proxy
+
+    def _resolve_verification_proxy_settings(self, session: QRLoginSession) -> Optional[Dict[str, str]]:
+        proxy_config = self._resolve_existing_account_proxy_config(session)
+        return self._build_browser_proxy_settings(proxy_config)
+
+    def _build_verification_browser_launch_args(self) -> list[str]:
+        return [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--no-first-run',
+            '--mute-audio',
+            '--no-default-browser-check',
+            '--force-color-profile=srgb',
+            '--password-store=basic',
+            '--use-mock-keychain',
+            '--window-size=1600,900',
+        ]
+
+    def _should_show_verification_browser(self) -> bool:
+        override = str(os.getenv("XY_QR_LOGIN_SHOW_BROWSER") or "").strip().lower()
+        if override:
+            return override in {"1", "true", "yes", "on"}
+        docker_env = str(os.getenv("DOCKER_ENV") or "").strip().lower() in {"1", "true", "yes", "on"}
+        return os.name == 'nt' and not docker_env
+
+    def _build_verification_context_options(self, show_browser: bool) -> Dict[str, Any]:
+        context_options: Dict[str, Any] = {
+            'locale': 'zh-CN',
+            'timezone': 'Asia/Shanghai',
+            'color_scheme': 'light',
+            'accept_downloads': True,
+            'ignore_https_errors': True,
+        }
+        if show_browser:
+            context_options['no_viewport'] = True
+        else:
+            context_options['viewport'] = {'width': 1600, 'height': 900}
+        return context_options
+
+    def _resolve_verification_profile_dir(self, session: QRLoginSession) -> str:
+        # 已匹配到现有账号时，优先复用账号级画像目录，避免扫码验证和后续恢复跑到两套画像上。
+        profile_key = (
+            str(getattr(session, 'proxy_account_id', '') or '').strip()
+            or str(session.unb or "").strip()
+            or f"qr_{session.session_id}"
+        )
+        safe_key = re.sub(r"[^0-9A-Za-z_.-]+", "_", profile_key)
+        profile_dir = os.path.join(os.getcwd(), 'browser_data', f'user_{safe_key}')
+        os.makedirs(profile_dir, exist_ok=True)
+        return profile_dir
+
+    async def _launch_verification_browser_context(self, session: QRLoginSession):
+        show_browser = self._should_show_verification_browser()
+        launch_options = {
+            'headless': not show_browser,
+            'args': self._build_verification_browser_launch_args(),
+            'humanize': True,
+            'human_preset': 'careful',
+        }
+        proxy_settings = self._resolve_verification_proxy_settings(session)
+        if proxy_settings:
+            launch_options['proxy'] = proxy_settings
+        context_options = self._build_verification_context_options(show_browser)
+        profile_dir = self._resolve_verification_profile_dir(session)
+
+        try:
+            context = await launch_browser_persistent_context_async(
+                user_data_dir=profile_dir,
+                **launch_options,
+                **context_options,
+            )
+            browser = getattr(context, 'browser', None)
+            logger.info(
+                f"扫码登录验证页复用 CloakBrowser 持久化画像: {session.session_id}, "
+                f"profile_dir: {profile_dir}, headless: {not show_browser}"
+            )
+            return browser, context, show_browser
+        except Exception as persistent_error:
+            logger.warning(
+                f"扫码登录持久化画像启动失败，降级到临时上下文: {session.session_id}, "
+                f"错误: {persistent_error}"
+            )
+            browser = await launch_browser_async(**launch_options)
+            context = await browser.new_context(**context_options)
+            return browser, context, show_browser
+
+    async def _get_or_create_context_page(self, context):
+        context_pages = getattr(context, 'pages', None)
+        if isinstance(context_pages, (list, tuple)):
+            for existing_page in context_pages:
+                if existing_page is None:
+                    continue
+                try:
+                    if not existing_page.is_closed():
+                        return existing_page
+                except Exception:
+                    continue
+        return await context.new_page()
 
     def _normalize_cookie_dict(self, cookies: Any) -> Dict[str, str]:
         """将不同形式的Cookie数据统一转换为字典"""
@@ -375,22 +627,20 @@ class QRLoginManager:
         try:
 
             logger.info(f"开始打开扫码登录验证页面: {session_id}")
-            browser = await launch_browser_async(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                ]
-            )
-            context = await browser.new_context(ignore_https_errors=True)
+            browser, context, show_browser = await self._launch_verification_browser_context(session)
 
-            browser_cookies = self._build_browser_cookies(session.verification_url, session.cookies)
+            browser_cookies = self._build_cross_domain_browser_cookies(session.verification_url, session.cookies)
             if browser_cookies:
                 await context.add_cookies(browser_cookies)
+                logger.info(f"扫码登录验证页已注入 {len(browser_cookies)} 个跨域 Cookie: {session_id}")
 
-            page = await context.new_page()
+            page = await self._get_or_create_context_page(context)
+            try:
+                logger.info(f"扫码登录验证页预热闲鱼首页: {session_id}")
+                await page.goto('https://www.goofish.com/', wait_until='domcontentloaded', timeout=15000)
+                await page.wait_for_timeout(1200 if show_browser else 800)
+            except Exception as warmup_error:
+                logger.warning(f"扫码登录验证页预热失败（继续主流程）: {session_id}, 错误: {warmup_error}")
             await page.goto(session.verification_url, wait_until='domcontentloaded', timeout=60000)
             await page.wait_for_timeout(2500)
 
@@ -508,7 +758,11 @@ class QRLoginManager:
         app_key = "34839810"
 
         # 先发一次 GET 请求，获取 cookie 中的 m_h5_tk
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True, proxy=self.proxy) as client:
+        async with httpx.AsyncClient(
+            timeout=self.timeout,
+            follow_redirects=True,
+            proxy=self._resolve_session_proxy_url(session),
+        ) as client:
             try:
                 resp = await client.get(self.api_h5_tk, headers=self.headers)
                 cookies = {k: v for k, v in resp.cookies.items()}
@@ -565,7 +819,11 @@ class QRLoginManager:
             "rnd": random(),
         }
 
-        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, proxy=self.proxy) as client:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=self.timeout,
+            proxy=self._resolve_session_proxy_url(session),
+        ) as client:
             try:
                 resp = await client.get(
                     self.api_mini_login,
@@ -599,12 +857,12 @@ class QRLoginManager:
                 logger.error("获取登录参数时连接错误")
                 raise
     
-    async def generate_qr_code(self) -> Dict[str, Any]:
+    async def generate_qr_code(self, user_id: Optional[int] = None) -> Dict[str, Any]:
         """生成二维码"""
         try:
             # 创建新的会话
             session_id = str(uuid.uuid4())
-            session = QRLoginSession(session_id)
+            session = QRLoginSession(session_id, user_id=user_id)
 
             # 1. 获取m_h5_tk
             await self._get_mh5tk(session)
@@ -615,7 +873,11 @@ class QRLoginManager:
             logger.info(f"获取登录参数成功: {session_id}")
 
             # 3. 生成二维码
-            async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, proxy=self.proxy) as client:
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=self.timeout,
+                proxy=self._resolve_session_proxy_url(session),
+            ) as client:
                 resp = await client.get(
                     self.api_generate_qr,
                     params=login_params,
@@ -694,7 +956,11 @@ class QRLoginManager:
     
     async def _poll_qrcode_status(self, session: QRLoginSession) -> httpx.Response:
         """获取二维码扫描状态"""
-        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, proxy=self.proxy) as client:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=self.timeout,
+            proxy=self._resolve_session_proxy_url(session),
+        ) as client:
             resp = await client.post(
                 self.api_scan_status,
                 data=session.params,
@@ -757,6 +1023,7 @@ class QRLoginManager:
                             session.verification_url = iframe_url
                             session.expire_time = max(session.expire_time, 600)
                             self._merge_session_cookies(session, resp.cookies)
+                            self._resolve_existing_account_proxy_config(session)
                             self._ensure_verification_task(session)
                             logger.warning(f"账号被风控，需要手机验证: {session_id}, URL: {iframe_url}")
                             await asyncio.sleep(0.8)
