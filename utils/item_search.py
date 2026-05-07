@@ -52,6 +52,26 @@ class XianyuSearcher:
         self.page = None
         self.api_responses = []
         self.user_id = "default"  # 默认用户ID
+        self.enable_manual_scratch_captcha_debug = False
+        self.use_remote_control = False
+
+    def _is_manual_scratch_captcha_debug_enabled(self) -> bool:
+        """仅在显式 debug 开关开启时允许人工远控刮刮乐。"""
+        return bool(getattr(self, "enable_manual_scratch_captcha_debug", False))
+
+    def _create_slider_handler(self, page, context, browser, playwright):
+        from utils.xianyu_slider_stealth import XianyuSliderStealth
+
+        slider_handler = XianyuSliderStealth(
+            user_id=getattr(self, 'user_id', 'default'),
+            enable_learning=True,
+            headless=True
+        )
+        slider_handler.page = page
+        slider_handler.context = context
+        slider_handler.browser = browser
+        slider_handler.playwright = playwright
+        return slider_handler
 
     async def _handle_scratch_captcha_manual(self, page, max_retries=3, wait_for_completion=True):
         """人工处理刮刮乐滑块（远程控制 + 截图备份）
@@ -70,8 +90,8 @@ class XianyuSearcher:
         # 获取会话ID
         session_id = getattr(self, 'user_id', 'default')
         
-        # 【新方案】启用远程控制
-        use_remote_control = getattr(self, 'use_remote_control', True)
+        # 只有显式 debug 开关开启时才允许进入人工远控链路
+        use_remote_control = self._is_manual_scratch_captcha_debug_enabled() and getattr(self, 'use_remote_control', False)
         
         if use_remote_control:
             try:
@@ -536,6 +556,7 @@ class XianyuSearcher:
             
             # 检测到滑块，开始处理
             logger.warning(f"⚠️ 检测到滑块验证（{detected_selector}），开始处理...")
+            actual_max_retries = max_retries
             
             # 检测是否为刮刮乐类型（更精确的判断）
             is_scratch_captcha = False
@@ -557,40 +578,35 @@ class XianyuSearcher:
             
             if is_scratch_captcha:
                 logger.warning("🎨 检测到刮刮乐类型滑块")
-                
-                # 人工处理模式 - 等待用户完成验证
-                logger.warning("⚠️ 刮刮乐需要人工处理，等待验证完成")
-                slider_success = await self._handle_scratch_captcha_manual(page, max_retries=3, wait_for_completion=True)
+
+                logger.info("🧩 刮刮乐优先走自动处理链路")
+                slider_success = await self._handle_scratch_captcha_async(page, max_retries=actual_max_retries)
             else:
-                actual_max_retries = max_retries
                 slider_success = None
             
             try:
-                # 刮刮乐已经处理过了，直接检查结果
-                if is_scratch_captcha:
-                    pass  # slider_success 已经在上面设置
-                else:
-                    # 普通滑块：使用 XianyuSliderStealth（同步API）
-                    from utils.xianyu_slider_stealth import XianyuSliderStealth
-                    
-                    # 创建滑块处理实例
-                    slider_handler = XianyuSliderStealth(
-                        user_id=getattr(self, 'user_id', 'default'),
-                        enable_learning=True,
-                        headless=True
-                    )
-                    
-                    # 将现有的浏览器对象传递给滑块处理器（复用现有浏览器）
-                    slider_handler.page = page
-                    slider_handler.context = context
-                    slider_handler.browser = browser
-                    slider_handler.playwright = playwright
-                    
-                    # 调用滑块处理方法
+                slider_handler = None
+                should_use_stealth_fallback = (not slider_success) or (not is_scratch_captcha)
+                if should_use_stealth_fallback:
+                    if is_scratch_captcha:
+                        logger.warning("⚠️ 刮刮乐自动处理失败，回退到通用滑块求解器")
+                    else:
+                        logger.info("🎯 开始处理普通滑块验证")
+
+                    slider_handler = self._create_slider_handler(page, context, browser, playwright)
+
                     logger.info(f"🎯 开始处理滑块验证（最多尝试 {actual_max_retries} 次）...")
                     slider_success = slider_handler.solve_slider(max_retries=actual_max_retries)
-                    
-                    # 清除引用，防止 XianyuSliderStealth 尝试关闭我们的浏览器
+
+                if not slider_success and is_scratch_captcha and self._is_manual_scratch_captcha_debug_enabled():
+                    logger.warning("🛠️ 显式 debug 开关已开启，允许人工远控兜底刮刮乐")
+                    slider_success = await self._handle_scratch_captcha_manual(
+                        page,
+                        max_retries=3,
+                        wait_for_completion=True,
+                    )
+
+                if slider_handler is not None:
                     slider_handler.page = None
                     slider_handler.context = None
                     slider_handler.browser = None

@@ -90,7 +90,15 @@ class QRLoginSession:
     def __init__(self, session_id: str, user_id: Optional[int] = None):
         self.session_id = session_id
         self.user_id = user_id
-        self.status = 'waiting'  # waiting, scanned, success, expired, cancelled, verification_required
+        self.status = 'waiting'  # waiting, scanned, confirmed, success, failed, expired, cancelled, verification_required
+        self.phase = 'waiting_for_scan'
+        self.verification_type = None
+        self.error_message = None
+        self.handoff_status = 'idle'
+        self.handoff_error = None
+        self.success_stage = None
+        self.browser_alive = False
+        self.account_info = None
         self.qr_code_url = None
         self.qr_content = None
         self.cookies = {}
@@ -119,6 +127,13 @@ class QRLoginSession:
         return {
             'session_id': self.session_id,
             'status': self.status,
+            'phase': self.phase,
+            'verification_type': self.verification_type,
+            'error_message': self.error_message,
+            'handoff_status': self.handoff_status,
+            'handoff_error': self.handoff_error,
+            'success_stage': self.success_stage,
+            'browser_alive': self.browser_alive,
             'qr_code_url': self.qr_code_url,
             'created_time': self.created_time,
             'is_expired': self.is_expired()
@@ -409,6 +424,144 @@ class QRLoginManager:
         if cookie_dict.get('unb'):
             session.unb = cookie_dict['unb']
 
+    def _update_session_state(
+        self,
+        session: Optional[QRLoginSession],
+        *,
+        status: Optional[str] = None,
+        phase: Optional[str] = None,
+        verification_type: Optional[str] = None,
+        error_message: Optional[str] = None,
+        handoff_status: Optional[str] = None,
+        handoff_error: Optional[str] = None,
+        success_stage: Optional[str] = None,
+        browser_alive: Optional[bool] = None,
+        verification_url: Optional[str] = None,
+        clear_error: bool = False,
+        clear_handoff_error: bool = False,
+    ) -> Optional[QRLoginSession]:
+        if not session:
+            return None
+
+        if status is not None:
+            session.status = status
+        if phase is not None:
+            session.phase = phase
+        if verification_type is not None:
+            session.verification_type = verification_type
+        if clear_error:
+            session.error_message = None
+        if error_message is not None:
+            session.error_message = str(error_message)
+        if handoff_status is not None:
+            session.handoff_status = handoff_status
+        if clear_handoff_error:
+            session.handoff_error = None
+        if handoff_error is not None:
+            session.handoff_error = str(handoff_error)
+        if success_stage is not None:
+            session.success_stage = success_stage
+        if browser_alive is not None:
+            session.browser_alive = bool(browser_alive)
+        if verification_url is not None:
+            session.verification_url = verification_url
+        return session
+
+    def update_session_fields(self, session_id: str, **fields) -> Optional[QRLoginSession]:
+        return self._update_session_state(self.sessions.get(session_id), **fields)
+
+    def update_session_handoff_status(
+        self,
+        session_id: str,
+        status: str,
+        *,
+        error: Optional[str] = None,
+        account_info: Optional[Dict[str, Any]] = None,
+    ) -> Optional[QRLoginSession]:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+
+        normalized_status = str(status or 'idle').strip() or 'idle'
+        phase_map = {
+            'idle': 'login_complete',
+            'processing': 'handoff_processing',
+            'success': 'handoff_completed',
+            'failed': 'handoff_failed',
+        }
+        self._update_session_state(
+            session,
+            status=('failed' if normalized_status == 'failed' else session.status),
+            handoff_status=normalized_status,
+            handoff_error=(error if normalized_status == 'failed' else None),
+            phase=phase_map.get(normalized_status, session.phase),
+            error_message=(error if normalized_status == 'failed' else session.error_message),
+            clear_error=normalized_status != 'failed',
+            clear_handoff_error=normalized_status != 'failed',
+        )
+        if account_info is not None:
+            session.account_info = account_info
+        return session
+
+    def _detect_verification_type(self, verification_url: Optional[str]) -> Optional[str]:
+        url = str(verification_url or '').lower()
+        if not url:
+            return None
+        if '/iv/' in url or 'face' in url:
+            return 'face_verify'
+        if 'qrcode' in url or 'scan' in url or 'qr' in url:
+            return 'qr_verify'
+        return 'identity_verify'
+
+    def _handle_confirmed_qr_response(self, session: QRLoginSession, resp: httpx.Response) -> bool:
+        payload = (
+            resp.json()
+            .get("content", {})
+            .get("data", {})
+        )
+        self._merge_session_cookies(session, resp.cookies)
+
+        if payload.get("iframeRedirect") is True:
+            iframe_url = payload.get("iframeRedirectUrl")
+            verification_type = self._detect_verification_type(iframe_url)
+            self._update_session_state(
+                session,
+                status='verification_required',
+                phase='awaiting_verification',
+                verification_type=verification_type,
+                error_message='扫码已确认，等待完成验证',
+                success_stage='confirmed_requires_verification',
+                browser_alive=False,
+                verification_url=iframe_url,
+                clear_handoff_error=True,
+            )
+            session.expire_time = max(session.expire_time, 600)
+            self._resolve_existing_account_proxy_config(session)
+            self._ensure_verification_task(session)
+            logger.warning(f"账号被风控，需要继续验证: {session.session_id}, URL: {iframe_url}")
+            return False
+
+        if self._mark_session_success(session, resp.cookies, 'api', require_complete_cookies=True):
+            self._update_session_state(
+                session,
+                phase='login_complete',
+                success_stage='api_complete',
+                browser_alive=False,
+                clear_error=True,
+                clear_handoff_error=True,
+            )
+            return True
+
+        self._update_session_state(
+            session,
+            status='confirmed',
+            phase='awaiting_complete_cookies',
+            error_message='扫码已确认，正在等待完整登录Cookie',
+            success_stage='confirmed_pending_cookies',
+        )
+        logger.warning(f"扫码登录API返回CONFIRMED，但关键Cookie仍不完整: {session.session_id}")
+        return False
+
     def _has_completed_login_cookies(self, cookie_dict: Dict[str, str]) -> bool:
         """基于关键Cookie判断是否已经完成登录"""
         if not cookie_dict.get('unb'):
@@ -465,6 +618,13 @@ class QRLoginManager:
             session.managed_context = managed_context
         if managed_page is not None:
             session.managed_page = managed_page
+        self._update_session_state(
+            session,
+            phase='login_complete',
+            success_stage=f'{source}_complete',
+            clear_error=True,
+            clear_handoff_error=True,
+        )
 
         if not was_success:
             logger.info(
@@ -623,11 +783,18 @@ class QRLoginManager:
         browser = None
         context = None
         page = None
+        launch_error_message = None
 
         try:
 
             logger.info(f"开始打开扫码登录验证页面: {session_id}")
             browser, context, show_browser = await self._launch_verification_browser_context(session)
+            self._update_session_state(
+                session,
+                phase='verification_browser_ready',
+                browser_alive=True,
+                clear_error=True,
+            )
 
             browser_cookies = self._build_cross_domain_browser_cookies(session.verification_url, session.cookies)
             if browser_cookies:
@@ -651,6 +818,11 @@ class QRLoginManager:
                     if session.screenshot_path and session.screenshot_path != screenshot_path:
                         image_manager.delete_image(session.screenshot_path)
                     session.screenshot_path = screenshot_path
+                    self._update_session_state(
+                        session,
+                        phase='awaiting_verification',
+                        browser_alive=True,
+                    )
                     logger.info(f"扫码登录验证截图已保存: {session_id}, 路径: {screenshot_path}")
                 else:
                     logger.warning(f"扫码登录验证截图保存失败: {session_id}")
@@ -664,7 +836,7 @@ class QRLoginManager:
                 if current_session.status == 'success':
                     logger.info(f"扫码登录验证页检测到会话已成功: {session_id}")
                     break
-                if current_session.status not in {'verification_required', 'scanned', 'waiting', 'processing'}:
+                if current_session.status not in {'verification_required', 'scanned', 'waiting', 'processing', 'confirmed'}:
                     break
 
                 if await self._probe_browser_login_success(
@@ -681,8 +853,17 @@ class QRLoginManager:
             logger.info(f"扫码登录验证页面任务已取消: {session_id}")
             raise
         except Exception as e:
+            launch_error_message = str(e)
             logger.error(f"打开扫码登录验证页面失败: {session_id}, 错误: {e}")
         finally:
+            if launch_error_message:
+                self._update_session_state(
+                    self.sessions.get(session_id),
+                    status='failed',
+                    phase='verification_failed',
+                    error_message=launch_error_message,
+                    browser_alive=False,
+                )
             latest_session = self.sessions.get(session_id)
             keep_session_handles = self._should_keep_session_browser_handles(
                 latest_session,
@@ -706,7 +887,23 @@ class QRLoginManager:
             except Exception:
                 pass
             if latest_session:
+                if not keep_session_handles:
+                    latest_session.browser_alive = False
                 latest_session.verification_task = None
+                if not keep_session_handles:
+                    latest_session.browser_alive = False
+                if (
+                    latest_session.status == 'verification_required'
+                    and not keep_session_handles
+                    and not latest_session.error_message
+                ):
+                    self._update_session_state(
+                        latest_session,
+                        status='failed',
+                        phase='verification_failed',
+                        error_message='验证页面已退出，登录未完成',
+                        browser_alive=False,
+                    )
 
             logger.info(f"扫码登录验证页面已关闭: {session_id}")
 
@@ -1004,37 +1201,13 @@ class QRLoginManager:
                     )
 
                     if qrcode_status == "CONFIRMED":
-                        # 登录确认
-                        if (
-                            resp.json()
-                            .get("content", {})
-                            .get("data", {})
-                            .get("iframeRedirect")
-                            is True
-                        ):
-                            # 账号被风控，需要手机验证
-                            session.status = 'verification_required'
-                            iframe_url = (
-                                resp.json()
-                                .get("content", {})
-                                .get("data", {})
-                                .get("iframeRedirectUrl")
-                            )
-                            session.verification_url = iframe_url
-                            session.expire_time = max(session.expire_time, 600)
-                            self._merge_session_cookies(session, resp.cookies)
-                            self._resolve_existing_account_proxy_config(session)
-                            self._ensure_verification_task(session)
-                            logger.warning(f"账号被风控，需要手机验证: {session_id}, URL: {iframe_url}")
-                            await asyncio.sleep(0.8)
-                            continue
-                        else:
-                            # 登录成功
-                            if self._mark_session_success(session, resp.cookies, 'api'):
-                                break
-                            logger.warning(f"扫码登录API返回成功状态，但关键Cookie不足: {session_id}")
+                        if self._handle_confirmed_qr_response(session, resp):
+                            break
+                        await asyncio.sleep(0.8)
+                        continue
 
                     elif qrcode_status == "NEW":
+                        self._update_session_state(session, phase='waiting_for_scan')
                         # 二维码未被扫描，继续轮询
                         continue
 
@@ -1043,21 +1216,38 @@ class QRLoginManager:
                         if session.status == 'verification_required':
                             logger.info(f"二维码已过期，但会话已进入验证流程，继续等待: {session_id}")
                         else:
-                            session.status = 'expired'
+                            self._update_session_state(
+                                session,
+                                status='expired',
+                                phase='expired',
+                                error_message='二维码已过期',
+                                browser_alive=False,
+                            )
                             logger.info(f"二维码已过期: {session_id}")
                             break
 
                     elif qrcode_status == "SCANED":
                         # 二维码已被扫描，等待确认
-                        if session.status == 'waiting':
-                            session.status = 'scanned'
+                        if session.status in {'waiting', 'confirmed'}:
+                            self._update_session_state(
+                                session,
+                                status='scanned',
+                                phase='awaiting_confirmation',
+                                clear_error=True,
+                            )
                             logger.info(f"二维码已扫描，等待确认: {session_id}")
                     else:
                         # 用户取消确认
                         if session.status == 'verification_required':
                             logger.info(f"扫码状态 {qrcode_status}，但验证流程仍在进行，继续等待: {session_id}")
                         else:
-                            session.status = 'cancelled'
+                            self._update_session_state(
+                                session,
+                                status='cancelled',
+                                phase='cancelled',
+                                error_message='用户取消登录',
+                                browser_alive=False,
+                            )
                             logger.info(f"用户取消登录: {session_id}")
                             break
 
@@ -1068,14 +1258,26 @@ class QRLoginManager:
                     await asyncio.sleep(2)
 
             # 超时处理
-            if session.status not in ['success', 'expired', 'cancelled', 'verification_required']:
-                session.status = 'expired'
+            if session.status not in ['success', 'expired', 'cancelled', 'verification_required', 'failed', 'confirmed']:
+                self._update_session_state(
+                    session,
+                    status='expired',
+                    phase='expired',
+                    error_message='二维码监控超时',
+                    browser_alive=False,
+                )
                 logger.info(f"二维码监控超时，标记为过期: {session_id}")
 
         except Exception as e:
             logger.error(f"监控二维码状态失败: {e}")
             if session_id in self.sessions:
-                self.sessions[session_id].status = 'expired'
+                self._update_session_state(
+                    self.sessions[session_id],
+                    status='failed',
+                    phase='monitor_failed',
+                    error_message=str(e),
+                    browser_alive=False,
+                )
     
     def get_session_status(self, session_id: str) -> Dict[str, Any]:
         """获取会话状态"""
@@ -1084,23 +1286,58 @@ class QRLoginManager:
             return {'status': 'not_found'}
 
         if session.is_expired() and session.status != 'success':
-            session.status = 'expired'
+            self._update_session_state(
+                session,
+                status='expired',
+                phase='expired',
+                error_message=session.error_message or '二维码已过期',
+                browser_alive=False,
+            )
+
+        verification_type = session.verification_type or self._detect_verification_type(session.verification_url)
+        verification_type_label = {
+            'face_verify': '人脸验证',
+            'sms_verify': '短信验证',
+            'qr_verify': '二维码验证',
+            'identity_verify': '身份验证',
+            None: None,
+        }.get(verification_type, verification_type)
 
         result = {
             'status': session.status,
-            'session_id': session_id
+            'session_id': session_id,
+            'phase': session.phase,
+            'verification_type': verification_type,
+            'verification_type_label': verification_type_label,
+            'handoff_status': session.handoff_status,
+            'handoff_error': session.handoff_error,
+            'success_stage': session.success_stage,
+            'browser_alive': session.browser_alive,
         }
+        if session.error_message:
+            result['error'] = session.error_message
         logger.info(f"获取会话状态: {result}")
         # 如果需要验证，返回验证URL
         if session.status == 'verification_required':
             result['verification_url'] = session.verification_url
             result['screenshot_path'] = session.screenshot_path
-            result['message'] = '账号被风控，需要扫码验证' if session.screenshot_path else '账号被风控，正在准备验证二维码'
+            result['message'] = (
+                f'需要{verification_type_label}，请查看验证截图'
+                if session.screenshot_path else
+                f'需要{verification_type_label}，请继续完成验证'
+            )
 
         # 如果登录成功，返回Cookie信息
+        elif session.status == 'confirmed':
+            result['message'] = '扫码已确认，正在等待完整登录Cookie'
+        elif session.status == 'failed' and session.error_message:
+            result['message'] = session.error_message
+
         if session.status == 'success' and session.cookies and session.unb:
             result['cookies'] = self._cookie_marshal(session.cookies)
             result['unb'] = session.unb
+        if session.account_info:
+            result['account_info'] = session.account_info
 
         return result
 

@@ -4065,6 +4065,61 @@ class XianyuSliderStealth:
             if not best_missing:
                 break
 
+        if best_missing and context:
+            fresh_page = None
+            fresh_actions = [
+                ("fresh_tab_home", "https://www.goofish.com/"),
+                ("fresh_tab_im", "https://www.goofish.com/im"),
+            ]
+            try:
+                logger.info(
+                    f"【{self.pure_user_id}】{scene}同页稳定化后仍缺关键Cookie，追加 fresh-tab 预热: "
+                    f"missing_protected_fields={best_missing}"
+                )
+                fresh_page = context.new_page()
+                for action_name, target_url in fresh_actions:
+                    try:
+                        logger.info(f"【{self.pure_user_id}】{scene}稳定化动作: {action_name} -> {target_url}")
+                        fresh_page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
+                    except Exception as fresh_nav_error:
+                        logger.warning(
+                            f"【{self.pure_user_id}】{scene}稳定化动作 {action_name} 失败: {fresh_nav_error}"
+                        )
+                        continue
+
+                    time.sleep(1.0)
+                    try:
+                        fresh_page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+
+                    current_cookies = self._snapshot_context_cookies(context, page=fresh_page)
+                    current_missing = [
+                        key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
+                        if not current_cookies.get(key)
+                    ]
+                    self._log_cookie_snapshot_integrity(current_cookies, f"{scene}稳定化[{action_name}]")
+
+                    if current_cookies and len(current_missing) < len(best_missing):
+                        best_cookies = current_cookies
+                        best_missing = current_missing
+                        logger.info(
+                            f"【{self.pure_user_id}】{scene}fresh-tab 稳定化后关键Cookie缺失减少到 {len(best_missing)} 个: "
+                            f"{best_missing}"
+                        )
+
+                    if not best_missing:
+                        break
+            except Exception as fresh_tab_error:
+                logger.warning(f"【{self.pure_user_id}】{scene}fresh-tab 稳定化失败: {fresh_tab_error}")
+            finally:
+                if fresh_page:
+                    try:
+                        fresh_page.close()
+                    except Exception:
+                        pass
+
         if best_missing:
             warmed_cookies = self._perform_browser_cookie_warmup_probes(
                 context,
@@ -5371,6 +5426,54 @@ class XianyuSliderStealth:
             return solved
         finally:
             self.page = original_page
+
+    def _retry_solve_slider_in_fresh_tab(self, current_page=None) -> bool:
+        current_context = getattr(self, 'context', None)
+        if not current_context:
+            return False
+
+        retry_depth = int(getattr(self, '_fresh_tab_slider_retry_depth', 0) or 0)
+        if retry_depth > 0:
+            logger.info(f"【{self.pure_user_id}】fresh-tab 滑块重试已在进行中，跳过递归重入")
+            return False
+
+        active_page = current_page or getattr(self, 'page', None)
+        target_url = self._safe_page_url(active_page) if active_page else ""
+        if not target_url or target_url == "about:blank":
+            logger.info(f"【{self.pure_user_id}】当前页面URL无效，跳过 fresh-tab 滑块重试")
+            return False
+
+        original_page = getattr(self, 'page', None)
+        fresh_page = None
+        setattr(self, '_fresh_tab_slider_retry_depth', retry_depth + 1)
+        try:
+            logger.info(f"【{self.pure_user_id}】常规滑块重试失败，开始同 context fresh-tab 重试: {target_url}")
+            fresh_page = current_context.new_page()
+            fresh_page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
+            try:
+                fresh_page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+
+            solved = self._attempt_solve_slider_on_page(fresh_page)
+            if solved:
+                self.page = fresh_page
+                logger.success(f"【{self.pure_user_id}】✅ fresh-tab 滑块重试成功，已切换到新标签页继续")
+                return True
+
+            logger.warning(f"【{self.pure_user_id}】⚠️ fresh-tab 滑块重试未成功")
+            return False
+        except Exception as fresh_tab_error:
+            logger.warning(f"【{self.pure_user_id}】fresh-tab 滑块重试失败: {fresh_tab_error}")
+            return False
+        finally:
+            setattr(self, '_fresh_tab_slider_retry_depth', retry_depth)
+            if fresh_page and self.page is not fresh_page:
+                try:
+                    fresh_page.close()
+                except Exception:
+                    pass
+                self.page = original_page
 
     def _cleanup_verification_screenshots(self, keep_paths: Optional[List[str]] = None):
         try:
@@ -9368,6 +9471,9 @@ class XianyuSliderStealth:
         
         # 输出当前统计摘要
         strategy_stats.log_summary()
+
+        if self._retry_solve_slider_in_fresh_tab(self.page):
+            return True
 
         self._save_debug_snapshot("solve_slider_failed", getattr(self, "_detected_slider_frame", None))
         

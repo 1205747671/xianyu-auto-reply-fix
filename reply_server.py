@@ -5018,6 +5018,31 @@ async def generate_qr_code(current_user: Dict[str, Any] = Depends(get_current_us
 async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """检查扫码登录状态"""
     try:
+        def _build_qr_status_payload(
+            status: str,
+            message: str,
+            session_status_info: Optional[Dict[str, Any]] = None,
+            **extra_fields,
+        ) -> Dict[str, Any]:
+            status_info = session_status_info or {}
+            payload = {
+                'status': status,
+                'message': message,
+                'phase': status_info.get('phase'),
+                'handoff_status': status_info.get('handoff_status'),
+                'handoff_error': status_info.get('handoff_error'),
+                'verification_type': status_info.get('verification_type'),
+                'verification_type_label': status_info.get('verification_type_label'),
+                'success_stage': status_info.get('success_stage'),
+                'browser_alive': status_info.get('browser_alive'),
+            }
+            error_message = status_info.get('error')
+            if error_message:
+                payload['error'] = error_message
+            for key, value in extra_fields.items():
+                if value is not None:
+                    payload[key] = value
+            return payload
         # 清理过期记录
         cleanup_qr_check_records()
 
@@ -5025,20 +5050,33 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
         if session_id in qr_check_processed:
             record = qr_check_processed[session_id]
             if record['processed']:
+                session_status_info = qr_login_manager.get_session_status(session_id)
                 log_with_user('debug', f"扫码登录session {session_id} 已处理过，直接返回", current_user)
                 if record.get('error'):
-                    return {'status': 'error', 'message': record['error']}
+                    return _build_qr_status_payload(
+                        'error',
+                        record['error'],
+                        session_status_info,
+                        error=record['error'],
+                        handoff_status=session_status_info.get('handoff_status') or 'failed',
+                    )
 
                 account_info = record.get('account_info')
                 if account_info:
-                    return {
-                        'status': 'success',
-                        'message': '扫码登录已完成',
-                        'account_info': account_info,
-                        'already_processed': True,
-                    }
+                    return _build_qr_status_payload(
+                        'success',
+                        '扫码登录已完成',
+                        session_status_info,
+                        account_info=account_info,
+                        handoff_status=session_status_info.get('handoff_status') or 'success',
+                        already_processed=True,
+                    )
 
-                return {'status': 'already_processed', 'message': '该会话已处理完成'}
+                return _build_qr_status_payload(
+                    'already_processed',
+                    '该会话已处理完成',
+                    session_status_info,
+                )
 
         # 获取该session的锁
         session_lock = qr_check_locks[session_id]
@@ -5046,26 +5084,44 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
         # 使用非阻塞方式尝试获取锁
         if session_lock.locked():
             log_with_user('debug', f"扫码登录session {session_id} 正在被其他请求处理，跳过", current_user)
-            return {'status': 'processing', 'message': '正在处理中，请稍候...'}
+            session_status_info = qr_login_manager.get_session_status(session_id)
+            return _build_qr_status_payload(
+                'processing',
+                '正在处理中，请稍候...',
+                session_status_info,
+            )
 
         async with session_lock:
             # 再次检查是否已处理（双重检查）
             if session_id in qr_check_processed and qr_check_processed[session_id]['processed']:
                 log_with_user('debug', f"扫码登录session {session_id} 在获取锁后发现已处理，直接返回", current_user)
                 record = qr_check_processed[session_id]
+                session_status_info = qr_login_manager.get_session_status(session_id)
                 if record.get('error'):
-                    return {'status': 'error', 'message': record['error']}
+                    return _build_qr_status_payload(
+                        'error',
+                        record['error'],
+                        session_status_info,
+                        error=record['error'],
+                        handoff_status=session_status_info.get('handoff_status') or 'failed',
+                    )
 
                 account_info = record.get('account_info')
                 if account_info:
-                    return {
-                        'status': 'success',
-                        'message': '扫码登录已完成',
-                        'account_info': account_info,
-                        'already_processed': True,
-                    }
+                    return _build_qr_status_payload(
+                        'success',
+                        '扫码登录已完成',
+                        session_status_info,
+                        account_info=account_info,
+                        handoff_status=session_status_info.get('handoff_status') or 'success',
+                        already_processed=True,
+                    )
 
-                return {'status': 'already_processed', 'message': '该会话已处理完成'}
+                return _build_qr_status_payload(
+                    'already_processed',
+                    '该会话已处理完成',
+                    session_status_info,
+                )
 
             # 清理过期会话
             qr_login_manager.cleanup_expired_sessions()
@@ -5075,10 +5131,28 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
             log_with_user('info', f"获取会话状态1111111: {status_info}", current_user)
             if status_info['status'] == 'success':
                 log_with_user('info', f"获取会话状态22222222: {status_info}", current_user)
+                handoff_updater = getattr(qr_login_manager, "update_session_handoff_status", None)
+
+                if status_info.get('handoff_status') == 'processing':
+                    return {
+                        'status': 'confirmed',
+                        'message': '已确认，正在获取Cookie...',
+                        'phase': status_info.get('phase') or 'handoff_processing',
+                        'handoff_status': 'processing',
+                        'verification_type': status_info.get('verification_type'),
+                        'success_stage': status_info.get('success_stage'),
+                    }
 
                 # 检查是否已经在后台处理中
                 if session_id in qr_check_processed and qr_check_processed[session_id].get('processing'):
-                    return {'status': 'confirmed', 'message': '已确认，正在获取Cookie...'}
+                    return {
+                        'status': 'confirmed',
+                        'message': '已确认，正在获取Cookie...',
+                        'phase': status_info.get('phase') or 'handoff_processing',
+                        'handoff_status': 'processing',
+                        'verification_type': status_info.get('verification_type'),
+                        'success_stage': status_info.get('success_stage'),
+                    }
 
                 # 标记为处理中，立即返回"已确认"状态（不阻塞前端）
                 qr_check_processed[session_id] = {
@@ -5086,6 +5160,8 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
                     'processing': True,
                     'timestamp': time.time()
                 }
+                if callable(handoff_updater):
+                    handoff_updater(session_id, 'processing')
 
                 # 获取 Cookie 信息
                 cookies_info = qr_login_manager.get_session_cookies(session_id)
@@ -5104,6 +5180,8 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
                                 managed_page=cookies_info.get('managed_page'),
                             )
                             log_with_user('info', f"扫码登录处理完成: {session_id}, 账号: {account_info.get('account_id', 'unknown')}", current_user)
+                            if callable(handoff_updater):
+                                handoff_updater(session_id, 'success', account_info=account_info)
                             qr_check_processed[session_id] = {
                                 'processed': True,
                                 'processing': False,
@@ -5112,6 +5190,8 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
                             }
                         except Exception as bg_e:
                             log_with_user('error', f"后台处理扫码Cookie失败: {bg_e}", current_user)
+                            if callable(handoff_updater):
+                                handoff_updater(session_id, 'failed', error=str(bg_e))
                             qr_check_processed[session_id] = {
                                 'processed': True,
                                 'processing': False,
@@ -5122,19 +5202,40 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
                     asyncio.create_task(_process_cookies_background())
 
                 # 立即返回"已确认"状态
-                return {'status': 'confirmed', 'message': '已确认，正在获取Cookie...'}
+                return {
+                    'status': 'confirmed',
+                    'message': '已确认，正在获取Cookie...',
+                    'phase': 'handoff_processing',
+                    'handoff_status': 'processing',
+                    'verification_type': status_info.get('verification_type'),
+                    'success_stage': status_info.get('success_stage'),
+                }
 
             # 检查后台处理是否已完成
             if session_id in qr_check_processed:
                 record = qr_check_processed[session_id]
                 if record.get('processed') and not record.get('processing'):
                     if record.get('error'):
-                        return {'status': 'error', 'message': record['error']}
+                        return {
+                            'status': 'error',
+                            'message': record['error'],
+                            'error': record['error'],
+                            'phase': status_info.get('phase'),
+                            'handoff_status': 'failed',
+                            'verification_type': status_info.get('verification_type'),
+                        }
                     status_info['status'] = 'success'
                     status_info['account_info'] = record.get('account_info', {})
                     return status_info
                 elif record.get('processing'):
-                    return {'status': 'confirmed', 'message': '已确认，正在获取Cookie...'}
+                    return {
+                        'status': 'confirmed',
+                        'message': '已确认，正在获取Cookie...',
+                        'phase': status_info.get('phase') or 'handoff_processing',
+                        'handoff_status': 'processing',
+                        'verification_type': status_info.get('verification_type'),
+                        'success_stage': status_info.get('success_stage'),
+                    }
 
             return status_info
 
