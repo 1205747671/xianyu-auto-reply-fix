@@ -1,12 +1,105 @@
 import asyncio
+import os
+import sys
+import types
 import unittest
 from unittest import mock
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+if "loguru" not in sys.modules:
+    loguru_stub = types.ModuleType("loguru")
+    loguru_stub.logger = mock.Mock()
+    sys.modules["loguru"] = loguru_stub
+
+if "websockets" not in sys.modules:
+    sys.modules["websockets"] = types.ModuleType("websockets")
+
+if "aiohttp" not in sys.modules:
+    aiohttp_stub = types.ModuleType("aiohttp")
+
+    class _ClientTimeout:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    aiohttp_stub.ClientTimeout = _ClientTimeout
+    sys.modules["aiohttp"] = aiohttp_stub
+
+if "blackboxprotobuf" not in sys.modules:
+    sys.modules["blackboxprotobuf"] = types.ModuleType("blackboxprotobuf")
+
+if "execjs" not in sys.modules:
+    execjs_stub = types.ModuleType("execjs")
+    execjs_stub.runtime_names = ["stub-runtime"]
+    execjs_stub.get = lambda: types.SimpleNamespace(name="stub-runtime")
+    execjs_stub.compile = lambda _source: types.SimpleNamespace(call=lambda *args, **kwargs: None)
+    sys.modules["execjs"] = execjs_stub
+
+if "db_manager" not in sys.modules:
+    db_manager_stub = types.ModuleType("db_manager")
+    db_manager_stub.db_manager = mock.Mock()
+    sys.modules["db_manager"] = db_manager_stub
+
+if "utils.notification_dispatcher" not in sys.modules:
+    notification_stub = types.ModuleType("utils.notification_dispatcher")
+    notification_stub.dispatch_account_notifications = lambda *args, **kwargs: None
+    notification_stub.format_notification_template = lambda *args, **kwargs: ""
+    notification_stub.get_notification_template_text = lambda *args, **kwargs: ""
+    notification_stub.guess_verification_type = lambda *args, **kwargs: None
+    notification_stub.render_notification_template = lambda *args, **kwargs: ""
+    sys.modules["utils.notification_dispatcher"] = notification_stub
+
+if "utils.browser_provider" not in sys.modules:
+    browser_provider_stub = types.ModuleType("utils.browser_provider")
+
+    async def _launch_browser_async(*args, **kwargs):
+        raise AssertionError("launch_browser_async should be patched in tests")
+
+    browser_provider_stub.launch_browser_async = _launch_browser_async
+    sys.modules["utils.browser_provider"] = browser_provider_stub
+
+if "cloakbrowser" not in sys.modules:
+    cloakbrowser_stub = types.ModuleType("cloakbrowser")
+
+    def _not_used(*args, **kwargs):
+        raise AssertionError("cloakbrowser stub should be patched in tests")
+
+    cloakbrowser_stub.launch = _not_used
+    cloakbrowser_stub.launch_async = _not_used
+    cloakbrowser_stub.launch_context = _not_used
+    cloakbrowser_stub.launch_context_async = _not_used
+    cloakbrowser_stub.launch_persistent_context = _not_used
+    cloakbrowser_stub.launch_persistent_context_async = _not_used
+    sys.modules["cloakbrowser"] = cloakbrowser_stub
 
 import XianyuAutoAsync
 from XianyuAutoAsync import XianyuLive
 
 
 class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _build_merge_result(merged_cookies_dict):
+        return {
+            "merged_cookies_dict": merged_cookies_dict,
+            "updated_fields": sorted(merged_cookies_dict.keys()),
+            "changed_fields": sorted(merged_cookies_dict.keys()),
+            "new_fields": [],
+            "preserved_fields": [],
+            "preserved_protected_fields": [],
+            "would_remove_fields": [],
+            "removed_fields": [],
+            "missing_protected_fields": [],
+            "missing_required_fields": [],
+            "incoming_missing_protected_fields": [],
+            "account_switched": False,
+            "incoming_count": len(merged_cookies_dict),
+            "existing_count": 0,
+            "merged_count": len(merged_cookies_dict),
+        }
+
     async def test_launch_browser_safe_delegates_to_provider_helper(self):
         sentinel_browser = object()
 
@@ -50,6 +143,25 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(asyncio.get_event_loop_policy(), original_policy)
         launch_browser_async.assert_awaited_once_with()
 
+    def test_build_browser_refresh_context_options_defer_identity_to_provider(self):
+        live = XianyuLive.__new__(XianyuLive)
+
+        context_options = live._build_browser_refresh_context_options()
+
+        self.assertEqual(context_options, {})
+
+    def test_build_browser_refresh_launch_args_skip_enable_automation_in_docker(self):
+        live = XianyuLive.__new__(XianyuLive)
+
+        with mock.patch.object(
+            XianyuAutoAsync.os,
+            "getenv",
+            side_effect=lambda key: "1" if key == "DOCKER_ENV" else None,
+        ):
+            browser_args = live._build_browser_refresh_launch_args()
+
+        self.assertNotIn("--enable-automation", browser_args)
+
     async def test_async_close_browser_closes_context_before_browser(self):
         close_order = []
 
@@ -76,6 +188,444 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(close_order, ["context.close", "browser.close"])
         context.close.assert_awaited_once_with()
         browser.close.assert_awaited_once_with()
+
+    async def test_async_close_browser_can_skip_managed_runtime_resources(self):
+        close_order = []
+
+        async def close_page():
+            close_order.append("page.close")
+
+        page = mock.Mock()
+        page.close = mock.AsyncMock(side_effect=close_page)
+
+        browser = mock.Mock()
+        browser.close = mock.AsyncMock(side_effect=AssertionError("browser should stay open"))
+
+        context = mock.Mock()
+        context.close = mock.AsyncMock(side_effect=AssertionError("context should stay open"))
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = "managed-runtime-close-test"
+        live._safe_str = str
+
+        await live._async_close_browser(
+            browser=browser,
+            context=context,
+            page=page,
+            close_browser=False,
+            close_context=False,
+        )
+
+        self.assertEqual(close_order, ["page.close"])
+        page.close.assert_awaited_once_with()
+        context.close.assert_not_awaited()
+        browser.close.assert_not_awaited()
+
+    async def test_async_close_browser_closes_external_browser_only_once_when_context_is_not_owned(self):
+        close_order = []
+
+        async def close_browser():
+            close_order.append("browser.close")
+
+        browser = mock.Mock()
+        browser.close = mock.AsyncMock(side_effect=close_browser)
+
+        context = mock.Mock()
+        context.close = mock.AsyncMock(side_effect=AssertionError("context should stay open"))
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = "managed-runtime-browser-close-once-test"
+        live._safe_str = str
+
+        await live._async_close_browser(
+            browser=browser,
+            context=context,
+            close_browser=True,
+            close_context=False,
+            close_page=False,
+        )
+
+        self.assertEqual(close_order, ["browser.close"])
+        context.close.assert_not_awaited()
+        browser.close.assert_awaited_once_with()
+
+    async def test_force_close_resources_closes_page_context_browser_sequentially(self):
+        close_order = []
+
+        async def close_page():
+            close_order.append("page.close")
+
+        async def close_context():
+            close_order.append("context.close")
+
+        async def close_browser():
+            close_order.append("browser.close")
+
+        page = mock.Mock()
+        page.close = mock.AsyncMock(side_effect=close_page)
+
+        context = mock.Mock()
+        context.close = mock.AsyncMock(side_effect=close_context)
+
+        browser = mock.Mock()
+        browser.close = mock.AsyncMock(side_effect=close_browser)
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = "force-close-order-test"
+        live._safe_str = str
+
+        await live._force_close_resources(
+            browser=browser,
+            context=context,
+            page=page,
+        )
+
+        self.assertEqual(
+            close_order,
+            ["page.close", "context.close", "browser.close"],
+        )
+        page.close.assert_awaited_once_with()
+        context.close.assert_awaited_once_with()
+        browser.close.assert_awaited_once_with()
+
+    async def test_refresh_cookies_from_qr_login_launches_minimal_context_without_identity_overrides(self):
+        browser = mock.Mock()
+        browser.close = mock.AsyncMock()
+
+        page = mock.Mock()
+        page.goto = mock.AsyncMock()
+        page.reload = mock.AsyncMock()
+        page.close = mock.AsyncMock()
+
+        context = mock.Mock()
+        context.add_cookies = mock.AsyncMock()
+        context.new_page = mock.AsyncMock(return_value=page)
+        context.cookies = mock.AsyncMock(
+            return_value=[
+                {"name": "unb", "value": "new-unb"},
+                {"name": "sgcookie", "value": "new-sg"},
+                {"name": "cookie2", "value": "new-cookie2"},
+                {"name": "_m_h5_tk", "value": "new-token_123"},
+                {"name": "_m_h5_tk_enc", "value": "new-enc"},
+                {"name": "t", "value": "new-t"},
+                {"name": "cna", "value": "new-cna"},
+            ]
+        )
+        context.close = mock.AsyncMock()
+        browser.new_context = mock.AsyncMock(return_value=context)
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = "fresh-context-test"
+        live.user_id = 7
+        live.qr_cookie_refresh_cooldown = 180
+        live.last_qr_cookie_refresh_time = 0
+        live._safe_str = str
+        live._extract_cookie_value = lambda cookie_record: (cookie_record or {}).get("cookie")
+        live._summarize_cookie_string = lambda cookie_string: cookie_string
+        live._set_runtime_cookie_state = mock.Mock()
+        live.protected_merge_cookie_dicts = lambda existing, incoming: self._build_merge_result(incoming)
+
+        qr_cookies_str = (
+            "unb=qr-unb; sgcookie=qr-sg; cookie2=qr-cookie2; "
+            "_m_h5_tk=qr-token_123; _m_h5_tk_enc=qr-enc; t=qr-t"
+        )
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "_launch_browser_safe",
+            new=mock.AsyncMock(return_value=browser),
+        ) as launch_browser_safe, \
+             mock.patch("XianyuAutoAsync.asyncio.sleep", new=mock.AsyncMock()), \
+             mock.patch.object(
+                 XianyuAutoAsync.os,
+                 "getenv",
+                 side_effect=lambda key: "1" if key == "DOCKER_ENV" else None,
+             ), \
+             mock.patch("XianyuAutoAsync.db_manager.get_cookie_details", return_value={"cookie": qr_cookies_str}), \
+             mock.patch("XianyuAutoAsync.db_manager.update_cookie_account_info", return_value=True):
+            result = await live.refresh_cookies_from_qr_login(qr_cookies_str)
+
+        self.assertTrue(result)
+        launch_args = launch_browser_safe.await_args.kwargs["args"]
+        self.assertNotIn("--enable-automation", launch_args)
+        browser.new_context.assert_awaited_once_with()
+        page.close.assert_awaited_once_with()
+        context.close.assert_awaited_once_with()
+        browser.close.assert_awaited_once_with()
+
+    async def test_refresh_cookies_from_qr_login_reuses_managed_context_without_launching_browser(self):
+        managed_runtime = mock.Mock()
+        managed_runtime.close = mock.AsyncMock()
+
+        page = mock.Mock()
+        page.goto = mock.AsyncMock()
+        page.reload = mock.AsyncMock()
+        page.close = mock.AsyncMock()
+
+        context = mock.Mock()
+        context.add_cookies = mock.AsyncMock()
+        context.new_page = mock.AsyncMock(return_value=page)
+        context.cookies = mock.AsyncMock(
+            return_value=[
+                {"name": "unb", "value": "new-unb"},
+                {"name": "sgcookie", "value": "new-sg"},
+                {"name": "cookie2", "value": "new-cookie2"},
+                {"name": "_m_h5_tk", "value": "new-token_123"},
+                {"name": "_m_h5_tk_enc", "value": "new-enc"},
+                {"name": "t", "value": "new-t"},
+                {"name": "cna", "value": "new-cna"},
+            ]
+        )
+        context.close = mock.AsyncMock()
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = "managed-context-test"
+        live.user_id = 7
+        live.qr_cookie_refresh_cooldown = 180
+        live.last_qr_cookie_refresh_time = 0
+        live._safe_str = str
+        live._extract_cookie_value = lambda cookie_record: (cookie_record or {}).get("cookie")
+        live._summarize_cookie_string = lambda cookie_string: cookie_string
+        live._set_runtime_cookie_state = mock.Mock()
+        live.protected_merge_cookie_dicts = lambda existing, incoming: self._build_merge_result(incoming)
+
+        qr_cookies_str = (
+            "unb=qr-unb; sgcookie=qr-sg; cookie2=qr-cookie2; "
+            "_m_h5_tk=qr-token_123; _m_h5_tk_enc=qr-enc; t=qr-t"
+        )
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "_launch_browser_safe",
+            new=mock.AsyncMock(side_effect=AssertionError("managed context path should not launch browser")),
+        ) as launch_browser_safe, \
+             mock.patch("XianyuAutoAsync.asyncio.sleep", new=mock.AsyncMock()) as sleep_mock, \
+             mock.patch("XianyuAutoAsync.db_manager.get_cookie_details", return_value={"cookie": qr_cookies_str}) as get_cookie_details, \
+             mock.patch("XianyuAutoAsync.db_manager.update_cookie_account_info", return_value=True) as update_cookie_account_info:
+            result = await live.refresh_cookies_from_qr_login(
+                qr_cookies_str,
+                managed_runtime=managed_runtime,
+                managed_context=context,
+            )
+
+        self.assertTrue(result)
+        launch_browser_safe.assert_not_awaited()
+        context.add_cookies.assert_awaited_once()
+        context.new_page.assert_awaited_once_with()
+        page.goto.assert_awaited_once_with(
+            "https://www.goofish.com/im",
+            wait_until="domcontentloaded",
+            timeout=15000,
+        )
+        page.reload.assert_awaited_once_with(
+            wait_until="domcontentloaded",
+            timeout=12000,
+        )
+        page.close.assert_awaited_once_with()
+        context.close.assert_not_awaited()
+        managed_runtime.close.assert_not_awaited()
+        update_cookie_account_info.assert_called_once()
+        get_cookie_details.assert_called()
+        self.assertGreaterEqual(sleep_mock.await_count, 3)
+        live._set_runtime_cookie_state.assert_called_once()
+
+    async def test_refresh_cookies_from_qr_login_ignores_managed_page_without_context(self):
+        managed_runtime = mock.Mock()
+        managed_runtime.close = mock.AsyncMock()
+
+        orphan_page = mock.Mock()
+        orphan_page.goto = mock.AsyncMock()
+        orphan_page.reload = mock.AsyncMock()
+        orphan_page.close = mock.AsyncMock()
+
+        created_page = mock.Mock()
+        created_page.goto = mock.AsyncMock()
+        created_page.reload = mock.AsyncMock()
+        created_page.close = mock.AsyncMock()
+
+        created_context = mock.Mock()
+        created_context.add_cookies = mock.AsyncMock()
+        created_context.new_page = mock.AsyncMock(return_value=created_page)
+        created_context.cookies = mock.AsyncMock(
+            return_value=[
+                {"name": "unb", "value": "new-unb"},
+                {"name": "sgcookie", "value": "new-sg"},
+                {"name": "cookie2", "value": "new-cookie2"},
+                {"name": "_m_h5_tk", "value": "new-token_123"},
+                {"name": "_m_h5_tk_enc", "value": "new-enc"},
+                {"name": "t", "value": "new-t"},
+                {"name": "cna", "value": "new-cna"},
+            ]
+        )
+        created_context.close = mock.AsyncMock()
+        managed_runtime.new_context = mock.AsyncMock(return_value=created_context)
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = "managed-page-without-context-test"
+        live.user_id = 7
+        live.qr_cookie_refresh_cooldown = 180
+        live.last_qr_cookie_refresh_time = 0
+        live._safe_str = str
+        live._extract_cookie_value = lambda cookie_record: (cookie_record or {}).get("cookie")
+        live._summarize_cookie_string = lambda cookie_string: cookie_string
+        live._set_runtime_cookie_state = mock.Mock()
+        live.protected_merge_cookie_dicts = lambda existing, incoming: self._build_merge_result(incoming)
+
+        qr_cookies_str = (
+            "unb=qr-unb; sgcookie=qr-sg; cookie2=qr-cookie2; "
+            "_m_h5_tk=qr-token_123; _m_h5_tk_enc=qr-enc; t=qr-t"
+        )
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "_launch_browser_safe",
+            new=mock.AsyncMock(side_effect=AssertionError("managed runtime path should not launch browser")),
+        ) as launch_browser_safe, \
+             mock.patch("XianyuAutoAsync.asyncio.sleep", new=mock.AsyncMock()) as sleep_mock, \
+             mock.patch("XianyuAutoAsync.db_manager.get_cookie_details", return_value={"cookie": qr_cookies_str}) as get_cookie_details, \
+             mock.patch("XianyuAutoAsync.db_manager.update_cookie_account_info", return_value=True) as update_cookie_account_info:
+            result = await live.refresh_cookies_from_qr_login(
+                qr_cookies_str,
+                managed_runtime=managed_runtime,
+                managed_page=orphan_page,
+            )
+
+        self.assertTrue(result)
+        launch_browser_safe.assert_not_awaited()
+        managed_runtime.new_context.assert_awaited_once_with()
+        created_context.new_page.assert_awaited_once_with()
+        orphan_page.goto.assert_not_awaited()
+        orphan_page.reload.assert_not_awaited()
+        orphan_page.close.assert_not_awaited()
+        created_page.close.assert_awaited_once_with()
+        created_context.close.assert_awaited_once_with()
+        managed_runtime.close.assert_not_awaited()
+        update_cookie_account_info.assert_called_once()
+        get_cookie_details.assert_called()
+        self.assertGreaterEqual(sleep_mock.await_count, 3)
+        live._set_runtime_cookie_state.assert_called_once()
+
+    async def test_refresh_cookies_from_qr_login_reuses_managed_page_without_creating_or_closing_extra_tabs(self):
+        managed_runtime = mock.Mock()
+        managed_runtime.close = mock.AsyncMock()
+
+        managed_page = mock.Mock()
+        managed_page.goto = mock.AsyncMock()
+        managed_page.reload = mock.AsyncMock()
+        managed_page.close = mock.AsyncMock()
+
+        context = mock.Mock()
+        context.add_cookies = mock.AsyncMock()
+        context.new_page = mock.AsyncMock(side_effect=AssertionError("managed page path should not create extra tab"))
+        context.cookies = mock.AsyncMock(
+            return_value=[
+                {"name": "unb", "value": "new-unb"},
+                {"name": "sgcookie", "value": "new-sg"},
+                {"name": "cookie2", "value": "new-cookie2"},
+                {"name": "_m_h5_tk", "value": "new-token_123"},
+                {"name": "_m_h5_tk_enc", "value": "new-enc"},
+                {"name": "t", "value": "new-t"},
+                {"name": "cna", "value": "new-cna"},
+            ]
+        )
+        context.close = mock.AsyncMock()
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = "managed-page-test"
+        live.user_id = 7
+        live.qr_cookie_refresh_cooldown = 180
+        live.last_qr_cookie_refresh_time = 0
+        live._safe_str = str
+        live._extract_cookie_value = lambda cookie_record: (cookie_record or {}).get("cookie")
+        live._summarize_cookie_string = lambda cookie_string: cookie_string
+        live._set_runtime_cookie_state = mock.Mock()
+        live.protected_merge_cookie_dicts = lambda existing, incoming: self._build_merge_result(incoming)
+
+        qr_cookies_str = (
+            "unb=qr-unb; sgcookie=qr-sg; cookie2=qr-cookie2; "
+            "_m_h5_tk=qr-token_123; _m_h5_tk_enc=qr-enc; t=qr-t"
+        )
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "_launch_browser_safe",
+            new=mock.AsyncMock(side_effect=AssertionError("managed page path should not launch browser")),
+        ) as launch_browser_safe, \
+             mock.patch("XianyuAutoAsync.asyncio.sleep", new=mock.AsyncMock()) as sleep_mock, \
+             mock.patch("XianyuAutoAsync.db_manager.get_cookie_details", return_value={"cookie": qr_cookies_str}) as get_cookie_details, \
+             mock.patch("XianyuAutoAsync.db_manager.update_cookie_account_info", return_value=True) as update_cookie_account_info:
+            result = await live.refresh_cookies_from_qr_login(
+                qr_cookies_str,
+                managed_runtime=managed_runtime,
+                managed_context=context,
+                managed_page=managed_page,
+            )
+
+        self.assertTrue(result)
+        launch_browser_safe.assert_not_awaited()
+        context.add_cookies.assert_awaited_once()
+        context.new_page.assert_not_awaited()
+        managed_page.goto.assert_awaited_once_with(
+            "https://www.goofish.com/im",
+            wait_until="domcontentloaded",
+            timeout=15000,
+        )
+        managed_page.reload.assert_awaited_once_with(
+            wait_until="domcontentloaded",
+            timeout=12000,
+        )
+        managed_page.close.assert_not_awaited()
+        context.close.assert_not_awaited()
+        managed_runtime.close.assert_not_awaited()
+        update_cookie_account_info.assert_called_once()
+        get_cookie_details.assert_called()
+        self.assertGreaterEqual(sleep_mock.await_count, 3)
+        live._set_runtime_cookie_state.assert_called_once()
+
+    async def test_fetch_item_detail_from_browser_defers_identity_to_provider(self):
+        browser = mock.Mock()
+        context = mock.Mock()
+        page = mock.Mock()
+        detail_element = mock.Mock()
+
+        browser.new_context = mock.AsyncMock(return_value=context)
+        context.add_cookies = mock.AsyncMock()
+        context.new_page = mock.AsyncMock(return_value=page)
+        detail_element.inner_text = mock.AsyncMock(return_value="detail text")
+        page.goto = mock.AsyncMock()
+        page.wait_for_selector = mock.AsyncMock(return_value=True)
+        page.query_selector = mock.AsyncMock(return_value=detail_element)
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = "item-detail-browser-test"
+        live.cookies_str = "unb=1; cookie2=2"
+        live._safe_str = str
+        live._build_browser_refresh_launch_args = mock.Mock(return_value=["--cloak-flag"])
+        live._build_browser_refresh_context_options = mock.Mock(return_value={})
+        live._async_close_browser = mock.AsyncMock()
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "_launch_browser_safe",
+            new=mock.AsyncMock(return_value=browser),
+        ) as launch_browser_safe, \
+             mock.patch("XianyuAutoAsync.asyncio.sleep", new=mock.AsyncMock()):
+            result = await live._fetch_item_detail_from_browser("123456")
+
+        self.assertEqual(result, "detail text")
+        launch_browser_safe.assert_awaited_once_with(
+            "item-detail-browser-test",
+            headless=True,
+            args=["--cloak-flag"],
+        )
+        browser.new_context.assert_awaited_once_with()
+        page.goto.assert_awaited_once_with(
+            "https://www.goofish.com/item?id=123456",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        live._build_browser_refresh_context_options.assert_called_once_with()
+        live._async_close_browser.assert_awaited_once_with(browser=browser, context=context)
 
 
 if __name__ == "__main__":

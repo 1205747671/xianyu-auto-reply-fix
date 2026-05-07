@@ -1,6 +1,7 @@
 import asyncio
 import time
 import unittest
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest import mock
 
@@ -14,6 +15,36 @@ class _FakeSlider:
     def run(self, *args, **kwargs):
         self.run_called = True
         return True, {"unexpected": "browser"}
+
+
+class _FakeSessionClosedSlider:
+    def __init__(self):
+        self.run_called = False
+        self.last_login_error = ""
+
+    def _get_slider_failure_message(self, message):
+        return message
+
+    def run(self, target_url, notification_callback=None, notification_scene=None):
+        self.run_called = True
+        self.last_login_error = "浏览器会话已关闭或 CDP 已断开"
+        if notification_callback:
+            notification_callback(
+                "Target page, context or browser has been closed",
+                verification_url=target_url,
+                verification_type="face_verify",
+            )
+        return False, None
+
+
+class _FakeDeadRuntimeSlider:
+    def __init__(self, error_message):
+        self.context = object()
+        self.page = object()
+        self._error_message = error_message
+
+    def _ensure_active_verification_session(self, _context, _page):
+        return self._error_message
 
 
 class ReplyServerManualCookieImportFlowTest(unittest.TestCase):
@@ -106,6 +137,242 @@ class ReplyServerManualCookieImportFlowTest(unittest.TestCase):
         self.assertIn("_m_h5_tk=refreshed_token_12345", saved_cookie_value)
         self.assertIn("cookie2=updated_cookie2", saved_cookie_value)
         fake_manager.add_cookie.assert_called_once()
+
+    def test_execute_manual_cookie_import_fast_fails_when_browser_session_is_closed(self):
+        session_id = "manual_import_runtime_closed_session"
+        account_id = "manual_import_runtime_closed_account"
+        reply_server.manual_cookie_import_sessions[session_id] = {
+            "account_id": account_id,
+            "status": "processing",
+            "verification_url": None,
+            "screenshot_path": None,
+            "verification_type": None,
+            "slider_instance": None,
+            "task": None,
+            "timestamp": time.time(),
+            "completed_at": None,
+            "user_id": 1,
+        }
+
+        fake_slider = _FakeSessionClosedSlider()
+        probe_result = {
+            "status": "verification_required",
+            "verification_url": "https://passport.goofish.com/iv/test",
+            "payload": {"ret": ["FAIL_SYS_USER_VALIDATE"]},
+        }
+
+        async def invoke():
+            await reply_server._execute_manual_cookie_import(
+                session_id=session_id,
+                account_id=account_id,
+                cookie_value="unb=test_user; cookie2=old_cookie2",
+                show_browser=False,
+                user_id=1,
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        with mock.patch("utils.xianyu_slider_stealth.XianyuSliderStealth", return_value=fake_slider), \
+             mock.patch("utils.xianyu_slider_stealth.probe_cookie_verification_from_cookie", return_value=probe_result), \
+             mock.patch("utils.xianyu_slider_stealth.concurrency_manager.unregister_instance"), \
+             mock.patch.object(reply_server, "log_with_user"), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_details", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "save_cookie") as save_cookie_mock, \
+             mock.patch.object(reply_server.db_manager, "update_cookie_account_info") as update_cookie_mock:
+            asyncio.run(invoke())
+
+            deadline = time.time() + 2
+            while (
+                reply_server.manual_cookie_import_sessions[session_id]["status"] == "processing"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+
+        session = reply_server.manual_cookie_import_sessions[session_id]
+        self.assertEqual(session["status"], "failed")
+        self.assertEqual(session["error"], "浏览器会话已关闭或 CDP 已断开")
+        self.assertTrue(fake_slider.run_called)
+        save_cookie_mock.assert_not_called()
+        update_cookie_mock.assert_not_called()
+
+
+class ReplyServerManualCookieImportStatusTest(unittest.TestCase):
+    def setUp(self):
+        self._original_sessions = reply_server.manual_cookie_import_sessions
+        reply_server.manual_cookie_import_sessions = {}
+
+    def tearDown(self):
+        reply_server.manual_cookie_import_sessions = self._original_sessions
+
+    def test_check_manual_cookie_import_status_fails_when_runtime_is_already_closed(self):
+        session_id = "manual_import_dead_runtime_status_session"
+        reply_server.manual_cookie_import_sessions[session_id] = {
+            "account_id": "dead_runtime_account",
+            "status": "verification_required",
+            "verification_url": "https://passport.goofish.com/iv/test",
+            "screenshot_path": None,
+            "verification_type": "人脸验证",
+            "slider_instance": _FakeDeadRuntimeSlider("浏览器会话已关闭或 CDP 已断开"),
+            "task": None,
+            "timestamp": time.time(),
+            "completed_at": None,
+            "user_id": 1,
+        }
+
+        result = asyncio.run(
+            reply_server.check_manual_cookie_import_status(
+                session_id,
+                current_user={"user_id": 1, "username": "admin"},
+            )
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"], "浏览器会话已关闭或 CDP 已断开")
+        self.assertEqual(
+            reply_server.manual_cookie_import_sessions[session_id]["status"],
+            "failed",
+        )
+
+
+class ReplyServerQrCodeStatusTest(unittest.TestCase):
+    def setUp(self):
+        self._original_processed = reply_server.qr_check_processed
+        self._original_locks = reply_server.qr_check_locks
+        reply_server.qr_check_processed = {}
+        reply_server.qr_check_locks = defaultdict(lambda: asyncio.Lock())
+
+    def tearDown(self):
+        reply_server.qr_check_processed = self._original_processed
+        reply_server.qr_check_locks = self._original_locks
+
+    def test_check_qr_code_status_passes_managed_runtime_context_and_page_to_background_processing(self):
+        managed_runtime = object()
+        managed_context = object()
+        managed_page = object()
+        process_mock = mock.AsyncMock(return_value={"account_id": "qr_account"})
+
+        async def invoke():
+            result = await reply_server.check_qr_code_status(
+                "qr_session_with_managed_runtime",
+                current_user={"user_id": 1, "username": "admin"},
+            )
+            await asyncio.sleep(0)
+            return result
+
+        with mock.patch.object(reply_server, "cleanup_qr_check_records"), \
+             mock.patch.object(reply_server.qr_login_manager, "cleanup_expired_sessions"), \
+             mock.patch.object(
+                 reply_server.qr_login_manager,
+                 "get_session_status",
+                 return_value={"status": "success"},
+             ), \
+             mock.patch.object(
+                 reply_server.qr_login_manager,
+                 "get_session_cookies",
+                 return_value={
+                     "cookies": "unb=test_user; cookie2=test_cookie2",
+                     "unb": "test_user",
+                     "managed_runtime": managed_runtime,
+                     "managed_context": managed_context,
+                     "managed_page": managed_page,
+                 },
+             ), \
+             mock.patch.object(reply_server, "process_qr_login_cookies", process_mock), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertEqual(result["status"], "confirmed")
+        process_mock.assert_awaited_once_with(
+            "unb=test_user; cookie2=test_cookie2",
+            "test_user",
+            {"user_id": 1, "username": "admin"},
+            managed_runtime=managed_runtime,
+            managed_context=managed_context,
+            managed_page=managed_page,
+        )
+
+
+class _FakeQrRefreshSuccessLive:
+    def __init__(self, cookies_str, cookie_id, user_id, register_instance=False, **kwargs):
+        self.cookies_str = cookies_str
+        self.cookie_id = cookie_id
+        self.user_id = user_id
+        self.register_instance = register_instance
+        self.kwargs = kwargs
+
+    async def refresh_cookies_from_qr_login(self, **kwargs):
+        return True
+
+
+class _FakeQrRefreshFailureLive(_FakeQrRefreshSuccessLive):
+    async def refresh_cookies_from_qr_login(self, **kwargs):
+        return False
+
+
+class _FakeQrRefreshExceptionLive(_FakeQrRefreshSuccessLive):
+    async def refresh_cookies_from_qr_login(self, **kwargs):
+        raise RuntimeError("refresh exploded")
+
+
+class ReplyServerProcessQrLoginCookiesTest(unittest.TestCase):
+    def test_process_qr_login_cookies_raises_and_never_saves_raw_cookie_when_real_cookie_flow_fails(self):
+        current_user = {"user_id": 1, "username": "admin"}
+        fake_manager = SimpleNamespace(
+            cookies={},
+            add_cookie=mock.Mock(),
+            update_cookie=mock.Mock(),
+        )
+
+        scenarios = (
+            (
+                "missing_real_cookie_in_db",
+                _FakeQrRefreshSuccessLive,
+                None,
+                "扫码登录未完成：无法从数据库获取真实Cookie",
+            ),
+            (
+                "refresh_failed",
+                _FakeQrRefreshFailureLive,
+                mock.DEFAULT,
+                "扫码登录未完成：真实Cookie获取失败",
+            ),
+            (
+                "refresh_exception",
+                _FakeQrRefreshExceptionLive,
+                mock.DEFAULT,
+                "扫码登录未完成：获取真实Cookie异常: refresh exploded",
+            ),
+        )
+
+        for scenario_name, live_cls, db_cookie_result, expected_error in scenarios:
+            with self.subTest(scenario=scenario_name):
+                get_cookie_by_id_mock = mock.Mock(return_value=db_cookie_result)
+                save_cookie_mock = mock.Mock()
+                update_cookie_mock = mock.Mock()
+
+                with mock.patch("XianyuAutoAsync.XianyuLive", live_cls), \
+                     mock.patch.object(reply_server.db_manager, "get_all_cookies", return_value={}), \
+                     mock.patch.object(reply_server.db_manager, "get_cookie_by_id", get_cookie_by_id_mock), \
+                     mock.patch.object(reply_server.db_manager, "add_risk_control_log", return_value=None), \
+                     mock.patch.object(reply_server.db_manager, "update_risk_control_log"), \
+                     mock.patch.object(reply_server.db_manager, "save_cookie", save_cookie_mock), \
+                     mock.patch.object(reply_server.db_manager, "update_cookie_account_info", update_cookie_mock), \
+                     mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+                     mock.patch.object(reply_server, "log_with_user"):
+                    with self.assertRaisesRegex(RuntimeError, expected_error):
+                        asyncio.run(
+                            reply_server.process_qr_login_cookies(
+                                "unb=test_user; cookie2=test_cookie2",
+                                "test_user",
+                                current_user,
+                            )
+                        )
+
+                save_cookie_mock.assert_not_called()
+                update_cookie_mock.assert_not_called()
+                fake_manager.add_cookie.assert_not_called()
+                fake_manager.update_cookie.assert_not_called()
+                fake_manager.add_cookie.reset_mock()
+                fake_manager.update_cookie.reset_mock()
 
 
 if __name__ == "__main__":

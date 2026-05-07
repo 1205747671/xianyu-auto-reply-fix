@@ -94,23 +94,6 @@ class OrderDetailFetcher:
         self._pending_response_tasks = set()
         self._response_handler = None
 
-        # 请求头配置
-        self.headers = {
-            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "accept-language": "en,zh-CN;q=0.9,zh;q=0.8,ru;q=0.7",
-            "cache-control": "no-cache",
-            "pragma": "no-cache",
-            "priority": "u=0, i",
-            "sec-ch-ua": "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Google Chrome\";v=\"138\"",
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": "\"Windows\"",
-            "sec-fetch-dest": "document",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-site": "same-origin",
-            "sec-fetch-user": "?1",
-            "upgrade-insecure-requests": "1"
-        }
-
         # Cookie配置 - 支持动态传入
         self.cookie = cookie_string
 
@@ -167,7 +150,6 @@ class OrderDetailFetcher:
                     '--metrics-recording-only',
                     '--no-first-run',
                     '--safebrowsing-disable-auto-update',
-                    '--enable-automation',
                     '--password-store=basic',
                     '--use-mock-keychain',
                     # 添加内存优化和稳定性参数
@@ -191,16 +173,8 @@ class OrderDetailFetcher:
 
             logger.info("浏览器启动成功，创建上下文...")
 
-            # 创建浏览器上下文
-            self.context = await self.browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
-            )
-
-            logger.info("浏览器上下文创建成功，设置HTTP头...")
-
-            # 设置额外的HTTP头
-            await self.context.set_extra_http_headers(self.headers)
+            # 让 CloakBrowser 接管浏览器身份，不再额外覆盖上下文层 UA/headers。
+            self.context = await self.browser.new_context()
 
             logger.info("创建页面...")
 

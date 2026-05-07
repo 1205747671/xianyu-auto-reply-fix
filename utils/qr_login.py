@@ -67,6 +67,10 @@ class QRLoginSession:
         self.screenshot_path = None  # 风控验证截图
         self.verification_task = None  # 风控验证页面保持任务
         self.success_source = None  # 登录成功来源: api/browser
+        self.managed_runtime = None
+        self.managed_context = None
+        self.managed_page = None
+        self.last_active_probe_time = 0.0
 
     def is_expired(self) -> bool:
         """检查是否过期"""
@@ -182,7 +186,10 @@ class QRLoginManager:
         session: QRLoginSession,
         cookies: Any,
         source: str,
-        require_complete_cookies: bool = False
+        require_complete_cookies: bool = False,
+        managed_runtime=None,
+        managed_context=None,
+        managed_page=None,
     ) -> bool:
         """统一的会话成功收口，避免多条链路重复覆盖状态"""
         if not session:
@@ -200,6 +207,12 @@ class QRLoginManager:
         was_success = session.status == 'success'
         session.status = 'success'
         session.success_source = session.success_source or source
+        if managed_runtime is not None:
+            session.managed_runtime = managed_runtime
+        if managed_context is not None:
+            session.managed_context = managed_context
+        if managed_page is not None:
+            session.managed_page = managed_page
 
         if not was_success:
             logger.info(
@@ -214,8 +227,9 @@ class QRLoginManager:
         cookies = await context.cookies()
         return self._normalize_cookie_dict(cookies)
 
-    async def _probe_browser_login_success(self, session: QRLoginSession, page, context) -> bool:
+    async def _probe_browser_login_success(self, session: QRLoginSession, page, context, managed_runtime=None) -> bool:
         """在浏览器侧兜底判断验证是否已经完成"""
+        runtime = managed_runtime if managed_runtime is not None else getattr(context, 'browser', None)
         current_url = page.url
         cookie_dict = await self._context_cookie_dict(context)
         cookies_ready = self._has_completed_login_cookies(cookie_dict)
@@ -225,13 +239,56 @@ class QRLoginManager:
             logger.info(
                 f"扫码登录浏览器侧检测成功（当前页）: {session.session_id}, URL: {current_url}"
             )
-            return self._mark_session_success(session, cookie_dict, 'browser', require_complete_cookies=True)
+            return self._mark_session_success(
+                session,
+                cookie_dict,
+                'browser',
+                require_complete_cookies=True,
+                managed_runtime=runtime,
+                managed_context=context,
+                managed_page=page,
+            )
 
         if not cookies_ready:
             return False
 
+        context_pages = getattr(context, 'pages', None)
+        if callable(context_pages):
+            try:
+                context_pages = context_pages()
+            except Exception:
+                context_pages = None
+
+        if isinstance(context_pages, (list, tuple)):
+            for existing_page in context_pages:
+                if existing_page is None or existing_page is page:
+                    continue
+                existing_url = getattr(existing_page, 'url', '')
+                if not self._is_logged_in_url(existing_url):
+                    continue
+
+                probe_cookie_dict = await self._context_cookie_dict(context)
+                logger.info(
+                    f"扫码登录浏览器侧复用现有页面确认成功: {session.session_id}, "
+                    f"page_url: {existing_url}"
+                )
+                return self._mark_session_success(
+                    session,
+                    probe_cookie_dict,
+                    'browser',
+                    require_complete_cookies=True,
+                    managed_runtime=runtime,
+                    managed_context=context,
+                    managed_page=existing_page,
+                )
+
         probe_page = None
         try:
+            now = time.time()
+            if session.last_active_probe_time and now - session.last_active_probe_time < 10:
+                return False
+            session.last_active_probe_time = now
+
             probe_page = await context.new_page()
             await probe_page.goto('https://www.goofish.com/im', wait_until='domcontentloaded', timeout=30000)
             await probe_page.wait_for_timeout(1500)
@@ -246,7 +303,15 @@ class QRLoginManager:
                     f"扫码登录浏览器侧探测成功: {session.session_id}, "
                     f"probe_url: {probe_url}, has_im_root: {has_im_root}"
                 )
-                return self._mark_session_success(session, probe_cookie_dict, 'browser', require_complete_cookies=True)
+                return self._mark_session_success(
+                    session,
+                    probe_cookie_dict,
+                    'browser',
+                    require_complete_cookies=True,
+                    managed_runtime=runtime,
+                    managed_context=context,
+                    managed_page=page,
+                )
         except Exception as e:
             logger.debug(f"扫码登录浏览器侧探测未确认成功: {session.session_id}, 错误: {e}")
         finally:
@@ -257,6 +322,45 @@ class QRLoginManager:
                     pass
 
         return False
+
+    def _should_keep_session_browser_handles(
+        self,
+        session: Optional[QRLoginSession],
+        runtime,
+        context,
+    ) -> bool:
+        """判断当前浏览器 runtime/context 是否已经移交给后续 cookie 刷新链路"""
+        return bool(
+            session and
+            session.status == 'success' and
+            session.managed_runtime is runtime and
+            session.managed_context is context
+        )
+
+    def _should_keep_session_page(
+        self,
+        session: Optional[QRLoginSession],
+        page,
+    ) -> bool:
+        """判断当前标签页是否就是后续链路要继续复用的标签页"""
+        return bool(
+            session and
+            session.status == 'success' and
+            session.managed_page is page
+        )
+
+    async def _close_managed_browser_handles(self, runtime, context, page):
+        """关闭扫码验证页暂存的浏览器句柄。"""
+        for close_target in (page, context, runtime):
+            if not close_target:
+                continue
+            close_method = getattr(close_target, "close", None)
+            if not callable(close_method):
+                continue
+            try:
+                await close_method()
+            except Exception as close_error:
+                logger.debug(f"关闭扫码登录暂存句柄失败，忽略: {close_error}")
 
     async def _launch_verification_page(self, session_id: str):
         """在服务端打开验证页面并截取二维码，保持原始会话存活"""
@@ -278,18 +382,9 @@ class QRLoginManager:
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
                     '--disable-gpu',
-                    '--lang=zh-CN',
                 ]
             )
-            context = await browser.new_context(
-                viewport={'width': 540, 'height': 960},
-                locale='zh-CN',
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                ignore_https_errors=True,
-                extra_http_headers={
-                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
-                }
-            )
+            context = await browser.new_context(ignore_https_errors=True)
 
             browser_cookies = self._build_browser_cookies(session.verification_url, session.cookies)
             if browser_cookies:
@@ -322,7 +417,12 @@ class QRLoginManager:
                 if current_session.status not in {'verification_required', 'scanned', 'waiting', 'processing'}:
                     break
 
-                if await self._probe_browser_login_success(current_session, page, context):
+                if await self._probe_browser_login_success(
+                    current_session,
+                    page,
+                    context,
+                    managed_runtime=browser,
+                ):
                     break
 
                 await page.wait_for_timeout(3000)
@@ -333,22 +433,28 @@ class QRLoginManager:
         except Exception as e:
             logger.error(f"打开扫码登录验证页面失败: {session_id}, 错误: {e}")
         finally:
+            latest_session = self.sessions.get(session_id)
+            keep_session_handles = self._should_keep_session_browser_handles(
+                latest_session,
+                browser,
+                context,
+            )
+            keep_current_page = self._should_keep_session_page(latest_session, page)
             try:
-                if page:
+                if page and not keep_current_page:
                     await page.close()
             except Exception:
                 pass
             try:
-                if context:
+                if context and not keep_session_handles:
                     await context.close()
             except Exception:
                 pass
             try:
-                if browser:
+                if browser and not keep_session_handles:
                     await browser.close()
             except Exception:
                 pass
-            latest_session = self.sessions.get(session_id)
             if latest_session:
                 latest_session.verification_task = None
 
@@ -371,6 +477,28 @@ class QRLoginManager:
         if session.screenshot_path:
             image_manager.delete_image(session.screenshot_path)
             session.screenshot_path = None
+
+        managed_runtime = session.managed_runtime
+        managed_context = session.managed_context
+        managed_page = session.managed_page
+        session.managed_runtime = None
+        session.managed_context = None
+        session.managed_page = None
+
+        if not any((managed_runtime, managed_context, managed_page)):
+            return
+
+        close_coro = self._close_managed_browser_handles(
+            managed_runtime,
+            managed_context,
+            managed_page,
+        )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(close_coro)
+        else:
+            loop.create_task(close_coro)
 
     async def _get_mh5tk(self, session: QRLoginSession) -> dict:
         """获取m_h5_tk和m_h5_tk_enc"""
@@ -721,13 +849,16 @@ class QRLoginManager:
             del self.sessions[session_id]
             logger.info(f"清理过期会话: {session_id}")
 
-    def get_session_cookies(self, session_id: str) -> Optional[Dict[str, str]]:
+    def get_session_cookies(self, session_id: str) -> Optional[Dict[str, Any]]:
         """获取会话Cookie"""
         session = self.sessions.get(session_id)
         if session and session.status == 'success':
             return {
                 'cookies': self._cookie_marshal(session.cookies),
-                'unb': session.unb
+                'unb': session.unb,
+                'managed_runtime': session.managed_runtime,
+                'managed_context': session.managed_context,
+                'managed_page': session.managed_page,
             }
         return None
 

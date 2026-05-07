@@ -13,6 +13,12 @@ WRAPPER_EXPORT_NAMES = [
     "launch_browser_context_async",
     "launch_browser_persistent_context",
     "launch_browser_persistent_context_async",
+    "ManagedBrowserRuntime",
+    "AsyncManagedBrowserRuntime",
+    "launch_managed_browser_runtime",
+    "launch_managed_browser_runtime_async",
+    "close_managed_browser_runtime",
+    "close_managed_browser_runtime_async",
 ]
 
 

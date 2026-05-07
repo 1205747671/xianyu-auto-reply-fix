@@ -6853,7 +6853,7 @@ class XianyuLive:
                     )
                 return False
             
-            # 使用集成的 Playwright 登录方法（无需猴子补丁）
+            # 使用浏览器 provider 登录方法，保持账密链路与 CloakBrowser 收口一致
             from utils.xianyu_slider_stealth import XianyuSliderStealth
             browser_mode = "有头" if show_browser else "无头"
             logger.info(f"【{self.cookie_id}】开始使用{browser_mode}浏览器进行密码登录刷新Cookie...")
@@ -6882,7 +6882,7 @@ class XianyuLive:
             slider.risk_session_id = risk_session_id
             slider.risk_trigger_scene = trigger_scene
             result = await slider._run_sync_method_on_fresh_thread(
-                slider.login_with_password_playwright,
+                slider.login_with_password_browser,
                 account=username,
                 password=password,
                 show_browser=show_browser,
@@ -7641,45 +7641,7 @@ class XianyuLive:
             logger.info(f"开始使用浏览器获取商品详情: {item_id}")
 
             # 启动浏览器（参照order_detail_fetcher的配置）
-            browser_args = [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-gpu',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
-                '--disable-features=TranslateUI',
-                '--disable-ipc-flooding-protection',
-                '--disable-extensions',
-                '--disable-default-apps',
-                '--disable-sync',
-                '--disable-translate',
-                '--hide-scrollbars',
-                '--mute-audio',
-                '--no-default-browser-check',
-                '--no-pings'
-            ]
-
-            # 在Docker环境中添加额外参数
-            if os.getenv('DOCKER_ENV'):
-                browser_args.extend([
-                    # '--single-process',  # 注释掉，避免多用户并发时的进程冲突和资源泄漏
-                    '--disable-background-networking',
-                    '--disable-client-side-phishing-detection',
-                    '--disable-hang-monitor',
-                    '--disable-popup-blocking',
-                    '--disable-prompt-on-repost',
-                    '--disable-web-resources',
-                    '--metrics-recording-only',
-                    '--safebrowsing-disable-auto-update',
-                    '--enable-automation',
-                    '--password-store=basic',
-                    '--use-mock-keychain'
-                ])
+            browser_args = self._build_browser_refresh_launch_args()
 
             browser = await _launch_browser_safe(
                 self.cookie_id,
@@ -7687,14 +7649,8 @@ class XianyuLive:
                 args=browser_args
             )
 
-            # 创建移动设备浏览器上下文（模拟iPhone）
-            context = await browser.new_context(
-                viewport={'width': 375, 'height': 812},  # iPhone X/11/12 尺寸
-                user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 AliApp(TB/11.15.0)',
-                device_scale_factor=3,  # iPhone 的屏幕缩放比例
-                is_mobile=True,
-                has_touch=True
-            )
+            # 让 CloakBrowser 自己接管身份，商品详情抓取不再手搓移动端画像。
+            context = await browser.new_context(**self._build_browser_refresh_context_options())
 
             # 设置Cookie
             cookies = []
@@ -7714,12 +7670,12 @@ class XianyuLive:
             # 创建页面
             page = await context.new_page()
 
-            # 构造移动版商品详情页面URL
-            item_url = f"https://h5.m.goofish.com/item?id={item_id}"
-            logger.info(f"访问移动版商品页面: {item_url}")
+            # 直接访问主站详情页，避免项目侧额外模拟移动设备身份。
+            item_url = f"https://www.goofish.com/item?id={item_id}"
+            logger.info(f"访问商品页面: {item_url}")
 
             # 访问页面
-            await page.goto(item_url, wait_until='networkidle', timeout=30000)
+            await page.goto(item_url, wait_until='domcontentloaded', timeout=30000)
 
             # 等待页面完全加载
             await asyncio.sleep(2)
@@ -11793,7 +11749,15 @@ class XianyuLive:
         logger.info(f"【{self.cookie_id}】Cookie刷新功能已{status}")
 
 
-    async def refresh_cookies_from_qr_login(self, qr_cookies_str: str, cookie_id: str = None, user_id: int = None):
+    async def refresh_cookies_from_qr_login(
+        self,
+        qr_cookies_str: str,
+        cookie_id: str = None,
+        user_id: int = None,
+        managed_runtime=None,
+        managed_context=None,
+        managed_page=None,
+    ):
         """使用扫码登录获取的cookie访问指定界面获取真实cookie并存入数据库
 
         Args:
@@ -11804,8 +11768,12 @@ class XianyuLive:
         Returns:
             bool: 成功返回True，失败返回False
         """
-        browser = None
-        context = None
+        browser = managed_runtime
+        context = managed_context
+        page = managed_page
+        close_browser = False
+        close_context = False
+        close_page = False
         target_cookie_id = cookie_id or self.cookie_id
         target_user_id = user_id or self.user_id
 
@@ -11819,64 +11787,27 @@ class XianyuLive:
             qr_cookies_dict = trans_cookies(qr_cookies_str)
             logger.info(f"【{target_cookie_id}】扫码cookie字段数: {len(qr_cookies_dict)}")
 
-            # 启动浏览器（参照商品搜索的配置）
-            browser_args = [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-gpu',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
-                '--disable-features=TranslateUI',
-                '--disable-ipc-flooding-protection',
-                '--disable-extensions',
-                '--disable-default-apps',
-                '--disable-sync',
-                '--disable-translate',
-                '--hide-scrollbars',
-                '--mute-audio',
-                '--no-default-browser-check',
-                '--no-pings'
-            ]
+            browser_args = self._build_browser_refresh_launch_args()
 
-            # 在Docker环境中添加额外参数
-            if os.getenv('DOCKER_ENV'):
-                browser_args.extend([
-                    # '--single-process',  # 注释掉，避免多用户并发时的进程冲突和资源泄漏
-                    '--disable-background-networking',
-                    '--disable-client-side-phishing-detection',
-                    '--disable-hang-monitor',
-                    '--disable-popup-blocking',
-                    '--disable-prompt-on-repost',
-                    '--disable-web-resources',
-                    '--metrics-recording-only',
-                    '--safebrowsing-disable-auto-update',
-                    '--enable-automation',
-                    '--password-store=basic',
-                    '--use-mock-keychain'
-                ])
+            if page is not None and context is None:
+                logger.warning(f"【{target_cookie_id}】传入 managed_page 但缺少 managed_context，忽略该页面复用，改为创建临时页")
+                page = None
 
-            browser = await _launch_browser_safe(
-                target_cookie_id,
-                headless=True,  # 改回无头模式
-                args=browser_args
-            )
-            if not browser:
-                return False
+            if context is None:
+                if browser is None:
+                    browser = await _launch_browser_safe(
+                        target_cookie_id,
+                        headless=True,  # 改回无头模式
+                        args=browser_args
+                    )
+                    if not browser:
+                        return False
+                    close_browser = True
 
-            # 创建浏览器上下文
-            context_options = {
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
-            }
-
-            # 使用标准窗口大小
-            context_options['viewport'] = {'width': 1920, 'height': 1080}
-
-            context = await browser.new_context(**context_options)
+                context = await browser.new_context(**self._build_browser_refresh_context_options())
+                close_context = True
+            else:
+                logger.info(f"【{target_cookie_id}】复用上游传入的浏览器上下文获取真实Cookie，刷新时不主动关闭该上游会话")
 
             # 设置扫码登录获取的Cookie
             cookies = []
@@ -11898,8 +11829,12 @@ class XianyuLive:
             for i, cookie in enumerate(cookies, 1):
                 logger.info(f"【{target_cookie_id}】{i:2d}. {cookie['name']}: {cookie['value'][:50]}{'...' if len(cookie['value']) > 50 else ''}")
 
-            # 创建页面
-            page = await context.new_page()
+            # 优先复用上游已移交的页面，避免在同一会话里再额外开标签干扰状态。
+            if page is None:
+                page = await context.new_page()
+                close_page = True
+            else:
+                logger.info(f"【{target_cookie_id}】复用上游传入的页面获取真实Cookie，避免创建额外标签页")
 
             # 等待页面准备
             await asyncio.sleep(0.1)
@@ -12125,9 +12060,61 @@ class XianyuLive:
             # 确保资源清理
             try:
                 if browser or context:
-                    await self._async_close_browser(browser=browser, context=context)
+                    await self._async_close_browser(
+                        browser=browser,
+                        context=context,
+                        page=page,
+                        close_browser=close_browser,
+                        close_context=close_context,
+                        close_page=close_page,
+                    )
             except Exception as cleanup_e:
                 logger.warning(f"【{target_cookie_id}】清理浏览器资源时出错: {self._safe_str(cleanup_e)}")
+
+    def _build_browser_refresh_launch_args(self):
+        """构建浏览器型 Cookie 刷新链路的统一启动参数。"""
+        browser_args = [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--disable-gpu',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
+            '--disable-features=TranslateUI',
+            '--disable-ipc-flooding-protection',
+            '--disable-extensions',
+            '--disable-default-apps',
+            '--disable-sync',
+            '--disable-translate',
+            '--hide-scrollbars',
+            '--mute-audio',
+            '--no-default-browser-check',
+            '--no-pings',
+        ]
+
+        if os.getenv('DOCKER_ENV'):
+            browser_args.extend([
+                '--disable-background-networking',
+                '--disable-client-side-phishing-detection',
+                '--disable-hang-monitor',
+                '--disable-popup-blocking',
+                '--disable-prompt-on-repost',
+                '--disable-web-resources',
+                '--metrics-recording-only',
+                '--safebrowsing-disable-auto-update',
+                '--password-store=basic',
+                '--use-mock-keychain',
+            ])
+
+        return browser_args
+
+    def _build_browser_refresh_context_options(self):
+        """让 CloakBrowser 自己接管身份，刷新链路不再额外覆盖 UA/viewport。"""
+        return {}
 
     async def _refresh_cookies_via_browser_page(self, current_cookies_str: str, restart_on_success: bool = True):
         """使用当前cookie访问指定页面获取真实cookie并更新
@@ -12155,45 +12142,7 @@ class XianyuLive:
             current_cookies_dict = trans_cookies(current_cookies_str)
             logger.info(f"【{self.cookie_id}】当前cookie字段数: {len(current_cookies_dict)}")
 
-            # 启动浏览器（参照商品搜索的配置）
-            browser_args = [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-gpu',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
-                '--disable-features=TranslateUI',
-                '--disable-ipc-flooding-protection',
-                '--disable-extensions',
-                '--disable-default-apps',
-                '--disable-sync',
-                '--disable-translate',
-                '--hide-scrollbars',
-                '--mute-audio',
-                '--no-default-browser-check',
-                '--no-pings'
-            ]
-
-            # 在Docker环境中添加额外参数
-            if os.getenv('DOCKER_ENV'):
-                browser_args.extend([
-                    '--disable-background-networking',
-                    '--disable-client-side-phishing-detection',
-                    '--disable-hang-monitor',
-                    '--disable-popup-blocking',
-                    '--disable-prompt-on-repost',
-                    '--disable-web-resources',
-                    '--metrics-recording-only',
-                    '--safebrowsing-disable-auto-update',
-                    '--enable-automation',
-                    '--password-store=basic',
-                    '--use-mock-keychain'
-                ])
+            browser_args = self._build_browser_refresh_launch_args()
 
             # 使用无头浏览器
             # 创建浏览器上下文
@@ -12205,14 +12154,7 @@ class XianyuLive:
             if not browser:
                 return False
 
-            context_options = {
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
-            }
-
-            # 使用标准窗口大小
-            context_options['viewport'] = {'width': 1920, 'height': 1080}
-
-            context = await browser.new_context(**context_options)
+            context = await browser.new_context(**self._build_browser_refresh_context_options())
 
             # 设置当前的Cookie
             cookies = []
@@ -12423,45 +12365,7 @@ class XianyuLive:
 
             # 使用统一的Playwright启动方法
             # 启动浏览器（参照商品搜索的配置）
-            browser_args = [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-gpu',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
-                '--disable-features=TranslateUI',
-                '--disable-ipc-flooding-protection',
-                '--disable-extensions',
-                '--disable-default-apps',
-                '--disable-sync',
-                '--disable-translate',
-                '--hide-scrollbars',
-                '--mute-audio',
-                '--no-default-browser-check',
-                '--no-pings'
-            ]
-
-            # 在Docker环境中添加额外参数
-            if os.getenv('DOCKER_ENV'):
-                browser_args.extend([
-                    # '--single-process',  # 注释掉，避免多用户并发时的进程冲突和资源泄漏
-                    '--disable-background-networking',
-                    '--disable-client-side-phishing-detection',
-                    '--disable-hang-monitor',
-                    '--disable-popup-blocking',
-                    '--disable-prompt-on-repost',
-                    '--disable-web-resources',
-                    '--metrics-recording-only',
-                    '--safebrowsing-disable-auto-update',
-                    '--enable-automation',
-                    '--password-store=basic',
-                    '--use-mock-keychain'
-                ])
+            browser_args = self._build_browser_refresh_launch_args()
 
             # Cookie刷新模式使用无头浏览器
             browser = await _launch_browser_safe(
@@ -12472,15 +12376,7 @@ class XianyuLive:
             if not browser:
                 return False
 
-            # 创建浏览器上下文
-            context_options = {
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
-            }
-
-            # 使用标准窗口大小
-            context_options['viewport'] = {'width': 1920, 'height': 1080}
-
-            context = await browser.new_context(**context_options)
+            context = await browser.new_context(**self._build_browser_refresh_context_options())
 
             # 设置当前Cookie
             cookies = []
@@ -12718,15 +12614,30 @@ class XianyuLive:
                     except Exception:
                         pass
 
-    async def _async_close_browser(self, browser, context=None):
-        """异步关闭：先关 context，再兜底关闭 browser。"""
+    async def _async_close_browser(
+        self,
+        browser,
+        context=None,
+        page=None,
+        close_browser=True,
+        close_context=True,
+        close_page=True,
+    ):
+        """异步关闭：按需关闭 page/context/browser，避免误关复用运行时。"""
         try:
             logger.info(f"【{self.cookie_id}】开始异步关闭浏览器...")
             await asyncio.wait_for(
-                self._normal_close_resources(browser=browser, context=context),
+                self._normal_close_resources(
+                    browser=browser,
+                    context=context,
+                    page=page,
+                    close_browser=close_browser,
+                    close_context=close_context,
+                    close_page=close_page,
+                ),
                 timeout=10.0
             )
-            if context and browser:
+            if close_browser and browser and (context is not None or page is not None):
                 try:
                     await asyncio.wait_for(browser.close(), timeout=5.0)
                     logger.info(f"【{self.cookie_id}】浏览器关闭完成")
@@ -12742,15 +12653,51 @@ class XianyuLive:
             logger.info(f"【{self.cookie_id}】浏览器正常关闭完成")
         except asyncio.TimeoutError:
             logger.warning(f"【{self.cookie_id}】正常关闭超时，开始强制关闭...")
-            await self._force_close_resources(browser=browser, context=context)
+            await self._force_close_resources(
+                browser=browser,
+                context=context,
+                page=page,
+                close_browser=close_browser,
+                close_context=close_context,
+                close_page=close_page,
+            )
         except Exception as e:
             logger.warning(f"【{self.cookie_id}】异步关闭时出错，强制关闭: {self._safe_str(e)}")
-            await self._force_close_resources(browser=browser, context=context)
+            await self._force_close_resources(
+                browser=browser,
+                context=context,
+                page=page,
+                close_browser=close_browser,
+                close_context=close_context,
+                close_page=close_page,
+            )
 
-    async def _normal_close_resources(self, browser, context=None):
-        """正常关闭资源：优先关闭 context，无 context 时关闭 browser。"""
+    async def _normal_close_resources(
+        self,
+        browser,
+        context=None,
+        page=None,
+        close_browser=True,
+        close_context=True,
+        close_page=True,
+    ):
+        """正常关闭资源：优先关闭 page/context，无 context 时关闭 browser。"""
         try:
-            if context:
+            if close_page and page:
+                try:
+                    await asyncio.wait_for(page.close(), timeout=5.0)
+                    logger.info(f"【{self.cookie_id}】页面关闭完成")
+                except asyncio.TimeoutError:
+                    logger.warning(f"【{self.cookie_id}】页面关闭超时，尝试强制关闭")
+                    try:
+                        if hasattr(page, '_connection'):
+                            page._connection.dispose()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.warning(f"【{self.cookie_id}】关闭页面时出错: {self._safe_str(e)}")
+
+            if close_context and context:
                 try:
                     await asyncio.wait_for(context.close(), timeout=5.0)
                     logger.info(f"【{self.cookie_id}】浏览器上下文关闭完成")
@@ -12763,7 +12710,7 @@ class XianyuLive:
                         pass
                 except Exception as e:
                     logger.warning(f"【{self.cookie_id}】关闭浏览器上下文时出错: {self._safe_str(e)}")
-            elif browser:
+            elif close_browser and browser and context is None and page is None:
                 try:
                     await asyncio.wait_for(browser.close(), timeout=5.0)
                     logger.info(f"【{self.cookie_id}】浏览器关闭完成")
@@ -12780,28 +12727,34 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】正常关闭时出现异常: {self._safe_str(e)}")
             raise
 
-    async def _force_close_resources(self, browser, context=None):
-        """强制关闭资源：围绕 context/browser 执行短超时关闭。"""
+    async def _force_close_resources(
+        self,
+        browser,
+        context=None,
+        page=None,
+        close_browser=True,
+        close_context=True,
+        close_page=True,
+    ):
+        """强制关闭资源：围绕 page/context/browser 执行短超时关闭。"""
         try:
             logger.warning(f"【{self.cookie_id}】开始强制关闭资源...")
             resources = []
-            if context:
+            if close_page and page:
+                resources.append(("页面", page))
+            if close_context and context:
                 resources.append(("浏览器上下文", context))
-            if browser:
+            if close_browser and browser:
                 resources.append(("浏览器", browser))
 
             if not resources:
                 logger.info(f"【{self.cookie_id}】没有需要强制关闭的资源")
                 return
 
-            tasks = [
-                asyncio.wait_for(resource.close(), timeout=3.0)
-                for _, resource in resources
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for (resource_name, resource), result in zip(resources, results):
-                if isinstance(result, Exception):
+            for resource_name, resource in resources:
+                try:
+                    await asyncio.wait_for(resource.close(), timeout=3.0)
+                except Exception:
                     logger.warning(f"【{self.cookie_id}】{resource_name}强制关闭失败，尝试直接清理连接")
                     try:
                         if hasattr(resource, '_connection'):

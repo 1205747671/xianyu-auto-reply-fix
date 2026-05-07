@@ -1319,17 +1319,10 @@ class XianyuSliderStealth:
     def _capture_verification_screenshot(self, page, frame=None, iframe_selector: Optional[str] = None) -> Optional[str]:
         """截取验证页面截图，多种方式逐级回退"""
         try:
-            import glob
-
-            screenshots_dir = "static/uploads/images"
+            screenshots_dir = self._get_verification_screenshots_dir()
             os.makedirs(screenshots_dir, exist_ok=True)
 
-            existing_screenshots = glob.glob(
-                os.path.join(screenshots_dir, f"face_verify_{self.pure_user_id}_*.jpg")
-            )
-            existing_screenshots += glob.glob(
-                os.path.join(screenshots_dir, f"face_verify_{self.pure_user_id}_*.png")
-            )
+            existing_screenshots = self._list_verification_screenshot_files()
 
             detection_text = ""
             try:
@@ -1404,9 +1397,8 @@ class XianyuSliderStealth:
                 logger.error(f"【{self.pure_user_id}】所有截图方式均失败")
                 return None
 
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"face_verify_{self.pure_user_id}_{timestamp}.jpg"
-            file_path = os.path.join(screenshots_dir, filename)
+            file_path = self._build_verification_screenshot_path()
+            self._cleanup_verification_screenshots(keep_paths=[file_path])
 
             with open(file_path, 'wb') as f:
                 f.write(screenshot_bytes)
@@ -1419,6 +1411,23 @@ class XianyuSliderStealth:
             import traceback
             logger.debug(traceback.format_exc())
             return None
+
+    def _get_verification_screenshots_dir(self) -> str:
+        return os.path.join("static", "uploads", "images")
+
+    def _build_verification_screenshot_path(self) -> str:
+        return os.path.join(
+            self._get_verification_screenshots_dir(),
+            f"face_verify_{self.pure_user_id}_latest.jpg",
+        )
+
+    def _list_verification_screenshot_files(self) -> List[str]:
+        import glob
+
+        screenshots_dir = self._get_verification_screenshots_dir()
+        screenshot_files = glob.glob(os.path.join(screenshots_dir, f"face_verify_{self.pure_user_id}_*.jpg"))
+        screenshot_files += glob.glob(os.path.join(screenshots_dir, f"face_verify_{self.pure_user_id}_*.png"))
+        return sorted(set(screenshot_files), key=lambda path: (os.path.getmtime(path), path))
     
     def _check_date_validity(self) -> bool:
         """保留接口兼容，但不再做日期限制。"""
@@ -1636,6 +1645,9 @@ class XianyuSliderStealth:
             monitor_page = self._select_monitor_page(self.context, monitor_page)
 
         if not monitor_page:
+            return False, ""
+
+        if getattr(self, '_slider_refresh_mode', False) and not self._has_ready_refresh_session_cookies(current_cookies):
             return False, ""
 
         try:
@@ -1952,6 +1964,9 @@ class XianyuSliderStealth:
         if override in {"off", "lite", "full"}:
             return override
 
+        if self._provider_owns_browser_identity():
+            return "off"
+
         # Docker 无头 Playwright 在落到系统兜底浏览器时，full 改写容易把风控打醒。
         # 但如果已经锁定到项目内浏览器缓存/显式浏览器路径，full 模式反而更稳定。
         if self.headless and self.is_docker_env and self.automation_backend == "cloakbrowser":
@@ -1965,6 +1980,56 @@ class XianyuSliderStealth:
             return "lite"
 
         return "full"
+
+    def _provider_owns_browser_identity(self) -> bool:
+        return str(getattr(self, "automation_backend", "cloakbrowser") or "").strip().lower() == "cloakbrowser"
+
+    def _is_high_risk_browser_scene(self) -> bool:
+        scene = str(getattr(self, "risk_trigger_scene", "") or "").strip().lower()
+        return scene in {
+            "password_login",
+            "manual_password_refresh",
+            "token_refresh",
+            "auto_cookie_refresh",
+        }
+
+    def _apply_provider_launch_defaults(self, launch_options: Dict[str, Any]) -> Dict[str, Any]:
+        resolved_options = dict(launch_options)
+        if not self._provider_owns_browser_identity():
+            return resolved_options
+
+        resolved_options.setdefault("humanize", True)
+        resolved_options.setdefault(
+            "human_preset",
+            "careful" if self._is_high_risk_browser_scene() else "default",
+        )
+        return resolved_options
+
+    def _verification_session_closed_message(self) -> str:
+        return "浏览器会话已关闭或 CDP 已断开"
+
+    def _looks_like_closed_browser_runtime_error(self, error: Any) -> bool:
+        error_text = str(error or "").strip().lower()
+        if not error_text:
+            return False
+        return any(
+            keyword in error_text
+            for keyword in (
+                "target page, context or browser has been closed",
+                "page has been closed",
+                "browser has been closed",
+                "session closed",
+                "session is closed",
+                "disconnected",
+                "detached",
+            )
+        )
+
+    def _is_cross_thread_playwright_access_error(self, error: Any) -> bool:
+        error_text = str(error or "").strip().lower()
+        if not error_text:
+            return False
+        return "cannot switch to a different thread" in error_text
 
     def _use_headless_stable_profile(self) -> bool:
         return bool(
@@ -2021,6 +2086,13 @@ class XianyuSliderStealth:
         """
 
     def _install_stealth_init_script(self, page, browser_features: Dict[str, Any], mode_override: Optional[str] = None):
+        if self._provider_owns_browser_identity():
+            logger.info(
+                f"【{self.pure_user_id}】CloakBrowser 已接管浏览器身份，忽略项目侧 init_script 覆盖"
+            )
+            self.active_stealth_mode = "off"
+            return
+
         mode = str(mode_override or "").strip().lower() or self._resolve_stealth_mode()
         self.active_stealth_mode = mode
 
@@ -2058,6 +2130,10 @@ class XianyuSliderStealth:
 
     def _harden_password_slider_runtime(self, search_target=None):
         if not (self.headless and self._is_password_login_scene() and self.page):
+            return
+
+        if self._provider_owns_browser_identity():
+            logger.info(f"【{self.pure_user_id}】账户密码滑块场景沿用 CloakBrowser 原生指纹，不再叠加 runtime stealth")
             return
 
         browser_features = dict(self.browser_features or {})
@@ -2292,21 +2368,27 @@ class XianyuSliderStealth:
         window_size = browser_features.get("window_size", "1600,900")
         lang = browser_features.get("lang", "zh-CN")
         accept_lang = browser_features.get("accept_lang", "zh-CN,zh;q=0.9")
-        return [
+        args = [
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--no-first-run",
             f"--window-size={window_size}",
-            f"--lang={lang}",
-            f"--accept-lang={accept_lang}",
-            "--disable-blink-features=AutomationControlled",
             "--mute-audio",
             "--no-default-browser-check",
             "--force-color-profile=srgb",
             "--password-store=basic",
             "--use-mock-keychain",
         ]
+        if self._provider_owns_browser_identity():
+            return args
+
+        args.extend([
+            f"--lang={lang}",
+            f"--accept-lang={accept_lang}",
+            "--disable-blink-features=AutomationControlled",
+        ])
+        return args
 
     def _should_use_account_persistent_profile(self) -> bool:
         return bool(getattr(self, "use_account_persistent_profile", False))
@@ -2341,7 +2423,32 @@ class XianyuSliderStealth:
         return context_options
 
     def _build_browser_context_options(self, browser_features: Dict[str, Any]) -> Dict[str, Any]:
+        if self._provider_owns_browser_identity():
+            context_options: Dict[str, Any] = {
+                'color_scheme': browser_features['color_scheme'],
+            }
+            if not self.headless:
+                context_options['no_viewport'] = True
+            else:
+                context_options['viewport'] = {
+                    'width': browser_features['viewport_width'],
+                    'height': browser_features['viewport_height'],
+                }
+            return context_options
         return self._build_playwright_context_options(browser_features)
+
+    def _build_persistent_context_options(
+        self,
+        browser_features: Dict[str, Any],
+        context_options: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        persistent_context_options = dict(context_options or self._build_browser_context_options(browser_features))
+        if self._provider_owns_browser_identity():
+            persistent_context_options.setdefault('locale', browser_features['locale'])
+            persistent_context_options.setdefault('timezone', browser_features['timezone_id'])
+        persistent_context_options.setdefault('accept_downloads', True)
+        persistent_context_options.setdefault('ignore_https_errors', True)
+        return persistent_context_options
 
     def _build_initial_cookie_payload(self) -> List[Dict[str, Any]]:
         if not self.initial_cookies:
@@ -2463,9 +2570,18 @@ class XianyuSliderStealth:
 
     def _sanitize_provider_launch_options(self, launch_options: Dict[str, Any]) -> Dict[str, Any]:
         sanitized_options = dict(launch_options)
+        if not self._provider_owns_browser_identity():
+            return sanitized_options
+
+        explicit_channel = str(sanitized_options.pop("channel", "") or "").strip()
         explicit_path = str(sanitized_options.pop("executable_path", "") or "").strip()
+        user_label = getattr(self, "pure_user_id", "unknown")
+        if explicit_channel and not getattr(self, "_cloakbrowser_ignored_explicit_channel_logged", False):
+            logger.warning(
+                f"【{user_label}】CloakBrowser 接管浏览器身份，忽略显式 channel: {explicit_channel}"
+            )
+            self._cloakbrowser_ignored_explicit_channel_logged = True
         if explicit_path and not getattr(self, "_cloakbrowser_ignored_explicit_path_logged", False):
-            user_label = getattr(self, "pure_user_id", "unknown")
             logger.warning(
                 f"【{user_label}】CloakBrowser 使用内置 Chromium，忽略显式 executable_path: {explicit_path}"
             )
@@ -4507,6 +4623,12 @@ class XianyuSliderStealth:
         )
         return any(cookie_dict.get(key) for key in companion_keys)
 
+    def _has_ready_refresh_session_cookies(self, cookie_dict: Dict[str, str]) -> bool:
+        """刷新模式下要求关键保护字段齐全，避免半残 Session 被当成成功。"""
+        if not cookie_dict:
+            return False
+        return all(cookie_dict.get(key) for key in self._PROTECTED_SESSION_COOKIE_FIELDS)
+
     def _is_logged_in_url(self, url: str) -> bool:
         current_url = str(url or '')
         if not current_url:
@@ -5250,15 +5372,19 @@ class XianyuSliderStealth:
         finally:
             self.page = original_page
 
-    def _cleanup_verification_screenshots(self):
+    def _cleanup_verification_screenshots(self, keep_paths: Optional[List[str]] = None):
         try:
-            import glob
-
-            screenshots_dir = 'static/uploads/images'
-            all_screenshots = glob.glob(os.path.join(screenshots_dir, f'face_verify_{self.pure_user_id}_*.jpg'))
-            all_screenshots += glob.glob(os.path.join(screenshots_dir, f'face_verify_{self.pure_user_id}_*.png'))
+            keep_path_set = {
+                os.path.normcase(os.path.abspath(os.path.normpath(path)))
+                for path in (keep_paths or [])
+                if path
+            }
+            all_screenshots = self._list_verification_screenshot_files()
             for screenshot_file in all_screenshots:
                 try:
+                    normalized_file = os.path.normcase(os.path.abspath(os.path.normpath(screenshot_file)))
+                    if normalized_file in keep_path_set:
+                        continue
                     if os.path.exists(screenshot_file):
                         os.remove(screenshot_file)
                         logger.info(f"【{self.pure_user_id}】✅ 已删除验证截图: {screenshot_file}")
@@ -5433,6 +5559,10 @@ class XianyuSliderStealth:
 
         while waited_time < max_wait_time:
             monitor_page = self._select_monitor_page(context, monitor_page)
+            session_error = self._ensure_active_verification_session(context, monitor_page)
+            if session_error:
+                self.last_login_error = session_error
+                return False, monitor_page
             self._attempt_solve_slider_on_page(monitor_page)
             has_verification, refreshed_frame = self._detect_qr_code_verification(monitor_page)
 
@@ -5506,11 +5636,71 @@ class XianyuSliderStealth:
                     last_verification_url = refreshed_url or None
                     last_verification_screenshot_path = refreshed_screenshot_path or None
 
+            session_error = self._ensure_active_verification_session(context, monitor_page)
+            if session_error:
+                self.last_login_error = session_error
+                return False, monitor_page
             time.sleep(check_interval)
             waited_time += check_interval
             logger.info(f"【{self.pure_user_id}】等待验证中... (已等待{waited_time}秒/{max_wait_time}秒)")
 
         return False, self._select_monitor_page(context, monitor_page)
+
+    def _ensure_active_verification_session(self, context, fallback_page=None) -> Optional[str]:
+        session_closed_message = self._verification_session_closed_message()
+
+        current_browser = getattr(context, "browser", None) or getattr(self, "browser", None)
+        if current_browser is not None and hasattr(current_browser, "is_connected"):
+            try:
+                if not current_browser.is_connected():
+                    return session_closed_message
+            except Exception as browser_error:
+                if self._is_cross_thread_playwright_access_error(browser_error):
+                    logger.debug(
+                        f"【{self.pure_user_id}】跨线程探活跳过 browser.is_connected 检查，避免误判会话关闭: {browser_error}"
+                    )
+                elif self._looks_like_closed_browser_runtime_error(browser_error):
+                    return session_closed_message
+
+        page_candidates: List[Any] = []
+        if fallback_page is not None:
+            page_candidates.append(fallback_page)
+        current_page = getattr(self, "page", None)
+        if current_page is not None and current_page is not fallback_page:
+            page_candidates.append(current_page)
+
+        if context is not None:
+            try:
+                page_candidates.extend(list(getattr(context, "pages", []) or []))
+            except Exception as context_error:
+                if self._is_cross_thread_playwright_access_error(context_error):
+                    logger.debug(
+                        f"【{self.pure_user_id}】跨线程探活跳过 context.pages 检查，避免误判会话关闭: {context_error}"
+                    )
+                elif self._looks_like_closed_browser_runtime_error(context_error):
+                    return session_closed_message
+
+        seen_page_ids = set()
+        for candidate in page_candidates:
+            if candidate is None:
+                continue
+            candidate_id = id(candidate)
+            if candidate_id in seen_page_ids:
+                continue
+            seen_page_ids.add(candidate_id)
+            if hasattr(candidate, "is_closed"):
+                try:
+                    if candidate.is_closed():
+                        return session_closed_message
+                except Exception as page_error:
+                    if self._is_cross_thread_playwright_access_error(page_error):
+                        logger.debug(
+                            f"【{self.pure_user_id}】跨线程探活跳过 page.is_closed 检查，避免误判会话关闭: {page_error}"
+                        )
+                    elif self._looks_like_closed_browser_runtime_error(page_error):
+                        return session_closed_message
+
+        return None
 
     def _notify_verification_required(
         self,
@@ -5697,18 +5887,20 @@ class XianyuSliderStealth:
                 notification_scene=notification_scene,
             )
         finally:
-            if screenshot_path:
-                logger.info(
-                    f"【{self.pure_user_id}】验证流程结束后暂不自动删除验证截图，"
-                    f"改由会话过期或手动清理: {screenshot_path}"
-                )
-            elif self.keep_verification_screenshots:
-                logger.info(f"【{self.pure_user_id}】保留验证截图供后续调试")
+            keep_paths = []
+            if screenshot_path and (not login_success or self.keep_verification_screenshots):
+                keep_paths = [screenshot_path]
+            self._cleanup_verification_screenshots(keep_paths=keep_paths)
+            if keep_paths:
+                logger.info(f"【{self.pure_user_id}】验证流程结束后保留当前验证截图: {keep_paths[0]}")
 
         if not login_success:
             if self.last_login_error and '已超时/失效，请重新发起验证' in self.last_login_error:
                 logger.error(f"【{self.pure_user_id}】❌ {self.last_login_error}")
                 return None
+            if self.last_login_error:
+                logger.error(f"【{self.pure_user_id}】❌ {self.last_login_error}")
+                return self._fail_login(self.last_login_error)
             logger.error(f"【{self.pure_user_id}】❌ 等待验证超时（{wait_timeout}秒）")
             return self._fail_login(f"等待{type_name}超时（{wait_timeout}秒）")
 
@@ -5759,6 +5951,11 @@ class XianyuSliderStealth:
         try:
             login_success, _, cookies = self._probe_context_login_success(self.context, fallback_page or self.page)
             if login_success:
+                if not self._has_ready_refresh_session_cookies(cookies or {}):
+                    logger.warning(
+                        f"【{self.pure_user_id}】滑块阶段虽然检测到上下文已登录，但关键保护 Cookie 仍未齐全，继续等待稳定化"
+                    )
+                    return False, cookies or {}
                 logger.success(f"【{self.pure_user_id}】✅ 滑块阶段检测到上下文已登录，停止继续重试")
                 self.last_verification_feedback = {
                     "status": "success",
@@ -5995,16 +6192,12 @@ class XianyuSliderStealth:
             "wow64": False,
         }
 
-    def _build_headless_extra_headers(self, browser_features: Dict[str, Any]) -> Dict[str, str]:
-        hints = self._build_client_hint_profile(browser_features)
-        return {
-            "sec-ch-ua": hints["secChUa"],
-            "sec-ch-ua-mobile": hints["secChUaMobile"],
-            "sec-ch-ua-platform": hints["secChUaPlatform"],
-        }
-
     def _apply_headless_network_fingerprint(self, page, browser_features: Dict[str, Any]):
         if not self.headless or not self.context or not page:
+            return
+
+        if self._provider_owns_browser_identity():
+            logger.info(f"【{self.pure_user_id}】当前由 CloakBrowser 接管指纹，跳过无头网络层 UA/CDP 覆盖")
             return
 
         try:
@@ -10012,18 +10205,13 @@ class XianyuSliderStealth:
         self,
         launch_options: Dict[str, Any],
         browser_features: Dict[str, Any],
+        context_options: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Any, Any]:
         browser = launch_browser(**launch_options)
-        context = browser.new_context(
-            viewport={'width': browser_features['viewport_width'], 'height': browser_features['viewport_height']},
-            user_agent=browser_features['user_agent'],
-            locale=browser_features['locale'],
-            accept_downloads=True,
-            ignore_https_errors=True,
-            extra_http_headers={
-                'Accept-Language': browser_features['accept_lang']
-            }
-        )
+        resolved_context_options = dict(context_options or self._build_browser_context_options(browser_features))
+        resolved_context_options.setdefault('accept_downloads', True)
+        resolved_context_options.setdefault('ignore_https_errors', True)
+        context = browser.new_context(**resolved_context_options)
         try:
             cookies_to_inject = self._build_initial_cookie_payload()
             cookie_str = ''
@@ -10154,22 +10342,7 @@ class XianyuSliderStealth:
                        f"scale: {browser_features['device_scale_factor']}")
 
             # 设置浏览器启动参数（保持原始参数，之前有头模式正常工作）
-            browser_args = [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-web-security',
-                '--disable-features=VizDisplayCompositor',
-                '--lang=zh-CN',
-                '--disable-infobars',
-                '--disable-extensions',
-                '--disable-popup-blocking',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
-            ]
+            browser_args = self._build_browser_launch_args()
 
             # 启动浏览器
             if self._should_prefer_project_browser_for_playwright():
@@ -10191,24 +10364,24 @@ class XianyuSliderStealth:
             if self.executable_path:
                 launch_options['executable_path'] = self.executable_path
             launch_options = self._sanitize_provider_launch_options(launch_options)
+            launch_options = self._apply_provider_launch_defaults(launch_options)
+            context_options = self._build_browser_context_options(browser_features)
+            persistent_context_options = self._build_persistent_context_options(
+                browser_features,
+                context_options=context_options,
+            )
             if force_clean_context:
                 browser, context = self._launch_clean_cookie_seeded_context(
                     launch_options,
                     browser_features,
+                    context_options=context_options,
                 )
             else:
                 try:
                     context = launch_browser_persistent_context(
                         user_data_dir=user_data_dir,
                         **launch_options,
-                        viewport={'width': browser_features['viewport_width'], 'height': browser_features['viewport_height']},
-                        user_agent=browser_features['user_agent'],
-                        locale=browser_features['locale'],
-                        accept_downloads=True,
-                        ignore_https_errors=True,
-                        extra_http_headers={
-                            'Accept-Language': browser_features['accept_lang']
-                        }
+                        **persistent_context_options,
                     )
                 except Exception as persistent_launch_error:
                     if not self._is_profile_in_use_launch_error(persistent_launch_error):
@@ -10221,6 +10394,7 @@ class XianyuSliderStealth:
                     browser, context = self._launch_clean_cookie_seeded_context(
                         launch_options,
                         browser_features,
+                        context_options=context_options,
                     )
             effective_clean_context = force_clean_context or used_profile_lock_fallback
             logger.info(f"【{self.pure_user_id}】已设置浏览器语言为中文（zh-CN）")
@@ -10258,27 +10432,30 @@ class XianyuSliderStealth:
             except Exception as listener_e:
                 logger.warning(f"【{self.pure_user_id}】注册登录响应监听失败（不影响主流程）: {listener_e}")
 
-            # 有头模式使用轻量反检测脚本（完整脚本会覆盖 document.fonts / EventTarget /
-            # Performance.now / Date 等浏览器核心 API，导致页面白屏无法渲染）；
-            # 无头模式使用完整脚本以通过自动化检测。
-            if show_browser:
-                stealth_js = """
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
-                window.chrome = { runtime: {} };
-                """
-                page.add_init_script(stealth_js)
+            if self._provider_owns_browser_identity():
+                logger.info(f"【{self.pure_user_id}】CloakBrowser 已接管浏览器身份，账密登录页跳过额外 init script 注入")
             else:
-                password_login_stealth_mode = None
-                if not show_browser and not self.stealth_mode_override:
-                    # 账密登录页对 full 改写更敏感，先保证登录表单能稳定出现；
-                    # 真正过滑块主要靠稳定画像 + 学习轨迹，不靠这里硬怼 full。
-                    password_login_stealth_mode = "lite"
-                    logger.info(
-                        f"【{self.pure_user_id}】密码登录链路默认使用 {password_login_stealth_mode} 反检测脚本"
-                    )
-                self._install_stealth_init_script(page, browser_features, mode_override=password_login_stealth_mode)
+                # 有头模式使用轻量反检测脚本（完整脚本会覆盖 document.fonts / EventTarget /
+                # Performance.now / Date 等浏览器核心 API，导致页面白屏无法渲染）；
+                # 无头模式使用完整脚本以通过自动化检测。
+                if show_browser:
+                    stealth_js = """
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                    Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+                    window.chrome = { runtime: {} };
+                    """
+                    page.add_init_script(stealth_js)
+                else:
+                    password_login_stealth_mode = None
+                    if not show_browser and not self.stealth_mode_override:
+                        # 账密登录页对 full 改写更敏感，先保证登录表单能稳定出现；
+                        # 真正过滑块主要靠稳定画像 + 学习轨迹，不靠这里硬怼 full。
+                        password_login_stealth_mode = "lite"
+                        logger.info(
+                            f"【{self.pure_user_id}】密码登录链路默认使用 {password_login_stealth_mode} 反检测脚本"
+                        )
+                    self._install_stealth_init_script(page, browser_features, mode_override=password_login_stealth_mode)
 
             logger.info(f"【{self.pure_user_id}】浏览器已成功启动（{browser_mode}模式，画像: {self.profile_id}）")
 
@@ -10450,7 +10627,7 @@ class XianyuSliderStealth:
                                         success=False,
                                         verification_url=(detected_slider_frame.url if detected_slider_frame and hasattr(detected_slider_frame, 'url') else getattr(page, 'url', None)),
                                         error_message=self._get_slider_failure_message("页面状态已变化，未找到滑块容器，请重新尝试刷新Cookie"),
-                                        extra_meta={'detection_source': 'login_with_password_playwright_pre_login'},
+                                        extra_meta={'detection_source': 'login_with_password_browser_pre_login'},
                                     )
                                     return self._fail_login(self._get_slider_failure_message("页面状态已变化，未找到滑块容器，请重新尝试刷新Cookie"))
 
@@ -10473,7 +10650,7 @@ class XianyuSliderStealth:
                                             success=False,
                                             verification_url=(detected_slider_frame.url if detected_slider_frame and hasattr(detected_slider_frame, 'url') else getattr(page, 'url', None)),
                                             error_message=self._get_slider_failure_message("滑块验证失败，请稍后重试"),
-                                            extra_meta={'detection_source': 'login_with_password_playwright_pre_login'},
+                                            extra_meta={'detection_source': 'login_with_password_browser_pre_login'},
                                         )
                                         return self._fail_login(self._get_slider_failure_message("滑块验证失败，请稍后重试"))
                                     else:
@@ -10485,7 +10662,7 @@ class XianyuSliderStealth:
                                         success=False,
                                         verification_url=(detected_slider_frame.url if detected_slider_frame and hasattr(detected_slider_frame, 'url') else getattr(page, 'url', None)),
                                         error_message=f"页面会话已失效: {str(e)}",
-                                        extra_meta={'detection_source': 'login_with_password_playwright_pre_login'},
+                                        extra_meta={'detection_source': 'login_with_password_browser_pre_login'},
                                     )
                                     return self._fail_login("页面会话已失效，请重新尝试刷新Cookie")
                             else:
@@ -10495,7 +10672,7 @@ class XianyuSliderStealth:
                                 success=True,
                                 verification_url=(detected_slider_frame.url if detected_slider_frame and hasattr(detected_slider_frame, 'url') else getattr(page, 'url', None)),
                                 processing_result='密码登录流程中的滑块验证自动处理成功',
-                                extra_meta={'detection_source': 'login_with_password_playwright_pre_login'},
+                                extra_meta={'detection_source': 'login_with_password_browser_pre_login'},
                             )
                             
                             # 等待页面加载和状态更新（第一次等待3秒）
@@ -10853,7 +11030,7 @@ class XianyuSliderStealth:
                                 success=True,
                                 verification_url=(getattr(search_frame, 'url', None) if 'search_frame' in locals() else getattr(page, 'url', None)),
                                 processing_result='密码登录流程中的滑块验证自动处理成功',
-                                extra_meta={'detection_source': 'login_with_password_playwright_post_login'},
+                                extra_meta={'detection_source': 'login_with_password_browser_post_login'},
                             )
                         else:
                             logger.error(f"【{self.pure_user_id}】❌ 滑块验证{self.slider_max_retries}次均失败")
@@ -10862,7 +11039,7 @@ class XianyuSliderStealth:
                                 success=False,
                                 verification_url=(getattr(search_frame, 'url', None) if 'search_frame' in locals() else getattr(page, 'url', None)),
                                 error_message=self._get_slider_failure_message("滑块验证失败，请稍后重试"),
-                                extra_meta={'detection_source': 'login_with_password_playwright_post_login'},
+                                extra_meta={'detection_source': 'login_with_password_browser_post_login'},
                             )
                             fallback_page = locals().get('active_page') or page
                             monitor_page = self._select_monitor_page(context, fallback_page) or fallback_page
@@ -10917,7 +11094,7 @@ class XianyuSliderStealth:
                                     success=False,
                                     verification_url=(getattr(search_frame, 'url', None) if 'search_frame' in locals() else getattr(page, 'url', None)),
                                     processing_result='滑块失败后检测到可扫码验证，已转交二维码验证流程',
-                                    extra_meta={'detection_source': 'login_with_password_playwright_post_login_qr_handoff'},
+                                    extra_meta={'detection_source': 'login_with_password_browser_post_login_qr_handoff'},
                                 )
                                 return self._process_verification_requirement(
                                     context,
@@ -10966,7 +11143,7 @@ class XianyuSliderStealth:
                                 success=True,
                                 verification_url=getattr(active_page or page, 'url', None),
                                 processing_result='密码登录流程中的滑块验证自动处理成功（等待后）',
-                                extra_meta={'detection_source': 'login_with_password_playwright_post_wait'},
+                                extra_meta={'detection_source': 'login_with_password_browser_post_wait'},
                             )
                             time.sleep(3)  # 等待滑块验证后的状态更新
                         else:
@@ -10976,7 +11153,7 @@ class XianyuSliderStealth:
                                 success=False,
                                 verification_url=getattr(active_page or page, 'url', None),
                                 error_message=self._get_slider_failure_message("滑块验证失败，请稍后重试"),
-                                extra_meta={'detection_source': 'login_with_password_playwright_post_wait'},
+                                extra_meta={'detection_source': 'login_with_password_browser_post_wait'},
                             )
                             return self._fail_login(self._get_slider_failure_message("滑块验证失败，请稍后重试"))
                     
@@ -11089,37 +11266,27 @@ class XianyuSliderStealth:
                 # 关闭浏览器。这里不能无限阻塞，否则上层会话会一直卡在 processing。
                 try:
                     close_errors = []
+                    # sync Playwright 的 page/context/browser 需要在创建它们的同一线程关闭，
+                    # 否则 greenlet 会报 "Cannot switch to a different thread"。
+                    try:
+                        if context:
+                            context.close()
+                    except Exception as close_context_err:
+                        close_errors.append(f"context.close: {close_context_err}")
 
-                    def _close_runtime_resources():
+                    if effective_clean_context and browser:
                         try:
-                            if context:
-                                context.close()
-                        except Exception as close_context_err:
-                            close_errors.append(f"context.close: {close_context_err}")
+                            browser.close()
+                        except Exception as close_browser_err:
+                            close_errors.append(f"browser.close: {close_browser_err}")
 
-                        if effective_clean_context and browser:
-                            try:
-                                browser.close()
-                            except Exception as close_browser_err:
-                                close_errors.append(f"browser.close: {close_browser_err}")
+                    try:
+                        if playwright:
+                            playwright.stop()
+                    except Exception as stop_playwright_err:
+                        close_errors.append(f"playwright.stop: {stop_playwright_err}")
 
-                        try:
-                            if playwright:
-                                playwright.stop()
-                        except Exception as stop_playwright_err:
-                            close_errors.append(f"playwright.stop: {stop_playwright_err}")
-
-                    close_thread = threading.Thread(
-                        target=_close_runtime_resources,
-                        name=f"pwd-login-close-{self.pure_user_id}",
-                        daemon=True,
-                    )
-                    close_thread.start()
-                    close_thread.join(timeout=8)
-
-                    if close_thread.is_alive():
-                        logger.warning(f"【{self.pure_user_id}】关闭浏览器超时，改为后台继续清理，避免阻塞密码登录会话收尾")
-                    elif close_errors:
+                    if close_errors:
                         logger.warning(f"【{self.pure_user_id}】关闭浏览器时出现异常: {close_errors}")
                     elif effective_clean_context:
                         logger.info(f"【{self.pure_user_id}】浏览器已关闭，干净上下文已销毁")
@@ -11160,9 +11327,9 @@ class XianyuSliderStealth:
     def login_with_password_playwright(self, account: str, password: str, show_browser: bool = False, **kwargs):
         return self.login_with_password_browser(account, password, show_browser=show_browser, **kwargs)
 
-    def login_with_password_headful(self, account: str = None, password: str = None, show_browser: bool = False):
+    def login_with_password_headful(self, account: str = None, password: str = None, show_browser: bool = False, **kwargs):
         """兼容旧入口，转发到 `login_with_password_browser()`。"""
-        return self.login_with_password_browser(account, password, show_browser=show_browser)
+        return self.login_with_password_browser(account, password, show_browser=show_browser, **kwargs)
 
     def run(
         self,

@@ -797,6 +797,8 @@ password_login_locks = defaultdict(lambda: asyncio.Lock())
 manual_cookie_import_sessions = {}  # {session_id: {'account_id': str, 'status': str, 'verification_url': str, 'screenshot_path': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
 manual_cookie_import_locks = defaultdict(lambda: asyncio.Lock())
 PASSWORD_LOGIN_TERMINAL_STATUSES = {'success', 'failed', 'cancelled'}
+MANUAL_COOKIE_IMPORT_TERMINAL_STATUSES = {'success', 'failed'}
+MANUAL_COOKIE_IMPORT_RUNTIME_CLOSED_ERROR = '浏览器会话已关闭或 CDP 已断开'
 
 # 不再需要单独的密码初始化，由数据库初始化时处理
 
@@ -3606,15 +3608,71 @@ def _build_face_verification_screenshot_info(account_id: str, file_path: str) ->
 def _set_manual_cookie_import_session_status(session_id: str, status: str, **fields):
     session = manual_cookie_import_sessions.get(session_id)
     if not session:
-        return
+        return False
+
+    current_status = str(session.get('status') or '').strip().lower()
+    next_status = str(status or '').strip().lower()
+    if current_status in MANUAL_COOKIE_IMPORT_TERMINAL_STATUSES and next_status != current_status:
+        logger.info(
+            f"忽略手动导入 Cookie 会话终态回退: session_id={session_id}, current_status={current_status}, next_status={next_status}"
+        )
+        return False
 
     session['status'] = status
     session.update(fields)
 
-    if status in {'success', 'failed'}:
+    if next_status in MANUAL_COOKIE_IMPORT_TERMINAL_STATUSES:
         session['completed_at'] = time.time()
     else:
         session['completed_at'] = None
+
+    return True
+
+
+def _is_manual_cookie_import_runtime_closed_message(message: Any) -> bool:
+    normalized = str(message or '').strip().lower()
+    if not normalized:
+        return False
+
+    if MANUAL_COOKIE_IMPORT_RUNTIME_CLOSED_ERROR.lower() in normalized:
+        return True
+
+    return any(
+        keyword in normalized
+        for keyword in (
+            'target page, context or browser has been closed',
+            'page has been closed',
+            'browser has been closed',
+            'session closed',
+            'session is closed',
+            'playwright connection closed',
+            'connection closed',
+            'browser disconnected',
+            'cdp 已断开',
+            '浏览器会话已关闭',
+        )
+    )
+
+
+def _normalize_manual_cookie_import_failure_message(message: Any, default_message: str = '滑块验证失败，请稍后重试') -> str:
+    if _is_manual_cookie_import_runtime_closed_message(message):
+        return MANUAL_COOKIE_IMPORT_RUNTIME_CLOSED_ERROR
+
+    normalized = str(message or '').strip()
+    return normalized or default_message
+
+
+def _finalize_manual_cookie_import_session_failure(
+    session_id: str,
+    error_message: Any,
+    **fields,
+) -> bool:
+    return _set_manual_cookie_import_session_status(
+        session_id,
+        'failed',
+        error=_normalize_manual_cookie_import_failure_message(error_message),
+        **fields,
+    )
 
 
 def _empty_slider_session_stats() -> Dict[str, Any]:
@@ -4222,6 +4280,15 @@ async def _execute_manual_cookie_import(
                     message,
                     verification_url,
                 )
+                if _is_manual_cookie_import_runtime_closed_message(message):
+                    _finalize_manual_cookie_import_session_failure(session_id, message)
+                    log_with_user(
+                        'warning',
+                        f"手动导入 Cookie 会话检测到浏览器已关闭，直接标记失败: {session_id}",
+                        current_user,
+                    )
+                    return
+
                 _set_manual_cookie_import_session_status(
                     session_id,
                     'verification_required',
@@ -4315,8 +4382,16 @@ async def _execute_manual_cookie_import(
                     notification_scene='手动导入 Cookie',
                 )
                 if not success or not cookies_dict:
-                    failure_message = slider_instance._get_slider_failure_message('滑块验证失败，请稍后重试')
-                    _set_manual_cookie_import_session_status(session_id, 'failed', error=failure_message)
+                    session = manual_cookie_import_sessions.get(session_id) or {}
+                    if str(session.get('status') or '').strip().lower() == 'failed':
+                        failure_message = _normalize_manual_cookie_import_failure_message(session.get('error'))
+                    else:
+                        last_login_error = getattr(slider_instance, 'last_login_error', None)
+                        if _is_manual_cookie_import_runtime_closed_message(last_login_error):
+                            failure_message = MANUAL_COOKIE_IMPORT_RUNTIME_CLOSED_ERROR
+                        else:
+                            failure_message = slider_instance._get_slider_failure_message('滑块验证失败，请稍后重试')
+                        _finalize_manual_cookie_import_session_failure(session_id, failure_message)
                     log_with_user('error', f"手动导入 Cookie 验证失败: {account_id}, 错误: {failure_message}", current_user)
                     return
 
@@ -4324,7 +4399,7 @@ async def _execute_manual_cookie_import(
                 persist_manual_cookie_import_success(merged_cookies_dict, '浏览器验证')
             except Exception as exc:
                 error_message = str(exc)
-                _set_manual_cookie_import_session_status(session_id, 'failed', error=error_message)
+                _finalize_manual_cookie_import_session_failure(session_id, error_message)
                 log_with_user('error', f"手动导入 Cookie 执行异常: {account_id}, 错误: {error_message}", current_user)
                 import traceback
                 logger.error(traceback.format_exc())
@@ -4339,7 +4414,7 @@ async def _execute_manual_cookie_import(
         login_thread = threading.Thread(target=run_import, daemon=True)
         login_thread.start()
     except Exception as exc:
-        _set_manual_cookie_import_session_status(session_id, 'failed', error=str(exc))
+        _finalize_manual_cookie_import_session_failure(session_id, str(exc))
         log_with_user('error', f"执行手动导入 Cookie 任务异常: {str(exc)}", current_user)
         import traceback
         logger.error(traceback.format_exc())
@@ -4431,6 +4506,21 @@ async def check_manual_cookie_import_status(
 
         status = session['status']
         if status == 'verification_required':
+            slider_instance = session.get('slider_instance')
+            if slider_instance and hasattr(slider_instance, '_ensure_active_verification_session'):
+                runtime_error = slider_instance._ensure_active_verification_session(
+                    getattr(slider_instance, 'context', None),
+                    getattr(slider_instance, 'page', None),
+                )
+                if runtime_error:
+                    error_message = _normalize_manual_cookie_import_failure_message(runtime_error)
+                    _finalize_manual_cookie_import_session_failure(session_id, error_message)
+                    return {
+                        'status': 'failed',
+                        'message': error_message,
+                        'error': error_message,
+                    }
+
             screenshot_path = session.get('screenshot_path')
             verification_url = session.get('verification_url')
             verification_type = session.get('verification_type') or '身份验证'
@@ -4987,7 +5077,10 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
                             account_info = await process_qr_login_cookies(
                                 cookies_info['cookies'],
                                 cookies_info['unb'],
-                                current_user
+                                current_user,
+                                managed_runtime=cookies_info.get('managed_runtime'),
+                                managed_context=cookies_info.get('managed_context'),
+                                managed_page=cookies_info.get('managed_page'),
                             )
                             log_with_user('info', f"扫码登录处理完成: {session_id}, 账号: {account_info.get('account_id', 'unknown')}", current_user)
                             qr_check_processed[session_id] = {
@@ -5029,8 +5122,18 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
         return {'status': 'error', 'message': str(e)}
 
 
-async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[str, Any]) -> Dict[str, Any]:
+async def process_qr_login_cookies(
+    cookies: str,
+    unb: str,
+    current_user: Dict[str, Any],
+    managed_runtime: Any = None,
+    managed_context: Any = None,
+    managed_page: Any = None,
+) -> Dict[str, Any]:
     """处理扫码登录获取的Cookie - 先获取真实cookie再保存到数据库"""
+    def _build_qr_login_chain_error(message: str) -> RuntimeError:
+        return RuntimeError(f"扫码登录未完成：{message}")
+
     try:
         user_id = current_user['user_id']
 
@@ -5109,7 +5212,10 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
             refresh_success = await temp_instance.refresh_cookies_from_qr_login(
                 qr_cookies_str=cookies,
                 cookie_id=account_id,
-                user_id=user_id
+                user_id=user_id,
+                managed_runtime=managed_runtime,
+                managed_context=managed_context,
+                managed_page=managed_page,
             )
 
             if refresh_success:
@@ -5254,8 +5360,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                             )
                         except Exception:
                             pass
-                    # 降级处理：使用原始扫码cookie
-                    return await _fallback_save_qr_cookie(account_id, cookies, user_id, is_new_account, current_user, "无法从数据库获取真实cookie")
+                    raise _build_qr_login_chain_error("无法从数据库获取真实Cookie")
             else:
                 log_with_user('warning', f"扫码登录真实cookie获取失败: {account_id}", current_user)
                 if risk_log_id:
@@ -5272,8 +5377,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                         )
                     except Exception:
                         pass
-                # 降级处理：使用原始扫码cookie
-                return await _fallback_save_qr_cookie(account_id, cookies, user_id, is_new_account, current_user, "真实cookie获取失败")
+                raise _build_qr_login_chain_error("真实Cookie获取失败")
 
         except Exception as refresh_e:
             log_with_user('error', f"扫码登录真实cookie获取异常: {str(refresh_e)}", current_user)
@@ -5291,49 +5395,11 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     )
                 except Exception:
                     pass
-            # 降级处理：使用原始扫码cookie
-            return await _fallback_save_qr_cookie(account_id, cookies, user_id, is_new_account, current_user, f"获取真实cookie异常: {str(refresh_e)}")
+            raise _build_qr_login_chain_error(f"获取真实Cookie异常: {str(refresh_e)}") from refresh_e
 
     except Exception as e:
         log_with_user('error', f"处理扫码登录Cookie失败: {str(e)}", current_user)
         raise e
-
-
-async def _fallback_save_qr_cookie(account_id: str, cookies: str, user_id: int, is_new_account: bool, current_user: Dict[str, Any], error_reason: str) -> Dict[str, Any]:
-    """降级处理：当无法获取真实cookie时，保存原始扫码cookie"""
-    try:
-        log_with_user('warning', f"降级处理 - 保存原始扫码cookie: {account_id}, 原因: {error_reason}", current_user)
-
-        # 保存原始扫码cookie到数据库
-        if is_new_account:
-            db_manager.save_cookie(account_id, cookies, user_id)
-            log_with_user('info', f"降级处理 - 新账号原始cookie已保存: {account_id}", current_user)
-        else:
-            # 现有账号使用 update_cookie_account_info 避免覆盖其他字段
-            db_manager.update_cookie_account_info(account_id, cookie_value=cookies)
-            log_with_user('info', f"降级处理 - 现有账号原始cookie已更新: {account_id}", current_user)
-
-        # 添加到或更新cookie_manager
-        if cookie_manager.manager:
-            if is_new_account:
-                cookie_manager.manager.add_cookie(account_id, cookies)
-                log_with_user('info', f"降级处理 - 已将原始cookie添加到cookie_manager: {account_id}", current_user)
-            else:
-                # update_cookie_account_info 已经保存到数据库了，这里不需要再保存
-                cookie_manager.manager.update_cookie(account_id, cookies, save_to_db=False)
-                log_with_user('info', f"降级处理 - 已更新cookie_manager中的原始cookie: {account_id}", current_user)
-
-        return {
-            'account_id': account_id,
-            'is_new_account': is_new_account,
-            'real_cookie_refreshed': False,
-            'fallback_reason': error_reason,
-            'cookie_length': len(cookies)
-        }
-
-    except Exception as fallback_e:
-        log_with_user('error', f"降级处理失败: {str(fallback_e)}", current_user)
-        raise fallback_e
 
 
 @app.post("/qr-login/refresh-cookies")

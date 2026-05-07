@@ -184,6 +184,43 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         slider._probe_context_login_during_slider = lambda _page=None: (False, {})
         return slider
 
+    def _verification_screenshot_dir(self):
+        return os.path.join(PROJECT_ROOT, "static", "uploads", "images")
+
+    def _cleanup_verification_screenshots_for_user(self, user_id):
+        screenshot_dir = self._verification_screenshot_dir()
+        if not os.path.isdir(screenshot_dir):
+            return
+        for filename in os.listdir(screenshot_dir):
+            if filename.startswith(f"face_verify_{user_id}_"):
+                os.remove(os.path.join(screenshot_dir, filename))
+
+    def _prepare_verification_screenshot_user(self, slider, user_id):
+        slider.pure_user_id = user_id
+        self._cleanup_verification_screenshots_for_user(user_id)
+        self.addCleanup(lambda: self._cleanup_verification_screenshots_for_user(user_id))
+
+    def _write_verification_screenshot(self, user_id, suffix, content=b"unit-test-image"):
+        screenshot_dir = self._verification_screenshot_dir()
+        os.makedirs(screenshot_dir, exist_ok=True)
+        path = os.path.join(screenshot_dir, f"face_verify_{user_id}_{suffix}.jpg")
+        with open(path, "wb") as handle:
+            handle.write(content)
+        return path.replace("\\", "/")
+
+    def _list_verification_screenshots(self, user_id):
+        screenshot_dir = self._verification_screenshot_dir()
+        if not os.path.isdir(screenshot_dir):
+            return []
+        matched = []
+        for filename in os.listdir(screenshot_dir):
+            if filename.startswith(f"face_verify_{user_id}_"):
+                matched.append(os.path.join(screenshot_dir, filename).replace("\\", "/"))
+        return sorted(matched)
+
+    def _normalize_path(self, path):
+        return os.path.abspath(path).replace("\\", "/")
+
     def _make_success_record(self, user_id, *, distance=258.0, server_judge_wait=2.0):
         return {
             "success": True,
@@ -298,6 +335,73 @@ class SliderVerificationGuardsTest(unittest.TestCase):
 
         self.assertFalse(login_success)
         self.assertIs(success_page, page)
+
+    @mock.patch("utils.xianyu_slider_stealth.time.sleep", return_value=None)
+    def test_capture_verification_screenshot_replaces_old_file_and_reuses_last_on_timeout(self, _mock_sleep):
+        page = _FakePage(title="人脸验证", url="https://passport.goofish.com/iv/test")
+        page.screenshot = mock.Mock(return_value=b"fresh-screenshot")
+        slider = self._make_slider(page)
+        user_id = f"{self._testMethodName}_account"
+        self._prepare_verification_screenshot_user(slider, user_id)
+        stale_path = self._write_verification_screenshot(user_id, "stale", content=b"stale-screenshot")
+
+        first_path = slider._capture_verification_screenshot(page)
+
+        self.assertTrue(os.path.exists(first_path))
+        self.assertFalse(os.path.exists(stale_path))
+        self.assertEqual(
+            self._list_verification_screenshots(user_id),
+            [self._normalize_path(first_path)],
+        )
+
+        slider._collect_page_text_for_detection = lambda _page: "验证已超时，请重新发起"
+        slider._is_timed_out_verification_text = lambda text: True
+        page.screenshot.reset_mock()
+
+        reused_path = slider._capture_verification_screenshot(page)
+
+        self.assertEqual(reused_path, first_path)
+        self.assertEqual(
+            self._list_verification_screenshots(user_id),
+            [self._normalize_path(first_path)],
+        )
+        page.screenshot.assert_not_called()
+
+    def test_process_verification_requirement_success_cleans_old_screenshots_without_losing_keep_policy(self):
+        page = _FakePage(title="人脸验证", url="https://passport.goofish.com/iv/test")
+
+        for keep_last in (False, True):
+            with self.subTest(keep_last=keep_last):
+                slider = self._make_slider(page)
+                user_id = f"{self._testMethodName}_{'keep' if keep_last else 'drop'}"
+                self._prepare_verification_screenshot_user(slider, user_id)
+                slider.keep_verification_screenshots = keep_last
+                slider._verification_target_is_timed_out = lambda _frame, fallback_page=None: False
+                slider._notify_verification_required = lambda *_args, **_kwargs: None
+                slider._wait_for_context_login = lambda *args, **kwargs: (True, page)
+                slider._finalize_logged_in_cookies = lambda *args, **kwargs: {"cookie2": "ok"}
+
+                old_path = self._write_verification_screenshot(user_id, "old")
+                current_path = self._write_verification_screenshot(user_id, "current")
+                qr_frame = _FakeVerificationFrame(
+                    verification_type="face_verify",
+                    verify_url=page.url,
+                    screenshot_path=current_path,
+                )
+
+                result = slider._process_verification_requirement(
+                    context=object(),
+                    fallback_page=page,
+                    qr_frame=qr_frame,
+                )
+
+                self.assertEqual(result, {"cookie2": "ok"})
+                self.assertFalse(os.path.exists(old_path))
+                remaining = self._list_verification_screenshots(user_id)
+                if keep_last:
+                    self.assertEqual(remaining, [self._normalize_path(current_path)])
+                else:
+                    self.assertEqual(remaining, [])
 
     def test_finalize_logged_in_cookies_fails_when_session_still_unready(self):
         page = _FakePage(title="闲鱼消息", url="https://www.goofish.com/im")
@@ -750,6 +854,7 @@ class SliderVerificationGuardsTest(unittest.TestCase):
     ):
         slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
         slider.use_account_persistent_profile = True
+        slider.automation_backend = "playwright"
         slider.account_persistent_profile_dir = "browser_data/user_fallback_explicit"
         slider.headless = True
         slider.browser_channel = "msedge"
@@ -796,6 +901,7 @@ class SliderVerificationGuardsTest(unittest.TestCase):
                 "proxy": {"server": "http://127.0.0.1:8888"},
                 "args": ["--foo"],
                 "channel": "msedge",
+                "executable_path": "C:/Browsers/msedge.exe",
             },
         )
         self.assertEqual(
@@ -812,6 +918,7 @@ class SliderVerificationGuardsTest(unittest.TestCase):
     def test_init_browser_headless_falls_back_when_explicit_browser_launch_fails(self, mock_launch_browser):
         slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
         slider.use_account_persistent_profile = False
+        slider.automation_backend = "playwright"
         slider.headless = True
         slider.browser_channel = "msedge"
         slider.executable_path = "C:/Browsers/msedge.exe"
@@ -848,6 +955,7 @@ class SliderVerificationGuardsTest(unittest.TestCase):
                 "proxy": {"server": "http://127.0.0.1:8888"},
                 "args": ["--foo"],
                 "channel": "msedge",
+                "executable_path": "C:/Browsers/msedge.exe",
             },
         )
         self.assertEqual(
@@ -998,6 +1106,63 @@ class SliderVerificationGuardsTest(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertEqual(slider.last_verification_feedback, {})
+
+    @mock.patch("utils.xianyu_slider_stealth.time.sleep", return_value=None)
+    def test_wait_for_context_login_fast_fails_when_browser_session_is_closed(self, _mock_sleep):
+        page = _FakePage(title="人脸验证", url="https://passport.goofish.com/iv/test")
+        verify_frame = _FakeVerificationFrame(
+            verification_type="face_verify",
+            verify_url="https://passport.goofish.com/iv/test",
+        )
+        slider = self._make_slider(page)
+        slider.last_login_error = ""
+        slider._select_monitor_page = lambda _context, fallback_page=None: fallback_page or page
+        slider._attempt_solve_slider_on_page = lambda _page: False
+        slider._probe_context_login_success = lambda _context, _page: (False, page, {})
+        slider._detect_qr_code_verification = lambda _page: (True, verify_frame)
+        slider._verification_target_is_timed_out = lambda _frame, fallback_page=None: False
+        slider._notify_verification_required = lambda *_args, **_kwargs: None
+        slider._ensure_active_verification_session = lambda _context, _page: "浏览器会话已关闭或 CDP 已断开"
+
+        login_success, success_page = slider._wait_for_context_login(
+            context=object(),
+            fallback_page=page,
+            max_wait_time=30,
+            check_interval=10,
+            verification_type="face_verify",
+            verification_url=verify_frame.verify_url,
+        )
+
+        self.assertFalse(login_success)
+        self.assertIs(success_page, page)
+        self.assertEqual(slider.last_login_error, "浏览器会话已关闭或 CDP 已断开")
+
+    def test_ensure_active_verification_session_ignores_cross_thread_probe_errors(self):
+        slider = self._make_slider(_FakePage())
+
+        connected_browser = mock.Mock()
+        connected_browser.is_connected.return_value = True
+
+        foreign_thread_page = mock.Mock()
+        foreign_thread_page.is_closed.side_effect = Exception("Cannot switch to a different thread")
+
+        class _ForeignThreadContext:
+            @property
+            def browser(self):
+                return connected_browser
+
+            @property
+            def pages(self):
+                raise Exception("Cannot switch to a different thread")
+
+        foreign_thread_context = _ForeignThreadContext()
+
+        result = slider._ensure_active_verification_session(
+            foreign_thread_context,
+            foreign_thread_page,
+        )
+
+        self.assertIsNone(result)
 
 if __name__ == "__main__":
     unittest.main()
