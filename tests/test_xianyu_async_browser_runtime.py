@@ -498,6 +498,74 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         context.add_cookies.assert_awaited_once()
         live.update_config_cookies.assert_awaited_once_with()
 
+    async def test_refresh_cookies_via_browser_page_reuses_persistent_profile_after_recent_slider_success(self):
+        page = mock.Mock()
+        page.goto = mock.AsyncMock()
+        page.reload = mock.AsyncMock()
+
+        context = mock.Mock()
+        context.add_cookies = mock.AsyncMock()
+        context.new_page = mock.AsyncMock(return_value=page)
+        context.cookies = mock.AsyncMock(
+            return_value=[
+                {"name": "unb", "value": "user1"},
+                {"name": "cookie2", "value": "cookie2v"},
+                {"name": "_m_h5_tk", "value": "tokenv_123"},
+                {"name": "_m_h5_tk_enc", "value": "encv"},
+                {"name": "sgcookie", "value": "sgv"},
+                {"name": "t", "value": "tv"},
+                {"name": "cna", "value": "cnav"},
+            ]
+        )
+        context.browser = mock.Mock()
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = "recent-slider-user"
+        live.cookies_str = "unb=user1; cookie2=old; _m_h5_tk=old_123; _m_h5_tk_enc=oldenc; sgcookie=oldsg; t=oldt"
+        live.cookies = {
+            "unb": "user1",
+            "cookie2": "old",
+            "_m_h5_tk": "old_123",
+            "_m_h5_tk_enc": "oldenc",
+            "sgcookie": "oldsg",
+            "t": "oldt",
+        }
+        live._safe_str = str
+        live._summarize_cookie_string = lambda cookie_string: cookie_string
+        live._log_protected_merge_event = mock.Mock()
+        live._log_cookie_merge_summary = mock.Mock()
+        live._set_runtime_cookie_state = mock.Mock()
+        live.update_config_cookies = mock.AsyncMock()
+        live._async_close_browser = mock.AsyncMock()
+        live.protected_merge_cookie_dicts = lambda existing, incoming: self._build_merge_result(incoming)
+        live.get_qr_login_grace = mock.Mock(return_value=None)
+        live.get_manual_refresh_state = mock.Mock(return_value=None)
+        live._has_recent_slider_success = mock.Mock(return_value=True)
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "launch_browser_persistent_context_async",
+            new=mock.AsyncMock(return_value=context),
+        ) as launch_browser_persistent_context_async, \
+             mock.patch.object(
+                 XianyuAutoAsync,
+                 "_launch_browser_safe",
+                 new=mock.AsyncMock(side_effect=AssertionError("should not launch clean browser")),
+             ):
+            success = await live._refresh_cookies_via_browser_page(
+                live.cookies_str,
+                restart_on_success=False,
+            )
+
+        self.assertTrue(success)
+        launch_kwargs = launch_browser_persistent_context_async.await_args.kwargs
+        self.assertEqual(
+            launch_kwargs["user_data_dir"],
+            os.path.join(os.getcwd(), "browser_data", "user_recent-slider-user"),
+        )
+        self.assertTrue(launch_kwargs["headless"])
+        live.update_config_cookies.assert_awaited_once_with()
+
     async def test_try_password_login_refresh_disables_clean_context_during_qr_grace(self):
         captured = {}
 
@@ -823,6 +891,76 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         )
         live._build_browser_refresh_context_options.assert_called_once_with()
         live._async_close_browser.assert_awaited_once_with(browser=browser, context=context)
+
+    async def test_refresh_cookies_via_browser_reuses_persistent_profile_after_recent_slider_success(self):
+        page = mock.Mock()
+        page.goto = mock.AsyncMock()
+        page.reload = mock.AsyncMock()
+        page.title = mock.AsyncMock(return_value="聊天_闲鱼")
+
+        context = mock.Mock()
+        context.add_cookies = mock.AsyncMock()
+        context.new_page = mock.AsyncMock(return_value=page)
+        context.cookies = mock.AsyncMock(
+            return_value=[
+                {"name": "unb", "value": "user1"},
+                {"name": "cookie2", "value": "cookie2v"},
+                {"name": "_m_h5_tk", "value": "tokenv_123"},
+                {"name": "_m_h5_tk_enc", "value": "encv"},
+                {"name": "sgcookie", "value": "sgv"},
+                {"name": "t", "value": "tv"},
+                {"name": "cna", "value": "cnav"},
+            ]
+        )
+        context.browser = mock.Mock()
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.cookie_id = "recent-slider-user"
+        live.cookies_str = "unb=user1; cookie2=old; _m_h5_tk=old_123; _m_h5_tk_enc=oldenc; sgcookie=oldsg; t=oldt"
+        live.cookies = {
+            "unb": "user1",
+            "cookie2": "old",
+            "_m_h5_tk": "old_123",
+            "_m_h5_tk_enc": "oldenc",
+            "sgcookie": "oldsg",
+            "t": "oldt",
+        }
+        live.last_qr_cookie_refresh_time = 0
+        live.qr_cookie_refresh_cooldown = 0
+        live._safe_str = str
+        live._summarize_cookie_string = lambda cookie_string: cookie_string
+        live._log_protected_merge_event = mock.Mock()
+        live._log_cookie_merge_summary = mock.Mock()
+        live._set_runtime_cookie_state = mock.Mock()
+        live.update_config_cookies = mock.AsyncMock()
+        live._async_close_browser = mock.AsyncMock()
+        live.protected_merge_cookie_dicts = lambda existing, incoming: self._build_merge_result(incoming)
+        live.get_qr_login_grace = mock.Mock(return_value=None)
+        live.get_manual_refresh_state = mock.Mock(return_value=None)
+        live._has_recent_slider_success = mock.Mock(return_value=True)
+        live.browser_cookie_refreshed = False
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "launch_browser_persistent_context_async",
+            new=mock.AsyncMock(return_value=context),
+        ) as launch_browser_persistent_context_async, \
+             mock.patch.object(
+                 XianyuAutoAsync,
+                 "_launch_browser_safe",
+                 new=mock.AsyncMock(side_effect=AssertionError("should not launch clean browser")),
+             ), \
+             mock.patch("XianyuAutoAsync.asyncio.sleep", new=mock.AsyncMock()):
+            success = await live._refresh_cookies_via_browser(triggered_by_refresh_token=False)
+
+        self.assertTrue(success)
+        launch_kwargs = launch_browser_persistent_context_async.await_args.kwargs
+        self.assertEqual(
+            launch_kwargs["user_data_dir"],
+            os.path.join(os.getcwd(), "browser_data", "user_recent-slider-user"),
+        )
+        self.assertTrue(launch_kwargs["headless"])
+        live.update_config_cookies.assert_awaited_once_with()
 
 
 if __name__ == "__main__":

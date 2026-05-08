@@ -12201,6 +12201,83 @@ class XianyuLive:
         os.makedirs(profile_dir, exist_ok=True)
         return profile_dir
 
+    def _should_prefer_account_persistent_profile_for_browser_recovery(self) -> Tuple[bool, str]:
+        """浏览器恢复链优先复用账号持久化画像，避免临时空白上下文反复触发风控。"""
+        qr_login_grace = None
+        try:
+            qr_login_grace = self.get_qr_login_grace(self.cookie_id)
+        except Exception:
+            qr_login_grace = None
+        if qr_login_grace:
+            return True, "扫码登录缓冲期"
+
+        manual_refresh_state = None
+        try:
+            manual_refresh_state = self.get_manual_refresh_state(self.cookie_id)
+        except Exception:
+            manual_refresh_state = None
+        if isinstance(manual_refresh_state, dict):
+            phase = str(manual_refresh_state.get('phase') or '').strip()
+            if phase == 'handoff_recovery':
+                return True, "手动刷新交接恢复窗口"
+            if phase == 'manual_refresh':
+                return True, "手动刷新进行中"
+
+        try:
+            if self._has_recent_slider_success():
+                window_seconds = getattr(self, 'slider_success_reentry_window', None)
+                if window_seconds:
+                    return True, f"最近{int(window_seconds)}秒内刚通过滑块"
+                return True, "最近刚通过滑块"
+        except Exception:
+            pass
+
+        return True, "默认复用账号持久化画像稳定浏览器恢复链路"
+
+    async def _open_browser_recovery_context(self, recovery_label: str) -> Tuple[Any, Any, bool]:
+        """统一打开浏览器恢复上下文，优先复用账号持久化画像，失败再降级到临时上下文。"""
+        browser_args = self._build_browser_refresh_launch_args()
+        context_options = dict(self._build_browser_refresh_context_options())
+        prefer_persistent_profile, reuse_reason = (
+            self._should_prefer_account_persistent_profile_for_browser_recovery()
+        )
+
+        if prefer_persistent_profile:
+            profile_dir = self._resolve_account_browser_profile_dir()
+            persistent_context_options = dict(context_options)
+            persistent_context_options.setdefault('accept_downloads', True)
+            persistent_context_options.setdefault('ignore_https_errors', True)
+            try:
+                context = await launch_browser_persistent_context_async(
+                    user_data_dir=profile_dir,
+                    headless=True,
+                    args=browser_args,
+                    **persistent_context_options,
+                )
+                browser = getattr(context, 'browser', None)
+                logger.info(
+                    f"【{self.cookie_id}】{recovery_label}复用账号持久化画像: {profile_dir}"
+                    f"（原因: {reuse_reason}）"
+                )
+                return browser, context, True
+            except Exception as persistent_launch_error:
+                logger.warning(
+                    f"【{self.cookie_id}】{recovery_label}持久化画像启动失败，降级到临时上下文: "
+                    f"{self._safe_str(persistent_launch_error)}"
+                )
+
+        browser = await _launch_browser_safe(
+            self.cookie_id,
+            headless=True,
+            args=browser_args,
+        )
+        if not browser:
+            return None, None, False
+
+        context = await browser.new_context(**context_options)
+        logger.info(f"【{self.cookie_id}】{recovery_label}已降级到临时浏览器上下文")
+        return browser, context, False
+
     async def _refresh_cookies_via_browser_page(self, current_cookies_str: str, restart_on_success: bool = True):
         """使用当前cookie访问指定页面获取真实cookie并更新
         
@@ -12226,42 +12303,9 @@ class XianyuLive:
             # 解析当前的cookie
             current_cookies_dict = trans_cookies(current_cookies_str)
             logger.info(f"【{self.cookie_id}】当前cookie字段数: {len(current_cookies_dict)}")
-
-            browser_args = self._build_browser_refresh_launch_args()
-            context_options = dict(self._build_browser_refresh_context_options())
-            qr_login_grace = self.get_qr_login_grace(self.cookie_id)
-            reuse_persistent_profile = bool(qr_login_grace)
-
-            if reuse_persistent_profile:
-                profile_dir = self._resolve_account_browser_profile_dir()
-                persistent_context_options = dict(context_options)
-                persistent_context_options.setdefault('accept_downloads', True)
-                persistent_context_options.setdefault('ignore_https_errors', True)
-                try:
-                    context = await launch_browser_persistent_context_async(
-                        user_data_dir=profile_dir,
-                        headless=True,
-                        args=browser_args,
-                        **persistent_context_options,
-                    )
-                    browser = getattr(context, 'browser', None)
-                    logger.info(f"【{self.cookie_id}】扫码登录缓冲期浏览器稳定化复用账号持久化画像: {profile_dir}")
-                except Exception as persistent_launch_error:
-                    logger.warning(
-                        f"【{self.cookie_id}】扫码登录缓冲期持久化画像启动失败，降级到临时上下文稳定化: "
-                        f"{self._safe_str(persistent_launch_error)}"
-                    )
-
+            browser, context, _ = await self._open_browser_recovery_context("浏览器稳定化")
             if context is None:
-                browser = await _launch_browser_safe(
-                    self.cookie_id,
-                    headless=True,
-                    args=browser_args,
-                )
-                if not browser:
-                    return False
-
-                context = await browser.new_context(**context_options)
+                return False
 
             # 设置当前 Cookie，补齐 taobao 域票据，避免浏览器侧验证链路缺关键票。
             cookies = self._build_browser_cookie_payload(current_cookies_str)
@@ -12460,21 +12504,9 @@ class XianyuLive:
             logger.info(f"【{self.cookie_id}】开始通过浏览器刷新Cookie...")
             logger.info(f"【{self.cookie_id}】刷新前Cookie长度: {len(self.cookies_str)}")
             logger.info(f"【{self.cookie_id}】刷新前Cookie字段数: {len(self.cookies)}")
-
-            # 使用统一的Playwright启动方法
-            # 启动浏览器（参照商品搜索的配置）
-            browser_args = self._build_browser_refresh_launch_args()
-
-            # Cookie刷新模式使用无头浏览器
-            browser = await _launch_browser_safe(
-                self.cookie_id,
-                headless=True,
-                args=browser_args,
-            )
-            if not browser:
+            browser, context, _ = await self._open_browser_recovery_context("浏览器刷新Cookie")
+            if context is None:
                 return False
-
-            context = await browser.new_context(**self._build_browser_refresh_context_options())
 
             # 设置当前 Cookie，补齐 taobao 域票据，避免浏览器恢复链路跨域丢票。
             cookies = self._build_browser_cookie_payload(self.cookies_str)
