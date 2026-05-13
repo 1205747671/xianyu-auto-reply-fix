@@ -95,6 +95,7 @@ class OrderDetailFetcher:
         self._pending_response_tasks = set()
         self._response_handler = None
         self._runtime_lease = None
+        self._runtime_handles_managed = False
 
         # Cookie配置 - 支持动态传入
         self.cookie = cookie_string
@@ -105,6 +106,7 @@ class OrderDetailFetcher:
     async def _release_runtime_lease(self, reason: str) -> None:
         lease = self._runtime_lease
         self._runtime_lease = None
+        self._runtime_handles_managed = False
         self.browser = None
         self.context = None
         self.page = None
@@ -145,6 +147,7 @@ class OrderDetailFetcher:
             )
             self.page, self.context = await account_browser_runtime_manager.get_fresh_page(lease)
             self._runtime_lease = lease
+            self._runtime_handles_managed = True
             lease_runtime = getattr(lease, "runtime", None)
             self.browser = getattr(lease_runtime, "browser", None)
 
@@ -164,6 +167,18 @@ class OrderDetailFetcher:
                     pass
             logger.error(f"浏览器初始化失败: {e}")
             return False
+
+    def _detach_managed_runtime_handles_without_close(self, reason: str) -> bool:
+        if not self._runtime_handles_managed:
+            return False
+
+        logger.warning(f"检测到受管 runtime handles 缺少 lease，跳过 direct close: {reason}")
+        self.page = None
+        self.context = None
+        self.browser = None
+        self._active_order_id = ''
+        self._runtime_handles_managed = False
+        return True
 
     async def _set_cookies(self):
         """设置Cookie"""
@@ -2532,6 +2547,8 @@ class OrderDetailFetcher:
             if self._runtime_lease is not None:
                 await self._release_runtime_lease(reason="force_close_order_detail_page")
                 return
+            if self._detach_managed_runtime_handles_without_close("force_close_order_detail_page"):
+                return
 
             if self.page:
                 try:
@@ -2568,6 +2585,9 @@ class OrderDetailFetcher:
                 await self._release_runtime_lease(reason="close_order_detail_page")
                 logger.info("浏览器已关闭")
                 return
+            if self._detach_managed_runtime_handles_without_close("close_order_detail_page"):
+                logger.info("浏览器已关闭")
+                return
             if self.page:
                 await self.page.close()
             if self.context:
@@ -2575,6 +2595,7 @@ class OrderDetailFetcher:
             if self.browser:
                 await self.browser.close()
             self._active_order_id = ''
+            self._runtime_handles_managed = False
             logger.info("浏览器已关闭")
         except Exception as e:
             logger.error(f"关闭浏览器失败: {e}")

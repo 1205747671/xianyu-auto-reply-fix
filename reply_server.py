@@ -1190,7 +1190,7 @@ if not os.path.exists(uploads_dir):
 async def health_check():
     """健康检查端点，用于Docker健康检查和负载均衡器"""
     try:
-        # 检查Cookie管理器状态
+        # 检查账号凭证管理器状态
         manager_status = "ok" if cookie_manager.manager is not None else "error"
 
         # 检查数据库连接
@@ -8890,7 +8890,7 @@ async def search_items(
 async def check_valid_accounts(
     current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional)
 ):
-    """检查是否有有效的cookies账户（必须是启用状态）"""
+    """检查是否有有效账号（必须是启用状态）"""
     try:
         if cookie_manager.manager is None:
             return {

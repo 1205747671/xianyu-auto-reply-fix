@@ -50,6 +50,7 @@ class XianyuSearcher:
         self.context = None
         self.page = None
         self._runtime_lease = None
+        self._runtime_handles_managed = False
         self.api_responses = []
         self.account_id = account_id
         self.cookie_value = str(cookie_value or "").strip()
@@ -724,6 +725,7 @@ class XianyuSearcher:
             )
             self.page, self.context = await account_browser_runtime_manager.get_fresh_page(lease)
             self._runtime_lease = lease
+            self._runtime_handles_managed = True
             lease_runtime = getattr(lease, "runtime", None)
             self.browser = getattr(lease_runtime, "browser", None)
 
@@ -742,6 +744,7 @@ class XianyuSearcher:
     async def _release_runtime_lease(self, reason: str) -> None:
         lease = self._runtime_lease
         self._runtime_lease = None
+        self._runtime_handles_managed = False
         self.browser = None
         self.context = None
         self.page = None
@@ -754,12 +757,26 @@ class XianyuSearcher:
         except Exception as e:
             logger.warning(f"释放商品搜索 runtime 失败: {e}")
 
+    def _detach_managed_runtime_handles_without_close(self, reason: str) -> bool:
+        if not self._runtime_handles_managed:
+            return False
+
+        logger.warning(f"检测到受管商品搜索 runtime handles 缺少 lease，跳过 direct close: {reason}")
+        self.page = None
+        self.context = None
+        self.browser = None
+        self._runtime_handles_managed = False
+        return True
+
     async def close_browser(self):
         """关闭浏览器"""
         try:
             if self._runtime_lease is not None:
                 await self._release_runtime_lease(reason="close_item_search_page")
                 logger.debug("商品搜索器浏览器已关闭（runtime lease 已释放）")
+                return
+            if self._detach_managed_runtime_handles_without_close("close_item_search_page"):
+                logger.debug("商品搜索器浏览器已关闭")
                 return
             if self.page:
                 await self.page.close()
@@ -770,6 +787,7 @@ class XianyuSearcher:
             if self.browser:
                 await self.browser.close()
             self.browser = None
+            self._runtime_handles_managed = False
             logger.debug("商品搜索器浏览器已关闭")
         except Exception as e:
             logger.warning(f"关闭商品搜索器浏览器时出错: {e}")

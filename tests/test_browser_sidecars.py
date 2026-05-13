@@ -695,6 +695,145 @@ class BrowserSidecarsProviderMigrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(session.managed_context)
         self.assertIsNone(session.managed_page)
 
+    def test_qr_login_cleanup_session_assets_does_not_close_managed_handles_when_release_fails(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession("session-4b")
+        lease = object()
+        runtime_manager = types.SimpleNamespace(
+            release_runtime=mock.AsyncMock(side_effect=RuntimeError("release failed")),
+        )
+        session.managed_runtime_lease = lease
+        session.managed_runtime = mock.Mock(close=mock.AsyncMock())
+        session.managed_context = mock.Mock(close=mock.AsyncMock())
+        session.managed_page = mock.Mock(close=mock.AsyncMock())
+        managed_runtime = session.managed_runtime
+        managed_context = session.managed_context
+        managed_page = session.managed_page
+
+        with mock.patch.object(qr_login, "account_browser_runtime_manager", new=runtime_manager), \
+             mock.patch.object(qr_login.asyncio, "get_running_loop", side_effect=RuntimeError):
+            manager._cleanup_session_assets(session)
+
+        runtime_manager.release_runtime.assert_awaited_once_with(
+            lease,
+            reason="qr_login_session_cleanup",
+        )
+        managed_page.close.assert_not_awaited()
+        managed_context.close.assert_not_awaited()
+        managed_runtime.close.assert_not_awaited()
+        self.assertIsNone(session.managed_runtime_lease)
+        self.assertIsNone(session.managed_runtime)
+        self.assertIsNone(session.managed_context)
+        self.assertIsNone(session.managed_page)
+
+    def test_qr_login_mark_session_success_tracks_runtime_owned_handles(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession("session-4bb")
+        lease = object()
+        managed_runtime = object()
+        managed_context = mock.Mock()
+        managed_page = mock.Mock()
+
+        success = manager._mark_session_success(
+            session,
+            {"unb": "unb-value", "cookie2": "cookie2-value"},
+            "browser",
+            require_complete_cookies=True,
+            managed_runtime_lease=lease,
+            managed_runtime=managed_runtime,
+            managed_context=managed_context,
+            managed_page=managed_page,
+        )
+
+        self.assertTrue(success)
+        self.assertTrue(session.managed_handles_owned_by_runtime)
+        self.assertIs(session.managed_runtime_lease, lease)
+        self.assertIs(session.managed_runtime, managed_runtime)
+        self.assertIs(session.managed_context, managed_context)
+        self.assertIs(session.managed_page, managed_page)
+
+    def test_qr_login_cleanup_session_assets_does_not_close_runtime_owned_handles_without_lease(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession("session-4bc")
+        session.managed_handles_owned_by_runtime = True
+        session.managed_runtime = mock.Mock(close=mock.AsyncMock())
+        session.managed_context = mock.Mock(close=mock.AsyncMock())
+        session.managed_page = mock.Mock(close=mock.AsyncMock())
+        managed_runtime = session.managed_runtime
+        managed_context = session.managed_context
+        managed_page = session.managed_page
+
+        with mock.patch.object(qr_login.asyncio, "get_running_loop", side_effect=RuntimeError):
+            manager._cleanup_session_assets(session)
+
+        managed_page.close.assert_not_awaited()
+        managed_context.close.assert_not_awaited()
+        managed_runtime.close.assert_not_awaited()
+        self.assertFalse(session.managed_handles_owned_by_runtime)
+        self.assertIsNone(session.managed_runtime_lease)
+        self.assertIsNone(session.managed_runtime)
+        self.assertIsNone(session.managed_context)
+        self.assertIsNone(session.managed_page)
+
+    async def test_qr_login_verification_page_release_failure_does_not_close_managed_handles(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession("session-4c", account_id="qr-account-4c")
+        session.verification_url = "https://passport.goofish.com/iv/test"
+        session.status = "verification_required"
+        session.cookies = {
+            "unb": "unb-value",
+            "cookie2": "cookie2-value",
+        }
+        session.unb = "unb-value"
+        manager.sessions[session.session_id] = session
+
+        verification_page = mock.Mock()
+        verification_page.goto = mock.AsyncMock()
+        verification_page.wait_for_timeout = mock.AsyncMock()
+        verification_page.screenshot = mock.AsyncMock(return_value=b"image-bytes")
+        verification_page.close = mock.AsyncMock()
+
+        fake_browser = mock.Mock()
+        fake_browser.close = mock.AsyncMock()
+
+        fake_context = mock.Mock()
+        fake_context.add_cookies = mock.AsyncMock()
+        fake_context.new_page = mock.AsyncMock(return_value=verification_page)
+        fake_context.close = mock.AsyncMock()
+        fake_context.pages = []
+        fake_context.browser = fake_browser
+
+        lease = types.SimpleNamespace(
+            runtime=types.SimpleNamespace(context=fake_context, browser=fake_browser),
+            pages=[],
+        )
+        runtime_manager = types.SimpleNamespace(
+            acquire_runtime=mock.AsyncMock(return_value=lease),
+            release_runtime=mock.AsyncMock(side_effect=RuntimeError("release failed")),
+            resolve_profile_dir=mock.Mock(
+                return_value=os.path.join(os.getcwd(), "browser_data", "user_qr-account-4c")
+            ),
+        )
+
+        async def fail_verification(current_session, page, context, **_kwargs):
+            current_session.status = "failed"
+            return False
+
+        with mock.patch.object(qr_login, "account_browser_runtime_manager", new=runtime_manager), \
+             mock.patch.object(manager, "_should_show_verification_browser", return_value=False), \
+             mock.patch.object(manager, "_probe_browser_login_success", new=mock.AsyncMock(side_effect=fail_verification)), \
+             mock.patch("utils.qr_login.image_manager.save_image", return_value="saved.png"):
+            await manager._launch_verification_page(session.session_id)
+
+        runtime_manager.release_runtime.assert_awaited_once_with(
+            lease,
+            reason="qr_login_verification_page_closed",
+        )
+        verification_page.close.assert_not_awaited()
+        fake_context.close.assert_not_awaited()
+        fake_browser.close.assert_not_awaited()
+        self.assertIn(verification_page, lease.pages)
+
 
 class CaptchaRemoteControlTypingGuardTest(unittest.TestCase):
     def test_captcha_remote_control_uses_provider_neutral_page_annotations(self):

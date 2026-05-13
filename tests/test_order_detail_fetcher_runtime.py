@@ -275,6 +275,62 @@ class OrderDetailFetcherRuntimeTest(unittest.IsolatedAsyncioTestCase):
         runtime_manager.get_fresh_page.assert_awaited_once_with(runtime_lease)
         self.assertEqual(fake_page.goto_calls[0]["url"], "https://www.goofish.com/order-detail?orderId=order-2&role=seller")
 
+    async def test_close_does_not_direct_close_managed_handles_when_runtime_lease_is_missing(self):
+        fetcher = order_detail_fetcher.OrderDetailFetcher(
+            cookie_string="cookie2=current-token",
+            account_id="account_123",
+        )
+        page = mock.Mock(close=mock.AsyncMock())
+        context = mock.Mock(close=mock.AsyncMock())
+        browser = mock.Mock(close=mock.AsyncMock())
+        fetcher.page = page
+        fetcher.context = context
+        fetcher.browser = browser
+        fetcher._runtime_lease = None
+        fetcher._runtime_handles_managed = True
+        fetcher._active_order_id = "order-2"
+
+        with mock.patch.object(fetcher, "_wait_for_response_capture_tasks", mock.AsyncMock(return_value=None)), \
+             mock.patch.object(fetcher, "_clear_response_capture_handler"):
+            await fetcher.close()
+
+        page.close.assert_not_awaited()
+        context.close.assert_not_awaited()
+        browser.close.assert_not_awaited()
+        self.assertIsNone(fetcher.page)
+        self.assertIsNone(fetcher.context)
+        self.assertIsNone(fetcher.browser)
+        self.assertFalse(fetcher._runtime_handles_managed)
+        self.assertEqual(fetcher._active_order_id, "")
+
+    async def test_force_close_does_not_direct_close_managed_handles_when_runtime_lease_is_missing(self):
+        fetcher = order_detail_fetcher.OrderDetailFetcher(
+            cookie_string="cookie2=current-token",
+            account_id="account_123",
+        )
+        page = mock.Mock(close=mock.AsyncMock())
+        context = mock.Mock(close=mock.AsyncMock())
+        browser = mock.Mock(close=mock.AsyncMock())
+        fetcher.page = page
+        fetcher.context = context
+        fetcher.browser = browser
+        fetcher._runtime_lease = None
+        fetcher._runtime_handles_managed = True
+        fetcher._active_order_id = "order-2"
+
+        with mock.patch.object(fetcher, "_wait_for_response_capture_tasks", mock.AsyncMock(return_value=None)), \
+             mock.patch.object(fetcher, "_clear_response_capture_handler"):
+            await fetcher._force_close_browser()
+
+        page.close.assert_not_awaited()
+        context.close.assert_not_awaited()
+        browser.close.assert_not_awaited()
+        self.assertIsNone(fetcher.page)
+        self.assertIsNone(fetcher.context)
+        self.assertIsNone(fetcher.browser)
+        self.assertFalse(fetcher._runtime_handles_managed)
+        self.assertEqual(fetcher._active_order_id, "")
+
 
 if __name__ == "__main__":
     unittest.main()

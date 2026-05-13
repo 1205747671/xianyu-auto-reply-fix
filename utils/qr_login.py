@@ -112,6 +112,7 @@ class QRLoginSession:
         self.managed_runtime = None
         self.managed_context = None
         self.managed_page = None
+        self.managed_handles_owned_by_runtime = False
         self.last_active_probe_time = 0.0
         self.proxy_config = {}
         self.proxy_url = None
@@ -668,6 +669,8 @@ class QRLoginManager:
             session.managed_context = managed_context
         if managed_page is not None:
             session.managed_page = managed_page
+        if any(value is not None for value in (managed_runtime, managed_context, managed_page)) or managed_runtime_lease is not None:
+            session.managed_handles_owned_by_runtime = managed_runtime_lease is not None
         if managed_runtime_lease is not None and managed_page is not None:
             self._track_runtime_lease_page(managed_runtime_lease, managed_page)
         self._update_session_state(
@@ -947,6 +950,7 @@ class QRLoginManager:
             )
             keep_current_page = self._should_keep_session_page(latest_session, page)
             released_runtime_lease = False
+            managed_release_failed = False
             if runtime_lease is not None and not keep_session_handles:
                 try:
                     await account_browser_runtime_manager.release_runtime(
@@ -955,22 +959,25 @@ class QRLoginManager:
                     )
                     released_runtime_lease = True
                 except Exception as release_error:
-                    logger.debug(f"释放扫码登录 verification runtime lease 失败，降级为关闭句柄: {release_error}")
+                    managed_release_failed = True
+                    logger.warning(
+                        f"释放扫码登录 verification runtime lease 失败，保留受管 handles 等待统一回收: {release_error}"
+                    )
             try:
-                if page and not keep_current_page and not released_runtime_lease:
+                if page and not keep_current_page and not released_runtime_lease and not managed_release_failed:
                     await page.close()
             except Exception:
                 pass
             finally:
-                if page and not keep_current_page and not released_runtime_lease:
+                if page and not keep_current_page and not released_runtime_lease and not managed_release_failed:
                     self._untrack_runtime_lease_page(runtime_lease, page)
             try:
-                if context and not keep_session_handles and not released_runtime_lease:
+                if context and not keep_session_handles and not released_runtime_lease and not managed_release_failed:
                     await context.close()
             except Exception:
                 pass
             try:
-                if browser and not keep_session_handles and not released_runtime_lease:
+                if browser and not keep_session_handles and not released_runtime_lease and not managed_release_failed:
                     await browser.close()
             except Exception:
                 pass
@@ -1017,10 +1024,12 @@ class QRLoginManager:
         managed_runtime = session.managed_runtime
         managed_context = session.managed_context
         managed_page = session.managed_page
+        managed_handles_owned_by_runtime = bool(getattr(session, 'managed_handles_owned_by_runtime', False))
         session.managed_runtime_lease = None
         session.managed_runtime = None
         session.managed_context = None
         session.managed_page = None
+        session.managed_handles_owned_by_runtime = False
 
         if not any((managed_runtime_lease, managed_runtime, managed_context, managed_page)):
             return
@@ -1034,7 +1043,15 @@ class QRLoginManager:
                     )
                     return
                 except Exception as release_error:
-                    logger.debug(f"释放扫码登录 runtime lease 失败，降级为关闭句柄: {release_error}")
+                    logger.warning(
+                        f"释放扫码登录 runtime lease 失败，保留受管 handles 等待统一回收: {release_error}"
+                    )
+                    return
+            if managed_handles_owned_by_runtime:
+                logger.warning(
+                    "检测到扫码登录受管 handles 缺少 runtime lease，跳过 direct close，等待 runtime manager 统一回收"
+                )
+                return
             await self._close_managed_browser_handles(
                 managed_runtime,
                 managed_context,

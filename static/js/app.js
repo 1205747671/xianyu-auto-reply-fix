@@ -101,7 +101,7 @@ function showSection(sectionName) {
         loadDashboard();
         break;
     case 'accounts':         // 【账号管理菜单】
-        loadCookies();
+        loadAccounts();
         break;
     case 'items':           // 【商品管理菜单】
         loadItems();
@@ -151,7 +151,7 @@ function showSection(sectionName) {
             if (riskLogContainer) {
                 console.log('首次进入风控日志页面，自动加载日志...');
                 loadRiskControlLogs();
-                loadCookieFilterOptions();
+                loadRiskLogAccountFilterOptions();
             }
         }, 100);
         break;
@@ -1931,7 +1931,7 @@ function openAccountManagement(accountId) {
     pendingAccountManagementFocusId = accountId || '';
     const accountsSection = document.getElementById('accounts-section');
     if (accountsSection && accountsSection.classList.contains('active')) {
-        loadCookies();
+        loadAccounts();
         return;
     }
     showSection('accounts');
@@ -1942,7 +1942,7 @@ function focusPendingAccountManagementRow() {
         return;
     }
 
-    const rows = document.querySelectorAll('#cookieTable tbody tr[data-account-id]');
+    const rows = document.querySelectorAll('#accountTable tbody tr[data-account-id]');
     const targetRow = Array.from(rows).find(row => row.dataset.accountId === pendingAccountManagementFocusId);
     if (!targetRow) {
         return;
@@ -4049,11 +4049,11 @@ function initAboutDiagnosticsEvents() {
 // 【账号管理菜单】相关功能
 // ================================
 
-// 加载Cookie列表
-async function loadCookies() {
+// 加载账号列表
+async function loadAccounts() {
     try {
     toggleLoading(true);
-    const tbody = document.querySelector('#cookieTable tbody');
+    const tbody = document.querySelector('#accountTable tbody');
     tbody.innerHTML = '';
 
     const cookieDetails = await fetchJSON(apiBase + '/accounts/details');
@@ -4152,7 +4152,7 @@ async function loadCookies() {
 
         tr.innerHTML = `
         <td class="align-middle">
-            <div class="cookie-id">
+            <div class="account-id">
             <strong class="text-primary">${accountId}</strong>
             </div>
         </td>
@@ -4227,7 +4227,7 @@ async function loadCookies() {
             <button class="btn btn-sm btn-outline-secondary" onclick="showFaceVerification('${accountId}')" title="验证截图">
                 <i class="bi bi-shield-check"></i>
             </button>
-            <button class="btn btn-sm btn-outline-primary" onclick="editCookieInline('${accountId}', '${cookie.value}')" title="修改Cookie" ${!isEnabled ? 'disabled' : ''}>
+            <button class="btn btn-sm btn-outline-primary" onclick="openAccountEditor('${accountId}')" title="修改Cookie" ${!isEnabled ? 'disabled' : ''}>
                 <i class="bi bi-pencil"></i>
             </button>
             <button class="btn btn-sm btn-outline-success" onclick="goToAutoReply('${accountId}')" title="${isEnabled ? '设置自动回复' : '配置关键词 (账号已禁用)'}">
@@ -4243,7 +4243,7 @@ async function loadCookies() {
                 <i class="bi bi-clock"></i>
             </button>
 
-            <button class="btn btn-sm btn-outline-danger" onclick="delCookie('${accountId}')" title="删除账号">
+            <button class="btn btn-sm btn-outline-danger" onclick="deleteAccount('${accountId}')" title="删除账号">
                 <i class="bi bi-trash"></i>
             </button>
             </div>
@@ -4257,7 +4257,7 @@ async function loadCookies() {
         element.style.cursor = 'pointer';
         element.addEventListener('click', function() {
         const row = this.closest('tr');
-        const accountId = row?.querySelector('.cookie-id strong')?.textContent;
+        const accountId = row?.querySelector('.account-id strong')?.textContent;
         if (accountId) {
             copyCookie(accountId);
         }
@@ -4377,7 +4377,7 @@ async function refreshRealCookie(accountId) {
         if (result.success) {
             showToast(`账号 "${accountId}" 真实Cookie刷新成功`, 'success');
             // 刷新账号列表以显示更新后的cookie
-            loadCookies();
+            loadAccounts();
         } else {
             showToast(`真实Cookie刷新失败: ${result.message}`, 'danger');
         }
@@ -4483,20 +4483,20 @@ async function resetCooldownTime(accountId) {
 }
 
 // 删除Cookie
-async function delCookie(id) {
+async function deleteAccount(id) {
     if (!confirm(`确定要删除账号 "${id}" 吗？此操作不可恢复。`)) return;
 
     try {
     await fetchJSON(apiBase + `/accounts/${id}`, { method: 'DELETE' });
     showToast(`账号 "${id}" 已删除`, 'success');
-    loadCookies();
+    loadAccounts();
     } catch (err) {
     // 错误已在fetchJSON中处理
     }
 }
 
 // 内联编辑Cookie
-async function editCookieInline(id, currentValue) {
+async function openAccountEditor(id) {
     try {
         toggleLoading(true);
         
@@ -4639,7 +4639,7 @@ async function saveAccountEdit() {
         modal.hide();
         
         // 重新加载账号列表
-        loadCookies();
+        loadAccounts();
     } catch (err) {
         console.error('保存账号信息失败:', err);
         showToast(`保存失败: ${err.message || '未知错误'}`, 'danger');
@@ -4647,64 +4647,6 @@ async function saveAccountEdit() {
         toggleLoading(false);
     }
 }
-
-// 保存内联编辑的Cookie
-async function saveCookieInline(id) {
-    const input = document.getElementById(`edit-${id}`);
-    const newValue = input.value.trim();
-
-    if (!newValue) {
-    showToast('Cookie值不能为空', 'warning');
-    return;
-    }
-
-    try {
-    toggleLoading(true);
-
-    await fetchJSON(apiBase + `/accounts/${id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-        account_id: id,
-        value: newValue
-        })
-    });
-
-    showToast(`账号 "${id}" Cookie已更新`, 'success');
-    loadCookies(); // 重新加载列表
-
-    } catch (err) {
-    console.error('Cookie更新失败:', err);
-    showToast(`Cookie更新失败: ${err.message || '未知错误'}`, 'danger');
-    // 恢复原内容
-    cancelCookieEdit(id);
-    } finally {
-    toggleLoading(false);
-    }
-}
-
-// 取消Cookie编辑
-function cancelCookieEdit(id) {
-    if (!window.editingAccountData || window.editingAccountData.id !== id) {
-    console.error('编辑数据不存在');
-    return;
-    }
-
-    const row = document.querySelector(`#edit-${id}`).closest('tr');
-    const cookieValueCell = row.querySelector('.cookie-value');
-
-    // 恢复原内容
-    cookieValueCell.innerHTML = window.editingAccountData.originalContent;
-
-    // 恢复按钮状态
-    const actionButtons = row.querySelectorAll('.btn-group button');
-    actionButtons.forEach(btn => btn.disabled = false);
-
-    // 清理全局数据
-    delete window.editingAccountData;
-}
-
-
 
 // 切换账号启用/禁用状态
 async function toggleAccountStatus(accountId, enabled) {
@@ -4795,7 +4737,7 @@ function updateAccountRowStatus(accountId, enabled) {
 
     // 更新按钮状态（只禁用编辑Cookie按钮，其他按钮保持可用）
     actionButtons.forEach(btn => {
-    if (btn.onclick && btn.onclick.toString().includes('editCookieInline')) {
+    if (btn.onclick && btn.onclick.toString().includes('openAccountEditor')) {
         btn.disabled = !enabled;
     }
     // 设置自动回复按钮始终可用，但更新提示文本
@@ -5715,7 +5657,7 @@ async function saveDefaultReply() {
         showToast('默认回复设置保存成功', 'success');
         bootstrap.Modal.getInstance(document.getElementById('editDefaultReplyModal')).hide();
         loadDefaultReplies(); // 刷新列表
-        loadCookies(); // 刷新账号列表以更新默认回复状态显示
+        loadAccounts(); // 刷新账号列表以更新默认回复状态显示
     } else {
         const error = await response.text();
         showToast(`保存失败: ${error}`, 'danger');
@@ -5938,7 +5880,7 @@ async function saveAIReplyConfig() {
     if (response.ok) {
         showToast('AI回复配置保存成功', 'success');
         bootstrap.Modal.getInstance(document.getElementById('aiReplyConfigModal')).hide();
-        loadCookies(); // 刷新账号列表以更新AI回复状态显示
+        loadAccounts(); // 刷新账号列表以更新AI回复状态显示
     } else {
         const error = await response.text();
         showToast(`保存失败: ${error}`, 'danger');
@@ -9747,7 +9689,7 @@ async function importBackup() {
 
             // 刷新账号列表
             if (document.getElementById('accounts-section').classList.contains('active')) {
-            await loadCookies();
+            await loadAccounts();
             }
 
             showToast('数据刷新完成！', 'success');
@@ -9942,8 +9884,8 @@ async function toggleItemMultiQuantityDelivery(accountId, itemId, multiQuantityD
 // 加载商品列表
 async function loadItems() {
     try {
-    // 先加载Cookie列表用于筛选
-    await loadCookieFilter('itemAccountFilter');
+    // 先加载账号列表用于筛选
+    await loadAccountOptions('itemAccountFilter');
 
     // 加载商品列表
     await refreshItemsData();
@@ -9956,8 +9898,8 @@ async function loadItems() {
 // 只刷新商品数据，不重新加载筛选器
 async function refreshItemsData() {
     try {
-    const selectedCookie = document.getElementById('itemAccountFilter').value;
-    if (selectedCookie) {
+    const selectedAccountId = document.getElementById('itemAccountFilter').value;
+    if (selectedAccountId) {
         await loadItemsByAccount();
     } else {
         await loadAllItems();
@@ -9968,8 +9910,8 @@ async function refreshItemsData() {
     }
 }
 
-// 加载Cookie筛选选项
-async function loadCookieFilter(id) {
+// 加载账号筛选选项
+async function loadAccountOptions(id, emptyLabel = '所有账号') {
     try {
     const response = await fetch(`${apiBase}/accounts/details`, {
         headers: {
@@ -9980,12 +9922,15 @@ async function loadCookieFilter(id) {
     if (response.ok) {
         const accounts = await response.json();
         const select = document.getElementById(id);
+        if (!select) {
+        return;
+        }
 
         // 保存当前选择的值
         const currentValue = select.value;
 
-        // 清空现有选项（保留"所有账号"）
-        select.innerHTML = '<option value="">所有账号</option>';
+        // 清空现有选项（保留默认占位）
+        select.innerHTML = `<option value="">${emptyLabel}</option>`;
 
         if (accounts.length === 0) {
         const option = document.createElement('option');
@@ -10039,7 +9984,7 @@ async function loadCookieFilter(id) {
         }
     }
     } catch (error) {
-    console.error('加载Cookie列表失败:', error);
+    console.error('加载账号列表失败:', error);
     showToast('加载账号列表失败', 'danger');
     }
 }
@@ -10065,7 +10010,7 @@ async function loadAllItems() {
     }
 }
 
-// 按Cookie加载商品
+// 按账号加载商品
 async function loadItemsByAccount() {
     const accountId = document.getElementById('itemAccountFilter').value;
 
@@ -10408,8 +10353,8 @@ async function refreshItems() {
 
 // 获取商品信息
 async function getAllItemsFromAccount() {
-    const cookieSelect = document.getElementById('itemAccountFilter');
-    const selectedAccountId = cookieSelect.value;
+    const accountSelect = document.getElementById('itemAccountFilter');
+    const selectedAccountId = accountSelect.value;
     const pageNumber = parseInt(document.getElementById('pageNumber').value) || 1;
 
     if (!selectedAccountId) {
@@ -10466,8 +10411,8 @@ async function getAllItemsFromAccount() {
 
 // 获取所有页商品信息
 async function getAllItemsFromAccountAll() {
-    const cookieSelect = document.getElementById('itemAccountFilter');
-    const selectedAccountId = cookieSelect.value;
+    const accountSelect = document.getElementById('itemAccountFilter');
+    const selectedAccountId = accountSelect.value;
 
     if (!selectedAccountId) {
     showToast('请先选择一个账号', 'warning');
@@ -10786,9 +10731,9 @@ function escapeHtml(text) {
 // 加载商品回复列表
 async function loadItemsReplay() {
     try {
-    // 先加载Cookie列表用于筛选
-    await loadCookieFilter('itemReplayAccountFilter');
-    await loadCookieFilterPlus('editReplyAccountIdSelect');
+    // 先加载账号列表用于筛选
+    await loadAccountOptions('itemReplayAccountFilter');
+    await loadAccountOptions('editReplyAccountIdSelect', '选择账号');
     // 加载商品列表
     await refreshItemsReplayData();
     } catch (error) {
@@ -10800,8 +10745,8 @@ async function loadItemsReplay() {
 // 只刷新商品回复数据，不重新加载筛选器
 async function refreshItemsReplayData() {
     try {
-    const selectedCookie = document.getElementById('itemReplayAccountFilter').value;
-    if (selectedCookie) {
+    const selectedAccountId = document.getElementById('itemReplayAccountFilter').value;
+    if (selectedAccountId) {
         await loadItemsReplayByAccount();
     } else {
         await loadAllItemReplays();
@@ -10809,82 +10754,6 @@ async function refreshItemsReplayData() {
     } catch (error) {
     console.error('刷新商品数据失败:', error);
     showToast('刷新商品数据失败', 'danger');
-    }
-}
-
-// 加载Cookie筛选选项添加弹框中使用
-async function loadCookieFilterPlus(id) {
-    try {
-    const response = await fetch(`${apiBase}/accounts/details`, {
-        headers: {
-        'Authorization': `Bearer ${authToken}`
-        }
-    });
-
-    if (response.ok) {
-        const accounts = await response.json();
-        const select = document.getElementById(id);
-
-        // 保存当前选择的值
-        const currentValue = select.value;
-
-        // 清空现有选项（保留"所有账号"）
-        select.innerHTML = '<option value="">选择账号</option>';
-
-        if (accounts.length === 0) {
-        const option = document.createElement('option');
-        option.value = '';
-        option.textContent = '❌ 暂无账号';
-        option.disabled = true;
-        select.appendChild(option);
-        return;
-        }
-
-        // 分组显示：先显示启用的账号，再显示禁用的账号
-        const enabledAccounts = accounts.filter(account => {
-        const enabled = account.enabled === undefined ? true : account.enabled;
-        return enabled;
-        });
-        const disabledAccounts = accounts.filter(account => {
-        const enabled = account.enabled === undefined ? true : account.enabled;
-        return !enabled;
-        });
-
-        // 添加启用的账号
-        enabledAccounts.forEach(account => {
-        const option = document.createElement('option');
-        option.value = getCookieDetailsAccountId(account);
-        option.textContent = `🟢 ${getCookieDetailsAccountId(account)}`;
-        select.appendChild(option);
-        });
-
-        // 添加禁用的账号
-        if (disabledAccounts.length > 0) {
-        // 添加分隔线
-        if (enabledAccounts.length > 0) {
-            const separator = document.createElement('option');
-            separator.value = '';
-            separator.textContent = '────────────────';
-            separator.disabled = true;
-            select.appendChild(separator);
-        }
-
-        disabledAccounts.forEach(account => {
-            const option = document.createElement('option');
-            option.value = getCookieDetailsAccountId(account);
-            option.textContent = `🔴 ${getCookieDetailsAccountId(account)} (已禁用)`;
-            select.appendChild(option);
-        });
-        }
-
-        // 恢复之前选择的值
-        if (currentValue) {
-        select.value = currentValue;
-        }
-    }
-    } catch (error) {
-    console.error('加载Cookie列表失败:', error);
-    showToast('加载账号列表失败', 'danger');
     }
 }
 
@@ -10915,7 +10784,7 @@ async function loadAllItemReplays() {
     }
 }
 
-// 按Cookie加载商品回复
+// 按账号加载商品回复
 async function loadItemsReplayByAccount() {
     const accountId = document.getElementById('itemReplayAccountFilter').value;
     if (!accountId) {
@@ -11767,7 +11636,7 @@ function handleManualCookieImportSuccess(data) {
     if (manualForm) {
         manualForm.style.display = 'none';
     }
-    loadCookies();
+    loadAccounts();
     resetManualCookieImportForm();
 }
 
@@ -12144,7 +12013,7 @@ function startRefreshCookiePolling(sessionId, accountId) {
                     // 隐藏表单
                     document.getElementById('refreshCookieForm').style.display = 'none';
                     // 刷新账号列表
-                    loadCookies();
+                    loadAccounts();
                     break;
                 case 'failed':
                 case 'cancelled':
@@ -12636,7 +12505,7 @@ function handlePasswordLoginSuccess(data) {
     togglePasswordLogin();
     
     // 刷新账号列表
-    loadCookies();
+    loadAccounts();
     
     // 重置表单
     resetPasswordLoginForm();
@@ -12719,13 +12588,13 @@ function closeQRCodeLoginModal(delay = 3000) {
     setTimeout(() => {
         const modalElement = document.getElementById('qrCodeLoginModal');
         if (!modalElement) {
-            loadCookies();
+            loadAccounts();
             return;
         }
 
         const modal = bootstrap.Modal.getInstance(modalElement) || new bootstrap.Modal(modalElement);
         modal.hide();
-        loadCookies();
+        loadAccounts();
     }, delay);
 }
 
@@ -14487,8 +14356,8 @@ async function startOrdersStream() {
 // 加载订单列表
 async function loadOrders() {
     try {
-        // 先加载Cookie列表用于筛选
-        await loadOrderCookieFilter();
+        // 先加载账号列表用于筛选
+        await loadOrderAccountFilterOptions();
 
         // 加载订单列表
         await refreshOrdersData();
@@ -14510,8 +14379,8 @@ async function refreshOrdersData() {
     }
 }
 
-// 加载Cookie筛选选项
-async function loadOrderCookieFilter() {
+// 加载订单账号筛选选项
+async function loadOrderAccountFilterOptions() {
     try {
         const select = document.getElementById('orderAccountFilter');
         const previousValue = select ? select.value : '';
@@ -14525,7 +14394,7 @@ async function loadOrderCookieFilter() {
             }
         }
     } catch (error) {
-        console.error('加载Cookie选项失败:', error);
+        console.error('加载订单账号选项失败:', error);
     }
 }
 
@@ -14560,13 +14429,9 @@ async function loadAllOrders() {
     }
 }
 
-// 根据Cookie加载订单
+// 根据账号加载订单
 async function loadOrdersByAccount() {
     filterOrders(false);
-}
-
-async function loadOrdersByCookie() {
-    await loadOrdersByAccount();
 }
 
 // 筛选订单
@@ -15051,14 +14916,14 @@ function renderOrderHistorySyncJob(job) {
     const currentText = document.getElementById('orderHistorySyncCurrentText');
     const warningsWrap = document.getElementById('orderHistorySyncWarningsWrap');
     const warningsContainer = document.getElementById('orderHistorySyncWarnings');
-    const cookieSelect = document.getElementById('orderHistorySyncAccountId');
+    const accountSelect = document.getElementById('orderHistorySyncAccountId');
     const startDateInput = document.getElementById('orderHistorySyncStartDate');
     const endDateInput = document.getElementById('orderHistorySyncEndDate');
     const maxOrdersInput = document.getElementById('orderHistorySyncMaxOrders');
     const fetchDetailsInput = document.getElementById('orderHistorySyncFetchDetails');
 
-    if (cookieSelect && Object.prototype.hasOwnProperty.call(request, 'account_id')) {
-        cookieSelect.value = request.account_id || '';
+    if (accountSelect && Object.prototype.hasOwnProperty.call(request, 'account_id')) {
+        accountSelect.value = request.account_id || '';
     }
     if (startDateInput && request.start_date) {
         startDateInput.value = request.start_date;
@@ -16130,8 +15995,8 @@ let currentData = [];
 // 表的中文描述
 const tableDescriptions = {
     'users': '用户表',
-    'cookies': 'Cookie账号表',
-    'cookie_status': 'Cookie状态表',
+    'cookies': '账号凭证表',
+    'cookie_status': '账号状态表',
     'keywords': '关键字表',
     'item_replay': '指定商品回复表',
     'default_replies': '默认回复表',
@@ -17459,8 +17324,8 @@ function filterRiskLogsByStatus(status) {
     loadRiskControlLogs(0);
 }
 
-// 加载账号筛选选项
-async function loadCookieFilterOptions() {
+// 加载风控日志账号筛选选项
+async function loadRiskLogAccountFilterOptions() {
     try {
         const token = localStorage.getItem('auth_token');
         const response = await fetch('/admin/accounts', {
@@ -17598,7 +17463,7 @@ async function handleItemSearch(event) {
     hideSearchResults();
 
     try {
-        // 检查是否有有效的cookies账户
+        // 检查是否有有效的账号
         const accountsCheckResponse = await fetch('/accounts/check', {
             headers: {
                 'Authorization': `Bearer ${localStorage.getItem('auth_token')}`
@@ -17606,9 +17471,9 @@ async function handleItemSearch(event) {
         });
 
         if (accountsCheckResponse.ok) {
-            const cookiesData = await accountsCheckResponse.json();
-            if (!cookiesData.hasValidAccounts) {
-                showToast('搜索失败：系统中不存在有效的账户信息。请先在Cookie管理中添加有效的闲鱼账户。', 'warning');
+            const accountsData = await accountsCheckResponse.json();
+            if (!accountsData.hasValidAccounts) {
+                showToast('搜索失败：系统中不存在有效的账户信息。请先在账号管理中添加有效的闲鱼账户。', 'warning');
                 showSearchStatus(false);
                 return;
             }
@@ -18155,7 +18020,7 @@ const LOCAL_VERSION_HISTORY = {
             version: 'v1.9.3',
             date: '2026-05-12',
             updates: [
-                '【修复】账号管理接口与前端调用统一切换到 /accounts、/accounts/check、/admin/accounts，收口旧 /cookies 外部契约',
+                '【修复】账号管理接口与前端调用统一切换到 /accounts、/accounts/check、/admin/accounts，统一账号外部契约',
                 '【修复】账号管理请求模型统一使用 account_id，更新、删除、启停、自动确认、自动好评、备注、暂停时长全部按 account_id 语义收口',
                 '【优化】管理员账号筛选与有效账号检查统一改为 accounts 响应字段，减少 account / cookie 混用带来的状态错判',
                 '【优化】同步更新本地版本元数据与临时文件忽略规则，降低发布前 review 与热更新清单噪音'
