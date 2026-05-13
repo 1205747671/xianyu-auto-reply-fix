@@ -6605,7 +6605,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return True
             except Exception as e:
-                logger.error(f"淇濆瓨鍏抽敭瀛楀け璐? account_id={account_id}, error={e}")
+                logger.error(f"保存关键词失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -6640,7 +6640,7 @@ Cookie数量: {cookie_count}
                         )
                     if cursor.fetchone():
                         item_desc = f"item_id={normalized_item_id}" if normalized_item_id else "item_id=<general>"
-                        raise ValueError(f"鍏抽敭璇? {keyword!r} 涓庡凡鏈夊浘鐗囧叧閿瓧鍐茬獊: {item_desc}")
+                        raise ValueError(f"关键词 {keyword!r} 与已有图片关键词冲突: {item_desc}")
 
                 cursor.execute(
                     """
@@ -6666,7 +6666,7 @@ Cookie数量: {cookie_count}
                 self.conn.rollback()
                 raise
             except Exception as e:
-                logger.error(f"淇濆瓨鏂囨湰鍏抽敭瀛楀け璐? account_id={account_id}, error={e}")
+                logger.error(f"保存文本关键词失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -6687,7 +6687,7 @@ Cookie数量: {cookie_count}
                 )
                 return [(row[0], row[1]) for row in cursor.fetchall()]
             except Exception as e:
-                logger.error(f"鑾峰彇鍏抽敭瀛楀け璐? account_id={account_id}, error={e}")
+                logger.error(f"获取关键词失败: account_id={account_id}, error={e}")
                 return []
 
     def get_keywords_with_item_id(self, account_id: str) -> List[Tuple[str, str, str]]:
@@ -6707,7 +6707,7 @@ Cookie数量: {cookie_count}
                 )
                 return [(row[0], row[1], row[2]) for row in cursor.fetchall()]
             except Exception as e:
-                logger.error(f"鑾峰彇甯﹀晢鍝両D 鍏抽敭瀛楀け璐? account_id={account_id}, error={e}")
+                logger.error(f"获取带商品ID关键词失败: account_id={account_id}, error={e}")
                 return []
 
     def check_keyword_duplicate(self, account_id: str, keyword: str, item_id: str = None) -> bool:
@@ -6738,7 +6738,7 @@ Cookie数量: {cookie_count}
                 result = cursor.fetchone()
                 return bool(result and result[0] > 0)
             except Exception as e:
-                logger.error(f"妫€鏌ュ叧閿瘝閲嶅澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"检查关键词重复失败: account_id={account_id}, error={e}")
                 return False
 
     def save_image_keyword(self, account_id: str, keyword: str, image_url: str, item_id: str = None) -> bool:
@@ -6758,7 +6758,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return True
             except Exception as e:
-                logger.error(f"淇濆瓨鍥剧墖鍏抽敭璇嶅け璐? account_id={account_id}, keyword={keyword}, error={e}")
+                logger.error(f"保存图片关键词失败: account_id={account_id}, keyword={keyword}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -6790,7 +6790,7 @@ Cookie数量: {cookie_count}
                     for row in cursor.fetchall()
                 ]
             except Exception as e:
-                logger.error(f"鑾峰彇甯︾被鍨嬬殑鍏抽敭瀛楀け璐? account_id={account_id}, error={e}")
+                logger.error(f"获取带类型的关键词失败: account_id={account_id}, error={e}")
                 return []
 
     def update_keyword_image_url(self, account_id: str, keyword: str, new_image_url: str) -> bool:
@@ -6810,7 +6810,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return cursor.rowcount > 0
             except Exception as e:
-                logger.error(f"鏇存柊鍏抽敭璇嶅浘鐗嘢RL 澶辫触: account_id={account_id}, keyword={keyword}, error={e}")
+                logger.error(f"更新关键词图片URL失败: account_id={account_id}, keyword={keyword}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -6837,7 +6837,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return cursor.rowcount > 0
             except Exception as e:
-                logger.error(f"鎸夌储寮曞垹闄ゅ叧閿瓧澶辫触: account_id={account_id}, index={index}, error={e}")
+                logger.error(f"按索引删除关键字失败: account_id={account_id}, index={index}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -6869,7 +6869,7 @@ Cookie数量: {cookie_count}
                 result = cursor.fetchone()
                 return bool(result[0]) if result else True
             except Exception as e:
-                logger.error(f"鑾峰彇璐﹀彿鍚敤鐘舵€佸け璐? account_id={account_id}, error={e}")
+                logger.error(f"获取账号启用状态失败: account_id={account_id}, error={e}")
                 return True
 
     def get_all_cookie_status(self) -> Dict[str, bool]:
@@ -6879,7 +6879,7 @@ Cookie数量: {cookie_count}
                 cursor.execute("SELECT account_id, enabled FROM cookie_status")
                 return {row[0]: bool(row[1]) for row in cursor.fetchall()}
             except Exception as e:
-                logger.error(f"鑾峰彇鍏ㄩ儴璐﹀彿鍚敤鐘舵€佸け璐? error={e}")
+                logger.error(f"获取全部账号启用状态失败: error={e}")
                 return {}
 
     def save_ai_reply_settings(self, account_id: str, settings: dict) -> bool:
@@ -6925,7 +6925,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return True
             except Exception as e:
-                logger.error(f"淇濆瓨 AI 鍥炲璁剧疆澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"保存 AI 回复设置失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -6961,7 +6961,7 @@ Cookie数量: {cookie_count}
                     "custom_prompts": row[8] or "",
                 }
             except Exception as e:
-                logger.error(f"鑾峰彇 AI 鍥炲璁剧疆澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"获取 AI 回复设置失败: account_id={account_id}, error={e}")
                 return defaults
 
     def get_all_ai_reply_settings(self) -> Dict[str, dict]:
@@ -6994,7 +6994,7 @@ Cookie数量: {cookie_count}
 
                 return result
             except Exception as e:
-                logger.error(f"鑾峰彇鍏ㄩ儴 AI 鍥炲璁剧疆澶辫触: error={e}")
+                logger.error(f"获取全部 AI 回复设置失败: error={e}")
                 return {}
 
     def save_default_reply(self, account_id: str, enabled: bool, reply_content: str = None, reply_once: bool = False):
@@ -7043,7 +7043,7 @@ Cookie数量: {cookie_count}
                     "updated_at": row[5],
                 }
             except Exception as e:
-                logger.error(f"鑾峰彇榛樿鍥炲澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"获取默认回复失败: account_id={account_id}, error={e}")
                 return None
 
     def get_all_default_replies(self) -> Dict[str, Dict[str, Any]]:
@@ -7067,7 +7067,7 @@ Cookie数量: {cookie_count}
                     }
                 return result
             except Exception as e:
-                logger.error(f"鑾峰彇鍏ㄩ儴榛樿鍥炲澶辫触: error={e}")
+                logger.error(f"获取全部默认回复失败: error={e}")
                 return {}
 
     def add_default_reply_record(self, account_id: str, chat_id: str):
@@ -7102,7 +7102,7 @@ Cookie数量: {cookie_count}
                 )
                 return cursor.fetchone() is not None
             except Exception as e:
-                logger.error(f"妫€鏌ラ粯璁ゅ洖澶嶈褰曞け璐? account_id={account_id}, chat_id={chat_id}, error={e}")
+                logger.error(f"检查默认回复记录失败: account_id={account_id}, chat_id={chat_id}, error={e}")
                 return False
 
     def clear_default_reply_records(self, account_id: str):
@@ -7124,7 +7124,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return cursor.rowcount > 0
             except Exception as e:
-                logger.error(f"鍒犻櫎榛樿鍥炲澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"删除默认回复失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -7147,7 +7147,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return True
             except Exception as e:
-                logger.error(f"淇濆瓨娑堟伅閫氱煡璁剧疆澶辫触: account_id={account_id}, channel_id={channel_id}, error={e}")
+                logger.error(f"保存消息通知设置失败: account_id={account_id}, channel_id={channel_id}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -7185,7 +7185,7 @@ Cookie数量: {cookie_count}
                     for row in cursor.fetchall()
                 ]
             except Exception as e:
-                logger.error(f"鑾峰彇璐﹀彿娑堟伅閫氱煡璁剧疆澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"获取账号消息通知设置失败: account_id={account_id}, error={e}")
                 return []
 
     def get_all_message_notifications(self) -> Dict[str, List[Dict[str, Any]]]:
@@ -7222,7 +7222,7 @@ Cookie数量: {cookie_count}
                     )
                 return result
             except Exception as e:
-                logger.error(f"鑾峰彇鍏ㄩ儴娑堟伅閫氱煡璁剧疆澶辫触: error={e}")
+                logger.error(f"获取全部消息通知设置失败: error={e}")
                 return {}
 
     def delete_account_notifications(self, account_id: str, user_id: int = None) -> bool:
@@ -7246,7 +7246,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return cursor.rowcount > 0
             except Exception as e:
-                logger.error(f"鍒犻櫎璐﹀彿娑堟伅閫氱煡璁剧疆澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"删除账号消息通知设置失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -7266,7 +7266,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return True
             except Exception as e:
-                logger.error(f"鏇存柊鑷姩纭鍙戣揣璁剧疆澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"更新自动确认发货设置失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -7287,7 +7287,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return True
             except Exception as e:
-                logger.error(f"鏇存柊鑷姩鍥炲鏆傚仠鏃堕棿澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"更新自动回复暂停时间失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -7307,7 +7307,7 @@ Cookie数量: {cookie_count}
                     return 10
                 return int(result[0])
             except Exception as e:
-                logger.error(f"鑾峰彇鑷姩鍥炲鏆傚仠鏃堕棿澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"获取自动回复暂停时间失败: account_id={account_id}, error={e}")
                 return 10
 
     def get_auto_confirm(self, account_id: str) -> bool:
@@ -7320,7 +7320,7 @@ Cookie数量: {cookie_count}
                 result = cursor.fetchone()
                 return bool(result[0]) if result else True
             except Exception as e:
-                logger.error(f"鑾峰彇鑷姩纭鍙戣揣璁剧疆澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"获取自动确认发货设置失败: account_id={account_id}, error={e}")
                 return True
 
     def get_auto_comment(self, account_id: str) -> bool:
@@ -7335,7 +7335,7 @@ Cookie数量: {cookie_count}
                     return bool(result[0])
                 return False
             except Exception as e:
-                logger.error(f"鑾峰彇鑷姩濂借瘎璁剧疆澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"获取自动好评设置失败: account_id={account_id}, error={e}")
                 return False
 
     def update_auto_comment(self, account_id: str, auto_comment: bool) -> bool:
@@ -7354,7 +7354,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return True
             except Exception as e:
-                logger.error(f"鏇存柊鑷姩濂借瘎璁剧疆澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"更新自动好评设置失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -7375,7 +7375,7 @@ Cookie数量: {cookie_count}
                 )
                 return [self._comment_template_row_to_dict(row) for row in cursor.fetchall()]
             except Exception as e:
-                logger.error(f"鑾峰彇濂借瘎妯℃澘鍒楄〃澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"获取好评模板列表失败: account_id={account_id}, error={e}")
                 return []
 
     def get_active_comment_template(self, account_id: str) -> Optional[Dict]:
@@ -7397,7 +7397,7 @@ Cookie数量: {cookie_count}
                 row = cursor.fetchone()
                 return self._comment_template_row_to_dict(row) if row else None
             except Exception as e:
-                logger.error(f"鑾峰彇婵€娲诲ソ璇勬ā鏉垮け璐? account_id={account_id}, error={e}")
+                logger.error(f"获取激活好评模板失败: account_id={account_id}, error={e}")
                 return None
 
     def add_comment_template(self, account_id: str, name: str, content: str, is_active: bool = False) -> Optional[int]:
@@ -7421,7 +7421,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return cursor.lastrowid
             except Exception as e:
-                logger.error(f"娣诲姞濂借瘎妯℃澘澶辫触: account_id={account_id}, name={name}, error={e}")
+                logger.error(f"添加好评模板失败: account_id={account_id}, name={name}, error={e}")
                 self.conn.rollback()
                 return None
 
@@ -7465,7 +7465,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return True
             except Exception as e:
-                logger.error(f"鏇存柊濂借瘎妯℃澘澶辫触: account_id={account_id}, template_id={template_id}, error={e}")
+                logger.error(f"更新好评模板失败: account_id={account_id}, template_id={template_id}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -7482,7 +7482,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return cursor.rowcount > 0
             except Exception as e:
-                logger.error(f"鍒犻櫎濂借瘎妯℃澘澶辫触: account_id={account_id}, template_id={template_id}, error={e}")
+                logger.error(f"删除好评模板失败: account_id={account_id}, template_id={template_id}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -7511,7 +7511,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return True
             except Exception as e:
-                logger.error(f"璁剧疆婵€娲诲ソ璇勬ā鏉垮け璐? account_id={account_id}, template_id={template_id}, error={e}")
+                logger.error(f"设置激活好评模板失败: account_id={account_id}, template_id={template_id}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -7640,7 +7640,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return cursor.lastrowid
             except Exception as e:
-                logger.error(f"鍒涘缓鍙戣揣鏃ュ織澶辫触: account_id={account_id}, order_id={order_id}, error={e}")
+                logger.error(f"创建发货日志失败: account_id={account_id}, order_id={order_id}, error={e}")
                 self.conn.rollback()
                 return None
 
@@ -7720,7 +7720,7 @@ Cookie数量: {cookie_count}
                 return True
             except Exception as e:
                 logger.error(
-                    f"鍐欏叆鍙戣揣 finalize 鐘舵€佸け璐? order_id={order_id}, unit_index={unit_index}, account_id={account_id}, error={e}"
+                    f"写入发货 finalize 状态失败: order_id={order_id}, unit_index={unit_index}, account_id={account_id}, error={e}"
                 )
                 self.conn.rollback()
                 return False
@@ -7745,7 +7745,7 @@ Cookie数量: {cookie_count}
                 return self._delivery_state_row_to_dict(row) if row else None
             except Exception as e:
                 logger.error(
-                    f"鑾峰彇鍙戣揣 finalize 鐘舵€佸け璐? order_id={order_id}, unit_index={unit_index}, account_id={account_id}, error={e}"
+                    f"获取发货 finalize 状态失败: order_id={order_id}, unit_index={unit_index}, account_id={account_id}, error={e}"
                 )
                 return None
 
@@ -7767,7 +7767,7 @@ Cookie数量: {cookie_count}
                 )
                 return [self._delivery_state_row_to_dict(row) for row in cursor.fetchall()]
             except Exception as e:
-                logger.error(f"鑾峰彇鍙戣揣 finalize 鐘舵€佸垪琛ㄥけ璐? order_id={order_id}, account_id={account_id}, error={e}")
+                logger.error(f"获取发货 finalize 状态列表失败: order_id={order_id}, account_id={account_id}, error={e}")
                 return []
 
     def get_delivery_progress_summary(self, order_id: str, account_id: str = None, expected_quantity: int = 1):
@@ -7840,7 +7840,7 @@ Cookie数量: {cookie_count}
                 )
                 return [self._delivery_log_row_to_dict(row) for row in cursor.fetchall()]
             except Exception as e:
-                logger.error(f"鑾峰彇鏈€杩戝彂璐ф棩蹇楀け璐? user_id={user_id}, error={e}")
+                logger.error(f"获取最近发货日志失败: user_id={user_id}, error={e}")
                 return []
 
     def reserve_batch_data(self, card_id: int, order_id: str, unit_index: int = 1,
@@ -7940,7 +7940,7 @@ Cookie数量: {cookie_count}
                 }
             except Exception as e:
                 logger.error(
-                    f"棰勫崰鎵归噺鏁版嵁澶辫触: card_id={card_id}, order_id={order_id}, account_id={account_id}, error={e}"
+                    f"预占批量数据失败: card_id={card_id}, order_id={order_id}, account_id={account_id}, error={e}"
                 )
                 self.conn.rollback()
                 return None
@@ -7981,7 +7981,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return cursor.lastrowid
         except Exception as e:
-            logger.error(f"娣诲姞椋庢帶鏃ュ織澶辫触: account_id={account_id}, error={e}")
+            logger.error(f"添加风控日志失败: account_id={account_id}, error={e}")
             return None
 
     def get_risk_control_logs(self, account_id: str = None, processing_status: str = None,
@@ -8042,7 +8042,7 @@ Cookie数量: {cookie_count}
                 cursor.execute(query, params)
                 return [self._risk_control_row_to_dict(row) for row in cursor.fetchall()]
         except Exception as e:
-            logger.error(f"鑾峰彇椋庢帶鏃ュ織澶辫触: account_id={account_id}, error={e}")
+            logger.error(f"获取风控日志失败: account_id={account_id}, error={e}")
             return []
 
     def get_risk_control_logs_count(self, account_id: str = None, processing_status: str = None,
@@ -8091,7 +8091,7 @@ Cookie数量: {cookie_count}
                 result = cursor.fetchone()
                 return int(result[0] if result else 0)
         except Exception as e:
-            logger.error(f"鑾峰彇椋庢帶鏃ュ織鏁伴噺澶辫触: account_id={account_id}, error={e}")
+            logger.error(f"获取风控日志数量失败: account_id={account_id}, error={e}")
             return 0
 
     def get_slider_verification_session_stats(self, account_ids: Optional[List[str]] = None, range_key: str = 'all') -> Dict[str, Any]:
@@ -8109,9 +8109,9 @@ Cookie数量: {cookie_count}
             "accounts_with_sessions": 0,
             "accounts_with_failures": 0,
             "stats_mode": "session",
-            "summary_text": "鏆傛棤婊戝潡楠岃瘉璁板綍",
+            "summary_text": "暂无滑块验证记录",
             "selected_range": "all",
-            "range_label": "鎵€鏈?",
+            "range_label": "所有",
         }
 
         def _normalize_account_ids(values: Optional[List[str]]) -> Optional[List[str]]:
@@ -8137,9 +8137,9 @@ Cookie数量: {cookie_count}
         def _build_range_filter(value: str) -> Tuple[List[str], List[Any], str]:
             normalized_range = _normalize_range(value)
             label_map = {
-                "today": "褰撴棩",
-                "7d": "杩?7 澶?",
-                "all": "鎵€鏈?",
+                "today": "当日",
+                "7d": "近 7 天",
+                "all": "所有",
             }
             if normalized_range == "all":
                 return [], [], label_map[normalized_range]
@@ -8225,11 +8225,11 @@ Cookie数量: {cookie_count}
 
                 if total_sessions > 0:
                     if normalized_range == "all":
-                        summary_text = "宸插寘鍚叏閮ㄦ椂闂寸殑婊戝潡鎴愬姛/澶辫触缁熻"
+                        summary_text = "已包含全部时间的滑块成功/失败统计"
                     else:
-                        summary_text = f"宸叉寜{range_label}鑼冨洿缁熻婊戝潡鎴愬姛/澶辫触"
+                        summary_text = f"已按{range_label}范围统计滑块成功/失败"
                 else:
-                    summary_text = "鏆傛棤婊戝潡楠岃瘉璁板綍" if normalized_range == "all" else f"{range_label}鏆傛棤婊戝潡楠岃瘉璁板綍"
+                    summary_text = "暂无滑块验证记录" if normalized_range == "all" else f"{range_label}暂无滑块验证记录"
 
                 return {
                     "has_data": total_sessions > 0,
@@ -8253,15 +8253,15 @@ Cookie数量: {cookie_count}
                     "range_label": range_label,
                 }
         except Exception as e:
-            logger.error(f"鑾峰彇婊戝潡楠岃瘉缁熻澶辫触: error={e}")
+            logger.error(f"获取滑块验证统计失败: error={e}")
             empty_result = dict(empty_stats)
             normalized_range = str(range_key or "").strip().lower()
             if normalized_range in {"today", "7d"}:
                 empty_result.update(
                     {
                         "selected_range": normalized_range,
-                        "range_label": "褰撴棩" if normalized_range == "today" else "杩?7 澶?",
-                        "summary_text": "褰撴棩鏆傛棤婊戝潡楠岃瘉璁板綍" if normalized_range == "today" else "杩?7 澶╂殏鏃犳粦鍧楅獙璇佽褰?",
+                        "range_label": "当日" if normalized_range == "today" else "近 7 天",
+                        "summary_text": "当日暂无滑块验证记录" if normalized_range == "today" else "近 7 天暂无滑块验证记录",
                     }
                 )
             return empty_result
@@ -8273,8 +8273,8 @@ Cookie数量: {cookie_count}
                 normalized_account_id = self._require_account_id(account_id) if account_id is not None else None
 
                 params: List[Any] = [
-                    f"澶勭悊瓒呮椂锛?{timeout_minutes}鍒嗛挓锛夛紝绯荤粺鑷姩鍏抽棴",
-                    "澶勭悊瓒呮椂锛岃嚜鍔ㄦ爣璁板け璐?",
+                    f"处理超时（{timeout_minutes}分钟），系统自动关闭",
+                    "处理超时，自动标记失败",
                 ]
                 where_conditions = ["processing_status = 'processing'"]
 
@@ -8301,7 +8301,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return cursor.rowcount
         except Exception as e:
-            logger.error(f"鏍囪瓒呮椂椋庢帶鏃ュ織澶辫触: account_id={account_id}, error={e}")
+            logger.error(f"标记超时风控日志失败: account_id={account_id}, error={e}")
             return 0
 
     def export_backup(self, user_id: int = None) -> Dict[str, any]:
@@ -8391,15 +8391,15 @@ Cookie数量: {cookie_count}
                     for table_name in tables:
                         backup_data["data"][table_name] = _fetch_table(cursor, table_name)
 
-                logger.info(f"瀵煎嚭澶囦唤鎴愬姛: user_id={user_id}")
+                logger.info(f"导出备份成功: user_id={user_id}")
                 return backup_data
             except Exception as e:
-                logger.error(f"瀵煎嚭澶囦唤澶辫触: {e}")
+                logger.error(f"导出备份失败: {e}")
                 raise
 
     def import_backup(self, backup_data: Dict[str, any], user_id: int = None) -> bool:
         if not isinstance(backup_data, dict) or "data" not in backup_data:
-            raise ValueError("澶囦唤鏁版嵁鏍煎紡鏃犳晥")
+            raise ValueError("备份数据格式无效")
 
         def _table_columns(cursor, table_name: str) -> List[str]:
             cursor.execute(f"PRAGMA table_info({table_name})")
@@ -8528,10 +8528,10 @@ Cookie数量: {cookie_count}
                         )
 
                 self.conn.commit()
-                logger.info(f"瀵煎叆澶囦唤鎴愬姛: user_id={user_id}")
+                logger.info(f"导入备份成功: user_id={user_id}")
                 return True
             except Exception as e:
-                logger.error(f"瀵煎叆澶囦唤澶辫触: {e}")
+                logger.error(f"导入备份失败: {e}")
                 self.conn.rollback()
                 return False
 
@@ -8546,7 +8546,7 @@ Cookie数量: {cookie_count}
 
                 if existing_row is not None and user_id is not None and existing_row[0] not in (None, user_id):
                     logger.warning(
-                        f"璐﹀彿 {normalized_account_id} 宸茬粦瀹氱敤鎴?{existing_row[0]}锛屾嫆缁濊縼绉诲埌鐢ㄦ埛 {user_id}"
+                        f"账号 {normalized_account_id} 已绑定用户 {existing_row[0]}，拒绝迁移到用户 {user_id}"
                     )
                     return False
 
@@ -8569,7 +8569,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return True
             except Exception as e:
-                logger.error(f"淇濆瓨璐﹀彿 Cookie 澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"保存账号 Cookie 失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -8583,7 +8583,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return cursor.rowcount > 0
             except Exception as e:
-                logger.error(f"鍒犻櫎璐﹀彿 Cookie 澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"删除账号 Cookie 失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -8599,7 +8599,7 @@ Cookie数量: {cookie_count}
                     return None
                 return self._decrypt_secret(result[0])
             except Exception as e:
-                logger.error(f"鑾峰彇璐﹀彿 Cookie 澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"获取账号 Cookie 失败: account_id={account_id}, error={e}")
                 return None
 
     def get_cookie_by_id(self, account_id: str) -> Optional[Dict[str, str]]:
@@ -8625,7 +8625,7 @@ Cookie数量: {cookie_count}
                     "created_at": result[2],
                 }
             except Exception as e:
-                logger.error(f"鏍规嵁璐﹀彿 ID 鑾峰彇 Cookie 澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"根据账号 ID 获取 Cookie 失败: account_id={account_id}, error={e}")
                 return None
 
     def get_cookie_details(self, account_id: str) -> Optional[Dict[str, Any]]:
@@ -8672,7 +8672,7 @@ Cookie数量: {cookie_count}
                     "proxy_pass": proxy_pass,
                 }
             except Exception as e:
-                logger.error(f"鑾峰彇璐﹀彿璇︾粏淇℃伅澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"获取账号详细信息失败: account_id={account_id}, error={e}")
                 return None
 
     def update_cookie_remark(self, account_id: str, remark: str) -> bool:
@@ -8688,7 +8688,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return cursor.rowcount > 0
             except Exception as e:
-                logger.error(f"鏇存柊璐﹀彿澶囨敞澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"更新账号备注失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -8712,7 +8712,7 @@ Cookie数量: {cookie_count}
                 if existing_row is None:
                     if cookie_value is None:
                         logger.warning(
-                            f"璐﹀彿 {normalized_account_id} 涓嶅瓨鍦紝涓旀湭鎻愪緵 cookie_value锛屾棤娉曞垱寤烘柊璁板綍"
+                            f"账号 {normalized_account_id} 不存在，且未提供 cookie_value，无法创建新记录"
                         )
                         return False
 
@@ -8750,7 +8750,7 @@ Cookie数量: {cookie_count}
                 existing_user_id = existing_row[1]
                 if user_id is not None and user_id != existing_user_id:
                     logger.warning(
-                        f"璐﹀彿 {normalized_account_id} 宸茬粦瀹氱敤鎴?{existing_user_id}锛屾嫆缁濊縼绉诲埌鐢ㄦ埛 {user_id}"
+                        f"账号 {normalized_account_id} 已绑定用户 {existing_user_id}，拒绝迁移到用户 {user_id}"
                     )
                     return False
 
@@ -8774,7 +8774,7 @@ Cookie数量: {cookie_count}
                     params.append(1 if show_browser else 0)
 
                 if not update_fields:
-                    logger.warning(f"鏇存柊璐﹀彿 {normalized_account_id} 淇℃伅鏃舵病鏈夋彁渚涗换浣曟洿鏂板瓧娈?")
+                    logger.warning(f"更新账号 {normalized_account_id} 信息时没有提供任何更新字段")
                     return False
 
                 params.append(normalized_account_id)
@@ -8785,7 +8785,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return cursor.rowcount > 0
             except Exception as e:
-                logger.error(f"鏇存柊璐﹀彿淇℃伅澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"更新账号信息失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -8831,7 +8831,7 @@ Cookie数量: {cookie_count}
                     params.append(self._encrypt_secret(proxy_pass))
 
                 if not update_fields:
-                    logger.warning(f"鏇存柊璐﹀彿 {normalized_account_id} 浠ｇ悊閰嶇疆鏃舵病鏈夋彁渚涗换浣曟洿鏂板瓧娈?")
+                    logger.warning(f"更新账号 {normalized_account_id} 代理配置时没有提供任何更新字段")
                     return False
 
                 params.append(normalized_account_id)
@@ -8842,7 +8842,7 @@ Cookie数量: {cookie_count}
                 self.conn.commit()
                 return cursor.rowcount > 0
             except Exception as e:
-                logger.error(f"鏇存柊浠ｇ悊閰嶇疆澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"更新代理配置失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
                 return False
 
@@ -8879,7 +8879,7 @@ Cookie数量: {cookie_count}
                     "proxy_pass": self._decrypt_secret(result[4]),
                 }
             except Exception as e:
-                logger.error(f"鑾峰彇浠ｇ悊閰嶇疆澶辫触: account_id={account_id}, error={e}")
+                logger.error(f"获取代理配置失败: account_id={account_id}, error={e}")
                 return dict(default_config)
 
     def save_item_basic_info(self, account_id: str, item_id: str, item_title: str = None,

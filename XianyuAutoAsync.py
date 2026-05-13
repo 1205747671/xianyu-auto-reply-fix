@@ -112,7 +112,7 @@ class AutoReplyPauseManager:
 
         if not pause_scope_key:
             logger.warning(
-                f"【default】手动发消息暂停缺少 canonical account_id ?chat_id，跳过记录暂停状? chat_id={chat_id}"
+                f"【default】手动发消息暂停缺少 canonical account_id 或 chat_id，跳过记录暂停状态: chat_id={chat_id}"
             )
             return
 
@@ -120,11 +120,11 @@ class AutoReplyPauseManager:
             from db_manager import db_manager
             pause_minutes = db_manager.get_cookie_pause_duration(resolved_account_id)
         except Exception as e:
-            logger.error(f"获取账号 {account_label} 暂停时间失败: {e}，使用默?0分钟")
+            logger.error(f"获取账号 {account_label} 暂停时间失败: {e}，使用默认10分钟")
             pause_minutes = 10
 
         if pause_minutes == 0:
-            logger.info(f"【{account_label}】检测到手动发出消息，但暂停时间设置?，不暂停自动回复")
+            logger.info(f"【{account_label}】检测到手动发出消息，但暂停时间设置为0，不暂停自动回复")
             return
 
         pause_duration_seconds = pause_minutes * 60
@@ -132,7 +132,7 @@ class AutoReplyPauseManager:
         self.paused_chats[pause_scope_key] = pause_until
 
         end_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(pause_until))
-        logger.info(f"【{account_label}】检测到手动发出消息，chat_id {chat_id} 自动回复暂停{pause_minutes}分钟，恢复时? {end_time}")
+        logger.info(f"【{account_label}】检测到手动发出消息，chat_id {chat_id} 自动回复暂停{pause_minutes}分钟，恢复时间: {end_time}")
 
     def is_chat_paused(self, chat_id: str, account_id: str = None) -> bool:
         pause_scope_key = self._compose_pause_scope_key(
@@ -388,7 +388,7 @@ class XianyuLive:
                 cls._manual_refresh_state.pop(account_id, None)
 
         for account_id in expired_account_ids:
-            logger.warning(f"【{account_id}】刷新交接恢复状态已过期，自动清?")
+            logger.warning(f"【{account_id}】刷新交接恢复状态已过期，自动清理")
 
     @classmethod
     def get_manual_refresh_state(
@@ -436,7 +436,7 @@ class XianyuLive:
             cls._manual_refresh_state[resolved_account_id] = state
 
         logger.warning(
-            f"【{resolved_account_id}】已进入刷新交接恢复窗口，允许新实例执行初始化恢?(有效?{int(expires_at - now)} ?"
+            f"【{resolved_account_id}】已进入刷新交接恢复窗口，允许新实例执行初始化恢复（有效期 {int(expires_at - now)} 秒）"
         )
         return {'updated': True, 'phase': 'handoff_recovery', 'expires_at': expires_at}
 
@@ -716,24 +716,61 @@ class XianyuLive:
         }
 
     @staticmethod
+    def _legacy_gbk_mojibake(text: str, replace_invalid: bool = False) -> str:
+        errors = "replace" if replace_invalid else "strict"
+        return text.encode("utf-8").decode("gbk", errors=errors).replace("\ufffd", "?")
+
+    @staticmethod
+    def _legacy_missing_tail(text: str) -> str:
+        return f"{text[:-1]}?" if len(text) > 1 else text
+
+    @staticmethod
+    def _legacy_drop_last_char(text: str) -> str:
+        return text[:-1] if text else text
+
+    @staticmethod
+    def _legacy_replace_tail(text: str, tail: str, replacement: str) -> str:
+        if tail and text.endswith(tail):
+            return f"{text[:-len(tail)]}{replacement}"
+        return text
+
+    @staticmethod
     def classify_password_login_failure(error_message: str) -> Tuple[str, int]:
         message = (error_message or "").lower()
         if any(keyword in message for keyword in ["账号密码错误", "账密错误", "用户名或密码错误", "密码错误"]):
             return "credentials", 1800
         if any(keyword in message for keyword in ["前置滑块", "风控", "拦截", "框体错误", "点击框体重试"]):
             return "risk_control", 900
-        if any(keyword in message for keyword in ["滑块验证失败", "未找到滑块容?"]):
+        if any(
+            keyword in message
+            for keyword in [
+                "滑块验证失败",
+                XianyuLive._legacy_gbk_mojibake("滑块验证失败"),
+                "未找到滑块容器",
+                XianyuLive._legacy_missing_tail("未找到滑块容器"),
+            ]
+        ):
             return "slider_failed", 600
         if any(
             keyword in message for keyword in [
-                "未找到登录表?",
+                "未找到登录表单",
+                XianyuLive._legacy_missing_tail("未找到登录表单"),
                 "未找到登录iframe",
-                "session过期且清理会话状态后未找到登录表?",
-                "session验证异常且清理会话状态后未找到登录表?",
+                "session过期且清理会话状态后未找到登录表单",
+                XianyuLive._legacy_missing_tail("session过期且清理会话状态后未找到登录表单"),
+                "session验证异常且清理会话状态后未找到登录表单",
+                XianyuLive._legacy_missing_tail("session验证异常且清理会话状态后未找到登录表单"),
             ]
         ):
             return "login_form_missing", 90
-        if any(keyword in message for keyword in ["页面会话已失?", "target page, context or browser has been closed"]):
+        if any(
+            keyword in message
+            for keyword in [
+                "页面会话已失效",
+                XianyuLive._legacy_missing_tail("页面会话已失效"),
+                "target page, context or browser has been closed",
+            ]
+        ):
             return "unknown", 180
         if any(keyword in message for keyword in ["网络", "timeout", "cannot connect", "连接", "dns", "ssl"]):
             return "network", 180
@@ -820,7 +857,7 @@ class XianyuLive:
                 meta['verification_step'] = step
             return {key: value for key, value in meta.items() if value is not None}
         except Exception as e:
-            logger.debug(f"【{self.account_id}】解析验证链接失? {self._safe_str(e)}")
+            logger.debug(f"【{self.account_id}】解析验证链接失败: {self._safe_str(e)}")
             return {'verification_source': text[:120]}
 
     def _build_risk_event_meta(self, trigger_scene: str = None, verification_url: str = None, extra: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -849,7 +886,7 @@ class XianyuLive:
             current_account_id = self._canonical_account_id()
             if not current_account_id:
                 logger.error(
-                    "【default】风控日志缺?canonical account_id，拒绝写?risk_control_logs"
+                    "【default】风控日志缺少 canonical account_id，拒绝写入 risk_control_logs"
                 )
                 return None
             return db_manager.add_risk_control_log(
@@ -866,7 +903,7 @@ class XianyuLive:
                 duration_ms=duration_ms,
             )
         except Exception as e:
-            logger.error(f"【{self.account_id}】记录风控日志失? {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】记录风控日志失败: {self._safe_str(e)}")
             return None
 
     def _update_risk_log(
@@ -899,7 +936,7 @@ class XianyuLive:
                 duration_ms=duration_ms,
             )
         except Exception as e:
-            logger.error(f"【{self.account_id}】更新风控日志失? {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】更新风控日志失败: {self._safe_str(e)}")
 
     @staticmethod
     def _extract_cookie_value(cookie_info: Optional[Dict[str, Any]]) -> str:
@@ -917,7 +954,7 @@ class XianyuLive:
         log_account_id = current_account_id or "default"
         try:
             if not current_account_id:
-                logger.warning("【default】加载代理配置缺?canonical account_id，跳过加载代理配?")
+                logger.warning("【default】加载代理配置缺少 canonical account_id，跳过加载代理配置")
                 return {
                     'proxy_type': 'none',
                     'proxy_host': '',
@@ -928,7 +965,7 @@ class XianyuLive:
             proxy_config = db_manager.get_cookie_proxy_config(current_account_id)
             return proxy_config
         except Exception as e:
-            logger.warning(f"【{log_account_id}】加载代理配置失? {e}，使用默认配置（无代理）")
+            logger.warning(f"【{log_account_id}】加载代理配置失败: {e}，使用默认配置（无代理）")
             return {
                 'proxy_type': 'none',
                 'proxy_host': '',
@@ -963,7 +1000,7 @@ class XianyuLive:
             self.connection_state = new_state
             self.last_state_change_time = time.time()
 
-            state_msg = f"【{self.account_id}】连接状? {old_state.value} ?{new_state.value}"
+            state_msg = f"【{self.account_id}】连接状态: {old_state.value} → {new_state.value}"
             if reason:
                 state_msg += f" ({reason})"
 
@@ -1013,14 +1050,14 @@ class XianyuLive:
             return False
 
         if getattr(ws, "closed", False):
-            logger.info(f"【{self.account_id}】{reason}，但当前WebSocket已关闭，等待主循环重?")
+            logger.info(f"【{self.account_id}】{reason}，但当前WebSocket已关闭，等待主循环重连")
             return False
 
         self._set_connection_state(ConnectionState.RECONNECTING, reason)
         logger.warning(f"【{self.account_id}】{reason}，主动关闭当前WebSocket触发重连")
         try:
             await asyncio.wait_for(ws.close(), timeout=2.0)
-            logger.warning(f"【{self.account_id}】当前WebSocket已关闭，主循环将使用朢新状态重新连?")
+            logger.warning(f"【{self.account_id}】当前WebSocket已关闭，主循环将使用最新状态重新连接")
             return True
         except asyncio.TimeoutError:
             logger.warning(f"【{self.account_id}】主动关闭WebSocket超时，等待主循环自行回收连接")
@@ -1043,18 +1080,18 @@ class XianyuLive:
 
         window_minutes = max(1, int(self.message_stream_notification_window // 60))
         sync_desc = (
-            f"朢近同步包距今{(occurred_at - self.last_sync_package_time):.0f}?"
+            f"最近同步包距今{(occurred_at - self.last_sync_package_time):.0f}秒"
             if self.last_sync_package_time else
-            "当前连接尚未收到同步?"
+            "当前连接尚未收到同步包"
         )
         user_chat_desc = (
-            f"朢近真实买家消息距今{(occurred_at - self.last_user_chat_time):.0f}?"
+            f"最近真实买家消息距今{(occurred_at - self.last_user_chat_time):.0f}秒"
             if self.last_user_chat_time else
             "当前连接尚未收到真实买家消息"
         )
         notification_message = (
-            f"业务消息流疑似假在线，最近{window_minutes}分钟内已连续触发{trigger_count}次自动重连?"
-            f"已连接{connected_for:.0f}秒，朢近非心跳业务包距今{business_idle:.0f}秒，"
+            f"业务消息流疑似假在线，最近{window_minutes}分钟内已连续触发{trigger_count}次自动重连。"
+            f"已连接{connected_for:.0f}秒，最近非心跳业务包距今{business_idle:.0f}秒，"
             f"{sync_desc}，{user_chat_desc}"
         )
         await self.send_token_refresh_notification(notification_message, "message_stream_stale")
@@ -1065,7 +1102,7 @@ class XianyuLive:
             while True:
                 try:
                     if not self._is_current_account_enabled():
-                        logger.info(f"【{self.account_id}】账号已禁用，停止业务流看门?")
+                        logger.info(f"【{self.account_id}】账号已禁用，停止业务流看门狗")
                         break
 
                     await self._interruptible_sleep(self.stream_watchdog_check_interval)
@@ -1102,65 +1139,65 @@ class XianyuLive:
 
                     self.last_stream_watchdog_reconnect_time = now
                     if self.last_sync_package_time:
-                        sync_status = f"朢近同步包距今{(now - self.last_sync_package_time):.0f}?"
+                        sync_status = f"最近同步包距今{(now - self.last_sync_package_time):.0f}秒"
                     else:
-                        sync_status = "当前连接尚未收到同步?"
+                        sync_status = "当前连接尚未收到同步包"
                     if self.last_user_chat_time:
-                        user_chat_status = f"，最近真实买家消息距今{(now - self.last_user_chat_time):.0f}?"
+                        user_chat_status = f"，最近真实买家消息距今{(now - self.last_user_chat_time):.0f}秒"
                     else:
-                        user_chat_status = "，当前连接尚未收到真实买家消?"
+                        user_chat_status = "，当前连接尚未收到真实买家消息"
 
                     logger.warning(
                         f"【{self.account_id}】检测到业务流疑似假在线: "
-                        f"已连接{connected_for:.0f}秒，朢近非心跳业务包距今{business_idle:.0f}秒，{sync_status}{user_chat_status}"
+                        f"已连接{connected_for:.0f}秒，最近非心跳业务包距今{business_idle:.0f}秒，{sync_status}{user_chat_status}"
                     )
                     await self._force_websocket_reconnect("业务消息流长时间只有心跳，疑似假在线")
                     await self._maybe_notify_message_stream_stale(now, connected_for, business_idle)
                 except asyncio.CancelledError:
-                    logger.info(f"【{self.account_id}】业务流看门狗收到取消信号，准备逢?")
+                    logger.info(f"【{self.account_id}】业务流看门狗收到取消信号，准备退出")
                     raise
                 except Exception as e:
-                    logger.error(f"【{self.account_id}】业务流看门狗异? {self._safe_str(e)}")
+                    logger.error(f"【{self.account_id}】业务流看门狗异常: {self._safe_str(e)}")
                     await self._interruptible_sleep(30)
         except asyncio.CancelledError:
-            logger.info(f"【{self.account_id}】业务流看门狗已取消，正在?..")
+            logger.info(f"【{self.account_id}】业务流看门狗已取消，正在退出...")
             raise
         finally:
-            logger.info(f"【{self.account_id}】业务流看门狗已逢?")
+            logger.info(f"【{self.account_id}】业务流看门狗已退出")
 
     def _reset_background_tasks(self):
         logger.info(f"【{self.account_id}】准备重置后台任务引用（仅重置依赖WebSocket的任务）...")
 
         if self.heartbeat_task:
-            status = "已完?" if self.heartbeat_task.done() else "运行?"
-            logger.info(f"【{self.account_id}】发现心跳任务（状? {status}），霢要重置（因为依赖WebSocket连接?")
+            status = "已完成" if self.heartbeat_task.done() else "运行中"
+            logger.info(f"【{self.account_id}】发现心跳任务（状态: {status}），需要重置（因为依赖WebSocket连接）")
             if not self.heartbeat_task.done():
                 try:
                     self.heartbeat_task.cancel()
-                    logger.debug(f"【{self.account_id}】已发取消信号给心跳任务（不等待响应?")
+                    logger.debug(f"【{self.account_id}】已发送取消信号给心跳任务（不等待响应）")
                 except Exception as e:
-                    logger.warning(f"【{self.account_id}】取消心跳任务失? {e}")
+                    logger.warning(f"【{self.account_id}】取消心跳任务失败: {e}")
             self.heartbeat_task = None
             logger.info(f"【{self.account_id}】心跳任务引用已重置")
         else:
-            logger.info(f"【{self.account_id}】没有心跳任务需要重?")
+            logger.info(f"【{self.account_id}】没有心跳任务需要重置")
 
         other_tasks_status = []
         if self.token_refresh_task:
-            status = "已完?" if self.token_refresh_task.done() else "运行?"
+            status = "已完成" if self.token_refresh_task.done() else "运行中"
             other_tasks_status.append(f"Token刷新任务({status})")
         if self.cleanup_task:
-            status = "已完?" if self.cleanup_task.done() else "运行?"
+            status = "已完成" if self.cleanup_task.done() else "运行中"
             other_tasks_status.append(f"清理任务({status})")
         if self.cookie_refresh_task:
-            status = "已完?" if self.cookie_refresh_task.done() else "运行?"
+            status = "已完成" if self.cookie_refresh_task.done() else "运行中"
             other_tasks_status.append(f"Cookie刷新任务({status})")
         if self.stream_watchdog_task:
-            status = "已完?" if self.stream_watchdog_task.done() else "运行?"
+            status = "已完成" if self.stream_watchdog_task.done() else "运行中"
             other_tasks_status.append(f"业务流看门狗({status})")
 
         if other_tasks_status:
-            logger.info(f"【{self.account_id}】其他任务继续运行（不依赖WebSocket? {', '.join(other_tasks_status)}")
+            logger.info(f"【{self.account_id}】其他任务继续运行（不依赖WebSocket）: {', '.join(other_tasks_status)}")
         else:
             logger.info(f"【{self.account_id}】没有其他任务在运行")
 
@@ -1174,7 +1211,7 @@ class XianyuLive:
                 if not self.heartbeat_task.done():
                     tasks_to_cancel.append(("心跳任务", self.heartbeat_task))
                 else:
-                    logger.debug(f"【{self.account_id}】心跳任务已完成，跳?")
+                    logger.debug(f"【{self.account_id}】心跳任务已完成，跳过")
 
             if self.token_refresh_task:
                 if not self.token_refresh_task.done():
@@ -1186,7 +1223,7 @@ class XianyuLive:
                 if not self.cleanup_task.done():
                     tasks_to_cancel.append(("清理任务", self.cleanup_task))
                 else:
-                    logger.debug(f"【{self.account_id}】清理任务已完成，跳?")
+                    logger.debug(f"【{self.account_id}】清理任务已完成，跳过")
 
             if self.cookie_refresh_task:
                 if not self.cookie_refresh_task.done():
@@ -1198,10 +1235,10 @@ class XianyuLive:
                 if not self.stream_watchdog_task.done():
                     tasks_to_cancel.append(("业务流看门狗", self.stream_watchdog_task))
                 else:
-                    logger.debug(f"【{self.account_id}】业务流看门狗已完成，跳?")
+                    logger.debug(f"【{self.account_id}】业务流看门狗已完成，跳过")
 
             if not tasks_to_cancel:
-                logger.info(f"【{self.account_id}】没有后台任务需要取消（扢有任务已完成或不存在?")
+                logger.info(f"【{self.account_id}】没有后台任务需要取消（所有任务已完成或不存在）")
                 self.heartbeat_task = None
                 self.token_refresh_task = None
                 self.cleanup_task = None
@@ -1209,20 +1246,20 @@ class XianyuLive:
                 self.stream_watchdog_task = None
                 return
 
-            logger.info(f"【{self.account_id}】开始取?{len(tasks_to_cancel)} 个未完成的后台任?..")
+            logger.info(f"【{self.account_id}】开始取消 {len(tasks_to_cancel)} 个未完成的后台任务...")
 
             for task_name, task in tasks_to_cancel:
                 try:
                     if task.done():
-                        logger.info(f"【{self.account_id}】任务已完成，跳过取? {task_name}")
+                        logger.info(f"【{self.account_id}】任务已完成，跳过取消: {task_name}")
                     else:
                         task.cancel()
-                        logger.info(f"【{self.account_id}】已发取消信? {task_name}")
+                        logger.info(f"【{self.account_id}】已发送取消信号: {task_name}")
                 except Exception as e:
-                    logger.warning(f"【{self.account_id}】取消任务失?{task_name}: {e}")
+                    logger.warning(f"【{self.account_id}】取消任务失败 {task_name}: {e}")
 
             tasks = [task for _, task in tasks_to_cancel]
-            logger.info(f"【{self.account_id}】等?{len(tasks)} 个任务响应取消信?..")
+            logger.info(f"【{self.account_id}】等待 {len(tasks)} 个任务响应取消信号...")
 
             wait_timeout = 5.0
             start_time = time.time()
@@ -1230,32 +1267,32 @@ class XianyuLive:
                 pending_tasks_list = [task for task in tasks if not task.done()]
 
                 for task_name, task in tasks_to_cancel:
-                    status = "已完?" if task.done() else "运行?"
-                    logger.info(f"【{self.account_id}】任务状? {task_name} - {status}")
+                    status = "已完成" if task.done() else "运行中"
+                    logger.info(f"【{self.account_id}】任务状态: {task_name} - {status}")
 
                 if not pending_tasks_list:
-                    logger.info(f"【{self.account_id}】所有任务已完成，无霢等待")
+                    logger.info(f"【{self.account_id}】所有任务已完成，无需等待")
                 else:
-                    logger.info(f"【{self.account_id}】等?{len(pending_tasks_list)} 个未完成任务响应（超时时? {wait_timeout}秒）...")
+                    logger.info(f"【{self.account_id}】等待 {len(pending_tasks_list)} 个未完成任务响应（超时时间: {wait_timeout}秒）...")
                     try:
-                        logger.debug(f"【{self.account_id}】开始调?asyncio.wait()...")
+                        logger.debug(f"【{self.account_id}】开始调用 asyncio.wait()...")
                         done, pending = await asyncio.wait(
                             pending_tasks_list,
                             timeout=wait_timeout,
                             return_when=asyncio.ALL_COMPLETED
                         )
                         elapsed = time.time() - start_time
-                        logger.info(f"【{self.account_id}】asyncio.wait() 返回，时 {elapsed:.3f}秒，已完? {len(done)}，未完成: {len(pending)}")
+                        logger.info(f"【{self.account_id}】asyncio.wait() 返回，耗时 {elapsed:.3f}秒，已完成: {len(done)}，未完成: {len(pending)}")
 
                         for task_name, task in tasks_to_cancel:
                             if task in done:
                                 try:
                                     task.result()
-                                    logger.warning(f"【{self.account_id}】⚠?任务正常完成（非取消? {task_name}")
+                                    logger.warning(f"【{self.account_id}】⚠️ 任务正常完成（非取消）: {task_name}")
                                 except asyncio.CancelledError:
-                                    logger.info(f"【{self.account_id}】✅ 任务已成功取? {task_name}")
+                                    logger.info(f"【{self.account_id}】✅ 任务已成功取消: {task_name}")
                                 except Exception as e:
-                                    logger.warning(f"【{self.account_id}】⚠?任务取消时出现异?{task_name}: {e}")
+                                    logger.warning(f"【{self.account_id}】⚠️ 任务取消时出现异常 {task_name}: {e}")
 
                         if pending:
                             pending_names = []
@@ -1267,21 +1304,21 @@ class XianyuLive:
                                             task.result()
                                             logger.warning(f"【{self.account_id}】任务在等待期间完成: {task_name}")
                                         except asyncio.CancelledError:
-                                            logger.info(f"【{self.account_id}】任务在等待期间被取? {task_name}")
+                                            logger.info(f"【{self.account_id}】任务在等待期间被取消: {task_name}")
                                         except Exception as e:
                                             logger.warning(f"【{self.account_id}】任务在等待期间异常 {task_name}: {e}")
                                     else:
-                                        logger.warning(f"【{self.account_id}】任务仍未完? {task_name} (done={task.done()})")
+                                        logger.warning(f"【{self.account_id}】任务仍未完成: {task_name} (done={task.done()})")
 
-                            logger.warning(f"【{self.account_id}】等待超?({elapsed:.3f}?，以下任务可能仍在运? {', '.join(pending_names)}")
+                            logger.warning(f"【{self.account_id}】等待超时 ({elapsed:.3f}秒)，以下任务可能仍在运行: {', '.join(pending_names)}")
 
                             for task_name, task in tasks_to_cancel:
                                 if task in pending and not task.done():
                                     try:
                                         task.cancel()
-                                        logger.warning(f"【{self.account_id}】强制取消任? {task_name}")
+                                        logger.warning(f"【{self.account_id}】强制取消任务: {task_name}")
                                     except Exception as e:
-                                        logger.warning(f"【{self.account_id}】强制取消任务失?{task_name}: {e}")
+                                        logger.warning(f"【{self.account_id}】强制取消任务失败 {task_name}: {e}")
 
                             if pending:
                                 try:
@@ -1291,35 +1328,35 @@ class XianyuLive:
                                             try:
                                                 task.result()
                                             except asyncio.CancelledError:
-                                                logger.info(f"【{self.account_id}】任务在二次等待期间被取? {task_name}")
+                                                logger.info(f"【{self.account_id}】任务在二次等待期间被取消: {task_name}")
                                             except Exception as e:
                                                 logger.warning(f"【{self.account_id}】任务在二次等待期间异常 {task_name}: {e}")
                                 except Exception as e:
                                     logger.warning(f"【{self.account_id}】二次等待任务时出错: {e}")
 
-                            logger.warning(f"【{self.account_id}】强制继续重连流程，未完成的任务将在后台继续运行（但已标记为取消?")
+                            logger.warning(f"【{self.account_id}】强制继续重连流程，未完成的任务将在后台继续运行（但已标记为取消）")
                         else:
-                            logger.info(f"【{self.account_id}】所有后台任务已取消 (耗时 {elapsed:.3f}?")
+                            logger.info(f"【{self.account_id}】所有后台任务已取消 (耗时 {elapsed:.3f}秒)")
 
                     except Exception as e:
                         elapsed = time.time() - start_time
-                        logger.warning(f"【{self.account_id}】等待任务时出错 (耗时 {elapsed:.3f}?: {e}")
+                        logger.warning(f"【{self.account_id}】等待任务时出错 (耗时 {elapsed:.3f}秒): {e}")
                         import traceback
-                        logger.warning(f"【{self.account_id}】等待任务异常堆?\n{traceback.format_exc()}")
+                        logger.warning(f"【{self.account_id}】等待任务异常堆栈:\n{traceback.format_exc()}")
 
             except Exception as e:
                 elapsed = time.time() - start_time
-                logger.error(f"【{self.account_id}】等待任务取消时出错 (耗时 {elapsed:.3f}?: {e}")
+                logger.error(f"【{self.account_id}】等待任务取消时出错 (耗时 {elapsed:.3f}秒): {e}")
                 import traceback
-                logger.error(f"【{self.account_id}】等待任务取消异常堆?\n{traceback.format_exc()}")
+                logger.error(f"【{self.account_id}】等待任务取消异常堆栈:\n{traceback.format_exc()}")
 
             logger.info(f"【{self.account_id}】任务取消流程完成，继续重连流程")
 
             for task_name, task in tasks_to_cancel:
                 if task and not task.done():
-                    logger.warning(f"【{self.account_id}】⚠?任务取消流程完成后，任务仍未完成: {task_name} (done={task.done()})")
+                    logger.warning(f"【{self.account_id}】⚠️ 任务取消流程完成后，任务仍未完成: {task_name} (done={task.done()})")
                 elif task and task.done():
-                    logger.debug(f"【{self.account_id}】✅ 任务已完? {task_name}")
+                    logger.debug(f"【{self.account_id}】✅ 任务已完成: {task_name}")
 
         finally:
             self.heartbeat_task = None
@@ -1371,7 +1408,7 @@ class XianyuLive:
                 self.delivery_sent_orders.discard(delivery_scope_key)
             if expired_deliveries:
                 cleaned_total += len(expired_deliveries)
-                logger.warning(f"【{self.account_id}】清理了 {len(expired_deliveries)} 个过期发货记?")
+                logger.warning(f"【{self.account_id}】清理了 {len(expired_deliveries)} 个过期发货记录")
 
             max_confirm_age = 1800
             expired_confirms = [
@@ -1382,11 +1419,11 @@ class XianyuLive:
                 del self.confirmed_orders[order_id]
             if expired_confirms:
                 cleaned_total += len(expired_confirms)
-                logger.warning(f"【{self.account_id}】清理了 {len(expired_confirms)} 个过期订单确认记?")
+                logger.warning(f"【{self.account_id}】清理了 {len(expired_confirms)} 个过期订单确认记录")
 
             if cleaned_total > 0:
-                logger.info(f"【{self.account_id}】实例缓存清理完成，共清?{cleaned_total} 条记?")
-                logger.warning(f"【{self.account_id}】当前缓存数?- 通知: {len(self.last_notification_time)}, 发货: {len(self.last_delivery_time)}, 确认: {len(self.confirmed_orders)}")
+                logger.info(f"【{self.account_id}】实例缓存清理完成，共清理 {cleaned_total} 条记录")
+                logger.warning(f"【{self.account_id}】当前缓存数量 - 通知: {len(self.last_notification_time)}, 发货: {len(self.last_delivery_time)}, 确认: {len(self.confirmed_orders)}")
 
         except Exception as e:
             logger.error(f"【{self.account_id}】清理实例缓存时出错: {self._safe_str(e)}")
@@ -1428,14 +1465,14 @@ class XianyuLive:
                                 total_size_mb += size / (1024 * 1024)
                                 total_cleaned += 1
                         except Exception as e:
-                            logger.warning(f"清理路径 {path} 时出? {e}")
+                            logger.warning(f"清理路径 {path} 时出错: {e}")
                 except Exception as e:
-                    logger.warning(f"匹配路径 {pattern} 时出? {e}")
+                    logger.warning(f"匹配路径 {pattern} 时出错: {e}")
 
             if total_cleaned > 0:
-                logger.info(f"【{self.account_id}】浏览器运行时缓存清理完? 删除?{total_cleaned} 个文?目录，释?{total_size_mb:.2f} MB")
+                logger.info(f"【{self.account_id}】浏览器运行时缓存清理完成: 删除了 {total_cleaned} 个文件/目录，释放 {total_size_mb:.2f} MB")
             else:
-                logger.warning(f"【{self.account_id}】浏览器运行时缓存清? 没有霢要清理的临时文件")
+                logger.warning(f"【{self.account_id}】浏览器运行时缓存清理: 没有需要清理的临时文件")
 
         except Exception as e:
             logger.warning(f"【{self.account_id}】清理浏览器运行时缓存时出错: {self._safe_str(e)}")
@@ -1473,14 +1510,14 @@ class XianyuLive:
                             os.remove(log_file)
                             total_size_mb += file_size / (1024 * 1024)
                             total_cleaned += 1
-                            logger.debug(f"【{self.account_id}】删除过期日志文? {log_file} (修改时间: {file_mtime})")
+                            logger.debug(f"【{self.account_id}】删除过期日志文件: {log_file} (修改时间: {file_mtime})")
                     except Exception as e:
-                        logger.warning(f"【{self.account_id}】删除日志文件失?{log_file}: {self._safe_str(e)}")
+                        logger.warning(f"【{self.account_id}】删除日志文件失败 {log_file}: {self._safe_str(e)}")
 
             if total_cleaned > 0:
-                logger.info(f"【{self.account_id}】日志清理完? 删除?{total_cleaned} 个日志文件，释放 {total_size_mb:.2f} MB (保留 {retention_days} 天内的日?")
+                logger.info(f"【{self.account_id}】日志清理完成: 删除了 {total_cleaned} 个日志文件，释放 {total_size_mb:.2f} MB (保留 {retention_days} 天内的日志)")
             else:
-                logger.debug(f"【{self.account_id}】日志清? 没有霢要清理的过期日志文件 (保留 {retention_days} ?")
+                logger.debug(f"【{self.account_id}】日志清理: 没有需要清理的过期日志文件 (保留 {retention_days} 天)")
 
             return total_cleaned
 
@@ -1512,7 +1549,7 @@ class XianyuLive:
 
         logger.info(f"【{init_log_account_id}】解析cookies...")
         self.cookies = trans_cookies(cookies_str)
-        logger.info(f"【{init_log_account_id}】cookies解析完成，包含字? {list(self.cookies.keys())}")
+        logger.info(f"【{init_log_account_id}】cookies解析完成，包含字段: {list(self.cookies.keys())}")
 
         self.account_id = resolved_account_id
         self.cookies_str = cookies_str
@@ -1523,7 +1560,7 @@ class XianyuLive:
         self.base_url = WEBSOCKET_URL
 
         if 'unb' not in self.cookies:
-            raise ValueError(f"【{init_log_account_id}】Cookie中缺少必霢?unb'字段，当前字? {list(self.cookies.keys())}")
+            raise ValueError(f"【{init_log_account_id}】Cookie中缺少必需的'unb'字段，当前字段: {list(self.cookies.keys())}")
 
         self.myid = self.cookies['unb']
         logger.info(f"【{init_log_account_id}】用户ID: {self.myid}")
@@ -1574,7 +1611,7 @@ class XianyuLive:
             self.current_token = prewarmed_token_info.get('token')
             self.last_token_refresh_time = prewarmed_token_info.get('timestamp', time.time())
             logger.info(
-                f"【{init_log_account_id}】已复用认证预热token，来? {prewarmed_token_info.get('source') or 'unknown'}"
+                f"【{init_log_account_id}】已复用认证预热token，来源: {prewarmed_token_info.get('source') or 'unknown'}"
             )
 
         prewarmed_token_info = self.pop_qr_prewarmed_token(canonical_account_id)
@@ -1733,7 +1770,7 @@ class XianyuLive:
         try:
             from order_status_handler import order_status_handler
             self.order_status_handler = order_status_handler
-            logger.info(f"【{self.account_id}】订单状态处理器已启?")
+            logger.info(f"【{self.account_id}】订单状态处理器已启用")
         except Exception as e:
             logger.error(f"【{self.account_id}】初始化订单状处理器失败: {self._safe_str(e)}")
             self.order_status_handler = None
@@ -1742,12 +1779,12 @@ class XianyuLive:
         try:
             current_account_id = self._canonical_account_id()
             if not current_account_id:
-                logger.warning("【missing-account-id】实例缺?account_id，跳过全屢注册")
+                logger.warning("【missing-account-id】实例缺少 account_id，跳过全局注册")
                 return
             XianyuLive._instances[current_account_id] = self
-            logger.warning(f"【{current_account_id}】实例已注册到全屢字典")
+            logger.warning(f"【{current_account_id}】实例已注册到全局字典")
         except Exception as e:
-            logger.error(f"【{self.account_id}】注册实例失? {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】注册实例失败: {self._safe_str(e)}")
 
     def _unregister_instance(self):
         try:
@@ -1756,9 +1793,9 @@ class XianyuLive:
                 return
             if current_account_id in XianyuLive._instances:
                 del XianyuLive._instances[current_account_id]
-                logger.warning(f"【{current_account_id}】实例已从全屢字典中注锢")
+                logger.warning(f"【{current_account_id}】实例已从全局字典中注销")
         except Exception as e:
-            logger.error(f"【{self.account_id}】注锢实例失败: {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】注销实例失败: {self._safe_str(e)}")
 
     @classmethod
     def get_instance(cls, account_id: str = None):
@@ -1832,7 +1869,7 @@ class XianyuLive:
             live_instance.enable_cookie_refresh(False)
             logger.warning(f"【{resolved_account_id}】已进入手动刷新保护期，暂停自动Cookie刷新")
         else:
-            logger.warning(f"【{resolved_account_id}】已进入手动刷新保护期，当前无运行中的账号实?")
+            logger.warning(f"【{resolved_account_id}】已进入手动刷新保护期，当前无运行中的账号实例")
 
         return {
             "started": True,
@@ -1869,7 +1906,7 @@ class XianyuLive:
         else:
             logger.warning(f"【{resolved_account_id}】手动刷新保护期已结束，当前无运行中的账号实例可恢复")
 
-        logger.info(f"【{resolved_account_id}】结束手动刷新保护期，来? {source}")
+        logger.info(f"【{resolved_account_id}】结束手动刷新保护期，来源: {source}")
         return True
 
     def _create_tracked_task(self, coro):
@@ -1891,13 +1928,13 @@ class XianyuLive:
             "订单",
             "全部",
             "交易消息",
-            "等待你发?",
-            "你人真不错，送你闲鱼小红?",
-            "卖家人不错？送Ta闲鱼小红?",
-            "快给ta丢个评价吧?",
+            "等待你发货",
+            "你人真不错，送你闲鱼小红花",
+            "卖家人不错？送Ta闲鱼小红花",
+            "快给ta一个评价吧～",
         }
         if text in invalid_exact_titles:
-            logger.info(f"{log_prefix} 👤 忽略系统标题型买家昵?{source}): {text}")
+            logger.info(f"{log_prefix} 👤 忽略系统标题型买家昵称({source}): {text}")
             return None
 
         meta = message_meta if isinstance(message_meta, dict) else {}
@@ -1908,22 +1945,22 @@ class XianyuLive:
                 related_notice_texts.append(value)
 
         if text in related_notice_texts:
-            logger.info(f"{log_prefix} 👤 忽略通知文案型买家昵?{source}): {text}")
+            logger.info(f"{log_prefix} 👤 忽略通知文案型买家昵称({source}): {text}")
             return None
 
         reminder_title = str(meta.get("reminderTitle", "")).strip()
         if source != "senderNick":
             invalid_keywords = (
-                "小红?", "待付?", "待发?", "待刀?", "成功小刀", "闲鱼",
-                "交易", "收货", "逢?", "评价", "发货", "付款", "拍下",
-                "确认", "关闭", "鼓励", "真不?", "全部", "订单",
+                "小红花", "待付款", "待发货", "待刀成", "成功小刀", "闲鱼",
+                "交易", "收货", "退款", "评价", "发货", "付款", "拍下",
+                "确认", "关闭", "鼓励", "真不错", "全部", "订单",
             )
             if any(keyword in text for keyword in invalid_keywords):
                 logger.info(f"{log_prefix} 👤 忽略系统关键词型买家昵称({source}): {text}")
                 return None
 
             if reminder_title == text and len(text) >= 10 and any(ch in text for ch in "?。！?!?～~"):
-                logger.info(f"{log_prefix} 👤 忽略长句型买家昵?{source}): {text}")
+                logger.info(f"{log_prefix} 👤 忽略长句型买家昵称({source}): {text}")
                 return None
 
         return text
@@ -2193,7 +2230,7 @@ class XianyuLive:
                 force_refresh=True
             )
         except Exception as refresh_error:
-            logger.warning(f"{log_prefix} sid未就绪订单强刷失? {self._safe_str(refresh_error)}")
+            logger.warning(f"{log_prefix} sid未就绪订单强刷失败: {self._safe_str(refresh_error)}")
             return sid_lookup
 
         refreshed_lookup = self._lookup_delivery_order_by_sid(
@@ -2215,13 +2252,13 @@ class XianyuLive:
             refreshed_lookup = dict(refreshed_lookup)
             refreshed_lookup['match_type'] = 'bargain_ready'
             logger.info(
-                f"{log_prefix} sid强刷后仍未进入待发货，但棢测到小刀成功证据?"
+                f"{log_prefix} sid强刷后仍未进入待发货，但检测到小刀成功证据，"
                 f"改用小刀兜底发货: order_id={refreshed_order.get('order_id') or order_id}, "
                 f"status={refreshed_order.get('order_status') or 'unknown'}"
             )
 
         logger.info(
-            f"{log_prefix} sid强刷后重新判? order_id={refreshed_order.get('order_id') or order_id}, "
+            f"{log_prefix} sid强刷后重新判定: order_id={refreshed_order.get('order_id') or order_id}, "
             f"status={refreshed_order.get('order_status') or 'unknown'}, "
             f"match_type={refreshed_lookup.get('match_type', 'missing')}"
         )
@@ -2236,7 +2273,7 @@ class XianyuLive:
             return False
         if not canonical_account_id:
             logger.error(
-                f"{log_prefix} 商品归属校验缺少 canonical account_id，拒绝继续运? item_id={item_id}"
+                f"{log_prefix} 商品归属校验缺少 canonical account_id，拒绝继续运行: item_id={item_id}"
             )
             return False
 
@@ -2244,12 +2281,12 @@ class XianyuLive:
         if existing_item:
             return True
 
-        logger.info(f"{log_prefix} 商品 {item_id} 未命中本地缓存，刷新在售商品列表后重试归属校?")
+        logger.info(f"{log_prefix} 商品 {item_id} 未命中本地缓存，刷新在售商品列表后重试归属校验")
         try:
             for page_number in range(1, max_pages + 1):
                 result = await self.get_item_list_info(page_number=page_number, page_size=page_size)
                 if not result.get("success"):
-                    logger.warning(f"{log_prefix} 刷新在售商品列表失败，停止归属校验回逢: page={page_number}, result={result}")
+                    logger.warning(f"{log_prefix} 刷新在售商品列表失败，停止归属校验回退: page={page_number}, result={result}")
                     break
 
                 current_items = result.get("items", [])
@@ -2299,7 +2336,7 @@ class XianyuLive:
             value = query.get(key, [None])[0]
             return self._normalize_buyer_id_value(value)
         except Exception as e:
-            logger.debug(f"【{self.account_id}】解析链接参数失? key={key}, error={self._safe_str(e)}")
+            logger.debug(f"【{self.account_id}】解析链接参数失败: key={key}, error={self._safe_str(e)}")
             return None
 
     def _extract_buyer_id_from_message_meta(self, message_meta: dict, *, meta_label: str,
@@ -2324,7 +2361,7 @@ class XianyuLive:
 
         if low_trust_candidates:
             logger.info(
-                f"{log_prefix} 👤 棢测到低可信买家ID候，已忽? {', '.join(low_trust_candidates[:3])}"
+                f"{log_prefix} 👤 检测到低可信买家ID候选，已忽略: {', '.join(low_trust_candidates[:3])}"
             )
         return None, None
 
@@ -2367,7 +2404,7 @@ class XianyuLive:
 
             if not incoming_buyer_is_trustworthy:
                 logger.info(
-                    f"{log_prefix} 忽略低可信buyer_id覆盖，保留已有买家信? "
+                    f"{log_prefix} 忽略低可信buyer_id覆盖，保留已有买家信息: "
                     f"order_id={order_id}, incoming_buyer_id={incoming_buyer_id}, "
                     f"incoming_source={source_label}, preserved_buyer_id={existing_buyer_id}"
                 )
@@ -2375,7 +2412,7 @@ class XianyuLive:
 
             if incoming_buyer_id != existing_buyer_id:
                 logger.warning(
-                    f"{log_prefix} 棢测到买家ID冲突，保留已有可信买家信? "
+                    f"{log_prefix} 检测到买家ID冲突，保留已有可信买家信息: "
                     f"order_id={order_id}, incoming_buyer_id={incoming_buyer_id}, "
                     f"incoming_source={source_label}, preserved_buyer_id={existing_buyer_id}"
                 )
@@ -2388,7 +2425,7 @@ class XianyuLive:
 
         if incoming_buyer_id:
             logger.info(
-                f"{log_prefix} 棢测到低可信buyer_id，暂不写入订? "
+                f"{log_prefix} 检测到低可信buyer_id，暂不写入订单: "
                 f"order_id={order_id}, incoming_buyer_id={incoming_buyer_id}, incoming_source={source_label}"
             )
 
@@ -2433,11 +2470,11 @@ class XianyuLive:
                             log_prefix=log_prefix
                         )
                         if buyer_nick:
-                            logger.info(f"{log_prefix} 👤 从message[4].reminderTitle提取到买家昵? {buyer_nick}")
+                            logger.info(f"{log_prefix} 👤 从message[4].reminderTitle提取到买家昵称: {buyer_nick}")
                     if buyer_nick:
-                        logger.info(f"{log_prefix} 👤 从message[4]提取到买家昵? {buyer_nick}")
+                        logger.info(f"{log_prefix} 👤 从message[4]提取到买家昵称: {buyer_nick}")
                 logger.info(
-                    f"{log_prefix} 📌 箢化消息，sid: {sid}，buyer_id: {buyer_id}?"
+                    f"{log_prefix} 📌 简化消息，sid: {sid}，buyer_id: {buyer_id}，"
                     f"buyer_id_source: {buyer_id_source or '-'}"
                 )
             elif isinstance(message_1, dict):
@@ -2463,14 +2500,14 @@ class XianyuLive:
                             log_prefix=log_prefix
                         )
                         if buyer_nick:
-                            logger.info(f"{log_prefix} 👤 从reminderTitle提取到买家昵? {buyer_nick}")
+                            logger.info(f"{log_prefix} 👤 从reminderTitle提取到买家昵称: {buyer_nick}")
                     if buyer_nick:
-                        logger.info(f"{log_prefix} 👤 提取到买家昵? {buyer_nick}")
+                        logger.info(f"{log_prefix} 👤 提取到买家昵称: {buyer_nick}")
                 sid = message_1.get("2", "")
                 if sid:
                     logger.info(f"{log_prefix} 📌 提取到sid: {sid}")
         except Exception as context_e:
-            logger.warning(f"{log_prefix} 提取订单上下文失? {self._safe_str(context_e)}")
+            logger.warning(f"{log_prefix} 提取订单上下文失败: {self._safe_str(context_e)}")
 
         try:
             if "1" in message and isinstance(message["1"], dict) and "10" in message["1"] and isinstance(message["1"]["10"], dict):
@@ -2503,13 +2540,13 @@ class XianyuLive:
             current_account_id = self._canonical_account_id()
             if not current_account_id:
                 logger.error(
-                    f"【default】基硢订单预入库缺?canonical account_id，拒绝继续运? {order_id}"
+                    f"【default】基础订单预入库缺少 canonical account_id，拒绝继续运行: {order_id}"
                 )
                 return False
             existing_order = db_manager.get_order_by_id(order_id, account_id=current_account_id)
             if not existing_order:
                 logger.warning(
-                    f"【{self.account_id}】基硢订单预入库命中未验证归属，拒绝首?scoped order: "
+                    f"【{self.account_id}】基础订单预入库命中未验证归属，拒绝首写 scoped order: "
                     f"order_id={order_id}, account_id={current_account_id}"
                 )
                 return False
@@ -2541,10 +2578,10 @@ class XianyuLive:
                     f"buyer_id={buyer_id_to_save}, sid={sid or '-'}"
                 )
             else:
-                logger.warning(f"【{self.account_id}】基硢订单预入库失? {order_id}")
+                logger.warning(f"【{self.account_id}】基础订单预入库失败: {order_id}")
             return success
         except Exception as e:
-            logger.error(f"【{self.account_id}】基硢订单预入库异? {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】基础订单预入库异常: {self._safe_str(e)}")
             return False
 
     async def _retry_order_detail_after_delay(self, order_id: str, item_id: str = None, buyer_id: str = None,
@@ -2556,7 +2593,7 @@ class XianyuLive:
             scheduled_account_id = self._canonical_account_id()
         if not scheduled_account_id:
             logger.error(
-                f"【default】订单详情延迟补抓缺?canonical account_id，拒绝继续运? {order_id}"
+                f"【default】订单详情延迟补抓缺少 canonical account_id，拒绝继续运行 {order_id}"
             )
             return
         scope_key = self._compose_order_detail_scope_key(scheduled_account_id, order_id)
@@ -2572,7 +2609,7 @@ class XianyuLive:
                 )
                 return
 
-            logger.info(f"【{scheduled_account_id}】开始延迟补抓订单详? order_id={order_id}, delay={delay_seconds}s")
+            logger.info(f"【{scheduled_account_id}】开始延迟补抓订单详情: order_id={order_id}, delay={delay_seconds}s")
             result = await self.fetch_order_detail_info(
                 order_id,
                 item_id,
@@ -2583,14 +2620,14 @@ class XianyuLive:
                 force_refresh=True
             )
             if result:
-                logger.info(f"【{scheduled_account_id}】订单详情延迟补抓成? {order_id}")
+                logger.info(f"【{scheduled_account_id}】订单详情延迟补抓成功: {order_id}")
             else:
-                logger.warning(f"【{scheduled_account_id}】订单详情延迟补抓仍失败，保留基硢订单: {order_id}")
+                logger.warning(f"【{scheduled_account_id}】订单详情延迟补抓仍失败，保留基础订单: {order_id}")
         except asyncio.CancelledError:
             logger.info(f"【{scheduled_account_id}】订单详情延迟补抓任务已取消: {order_id}")
             raise
         except Exception as e:
-            logger.error(f"【{scheduled_account_id}】订单详情延迟补抓异? {order_id} - {self._safe_str(e)}")
+            logger.error(f"【{scheduled_account_id}】订单详情延迟补抓异常: {order_id} - {self._safe_str(e)}")
         finally:
             existing_task = self.order_detail_retry_tasks.get(scope_key)
             if existing_task is current_task:
@@ -2602,7 +2639,7 @@ class XianyuLive:
         canonical_account_id = self._canonical_account_id()
         if not canonical_account_id:
             logger.error(
-                f"【default】订单详情补抓调度缺?canonical account_id，拒绝继续运? {order_id}"
+                f"【default】订单详情补抓调度缺少 canonical account_id，拒绝继续运行 {order_id}"
             )
             return
 
@@ -2612,7 +2649,7 @@ class XianyuLive:
 
         existing_task = self.order_detail_retry_tasks.get(scope_key)
         if existing_task and not existing_task.done():
-            logger.info(f"【{canonical_account_id}】订单详情补抓任务已存在，跳过重复调? {order_id}")
+            logger.info(f"【{canonical_account_id}】订单详情补抓任务已存在，跳过重复调度: {order_id}")
             return
 
         task = self._create_tracked_task(
@@ -2681,22 +2718,22 @@ class XianyuLive:
                 self.queue_stats['received'] += 1
 
                 if priority <= 1:
-                    logger.info(f"【{self.account_id}】?高优先级消息入队 [P{priority}][ID:{msg_id}] 队列大小: {self.message_queue.qsize()}")
+                    logger.info(f"【{self.account_id}】📥 高优先级消息入队 [P{priority}][ID:{msg_id}] 队列大小: {self.message_queue.qsize()}")
                 else:
-                    logger.debug(f"【{self.account_id}】?消息入队 [P{priority}][ID:{msg_id}] 队列大小: {self.message_queue.qsize()}")
+                    logger.debug(f"【{self.account_id}】📥 消息入队 [P{priority}][ID:{msg_id}] 队列大小: {self.message_queue.qsize()}")
 
                 return True
             except asyncio.QueueFull:
                 self.queue_stats['dropped_full'] += 1
-                logger.warning(f"【{self.account_id}】⚠?消息队列已满({self.message_queue_max_size})，消息[ID:{msg_id}]被丢?")
+                logger.warning(f"【{self.account_id}】⚠️ 消息队列已满({self.message_queue_max_size})，消息[ID:{msg_id}]被丢弃")
                 return False
 
         except Exception as e:
-            logger.error(f"【{self.account_id}】消息入队失? {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】消息入队失败: {self._safe_str(e)}")
             return False
 
     async def _message_worker(self, worker_id: int):
-        logger.info(f"【{self.account_id}】?消息处理工作协程 #{worker_id} 启动")
+        logger.info(f"【{self.account_id}】🔧 消息处理工作协程 #{worker_id} 启动")
 
         while self.message_queue_running:
             try:
@@ -2712,13 +2749,13 @@ class XianyuLive:
                 age = time.time() - enqueue_time
                 if age > self.message_expire_seconds:
                     self.queue_stats['dropped_expired'] += 1
-                    logger.warning(f"【{self.account_id}】⏰ 工作协程#{worker_id} 丢弃过期消息 [ID:{message_item['msg_id']}] 已等待{age:.1f}?")
+                    logger.warning(f"【{self.account_id}】⏰ 工作协程#{worker_id} 丢弃过期消息 [ID:{message_item['msg_id']}] 已等待{age:.1f}秒")
                     self.message_queue.task_done()
                     continue
 
                 msg_id = message_item['msg_id']
                 try:
-                    logger.debug(f"【{self.account_id}】?工作协程#{worker_id} 弢始处理消?[P{priority}][ID:{msg_id}] 等待{age:.2f}?")
+                    logger.debug(f"【{self.account_id}】🔄 工作协程#{worker_id} 开始处理消息 [P{priority}][ID:{msg_id}] 等待{age:.2f}秒")
 
                     async with self.message_semaphore:
                         self.active_message_tasks += 1
@@ -2741,16 +2778,16 @@ class XianyuLive:
                     self.message_queue.task_done()
 
             except asyncio.CancelledError:
-                logger.info(f"【{self.account_id}】?消息处理工作协程 #{worker_id} 被取?")
+                logger.info(f"【{self.account_id}】🛑 消息处理工作协程 #{worker_id} 被取消")
                 break
             except Exception as e:
-                logger.error(f"【{self.account_id}】工作协?{worker_id} 异常: {self._safe_str(e)}")
+                logger.error(f"【{self.account_id}】工作协程#{worker_id} 异常: {self._safe_str(e)}")
                 await asyncio.sleep(1)
-        logger.info(f"【{self.account_id}】?消息处理工作协程 #{worker_id} 已停?")
+        logger.info(f"【{self.account_id}】🔧 消息处理工作协程 #{worker_id} 已停止")
 
     async def _start_message_queue_workers(self):
         if not self.message_queue_enabled:
-            logger.info(f"【{self.account_id}】消息队列系统已禁用，使用传统处理模?")
+            logger.info(f"【{self.account_id}】消息队列系统已禁用，使用传统处理模式")
             return
 
         self.message_queue_running = True
@@ -2762,7 +2799,7 @@ class XianyuLive:
 
         self._create_tracked_task(self._queue_stats_monitor())
 
-        logger.info(f"【{self.account_id}】🚢 消息队列系统已启动，{self.message_queue_workers}个工作协?")
+        logger.info(f"【{self.account_id}】🚀 消息队列系统已启动，{self.message_queue_workers}个工作协程")
 
     async def _stop_message_queue_workers(self):
         self.message_queue_running = False
@@ -2775,7 +2812,7 @@ class XianyuLive:
             await asyncio.gather(*self.message_workers, return_exceptions=True)
 
         self.message_workers = []
-        logger.info(f"【{self.account_id}】?消息队列系统已停?")
+        logger.info(f"【{self.account_id}】🛑 消息队列系统已停止")
 
     async def _queue_stats_monitor(self):
         while self.message_queue_running:
@@ -2792,37 +2829,37 @@ class XianyuLive:
                     drop_rate = (stats['dropped_full'] + stats['dropped_expired']) / stats['received'] * 100
 
                     logger.info(
-                        f"【{self.account_id}】?消息队列统计 - "
+                        f"【{self.account_id}】📊 消息队列统计 - "
                         f"队列大小: {self.message_queue.qsize()}/{self.message_queue_max_size} | "
                         f"收到: {stats['received']} | "
                         f"处理: {stats['processed']} | "
-                        f"丢弃(?: {stats['dropped_full']} | "
+                        f"丢弃(满): {stats['dropped_full']} | "
                         f"丢弃(过期): {stats['dropped_expired']} | "
                         f"错误: {stats['errors']} | "
                         f"处理速率: {process_rate:.1f}/s | "
-                        f"丢弃? {drop_rate:.1f}%"
+                        f"丢弃率: {drop_rate:.1f}%"
                     )
 
                     if drop_rate > 10:
-                        logger.warning(f"【{self.account_id}】⚠?消息丢弃率过?{drop_rate:.1f}%)，建议增加工作协程数量或棢查消息处理效?")
+                        logger.warning(f"【{self.account_id}】⚠️ 消息丢弃率过高({drop_rate:.1f}%)，建议增加工作协程数量或检查消息处理效率")
 
                 stats['last_stats_time'] = time.time()
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"【{self.account_id}】队列监控异? {self._safe_str(e)}")
+                logger.error(f"【{self.account_id}】队列监控异常: {self._safe_str(e)}")
 
     def is_auto_confirm_enabled(self) -> bool:
         try:
             from db_manager import db_manager
             current_account_id = self._canonical_account_id()
             if not current_account_id:
-                logger.error("【default】自动确认发货开关检查缺?canonical account_id，拒绝继续运?")
+                logger.error("【default】自动确认发货开关检查缺少 canonical account_id，拒绝继续运行")
                 return False
             return db_manager.get_auto_confirm(current_account_id)
         except Exception as e:
-            logger.error(f"【{self.account_id}】获取自动确认发货设置失? {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】获取自动确认发货设置失败: {self._safe_str(e)}")
             return False
 
     def is_auto_comment_enabled(self) -> bool:
@@ -2830,11 +2867,11 @@ class XianyuLive:
             from db_manager import db_manager
             current_account_id = self._canonical_account_id()
             if not current_account_id:
-                logger.error("【default】自动好评开关检查缺?canonical account_id，拒绝继续运?")
+                logger.error("【default】自动好评开关检查缺少 canonical account_id，拒绝继续运行")
                 return False
             return db_manager.get_auto_comment(current_account_id)
         except Exception as e:
-            logger.error(f"【{self.account_id}】获取自动好评设置失? {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】获取自动好评设置失败: {self._safe_str(e)}")
             return False
     async def handle_auto_comment(self, message: dict, msg_time: str, msg_id: str = ""):
         try:
@@ -2845,13 +2882,13 @@ class XianyuLive:
             current_account_id = self._canonical_account_id()
             if not current_account_id:
                 logger.error(
-                    f'[{msg_time}] 【default】[{msg_id}] 自动好评缺少 canonical account_id，拒绝继续运?'
+                    f'[{msg_time}] 【default】[{msg_id}] 自动好评缺少 canonical account_id，拒绝继续运行'
                 )
                 return False
 
             order_id = self._extract_order_id_for_comment(message)
             if not order_id:
-                logger.warning(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 无法从评价消息中提取订单ID，跳过自动好?')
+                logger.warning(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 无法从评价消息中提取订单ID，跳过自动好评')
                 return False
 
             logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 棢测到评价提醒，订单ID: {order_id}')
@@ -2859,12 +2896,12 @@ class XianyuLive:
             from db_manager import db_manager
             template = db_manager.get_active_comment_template(current_account_id)
             if not template:
-                logger.warning(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 未设置激活的好评模板，跳过自动好?')
+                logger.warning(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 未设置激活的好评模板，跳过自动好评')
                 return False
 
             comment_content = template.get('content', '')
             if not comment_content:
-                logger.warning(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 好评模板内容为空，跳过自动好?')
+                logger.warning(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 好评模板内容为空，跳过自动好评')
                 return False
 
             logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 使用模板"{template.get("name", "")}"进行好评: {comment_content[:50]}...')
@@ -2872,10 +2909,10 @@ class XianyuLive:
             result = await self._call_comment_api(order_id, comment_content)
 
             if result.get('success'):
-                logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ?订单 {order_id} 自动好评成功')
+                logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ✅ 订单 {order_id} 自动好评成功')
                 return True
             else:
-                logger.warning(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ?订单 {order_id} 自动好评失败: {result.get("message", "未知错误")}')
+                logger.warning(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ❌ 订单 {order_id} 自动好评失败: {result.get("message", "未知错误")}')
                 return False
 
         except Exception as e:
@@ -2931,20 +2968,20 @@ class XianyuLive:
                         }
                     else:
                         error_text = await response.text()
-                        logger.error(f"【{self.account_id}】好评接口返回错? status={response.status}, body={error_text}")
+                        logger.error(f"【{self.account_id}】好评接口返回错误: status={response.status}, body={error_text}")
                         return {
                             "success": False,
                             "message": f"接口返回错误: {response.status}"
                         }
 
         except asyncio.TimeoutError:
-            logger.error(f"【{self.account_id}】好评接口请求超?")
+            logger.error(f"【{self.account_id}】好评接口请求超时")
             return {
                 "success": False,
                 "message": "请求超时"
             }
         except Exception as e:
-            logger.error(f"【{self.account_id}】调用好评接口异? {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】调用好评接口异常: {self._safe_str(e)}")
             return {
                 "success": False,
                 "message": str(e)
@@ -2953,13 +2990,13 @@ class XianyuLive:
     def can_auto_delivery(self, order_id: str) -> bool:
         normalized_order_id = str(order_id or "").strip()
         if not normalized_order_id:
-            logger.error("【default】订单自动发货冷却检查缺少有?order_id，拒绝继续运?")
+            logger.error("【default】订单自动发货冷却检查缺少有效 order_id，拒绝继续运行")
             return False
 
         current_account_id = self._canonical_account_id()
         if not current_account_id:
             logger.error(
-                f"【default】订单自动发货冷却检查缺?canonical account_id，拒绝继续运? {normalized_order_id}"
+                f"【default】订单自动发货冷却检查缺少 canonical account_id，拒绝继续运行 {normalized_order_id}"
             )
             return False
 
@@ -2974,7 +3011,7 @@ class XianyuLive:
         last_delivery = self.last_delivery_time.get(delivery_scope_key, 0)
 
         if current_time - last_delivery < self.delivery_cooldown:
-            logger.info(f"【{current_account_id}】订?{normalized_order_id} 在冷却期内，跳过自动发货")
+            logger.info(f"【{current_account_id}】订单 {normalized_order_id} 在冷却期内，跳过自动发货")
             return False
 
         return True
@@ -2984,7 +3021,7 @@ class XianyuLive:
         normalized_order_id = str(order_id or "").strip()
         if not current_account_id:
             logger.error(
-                f"【default】订单发货标记缺?canonical account_id，拒绝继续运? {normalized_order_id}"
+                f"【default】订单发货标记缺少 canonical account_id，拒绝继续运行 {normalized_order_id}"
             )
             return False
         delivery_scope_key = self._compose_order_delivery_scope_key(current_account_id, normalized_order_id)
@@ -2995,7 +3032,7 @@ class XianyuLive:
             return False
         self.delivery_sent_orders.add(delivery_scope_key)
         self.last_delivery_time[delivery_scope_key] = time.time()
-        logger.info(f"【{current_account_id}】订?{normalized_order_id} 已标记为发货")
+        logger.info(f"【{current_account_id}】订单 {normalized_order_id} 已标记为发货")
 
         logger.info(f"【{current_account_id}】检查自动发货订单状态处理器: handler_exists={self.order_status_handler is not None}")
         if self.order_status_handler:
@@ -3008,15 +3045,15 @@ class XianyuLive:
                 )
                 logger.info(f"【{current_account_id}】订单状态处理器.handle_auto_delivery_order_status返回结果: {success}")
                 if success:
-                    logger.info(f"【{current_account_id}】订?{normalized_order_id} 状已更新为已发货")
+                    logger.info(f"【{current_account_id}】订单 {normalized_order_id} 状态已更新为已发货")
                 else:
-                    logger.warning(f"【{current_account_id}】订?{normalized_order_id} 状更新为已发货失?")
+                    logger.warning(f"【{current_account_id}】订单 {normalized_order_id} 状态更新为已发货失败")
             except Exception as e:
-                logger.error(f"【{current_account_id}】订单状态更新失? {self._safe_str(e)}")
+                logger.error(f"【{current_account_id}】订单状态更新失败: {self._safe_str(e)}")
                 import traceback
-                logger.error(f"【{current_account_id}】详细错误信? {traceback.format_exc()}")
+                logger.error(f"【{current_account_id}】详细错误信息: {traceback.format_exc()}")
         else:
-            logger.warning(f"【{current_account_id}】订单状态处理器为None，跳过自动发货状态更? {normalized_order_id}")
+            logger.warning(f"【{current_account_id}】订单状态处理器为None，跳过自动发货状态更新: {normalized_order_id}")
         return True
 
     def _activate_delivery_lock(self, lock_key: str, delay_minutes: int = 10):
@@ -3045,7 +3082,7 @@ class XianyuLive:
             current_account_id = self._canonical_account_id()
             if not current_account_id:
                 logger.error(
-                    "【default】发货日志缺?canonical account_id，拒绝继续运?"
+                    "【default】发货日志缺少 canonical account_id，拒绝继续运行"
                 )
                 return False
             log_prefix = f"【{self.account_id}?"
@@ -3075,7 +3112,7 @@ class XianyuLive:
             )
             return True
         except Exception as log_e:
-            logger.error(f"【{self.account_id}】记录发货日志失? {self._safe_str(log_e)}")
+            logger.error(f"【{self.account_id}】记录发货日志失败: {self._safe_str(log_e)}")
             return False
 
     def _format_delivery_log_reason(self, reason: str = None, rule_meta: dict = None) -> str:
@@ -3101,7 +3138,7 @@ class XianyuLive:
             return reason_text
 
         if not reason_text:
-            reason_text = '未提供发货日志原?'
+            reason_text = '未提供发货日志原因'
 
         return f"{reason_text} [{', '.join(context_parts)}]"
 
@@ -3113,12 +3150,12 @@ class XianyuLive:
         if not meta.get('success'):
             return {
                 'success': False,
-                'error': '发货元数据无效，无法提交副作?'
+                'error': '发货元数据无效，无法提交副作用'
             }
 
         if not current_account_id:
             logger.error(
-                "【default】发货收尾缺?canonical account_id，拒绝继续运?"
+                "【default】发货收尾缺少 canonical account_id，拒绝继续运行"
             )
             return {
                 'success': False,
@@ -3130,7 +3167,7 @@ class XianyuLive:
 
         if not normalized_order_id:
             logger.error(
-                f"【{current_account_id}】发货收尾缺少有?order_id，拒绝继续提交副作用"
+                f"【{current_account_id}】发货收尾缺少有效 order_id，拒绝继续提交副作用"
             )
             return {
                 'success': False,
@@ -3143,7 +3180,7 @@ class XianyuLive:
         )
         if not scoped_order:
             logger.error(
-                f"【{current_account_id}】发货收尾订单归属校验失败，拒绝继续提交副作? "
+                f"【{current_account_id}】发货收尾订单归属校验失败，拒绝继续提交副作用 "
                 f"order_id={normalized_order_id}"
             )
             return {
@@ -3171,7 +3208,7 @@ class XianyuLive:
             elif not card_id or card_type != 'data':
                 return {
                     'success': False,
-                    'error': '批量数据卡券元数据不完整，无法提交消?'
+                    'error': '批量数据卡券元数据不完整，无法提交消费'
                 }
             else:
                 consumed = db_manager.consume_specific_batch_data(card_id, expected_line)
@@ -3204,7 +3241,7 @@ class XianyuLive:
                         should_confirm = False
 
                 if should_confirm:
-                    logger.info(f"弢始自动确认发? 订单ID={normalized_order_id}, 商品ID={item_id}")
+                    logger.info(f"开始自动确认发货: 订单ID={normalized_order_id}, 商品ID={item_id}")
                     confirm_result = await self.auto_confirm(normalized_order_id, item_id)
                     if confirm_result.get('success'):
                         if confirm_scope_key:
@@ -3250,7 +3287,7 @@ class XianyuLive:
         current_account_id = self._canonical_account_id()
         if not current_account_id:
             logger.error(
-                f"【default】读取发货收尾状态缺?canonical account_id，拒绝继续运? {order_id}"
+                f"【default】读取发货收尾状态缺少 canonical account_id，拒绝继续运行 {order_id}"
             )
             return None
         state = db_manager.get_delivery_finalization_state(
@@ -3277,7 +3314,7 @@ class XianyuLive:
         current_account_id = self._canonical_account_id()
         if not current_account_id:
             logger.error(
-                f"【default】发货收尾状态缺?canonical account_id，拒绝继续运? {order_id}"
+                f"【default】发货收尾状态缺少 canonical account_id，拒绝继续运行 {order_id}"
             )
             return False
         normalized_status = str(status or "sent").strip().lower() or "sent"
@@ -3288,12 +3325,12 @@ class XianyuLive:
         if not scoped_order:
             if normalized_status == 'finalized':
                 logger.error(
-                    f"【{current_account_id}】发货收尾状态拒绝写?finalized：订单不在当前账号作用域? "
+                    f"【{current_account_id}】发货收尾状态拒绝写入 finalized：订单不在当前账号作用域内: "
                     f"order_id={normalized_order_id}"
                 )
                 return False
             logger.warning(
-                f"【{current_account_id}】发货收尾状态未命中 scoped order，保?sent 补偿标记: "
+                f"【{current_account_id}】发货收尾状态未命中 scoped order，保留 sent 补偿标记: "
                 f"order_id={normalized_order_id}"
             )
         meta = delivery_meta or {}
@@ -3330,7 +3367,7 @@ class XianyuLive:
         current_account_id = self._canonical_account_id()
         if not current_account_id:
             logger.error(
-                f"【default】读取发货进度缺?canonical account_id，拒绝继续运? {order_id}"
+                f"【default】读取发货进度缺少 canonical account_id，拒绝继续运行 {order_id}"
             )
             return default_summary
         return db_manager.get_delivery_progress_summary(
@@ -3387,13 +3424,13 @@ class XianyuLive:
         current_account_id = self._canonical_account_id()
         if not current_account_id:
             logger.error(
-                f"【default】小刢订单标记缺少 canonical account_id，拒绝继续运? {normalized_order_id or order_id}"
+                f"【default】小刀订单标记缺少 canonical account_id，拒绝继续运行 {normalized_order_id or order_id}"
             )
             return False
         existing_order = db_manager.get_order_by_id(normalized_order_id, account_id=current_account_id) or {}
         if not existing_order:
             logger.warning(
-                f"【{self.account_id}】小刢订单标记命中未验证归属，拒绝首写 scoped order: "
+                f"【{self.account_id}】小刀订单标记命中未验证归属，拒绝首写 scoped order: "
                 f"order_id={normalized_order_id}, account_id={current_account_id}"
             )
             return False
@@ -3431,7 +3468,7 @@ class XianyuLive:
             )
         else:
             logger.warning(
-                f"【{self.account_id}】标记订单小刢流程失败: order_id={normalized_order_id}, context={context or 'unknown'}"
+                f"【{self.account_id}】标记订单小刀流程失败: order_id={normalized_order_id}, context={context or 'unknown'}"
             )
         return success
 
@@ -3451,14 +3488,14 @@ class XianyuLive:
 
         if incoming_amount_value is None:
             logger.warning(
-                f"【{self.account_id}】小刢订单缺少可信金额，回逢为商品配置价: "
+                f"【{self.account_id}】小刀订单缺少可信金额，回退为商品配置价: "
                 f"order_id={order_id}, item_id={item_id}, configured_amount={configured_amount}"
             )
             return configured_amount, 'bargain_item_price_locked'
 
         if incoming_amount_value > configured_amount_value + 0.009:
             logger.warning(
-                f"【{self.account_id}】检测到小刀订单仍返回原价，使用商品配置价覆? "
+                f"【{self.account_id}】检测到小刀订单仍返回原价，使用商品配置价覆盖: "
                 f"order_id={order_id}, item_id={item_id}, incoming_amount={incoming_amount}, "
                 f"configured_amount={configured_amount}, amount_source={amount_source}"
             )
@@ -3494,7 +3531,7 @@ class XianyuLive:
 
         if normalized_current in {'partial_success', 'partial_pending_finalize'} and normalized_aggregate == 'pending_ship':
             logger.warning(
-                f"【{self.account_id}】保留部分发货状态，忽略待发货覆? current={normalized_current}, incoming={normalized_aggregate}"
+                f"【{self.account_id}】保留部分发货状态，忽略待发货覆盖: current={normalized_current}, incoming={normalized_aggregate}"
             )
             return normalized_current
 
@@ -3507,12 +3544,12 @@ class XianyuLive:
         canonical_account_id = self._canonical_account_id()
         if not normalized_order_id:
             logger.error(
-                f"【{canonical_account_id or 'default'}】发货进度同步缺少有?order_id，拒绝继续运?"
+                f"【{canonical_account_id or 'default'}】发货进度同步缺少有效 order_id，拒绝继续运行"
             )
             return self._summarize_delivery_progress(normalized_order_id, expected_quantity=expected_quantity)
         if not normalized_account_id or not canonical_account_id or normalized_account_id != canonical_account_id:
             logger.error(
-                f"【default】发货进度同步缺?canonical account_id，拒绝继续运? {normalized_order_id}"
+                f"【default】发货进度同步缺少 canonical account_id，拒绝继续运行 {normalized_order_id}"
             )
             return self._summarize_delivery_progress(normalized_order_id, expected_quantity=expected_quantity)
         summary = self._summarize_delivery_progress(normalized_order_id, expected_quantity=expected_quantity)
@@ -3527,10 +3564,10 @@ class XianyuLive:
             ) if normalized_order_id else None
             previous_status = db_manager._normalize_order_status(current_order.get('order_status')) if current_order else None
         except Exception as e:
-            logger.warning(f"【{self.account_id}】读取订单旧状失? {self._safe_str(e)}")
+            logger.warning(f"【{self.account_id}】读取订单旧状态失败 {self._safe_str(e)}")
 
         logger.info(
-            f"【{self.account_id}】同步订单发货进? order_id={normalized_order_id}, status={aggregate_status}, "
+            f"【{self.account_id}】同步订单发货进度 order_id={normalized_order_id}, status={aggregate_status}, "
             f"finalized={summary.get('finalized_count')}/{summary.get('expected_quantity')}, "
             f"pending_finalize={summary.get('pending_finalize_count')}, remaining={summary.get('remaining_count')}"
         )
@@ -3551,7 +3588,7 @@ class XianyuLive:
                     context=context
                 )
             except Exception as e:
-                logger.warning(f"【{self.account_id}】过状处理器同步已发货状态失? {self._safe_str(e)}")
+                logger.warning(f"【{self.account_id}】订单状态处理器同步已发货状态失败 {self._safe_str(e)}")
 
         try:
             from db_manager import db_manager
@@ -3573,17 +3610,17 @@ class XianyuLive:
                     )
                 except Exception as publish_e:
                     logger.warning(
-                        f"【{self.account_id}】发布部分发货实时事件失? order_id={normalized_order_id}, error={self._safe_str(publish_e)}"
+                        f"【{self.account_id}】发布部分发货实时事件失败 order_id={normalized_order_id}, error={self._safe_str(publish_e)}"
                     )
         except Exception as e:
-            logger.warning(f"【{self.account_id}】写入订单聚合发货状态失? {self._safe_str(e)}")
+            logger.warning(f"【{self.account_id}】写入订单聚合发货状态失败 {self._safe_str(e)}")
 
         return summary
 
     async def _delayed_lock_release(self, lock_key: str, delay_minutes: int = 10):
         try:
             delay_seconds = delay_minutes * 60
-            logger.info(f"【{self.account_id}】订单锁 {lock_key} 将在 {delay_minutes} 分钟后释?")
+            logger.info(f"【{self.account_id}】订单锁 {lock_key} 将在 {delay_minutes} 分钟后释放")
 
             await asyncio.sleep(delay_seconds)
 
@@ -3595,7 +3632,7 @@ class XianyuLive:
 
 
         except asyncio.CancelledError:
-            logger.info(f"【{self.account_id}】订单锁 {lock_key} 延迟释放任务被取?")
+            logger.info(f"【{self.account_id}】订单锁 {lock_key} 延迟释放任务被取消")
             raise
         except Exception as e:
             logger.error(f"【{self.account_id}】订单锁 {lock_key} 延迟释放失败: {self._safe_str(e)}")
@@ -3652,12 +3689,12 @@ class XianyuLive:
             if total_expired > 0:
                 logger.info(
                     f"【{self.account_id}】清理了 {total_expired} 个过期锁/标记 "
-                    f"(发货? {len(expired_delivery_locks)}, 详情? {len(expired_detail_locks)}, 刷新标记: {len(expired_refresh_marks)})"
+                    f"(发货锁: {len(expired_delivery_locks)}, 详情锁: {len(expired_detail_locks)}, 刷新标记: {len(expired_refresh_marks)})"
                 )
-                logger.warning(f"【{self.account_id}】当前锁数量 - 发货? {len(self._order_locks)}, 详情? {len(self._order_detail_locks)}")
+                logger.warning(f"【{self.account_id}】当前锁数量 - 发货锁: {len(self._order_locks)}, 详情锁: {len(self._order_detail_locks)}")
 
         except Exception as e:
-            logger.error(f"【{self.account_id}】清理过期锁时发生错? {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】清理过期锁时发生错误: {self._safe_str(e)}")
 
     def _get_order_status_priority(self, status: str) -> int:
         normalized_status = db_manager._normalize_order_status(status)
@@ -3685,7 +3722,7 @@ class XianyuLive:
             summary = self._summarize_delivery_progress(normalized_order_id, expected_quantity=1) or {}
         except Exception as summary_error:
             logger.warning(
-                f"【{self.account_id}】读取订单发货进度失败，按已有发货证据处? "
+                f"【{self.account_id}】读取订单发货进度失败，按已有发货证据处理: "
                 f"order_id={normalized_order_id}, error={self._safe_str(summary_error)}"
             )
             return True
@@ -3704,7 +3741,7 @@ class XianyuLive:
         canonical_account_id = self._canonical_account_id()
         if not canonical_account_id:
             logger.error(
-                f"{log_prefix} 订单详情强刷标记缺少 canonical account_id，拒绝继续运? "
+                f"{log_prefix} 订单详情强刷标记缺少 canonical account_id，拒绝继续运行 "
                 f"order_id={normalized_order_id}"
             )
             return False
@@ -3721,7 +3758,7 @@ class XianyuLive:
 
         if last_timestamp and cooldown > 0 and elapsed < cooldown:
             logger.info(
-                f"{log_prefix} 订单详情强刷命中冷却，跳过重复刷? "
+                f"{log_prefix} 订单详情强刷命中冷却，跳过重复强刷 "
                 f"order_id={normalized_order_id}, reason={reason}, "
                 f"last_reason={existing.get('reason', 'unknown')}, remaining={round(cooldown - elapsed, 2)}s"
             )
@@ -3744,7 +3781,7 @@ class XianyuLive:
         if normalized_signal == 'pending_ship':
             if normalized_current == 'shipped' and not self._has_delivery_progress_evidence(order_id):
                 logger.warning(
-                    f"【{self.account_id}】检测到可疑已发货状态，允许待发货信号继续强刷详? "
+                    f"【{self.account_id}】检测到可疑已发货状态，允许待发货信号继续强刷详情 "
                     f"order_id={order_id or 'unknown'}, current_status={normalized_current}, signal={normalized_signal}"
                 )
                 return True
@@ -3804,7 +3841,7 @@ class XianyuLive:
         canonical_account_id = self._canonical_account_id()
         if not canonical_account_id:
             logger.error(
-                f"{log_prefix} 状信号订单详情强刷缺?canonical account_id，拒绝继续运? "
+                f"{log_prefix} 状态信号订单详情强刷缺少 canonical account_id，拒绝继续运行 "
                 f"order_id={normalized_order_id}"
             )
             return False
@@ -3813,7 +3850,7 @@ class XianyuLive:
         current_status = current_order.get('order_status')
         if not self._should_force_refresh_after_status_signal(status_signal, current_status, normalized_order_id):
             logger.info(
-                f"{log_prefix} 当前订单状无霢为该信号强刷详情: order_id={normalized_order_id}, "
+                f"{log_prefix} 当前订单状态无需为该信号强刷详情: order_id={normalized_order_id}, "
                 f"signal={status_signal or 'unknown'}, current_status={current_status or 'unknown'}"
             )
             return False
@@ -3832,7 +3869,7 @@ class XianyuLive:
         latest_status = latest_order.get('order_status')
         if not self._should_force_refresh_after_status_signal(status_signal, latest_status, normalized_order_id):
             logger.info(
-                f"{log_prefix} 延迟后订单状态已更新，无霢再强刷详? order_id={normalized_order_id}, "
+                f"{log_prefix} 延迟后订单状态已更新，无需再强刷详情: order_id={normalized_order_id}, "
                 f"signal={status_signal or 'unknown'}, current_status={latest_status or 'unknown'}"
             )
             return False
@@ -3840,7 +3877,7 @@ class XianyuLive:
         refresh_item_id = item_id or latest_order.get('item_id')
         refresh_buyer_id = buyer_id or latest_order.get('buyer_id')
         logger.info(
-            f"{log_prefix} 状信号触发订单详情强? order_id={normalized_order_id}, "
+            f"{log_prefix} 状态信号触发订单详情强刷 order_id={normalized_order_id}, "
             f"signal={status_signal or 'unknown'}, current_status={latest_status or 'unknown'}, reason={reason}"
         )
 
@@ -3856,7 +3893,7 @@ class XianyuLive:
             return True
         except Exception as refresh_error:
             logger.error(
-                f"{log_prefix} 状信号触发订单详情强刷失? order_id={normalized_order_id}, "
+                f"{log_prefix} 状态信号触发订单详情强刷失败 order_id={normalized_order_id}, "
                 f"reason={reason}, error={self._safe_str(refresh_error)}"
             )
             return False
@@ -3972,10 +4009,11 @@ class XianyuLive:
             '快给ta丢个评价吧',
         }
         special_flow_titles = {
-            '我已小刀，待刢',
-            '我已小刀,待刀',
+            '我已小刀，待刀成',
+            self._legacy_replace_tail('我已小刀，待刀成', '刀成', '\u5222'),
+            self._legacy_drop_last_char('我已小刀,待刀成'),
             '我已成功小刀，待发货',
-            '我已成功小刀,待发',
+            self._legacy_drop_last_char('我已成功小刀,待发货'),
         }
 
         if send_message in special_flow_messages or card_title in special_flow_titles:
@@ -3984,16 +4022,16 @@ class XianyuLive:
         else:
             order_status_signal = None
             closed_markers = (
-                '[你关闭了订单，钱款已原路逢返]',
+                '[你关闭了订单，钱款已原路退返]',
                 '交易关闭',
                 '订单关闭',
                 '钱款已原路',
             )
             refund_markers = (
-                '逢款中',
-                '逢款成',
-                '逢货',
-                '逢款关',
+                '退款中',
+                '退款成功',
+                '退货退款',
+                '退款关闭',
             )
             completed_markers = (
                 '[买家确认收货，交易成功]',
@@ -4090,20 +4128,20 @@ class XianyuLive:
     def _is_auto_delivery_trigger(self, message: str) -> bool:
 
         try:
-            logger.warning(f"【{self.account_id}】?完整消息结构: {message}")
+            logger.warning(f"【{self.account_id}】🔍 完整消息结构: {message}")
 
             for source, candidate_text in self._collect_order_id_candidate_texts(message, root='message'):
                 order_id = self._extract_order_id_from_candidate_text(candidate_text, source=source)
                 if order_id:
-                    logger.info(f'【{self.account_id}】?朢终提取到订单ID: {order_id} (source={source})')
+                    logger.info(f'【{self.account_id}】🎯 最终提取到订单ID: {order_id} (source={source})')
                     return order_id
 
             if raw_message_data:
-                logger.info(f'【{self.account_id}】?尝试从原始消息数据中搜索订单ID')
+                logger.info(f'【{self.account_id}】🔍 尝试从原始消息数据中搜索订单ID')
                 for source, candidate_text in self._collect_order_id_candidate_texts(raw_message_data, root='raw_message'):
                     order_id = self._extract_order_id_from_candidate_text(candidate_text, source=source)
                     if order_id:
-                        logger.info(f'【{self.account_id}】?从原始消息提取到订单ID: {order_id} (source={source})')
+                        logger.info(f'【{self.account_id}】🎯 从原始消息提取到订单ID: {order_id} (source={source})')
                         return order_id
 
                 try:
@@ -4124,10 +4162,10 @@ class XianyuLive:
                         for source, candidate_text in self._collect_order_id_candidate_texts(decoded_data, root=f'raw_sync[{idx}]'):
                             order_id = self._extract_order_id_from_candidate_text(candidate_text, source=source)
                             if order_id:
-                                logger.info(f'【{self.account_id}】?从syncPushPackage.data提取到订单ID: {order_id} (source={source})')
+                                logger.info(f'【{self.account_id}】🎯 从syncPushPackage.data提取到订单ID: {order_id} (source={source})')
                                 return order_id
                 except Exception as multi_data_e:
-                    logger.warning(f"遍历syncPushPackage.data时出? {multi_data_e}")
+                    logger.warning(f"遍历syncPushPackage.data时出错: {multi_data_e}")
 
             logger.warning(f'【{self.account_id}】❌ 未能从消息中提取到订单ID')
             return None
@@ -4145,7 +4183,7 @@ class XianyuLive:
                     f"【default】简化自动发货缺少 canonical account_id，拒绝继续运行: {order_id}"
                 )
                 return
-            logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 🚀 弢始处理简化消息自动发? order_id={order_id}, item_id={item_id}')
+            logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 🚀 开始处理简化消息自动发货: order_id={order_id}, item_id={item_id}')
 
             from db_manager import db_manager
             try:
@@ -4176,7 +4214,7 @@ class XianyuLive:
                         item_id,
                         log_prefix=f'[{msg_time}] 【{self.account_id}】[{msg_id}]'
                     ):
-                        logger.warning(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ?商品 {item_id} 不属于当前账号，跳过自动发货')
+                        logger.warning(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ❌ 商品 {item_id} 不属于当前账号，跳过自动发货')
                         self._record_delivery_log(
                             order_id=order_id,
                             item_id=item_id,
@@ -4186,15 +4224,15 @@ class XianyuLive:
                             channel='auto'
                         )
                         return
-                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ?商品 {item_id} 归属验证通过')
+                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ✅ 商品 {item_id} 归属验证通过')
                 except Exception as e:
-                    logger.error(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 棢查商品归属失? {self._safe_str(e)}，跳过自动发?')
+                    logger.error(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 检查商品归属失败: {self._safe_str(e)}，跳过自动发货')
                     self._record_delivery_log(
                         order_id=order_id,
                         item_id=item_id,
                         buyer_id=user_id,
                         status='failed',
-                        reason=f'棢查商品归属失? {self._safe_str(e)}',
+                        reason=f'检查商品归属失败: {self._safe_str(e)}',
                         channel='auto'
                     )
                     return
@@ -4234,10 +4272,10 @@ class XianyuLive:
             self._lock_usage_times[lock_key] = time.time()
 
             async with order_lock:
-                logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 获取订单锁成? {lock_key}')
+                logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 获取订单锁成功: {lock_key}')
 
                 if self.is_lock_held(lock_key) or not self.can_auto_delivery(order_id):
-                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 获取锁后棢查发现订单已处理，跳过发?')
+                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 获取锁后检查发现订单已处理，跳过发货')
                     self._record_delivery_log(
                         order_id=order_id,
                         item_id=item_id,
@@ -4248,7 +4286,7 @@ class XianyuLive:
                     )
                     return
 
-                logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 📤 弢始执行自动发货内容发送（发成功后再确认发货）')
+                logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 📤 开始执行自动发货内容发送（发送成功后再确认发货）')
 
                 item_title = "待获取商品信息"
 
@@ -4267,7 +4305,7 @@ class XianyuLive:
                             delivery_meta=pending_finalize_meta,
                             channel='auto',
                             status='sent',
-                            last_error=finalize_result.get('error') or '补完?finalize 失败'
+                            last_error=finalize_result.get('error') or '补完成 finalize 失败'
                         )
                         self._record_delivery_log(
                             order_id=order_id,
@@ -4318,7 +4356,7 @@ class XianyuLive:
                         error_message="发货成功",
                         chat_id=chat_id
                     )
-                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ?箢化消息自动发货补完成收尾成功')
+                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ✅ 简化消息自动发货补完成收尾成功')
                     return
 
                 delivery_result = await self._auto_delivery(
@@ -4373,9 +4411,9 @@ class XianyuLive:
                         if not self._mark_data_reservation_sent_if_needed(delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta):
                             self._release_data_reservation_if_needed(
                                 delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta,
-                                error='发成功后标记预占已发送失?'
+                                error='发送成功后标记预占已发送失败'
                             )
-                            raise Exception('批量数据预占标记已发送失?')
+                            raise Exception('批量数据预占标记已发送失败')
 
                         self._persist_delivery_finalization_state(
                             order_id=order_id,
@@ -4399,7 +4437,7 @@ class XianyuLive:
                                 delivery_meta=delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta,
                                 channel='auto',
                                 status='sent',
-                                last_error=finalize_result.get('error') or '发成功但提交发货副作用失?'
+                                last_error=finalize_result.get('error') or '发送成功但提交发货副作用失败'
                             )
                             self._record_delivery_log(
                                 order_id=order_id,
@@ -4432,7 +4470,7 @@ class XianyuLive:
                             order_id=order_id,
                             account_id=current_account_id,
                             expected_quantity=1,
-                            context="自动发货发成?"
+                            context="自动发货发送成功"
                         )
                         self._activate_delivery_lock(lock_key, delay_minutes=10)
 
@@ -4451,7 +4489,7 @@ class XianyuLive:
                             item_id=item_id,
                             buyer_id=user_id,
                             status='failed',
-                            reason=f'自动发货消息发失? {self._safe_str(send_e)}',
+                            reason=f'自动发货消息发送失败: {self._safe_str(send_e)}',
                             channel='auto',
                             rule_meta=delivery_rule_meta
                         )
@@ -4465,9 +4503,9 @@ class XianyuLive:
                         chat_id=chat_id
                     )
 
-                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ?箢化消息自动发货完?')
+                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ✅ 简化消息自动发货完成')
                 else:
-                    logger.warning(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ?未找到匹配的发货规则或获取发货内容失?')
+                    logger.warning(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ❌ 未找到匹配的发货规则或获取发货内容失败')
                     self._record_delivery_log(
                         order_id=order_id,
                         item_id=item_id,
@@ -4481,24 +4519,24 @@ class XianyuLive:
                         send_user_name="买家",
                         send_user_id=user_id,
                         item_id=item_id,
-                        error_message="未找到匹配的发货规则或获取发货内容失?",
+                        error_message="未找到匹配的发货规则或获取发货内容失败",
                         chat_id=chat_id
                     )
 
         except Exception as e:
             self._release_data_reservation_if_needed(
                 delivery_result if 'delivery_result' in locals() and isinstance(delivery_result, dict) else delivery_rule_meta if 'delivery_rule_meta' in locals() else None,
-                error=f'自动发货发失? {self._safe_str(e)}'
+                error=f'自动发货发送失败: {self._safe_str(e)}'
             )
             self._record_delivery_log(
                 order_id=order_id,
                 item_id=item_id,
                 buyer_id=user_id,
                 status='failed',
-                reason=f'箢化消息自动发货异? {self._safe_str(e)}',
+                reason=f'简化消息自动发货异常: {self._safe_str(e)}',
                 channel='auto'
             )
-            logger.error(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 箢化消息自动发货异? {self._safe_str(e)}')
+            logger.error(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 简化消息自动发货异常: {self._safe_str(e)}')
             import traceback
             logger.error(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 异常堆栈: {traceback.format_exc()}')
 
@@ -4534,7 +4572,7 @@ class XianyuLive:
 
                 if fallback_sid:
                     try:
-                        log_prefix = f'[{msg_time}] 【{self.account_id}?'
+                        log_prefix = f'[{msg_time}] 【{self.account_id}】'
                         sid_lookup_minutes = 5
                         sid_lookup = self._lookup_delivery_order_by_sid(
                             fallback_sid,
@@ -4566,14 +4604,14 @@ class XianyuLive:
 
                         if send_user_id and fallback_buyer_id and self._is_trustworthy_buyer_id(fallback_buyer_id) and str(send_user_id) != str(fallback_buyer_id):
                             logger.warning(
-                                f'[{msg_time}] 【{self.account_id}】❌ sid兜底命中订单但买家不丢致，已拒绝发? '
+                                f'[{msg_time}] 【{self.account_id}】❌ sid兜底命中订单但买家不一致，已拒绝发货: '
                                 f'send_user_id={send_user_id}, order_buyer_id={fallback_buyer_id}, sid={fallback_sid}'
                             )
                             return
 
                         if item_id and item_id != "未知商品" and fallback_item_id and str(item_id) != str(fallback_item_id):
                             logger.warning(
-                                f'[{msg_time}] 【{self.account_id}】❌ sid兜底命中订单但商品不丢致，已拒绝发? '
+                                f'[{msg_time}] 【{self.account_id}】❌ sid兜底命中订单但商品不一致，已拒绝发货: '
                                 f'message_item_id={item_id}, order_item_id={fallback_item_id}, sid={fallback_sid}'
                             )
                             return
@@ -4584,7 +4622,7 @@ class XianyuLive:
 
                         if sid_match_type == 'bargain_ready':
                             logger.info(
-                                f'[{msg_time}] 【{self.account_id}】✅ 订单ID提取失败，但棢测到小刀成功证据?'
+                                f'[{msg_time}] 【{self.account_id}】✅ 订单ID提取失败，但检测到小刀成功证据，'
                                 f'使用sid兜底直接进入自动发货: sid={fallback_sid}, order_id={order_id}'
                             )
 
@@ -4597,17 +4635,17 @@ class XianyuLive:
                         fallback_status = recent_order.get('order_status') or 'unknown'
                         if sid_match_type == 'already_processed':
                             logger.info(
-                                f'[{msg_time}] 【{self.account_id}】ℹ?订单ID提取失败，但sid命中的订单已处理完成，跳过重复发? '
+                                f'[{msg_time}] 【{self.account_id}】ℹ️ 订单ID提取失败，但sid命中的订单已处理完成，跳过重复发货: '
                                 f'sid={fallback_sid}, order_id={fallback_order_id}, status={fallback_status}'
                             )
                         elif sid_match_type == 'cancelled':
                             logger.info(
-                                f'[{msg_time}] 【{self.account_id}】ℹ?订单ID提取失败，但sid命中的订单已关闭，跳过自动发? '
+                                f'[{msg_time}] 【{self.account_id}】ℹ️ 订单ID提取失败，但sid命中的订单已关闭，跳过自动发货: '
                                 f'sid={fallback_sid}, order_id={fallback_order_id}'
                             )
                         else:
                             logger.info(
-                                f'[{msg_time}] 【{self.account_id}】ℹ?订单ID提取失败，但sid命中的订单当前状态不适合兜底发货，等待后续完整消? '
+                                f'[{msg_time}] 【{self.account_id}】ℹ️ 订单ID提取失败，但sid命中的订单当前状态不适合兜底发货，等待后续完整消息: '
                                 f'sid={fallback_sid}, order_id={fallback_order_id}, status={fallback_status}'
                             )
                         return
@@ -4640,7 +4678,7 @@ class XianyuLive:
                         )
                         return
                 else:
-                    logger.warning(f'[{msg_time}] 【{self.account_id}】❌ 未能提取到订单ID且无可用sid，跳过自动发?')
+                    logger.warning(f'[{msg_time}] 【{self.account_id}】❌ 未能提取到订单ID且无可用sid，跳过自动发货')
                     self._record_delivery_log(
                         item_id=item_id,
                         buyer_id=send_user_id,
@@ -4654,12 +4692,12 @@ class XianyuLive:
             try:
                 existing_order = db_manager.get_order_by_id(order_id, account_id=current_account_id)
             except Exception as order_check_e:
-                logger.error(f'[{msg_time}] 【{self.account_id}】查询订单一致校验失? {self._safe_str(order_check_e)}')
+                logger.error(f'[{msg_time}] 【{self.account_id}】查询订单一致性校验失败: {self._safe_str(order_check_e)}')
                 existing_order = None
 
             if not existing_order:
                 logger.warning(
-                    f'[{msg_time}] 【{current_account_id}】订单未验证归属，拒绝自动发? order_id={order_id}'
+                    f'[{msg_time}] 【{current_account_id}】订单未验证归属，拒绝自动发货 order_id={order_id}'
                 )
                 self._record_delivery_log(
                     order_id=order_id,
@@ -4715,7 +4753,7 @@ class XianyuLive:
                 try:
                     if not await self._ensure_item_owned_by_current_account(
                         item_id,
-                        log_prefix=f'[{msg_time}] 【{self.account_id}?'
+                        log_prefix=f'[{msg_time}] 【{self.account_id}】'
                     ):
                         logger.warning(f'[{msg_time}] 【{self.account_id}】❌ 商品 {item_id} 不属于当前账号，跳过自动发货')
                         self._record_delivery_log(
@@ -4729,13 +4767,13 @@ class XianyuLive:
                         return
                     logger.warning(f'[{msg_time}] 【{self.account_id}】✅ 商品 {item_id} 归属验证通过')
                 except Exception as e:
-                    logger.error(f'[{msg_time}] 【{self.account_id}】检查商品归属失? {self._safe_str(e)}，跳过自动发?')
+                    logger.error(f'[{msg_time}] 【{self.account_id}】检查商品归属失败 {self._safe_str(e)}，跳过自动发货')
                     self._record_delivery_log(
                         item_id=item_id,
                         buyer_id=send_user_id,
                         buyer_nick=send_user_name,
                         status='failed',
-                        reason=f'棢查商品归属失? {self._safe_str(e)}',
+                        reason=f'检查商品归属失败 {self._safe_str(e)}',
                         channel='auto'
                     )
                     return
@@ -4750,7 +4788,7 @@ class XianyuLive:
                 return
 
             if self.is_lock_held(lock_key):
-                logger.info(f'[{msg_time}] 【{self.account_id}】🔒提前检查订?{lock_key} 延迟锁仍在持有状态，跳过发货')
+                logger.info(f'[{msg_time}] 【{self.account_id}】🔒【提前检查】订单 {lock_key} 延迟锁仍在持有状态，跳过发货')
                 self._record_delivery_log(
                     order_id=order_id,
                     item_id=item_id,
@@ -4763,7 +4801,7 @@ class XianyuLive:
                 return
 
             if not self.can_auto_delivery(order_id):
-                logger.info(f'[{msg_time}] 【{self.account_id}】订?{order_id} 在冷却期内，跳过发货')
+                logger.info(f'[{msg_time}] 【{self.account_id}】订单 {order_id} 在冷却期内，跳过发货')
                 self._record_delivery_log(
                     order_id=order_id,
                     item_id=item_id,
@@ -4780,10 +4818,10 @@ class XianyuLive:
             self._lock_usage_times[lock_key] = time.time()
 
             async with order_lock:
-                logger.info(f'[{msg_time}] 【{self.account_id}】获取订单锁成功: {lock_key}，开始处理自动发?')
+                logger.info(f'[{msg_time}] 【{self.account_id}】获取订单锁成功: {lock_key}，开始处理自动发货')
 
                 if self.is_lock_held(lock_key):
-                    logger.info(f'[{msg_time}] 【{self.account_id}】订?{lock_key} 在获取锁后检查发现延迟锁仍持有，跳过发货')
+                    logger.info(f'[{msg_time}] 【{self.account_id}】订单 {lock_key} 在获取锁后检查发现延迟锁仍持有，跳过发货')
                     self._record_delivery_log(
                         order_id=order_id,
                         item_id=item_id,
@@ -4796,7 +4834,7 @@ class XianyuLive:
                     return
 
                 if not self.can_auto_delivery(order_id):
-                    logger.info(f'[{msg_time}] 【{self.account_id}】订?{order_id} 在获取锁后检查发现仍在冷却期，跳过发?')
+                    logger.info(f'[{msg_time}] 【{self.account_id}】订单 {order_id} 在获取锁后检查发现仍在冷却期，跳过发货')
                     self._record_delivery_log(
                         order_id=order_id,
                         item_id=item_id,
@@ -4813,14 +4851,14 @@ class XianyuLive:
                 try:
                     item_title = "待获取商品信息"
 
-                    logger.info(f"【{self.account_id}】准备自动发? item_id={item_id}, item_title={item_title}")
+                    logger.info(f"【{self.account_id}】准备自动发货: item_id={item_id}, item_title={item_title}")
 
                     from db_manager import db_manager
                     quantity_to_send = 1
                     multi_quantity_delivery = db_manager.get_item_multi_quantity_delivery_status(current_account_id, item_id)
 
                     if multi_quantity_delivery and order_id:
-                        logger.info(f"商品 {item_id} 弢启了多数量发货，获取订单详情...")
+                        logger.info(f"商品 {item_id} 开启了多数量发货，获取订单详情...")
                         try:
                             order_detail = await self.fetch_order_detail_info(order_id, item_id, send_user_id)
                             if order_detail and order_detail.get('quantity'):
@@ -4828,19 +4866,19 @@ class XianyuLive:
                                     order_quantity = int(order_detail['quantity'])
                                     if order_quantity > 1:
                                         quantity_to_send = order_quantity
-                                        logger.info(f"从订单详情获取数? {order_quantity}，将发?{quantity_to_send} 个卡?")
+                                        logger.info(f"从订单详情获取数量: {order_quantity}，将发送 {quantity_to_send} 个卡券")
                                     else:
-                                        logger.info(f"订单数量?{order_quantity}，发送单个卡?")
+                                        logger.info(f"订单数量为 {order_quantity}，发送单个卡券")
                                 except (ValueError, TypeError):
-                                    logger.warning(f"订单数量格式无效: {order_detail.get('quantity')}，发送单个卡?")
+                                    logger.warning(f"订单数量格式无效: {order_detail.get('quantity')}，发送单个卡券")
                             else:
-                                logger.info(f"未获取到订单数量信息，发送单个卡?")
+                                logger.info(f"未获取到订单数量信息，发送单个卡券")
                         except Exception as e:
-                            logger.error(f"获取订单详情失败: {self._safe_str(e)}，发送单个卡?")
+                            logger.error(f"获取订单详情失败: {self._safe_str(e)}，发送单个卡券")
                     elif not multi_quantity_delivery:
-                        logger.info(f"商品 {item_id} 未开启多数量发货，发送单个卡?")
+                        logger.info(f"商品 {item_id} 未开启多数量发货，发送单个卡券")
                     else:
-                        logger.info(f"无订单ID，发送单个卡?")
+                        logger.info(f"无订单ID，发送单个卡券")
 
                     successful_send_count = 0
                     last_delivery_error = None
@@ -4858,7 +4896,7 @@ class XianyuLive:
                                     item_id=item_id
                                 )
                                 if not finalize_result.get('success'):
-                                    last_delivery_error = finalize_result.get('error') or f"?{unit_index} 个卡券补完成收尾失败"
+                                    last_delivery_error = finalize_result.get('error') or f"第 {unit_index} 个卡券补完成收尾失败"
                                     self._persist_delivery_finalization_state(
                                         order_id=order_id,
                                         item_id=item_id,
@@ -4941,7 +4979,7 @@ class XianyuLive:
                                 delivery_steps = []
 
                             if not delivery_content:
-                                failure_reason = delivery_error or f"?{unit_index}/{quantity_to_send} 个卡券内容获取失?"
+                                failure_reason = delivery_error or f"第 {unit_index}/{quantity_to_send} 个卡券内容获取失败"
                                 last_delivery_error = failure_reason
                                 self._record_delivery_log(
                                     order_id=order_id,
@@ -4959,7 +4997,7 @@ class XianyuLive:
                             if not delivery_steps:
                                 delivery_steps = self._build_delivery_steps(delivery_content, rule_meta.get('card_description', ''))
                             if not delivery_steps:
-                                failure_reason = f"?{unit_index}/{quantity_to_send} 个卡券发货步骤构建失?"
+                                failure_reason = f"第 {unit_index}/{quantity_to_send} 个卡券发货步骤构建失败"
                                 last_delivery_error = failure_reason
                                 self._release_data_reservation_if_needed(rule_meta, error=failure_reason)
                                 self._record_delivery_log(
@@ -4984,7 +5022,7 @@ class XianyuLive:
 
                         except Exception as e:
                             self._release_data_reservation_if_needed(rule_meta, error=f'准备发货失败: {self._safe_str(e)}')
-                            last_delivery_error = f"准备?{unit_index}/{quantity_to_send} 个卡券失? {self._safe_str(e)}"
+                            last_delivery_error = f"准备第 {unit_index}/{quantity_to_send} 个卡券失败: {self._safe_str(e)}"
                             self._record_delivery_log(
                                 order_id=order_id,
                                 item_id=item_id,
@@ -5011,11 +5049,11 @@ class XianyuLive:
 
                         if is_batched_text_group:
                             group_log_prefix = (
-                                f'[{msg_time}] 多数量自动发货批?{group_index}/{total_send_groups} '
-                                f'({len(group_units)}个单? {send_group.get("char_count", 0)}?'
+                                f'[{msg_time}] 多数量自动发货批次 {group_index}/{total_send_groups} '
+                                f'({len(group_units)}个单元, {send_group.get("char_count", 0)}字)'
                             )
                         else:
-                            group_log_prefix = f'[{msg_time}] 多数量自动发?{single_unit_index}/{quantity_to_send}'
+                            group_log_prefix = f'[{msg_time}] 多数量自动发货 {single_unit_index}/{quantity_to_send}'
 
                         try:
                             await self._send_delivery_steps(
@@ -5033,9 +5071,9 @@ class XianyuLive:
                                 unit_index = prepared_unit.get('unit_index') or 1
                                 self._release_data_reservation_if_needed(
                                     unit_rule_meta,
-                                    error=f'发失?unit={unit_index}): {group_error}'
+                                    error=f'发送失败(unit={unit_index}): {group_error}'
                                 )
-                                last_delivery_error = f"发第 {unit_index}/{quantity_to_send} 个卡券失? {group_error}"
+                                last_delivery_error = f"发送第 {unit_index}/{quantity_to_send} 个卡券失败: {group_error}"
                                 self._record_delivery_log(
                                     order_id=order_id,
                                     item_id=item_id,
@@ -5058,9 +5096,9 @@ class XianyuLive:
                                 if not self._mark_data_reservation_sent_if_needed(unit_rule_meta):
                                     self._release_data_reservation_if_needed(
                                         unit_rule_meta,
-                                        error=f'发成功后标记预占已发送失?unit={unit_index})'
+                                        error=f'发送成功后标记预占已发送失败(unit={unit_index})'
                                     )
-                                    last_delivery_error = f'?{unit_index} 个卡券发送成功后标记预占已发送失?'
+                                    last_delivery_error = f'第 {unit_index} 个卡券发送成功后标记预占已发送失败'
                                     self._record_delivery_log(
                                         order_id=order_id,
                                         item_id=item_id,
@@ -5089,7 +5127,7 @@ class XianyuLive:
                                     item_id=item_id
                                 )
                                 if not finalize_result.get('success'):
-                                    last_delivery_error = finalize_result.get('error') or f"?{unit_index} 条消息发送成功但提交发货副作用失?"
+                                    last_delivery_error = finalize_result.get('error') or f"第 {unit_index} 条消息发送成功但提交发货副作用失败"
                                     self._persist_delivery_finalization_state(
                                         order_id=order_id,
                                         item_id=item_id,
@@ -5125,11 +5163,11 @@ class XianyuLive:
 
                                 has_image_step = any(step.get('type') == 'image' for step in unit_delivery_steps)
                                 if has_image_step:
-                                    success_reason = '自动发货图片步骤发成?'
+                                    success_reason = '自动发货图片步骤发送成功'
                                 elif is_batched_text_group and len(group_units) > 1:
-                                    success_reason = '自动发货文本批量合并发成?'
+                                    success_reason = '自动发货文本批量合并发送成功'
                                 else:
-                                    success_reason = '自动发货文本发成?'
+                                    success_reason = '自动发货文本发送成功'
 
                                 self._record_delivery_log(
                                     order_id=order_id,
@@ -5142,7 +5180,7 @@ class XianyuLive:
                                     rule_meta=unit_rule_meta
                                 )
                             except Exception as unit_post_error:
-                                last_delivery_error = f"?{unit_index} 个卡券消息已发，但发送后处理异常: {self._safe_str(unit_post_error)}"
+                                last_delivery_error = f"第 {unit_index} 个卡券消息已发送，但发送后处理异常: {self._safe_str(unit_post_error)}"
                                 self._persist_delivery_finalization_state(
                                     order_id=order_id,
                                     item_id=item_id,
@@ -5186,16 +5224,16 @@ class XianyuLive:
 
                             if aggregate_status == 'partial_pending_finalize':
                                 notify_message = (
-                                    f"多数量发货部分完成，已完?{finalized_count}/{quantity_to_send}?"
-                                    f"待收?{pending_finalize_count}，待补发 {remaining_count}"
+                                    f"多数量发货部分完成，已完成 {finalized_count}/{quantity_to_send}，"
+                                    f"待收尾 {pending_finalize_count}，待补发 {remaining_count}"
                                 )
                             elif aggregate_status == 'partial_success':
                                 notify_message = (
-                                    f"多数量发货部分成功，已完?{finalized_count}/{quantity_to_send}?"
-                                    f"待补?{remaining_count}"
+                                    f"多数量发货部分成功，已完成 {finalized_count}/{quantity_to_send}，"
+                                    f"待补发 {remaining_count}"
                                 )
                             else:
-                                notify_message = f"多数量发货成功，共完?{finalized_count}/{quantity_to_send} 个卡?"
+                                notify_message = f"多数量发货成功，共完成 {finalized_count}/{quantity_to_send} 个卡券"
                             await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, notify_message, chat_id)
                         else:
                             await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "发货成功", chat_id)
@@ -5207,10 +5245,10 @@ class XianyuLive:
                             buyer_id=send_user_id,
                             buyer_nick=send_user_name,
                             status='failed',
-                            reason=last_delivery_error or "未找到匹配的发货规则或获取发货内容失?",
+                            reason=last_delivery_error or "未找到匹配的发货规则或获取发货内容失败",
                             channel='auto'
                         )
-                        await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, last_delivery_error or "未找到匹配的发货规则或获取发货内容失?", chat_id)
+                        await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, last_delivery_error or "未找到匹配的发货规则或获取发货内容失败", chat_id)
 
                 except Exception as e:
                     self._record_delivery_log(
@@ -5225,7 +5263,7 @@ class XianyuLive:
                     logger.error(f"自动发货处理异常: {self._safe_str(e)}")
                     await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"自动发货处理异常: {str(e)}", chat_id)
 
-                logger.info(f'[{msg_time}] 【{self.account_id}】订单锁释放: {lock_key}，自动发货处理完?')
+                logger.info(f'[{msg_time}] 【{self.account_id}】订单锁释放: {lock_key}，自动发货处理完成')
 
         except Exception as e:
             self._record_delivery_log(
@@ -5255,7 +5293,7 @@ class XianyuLive:
                 suffix = f" ({reason})" if reason else ""
                 logger.info(f"【{log_account_id}】检测到数据库中的cookie已更新，重新加载cookie{suffix}")
                 self._set_runtime_cookie_state(cookies_str=new_cookies_str, source=f"db_reload{suffix}")
-                logger.warning(f"【{log_account_id}】Cookie已从数据库重新加?")
+                logger.warning(f"【{log_account_id}】Cookie已从数据库重新加载")
                 return True
         except Exception as reload_e:
             logger.warning(f"【{log_account_id}】从数据库重新加载cookie失败，继续使用当前cookie: {self._safe_str(reload_e)}")
@@ -5390,7 +5428,7 @@ class XianyuLive:
     def _clear_pending_slider_success_notice(self, reason: str = None):
         if self.pending_slider_success_notice:
             suffix = f" ({reason})" if reason else ""
-            logger.info(f"【{self.account_id}】已清理滑块成功待发送知{suffix}")
+            logger.info(f"【{self.account_id}】已清理滑块成功待发送通知{suffix}")
         self.pending_slider_success_notice = None
 
     def _build_x5_cookie_snapshot(self, cookie_string: str = None, cookies_dict: dict = None) -> Dict[str, Dict[str, Any]]:
@@ -5530,54 +5568,54 @@ class XianyuLive:
                                   missing_protected_fields=None, missing_required_fields=None,
                                   incoming_missing_protected_fields=None, account_switched: bool = False):
         context_prefix = f"{context} " if context else ""
-        logger.info(f"【{self.account_id}】{context_prefix}合并后cookies包含 {len(merged_cookies_dict)} 个字?")
+        logger.info(f"【{self.account_id}】{context_prefix}合并后cookies包含 {len(merged_cookies_dict)} 个字段")
 
         if updated_fields:
             logger.info(f"【{self.account_id}】{context_prefix}更新的cookie字段: {', '.join(updated_fields)}")
         else:
-            logger.info(f"【{self.account_id}】{context_prefix}没有cookie字段霢要更?")
+            logger.info(f"【{self.account_id}】{context_prefix}没有cookie字段需要更新")
 
         if account_switched:
             logger.warning(f"【{self.account_id}】{context_prefix}棢测到unb变化，按账号切换处理，不保留旧账号Cookie字段")
 
         if preserved_protected_fields:
             logger.warning(
-                f"【{self.account_id}】{context_prefix}保护性保留关键字?({len(preserved_protected_fields)}?: {', '.join(preserved_protected_fields)}"
+                f"【{self.account_id}】{context_prefix}保护性保留关键字段 ({len(preserved_protected_fields)}个): {', '.join(preserved_protected_fields)}"
             )
         if preserved_fields:
             logger.info(
-                f"【{self.account_id}】{context_prefix}保留旧Cookie字段 ({len(preserved_fields)}?: {', '.join(preserved_fields)}"
+                f"【{self.account_id}】{context_prefix}保留旧Cookie字段 ({len(preserved_fields)}个): {', '.join(preserved_fields)}"
             )
         if would_remove_fields:
             logger.info(
-                f"【{self.account_id}】{context_prefix}浏览器快照未返回的旧字段 ({len(would_remove_fields)}?: {', '.join(would_remove_fields)}"
+                f"【{self.account_id}】{context_prefix}浏览器快照未返回的旧字段 ({len(would_remove_fields)}个): {', '.join(would_remove_fields)}"
             )
         if removed_fields:
             logger.warning(
-                f"【{self.account_id}】{context_prefix}实际移除旧字?({len(removed_fields)}?: {', '.join(removed_fields)}"
+                f"【{self.account_id}】{context_prefix}实际移除旧字段 ({len(removed_fields)}个): {', '.join(removed_fields)}"
             )
         if incoming_missing_protected_fields:
             logger.warning(
-                f"【{self.account_id}】{context_prefix}新快照缺失的关键字段 ({len(incoming_missing_protected_fields)}?: {', '.join(incoming_missing_protected_fields)}"
+                f"【{self.account_id}】{context_prefix}新快照缺失的关键字段 ({len(incoming_missing_protected_fields)}个): {', '.join(incoming_missing_protected_fields)}"
             )
         if missing_protected_fields:
             logger.warning(
-                f"【{self.account_id}】{context_prefix}合并后仍缺失的受保护字段 ({len(missing_protected_fields)}?: {', '.join(missing_protected_fields)}"
+                f"【{self.account_id}】{context_prefix}合并后仍缺失的受保护字段 ({len(missing_protected_fields)}个): {', '.join(missing_protected_fields)}"
             )
         if missing_required_fields:
             logger.error(
-                f"【{self.account_id}】{context_prefix}合并后仍缺失的核心字?({len(missing_required_fields)}?: {', '.join(missing_required_fields)}"
+                f"【{self.account_id}】{context_prefix}合并后仍缺失的核心字段 ({len(missing_required_fields)}个): {', '.join(missing_required_fields)}"
             )
 
         important_keys = list(PROTECTED_SESSION_COOKIE_FIELDS) + ['x5sec', 'x5secdata']
-        logger.info(f"【{self.account_id}】{context_prefix}关键字段棢?")
+        logger.info(f"【{self.account_id}】{context_prefix}关键字段检查:")
         for key in important_keys:
             if key in merged_cookies_dict:
                 val = merged_cookies_dict[key]
                 marker = " [已变化]" if key in changed_fields else " [新增]" if key in new_fields else ""
-                logger.info(f"【{self.account_id}? ?{key}: {'存在' if val else '为空'} (长度: {len(str(val)) if val else 0}){marker}")
+                logger.info(f"【{self.account_id}】  ✅ {key}: {'存在' if val else '为空'} (长度: {len(str(val)) if val else 0}){marker}")
             else:
-                logger.info(f"【{self.account_id}? ?{key}: 缺失")
+                logger.info(f"【{self.account_id}】  ❌ {key}: 缺失")
 
     def _has_recent_slider_success(self, window_seconds: int = None) -> bool:
         if not self.last_slider_success_at:
@@ -5591,7 +5629,7 @@ class XianyuLive:
         if not current_account_id:
             self.last_token_refresh_status = "missing_account_id"
             self.last_token_refresh_error_message = "missing canonical account_id for token preflight"
-            logger.error(f"【{log_account_id}】{label}缺少 canonical account_id，拒绝继续运?")
+            logger.error(f"【{log_account_id}】{label}缺少 canonical account_id，拒绝继续运行")
             return ""
         logger.info(f"【{log_account_id}】开始执行{label}...")
         self.last_message_received_time = 0
@@ -5609,14 +5647,14 @@ class XianyuLive:
                 if attempt < max_preflight_retries:
                     wait_secs = 2.0 * attempt
                     logger.warning(
-                        f"【{log_account_id}】{label}第{attempt}次失败（状? {self.last_token_refresh_status}），"
-                        f"等待{wait_secs:.0f}秒后重试（Cookie可能尚未在服务端生效?"
+                        f"【{log_account_id}】{label}第{attempt}次失败（状态: {self.last_token_refresh_status}），"
+                        f"等待{wait_secs:.0f}秒后重试（Cookie可能尚未在服务端生效）"
                     )
                     await asyncio.sleep(wait_secs)
         finally:
             self._skip_db_cookie_reload_for_token_refresh = previous_skip_reload_flag
 
-        raise InitAuthError(f"{label}失败，状? {self.last_token_refresh_status or 'unknown'}")
+        raise InitAuthError(f"{label}失败，状态: {self.last_token_refresh_status or 'unknown'}")
 
     async def preflight_token_after_manual_refresh(self) -> str:
         return await self._preflight_token_for_fresh_auth_cookies(
@@ -5632,7 +5670,7 @@ class XianyuLive:
 
     async def refresh_token(self, captcha_retry_count: int = 0, allow_password_login_recovery: bool = True):
         if self.token_refresh_lock.locked():
-            logger.info(f"【{self.account_id}】Token刷新已有执行中任务，等待当前流程完成后复用结?")
+            logger.info(f"【{self.account_id}】Token刷新已有执行中任务，等待当前流程完成后复用结果")
 
         async with self.token_refresh_lock:
             if (
@@ -5641,7 +5679,7 @@ class XianyuLive:
                 self.last_token_refresh_status == "success" and
                 (time.time() - self.last_token_refresh_time) < 15
             ):
-                logger.info(f"【{self.account_id}】最?5秒内已有成功的Token刷新结果，直接复用当前Token")
+                logger.info(f"【{self.account_id}】最近15秒内已有成功的Token刷新结果，直接复用当前Token")
                 return self.current_token
             return await self._refresh_token_impl(
                 captcha_retry_count,
@@ -5678,7 +5716,7 @@ class XianyuLive:
             if not self.session:
                 await self.create_session()
 
-            self._reload_latest_cookies_from_db("轻量保活?")
+            self._reload_latest_cookies_from_db("轻量保活前")
 
             params = {
                 'jsv': '2.7.2',
@@ -5724,7 +5762,7 @@ class XianyuLive:
                     response_text = await response.text()
                     self.last_session_keepalive_status = "response_parse_failed"
                     self.last_session_keepalive_error_message = response_text[:200]
-                    logger.warning(f"【{self.account_id}】轻量保活响应解析失? {response_text[:200]}")
+                    logger.warning(f"【{self.account_id}】轻量保活响应解析失败: {response_text[:200]}")
                     return False
 
                 await self._apply_response_cookie_updates(response.headers, "session_keepalive")
@@ -5733,24 +5771,24 @@ class XianyuLive:
                     self.last_session_keepalive_status = "success"
                     self.last_session_keepalive_error_message = None
                     self.last_session_keepalive_time = time.time()
-                    logger.info(f"【{self.account_id}】轻量会话保活成?")
+                    logger.info(f"【{self.account_id}】轻量会话保活成功")
                     return True
 
                 error_message = ' | '.join([str(ret) for ret in ret_value]) or '未知错误'
                 self.last_session_keepalive_error_message = error_message
                 self.last_session_keepalive_status = "auth_failed" if self._is_auth_failure_ret(ret_value) else "api_failed"
-                logger.warning(f"【{self.account_id}】轻量会话保活失? {error_message}")
+                logger.warning(f"【{self.account_id}】轻量会话保活失败: {error_message}")
                 return False
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             self.last_session_keepalive_status = "network_failed"
             self.last_session_keepalive_error_message = self._safe_str(e)
-            logger.warning(f"【{self.account_id}】轻量会话保活网络异? {self._safe_str(e)}")
+            logger.warning(f"【{self.account_id}】轻量会话保活网络异常: {self._safe_str(e)}")
             return False
         except Exception as e:
             self.last_session_keepalive_status = "exception"
             self.last_session_keepalive_error_message = self._safe_str(e)
-            logger.error(f"【{self.account_id}】轻量会话保活异? {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】轻量会话保活异常: {self._safe_str(e)}")
             return False
 
     async def _refresh_token_impl(self, captcha_retry_count: int = 0, post_slider_session_grace_used: bool = False,
@@ -5761,7 +5799,7 @@ class XianyuLive:
         current_account_id = self._canonical_account_id()
         log_account_id = current_account_id or "default"
         if not current_account_id:
-            logger.error(f"【{log_account_id}】Token刷新缺少 canonical account_id，拒绝继续运?")
+            logger.error(f"【{log_account_id}】Token刷新缺少 canonical account_id，拒绝继续运行")
             self.last_token_refresh_status = "missing_account_id"
             self.last_token_refresh_error_message = "missing canonical account_id for token refresh"
             return None
@@ -5773,7 +5811,7 @@ class XianyuLive:
             self.restarted_in_browser_refresh = False
 
             if captcha_retry_count >= self.max_captcha_verification_count:
-                logger.error(f"【{log_account_id}】滑块验证重试次数已达上?({self.max_captcha_verification_count})，停止重?")
+                logger.error(f"【{log_account_id}】滑块验证重试次数已达上限 ({self.max_captcha_verification_count})，停止重试")
                 self.last_token_refresh_status = "captcha_max_retries_exceeded"
                 self._clear_pending_slider_success_notice("滑块重试次数达到上限")
                 await self.send_token_refresh_notification(
@@ -5789,15 +5827,15 @@ class XianyuLive:
                 remaining_time = self.message_cookie_refresh_cooldown - time_since_last_message
                 remaining_minutes = int(remaining_time // 60)
                 remaining_seconds = int(remaining_time % 60)
-                logger.info(f"【{log_account_id}】收到消息后冷却中，放弃本次token刷新，还霢等待 {remaining_minutes}分{remaining_seconds}?")
+                logger.info(f"【{log_account_id}】收到消息后冷却中，放弃本次token刷新，还需等待 {remaining_minutes}分{remaining_seconds}秒")
                 self.last_token_refresh_status = "skipped_cooldown"
                 return None
 
             logger.info(f"【{log_account_id}】开始执行Cookie刷新任务...")
             if getattr(self, '_skip_db_cookie_reload_for_token_refresh', False):
-                logger.info(f"【{log_account_id}】当前Token刷新使用内存中的新认证Cookie，跳过token刷新前的数据库重?")
+                logger.info(f"【{log_account_id}】当前Token刷新使用内存中的新认证Cookie，跳过token刷新前的数据库重载")
             else:
-                self._reload_latest_cookies_from_db("token刷新?")
+                self._reload_latest_cookies_from_db("token刷新前")
 
             timestamp = str(int(time.time() * 1000))
 
@@ -5881,7 +5919,7 @@ class XianyuLive:
                             response_set_cookies
                         )
                         logger.info(
-                            f"【{log_account_id}】Token预检响应携带 {len(response_set_cookies)} 个临时Cookie?"
+                            f"【{log_account_id}】Token预检响应携带 {len(response_set_cookies)} 个临时Cookie，"
                             f"仅用于本次恢复链路，不提前写入数据库"
                         )
 
@@ -5918,10 +5956,10 @@ class XianyuLive:
                     if self._need_captcha_verification(res_json):
                         qr_login_grace = self.get_qr_login_grace(current_account_id)
                         if qr_login_grace and not qr_login_grace.get('captcha_buffer_used'):
-                            logger.warning(f"【{log_account_id}】扫码登录后的首轮Token刷新命中风控，先执行浏览器侧Cookie稳定?")
+                            logger.warning(f"【{log_account_id}】扫码登录后的首轮Token刷新命中风控，先执行浏览器侧Cookie稳定化")
                             log_captcha_event(
                                 current_account_id,
-                                "扫码登录首轮Token刷新命中风控，先执行浏览器侧稳定?",
+                                "扫码登录首轮Token刷新命中风控，先执行浏览器侧稳定化",
                                 None,
                                 f"触发场景: Token刷新, ret={res_json.get('ret', [])}"
                             )
@@ -5949,17 +5987,17 @@ class XianyuLive:
                                     manual_refresh_browser_stabilization_used=manual_refresh_browser_stabilization_used,
                                     post_slider_session_retry_count=post_slider_session_retry_count,
                                 )
-                            logger.warning(f"【{log_account_id}】浏览器侧Cookie稳定化未消除风控，继续进入滑块验?")
+                            logger.warning(f"【{log_account_id}】浏览器侧Cookie稳定化未消除风控，继续进入滑块验证")
 
                         manual_refresh_state = self.get_manual_refresh_state(current_account_id)
                         is_manual_refresh_handoff = bool(
                             manual_refresh_state and manual_refresh_state.get('phase') == 'handoff_recovery'
                         )
                         if is_manual_refresh_handoff and not manual_refresh_browser_stabilization_used:
-                            logger.warning(f"【{log_account_id}】手动刷新交接阶段首轮Token预检命中风控，先执行浏览器侧Cookie稳定?")
+                            logger.warning(f"【{log_account_id}】手动刷新交接阶段首轮Token预检命中风控，先执行浏览器侧Cookie稳定化")
                             log_captcha_event(
                                 current_account_id,
-                                "手动刷新交接阶段首轮Token预检命中风控，先执行浏览器侧稳定?",
+                                "手动刷新交接阶段首轮Token预检命中风控，先执行浏览器侧稳定化",
                                 None,
                                 f"触发场景: Token刷新, ret={res_json.get('ret', [])}"
                             )
@@ -6006,10 +6044,10 @@ class XianyuLive:
                             notification_sent = True
                             return None
 
-                        logger.warning(f"【{log_account_id}】检测到霢要滑块验证，弢始处?..")
+                        logger.warning(f"【{log_account_id}】检测到需要滑块验证，开始处理...")
 
-                        verification_url = res_json.get('data', {}).get('url', 'Token刷新时检?')
-                        log_captcha_event(current_account_id, "棢测到滑块验证", None, f"触发场景: Token刷新, URL: {verification_url}")
+                        verification_url = res_json.get('data', {}).get('url', 'Token刷新时检测')
+                        log_captcha_event(current_account_id, "检测到滑块验证", None, f"触发场景: Token刷新, URL: {verification_url}")
                         captcha_trigger_scene = 'token_refresh'
                         captcha_session_id = self._new_risk_session_id('slider')
                         captcha_event_meta = self._build_risk_event_meta(
@@ -6025,14 +6063,14 @@ class XianyuLive:
                                 session_id=captcha_session_id,
                                 trigger_scene=captcha_trigger_scene,
                                 result_code='slider_captcha_detected',
-                                event_description='棢测到滑块验证（Token刷新',
+                                event_description='检测到滑块验证（Token刷新）',
                                 processing_status='processing',
                                 event_meta=captcha_event_meta,
                             )
                             if log_id:
                                 logger.info(f"【{log_account_id}】风控日志记录成功，ID: {log_id}")
                         except Exception as log_e:
-                            logger.error(f"【{log_account_id}】记录风控日志失? {log_e}")
+                            logger.error(f"【{log_account_id}】记录风控日志失败: {log_e}")
 
                         try:
                             captcha_start_time = time.time()
@@ -6084,7 +6122,7 @@ class XianyuLive:
                                     post_slider_session_retry_count=0,
                                 )
                             else:
-                                logger.error(f"【{log_account_id}】滑块验证失?")
+                                logger.error(f"【{log_account_id}】滑块验证失败")
 
                                 if 'log_id' in locals() and log_id:
                                     self._update_risk_log(
@@ -6124,7 +6162,7 @@ class XianyuLive:
 
                                 notification_sent = True
                         except Exception as captcha_e:
-                            logger.error(f"【{log_account_id}】滑块验证处理异? {self._safe_str(captcha_e)}")
+                            logger.error(f"【{log_account_id}】滑块验证处理异常: {self._safe_str(captcha_e)}")
                             self._clear_pending_slider_success_notice("滑块验证处理异常")
 
                             captcha_duration = time.time() - captcha_start_time if 'captcha_start_time' in locals() else 0
@@ -6176,7 +6214,7 @@ class XianyuLive:
                                     ),
                                 )
                             except Exception as log_e:
-                                logger.error(f"【{log_account_id}】记录风控日志失? {log_e}")
+                                logger.error(f"【{log_account_id}】记录风控日志失败: {log_e}")
 
                             if self.is_manual_refresh_active(current_account_id, allow_handoff_recovery=True):
                                 logger.warning(f"【{log_account_id}】检测到手动刷新进行中，跳过自动密码登录刷新")
@@ -6205,8 +6243,8 @@ class XianyuLive:
                             if recent_slider_success and not post_slider_session_grace_used:
                                 grace_delay = random.uniform(1.2, 2.2)
                                 logger.warning(
-                                    f"【{log_account_id}】检测到朢?{self.slider_success_reentry_window}s 内刚通过滑块?"
-                                    f"先等?{grace_delay:.2f}s 并重载Cookie后再试一次Token刷新"
+                                    f"【{log_account_id}】检测到最近 {self.slider_success_reentry_window}s 内刚通过滑块，"
+                                    f"先等待 {grace_delay:.2f}s 并重载Cookie后再试一次Token刷新"
                                 )
                                 log_captcha_event(
                                     current_account_id,
@@ -6232,7 +6270,7 @@ class XianyuLive:
                                 settle_retry_attempt = post_slider_session_retry_count + 1
                                 settle_delay = random.uniform(2.4, 3.6) + ((settle_retry_attempt - 1) * 0.8)
                                 logger.warning(
-                                    f"【{log_account_id}】预棢模式下滑块成功后仍返回{expire_type}?"
+                                    f"【{log_account_id}】预检模式下滑块成功后仍返回{expire_type}，"
                                     f"执行第{settle_retry_attempt}/{max_post_slider_session_retries}次稳定重试，"
                                     f"等待 {settle_delay:.2f}s 后再次尝试Token刷新"
                                 )
@@ -6308,7 +6346,7 @@ class XianyuLive:
                     if self.last_token_refresh_status in (None, "started"):
                         self.last_token_refresh_status = "token_refresh_failed"
                     self.last_token_refresh_error_message = json.dumps(res_json, ensure_ascii=False, separators=(',', ':'))
-                    self._clear_pending_slider_success_notice("Token刷新朢终失?")
+                    self._clear_pending_slider_success_notice("Token刷新最终失败")
                     logger.error(f"【{log_account_id}】Token刷新失败: {res_json}")
 
                     self.current_token = None
@@ -6326,7 +6364,7 @@ class XianyuLive:
                             logger.warning(f"【{log_account_id}】WebSocket未连接，发Token刷新失败通知")
                             await self.send_token_refresh_notification(f"Token刷新失败: {res_json}", "token_refresh_failed")
                     else:
-                        logger.info(f"【{log_account_id}】已发滑块验证相关知，跳过Token刷新失败通知")
+                        logger.info(f"【{log_account_id}】已发滑块验证相关通知，跳过Token刷新失败通知")
                     return None
 
         except Exception as e:
@@ -6347,10 +6385,10 @@ class XianyuLive:
                 if is_ws_connected:
                     logger.info(f"【{log_account_id}】WebSocket连接正常，Token刷新异常可能是暂时的，跳过失败知")
                 else:
-                    logger.warning(f"【{log_account_id}】WebSocket未连接，发Token刷新异常通知")
+                    logger.warning(f"【{log_account_id}】WebSocket未连接，发送Token刷新异常通知")
                     await self.send_token_refresh_notification(f"Token刷新异常: {str(e)}", "token_refresh_exception")
             else:
-                logger.info(f"【{log_account_id}】已发滑块验证相关知，跳过Token刷新异常通知")
+                logger.info(f"【{log_account_id}】已发滑块验证相关通知，跳过Token刷新异常通知")
             return None
 
     def _need_captcha_verification(self, res_json: dict) -> bool:
@@ -6362,17 +6400,17 @@ class XianyuLive:
             account_log_label = current_account_id or "default"
 
             res_json_str = json.dumps(res_json, ensure_ascii=False, separators=(',', ':'))
-            log_captcha_event(current_account_id, "棢查滑块验证响?", None, f"res_json内容: {res_json_str}")
+            log_captcha_event(current_account_id, "检查滑块验证响应", None, f"res_json内容: {res_json_str}")
 
             ret_value = res_json.get('ret', [])
 
             captcha_keywords = [
                 'FAIL_SYS_USER_VALIDATE',
                 'RGV587_ERROR',
-                '哎哟?被挤爆啦',
+                '哎哟喂，被挤爆啦',
                 '哎哟喂，被挤爆啦',
                 '挤爆',
-                '请稍后重',
+                '请稍后重试',
                 'punish?x5secdata',
                 'captcha',
                 ]
@@ -6381,7 +6419,7 @@ class XianyuLive:
 
             for keyword in captcha_keywords:
                 if keyword in error_msg:
-                    logger.info(f"【{account_log_label}】检测到霢要滑块验证的关键? {keyword}")
+                    logger.info(f"【{account_log_label}】检测到需要滑块验证的关键词: {keyword}")
                     return True
 
             data = res_json.get('data', {})
@@ -6408,7 +6446,7 @@ class XianyuLive:
     ):
         canonical_account_id = self._canonical_account_id()
         if not canonical_account_id:
-            raise RuntimeError("滑块验证缺少 canonical account_id，无法申请账号级浏览?runtime")
+            raise RuntimeError("滑块验证缺少 canonical account_id，无法申请账号级浏览器 runtime")
 
         request_builder = getattr(slider, "build_managed_runtime_request", None)
         if not callable(request_builder):
@@ -6489,7 +6527,7 @@ class XianyuLive:
                 verification_url = data.get('url')
 
             if not verification_url:
-                logger.info(f"【{current_account_id}】未找到验证URL，认为不霢要滑块验证，返回正常")
+                logger.info(f"【{current_account_id}】未找到验证URL，认为不需要滑块验证，返回正常")
                 return None
 
             logger.info(f"【{current_account_id}】验证URL: {verification_url}")
@@ -6574,7 +6612,7 @@ class XianyuLive:
                     )
 
                     if missing_required_fields:
-                        logger.error(f"【{self.account_id}】滑块验证后的Cookie仍缺失核心字段，放弃写回数据? {', '.join(missing_required_fields)}")
+                        logger.error(f"【{self.account_id}】滑块验证后的Cookie仍缺失核心字段，放弃写回数据库: {', '.join(missing_required_fields)}")
                         return None
 
                     try:
@@ -6596,7 +6634,7 @@ class XianyuLive:
 
                         x5sec_cookies_str = "; ".join([f"{k}={v}" for k, v in x5sec_cookies.items()]) if x5sec_cookies else "?"
                         log_captcha_event(current_account_id, "滑块验证成功并自动更新数据库", True,
-                            f"原有{len(current_cookies_dict)}个cookie? 浏览器快照{len(cookies)}? 合并后{len(updated_cookies)}? 变更字段{len(changed_fields)}? 新增字段{len(new_fields)}? 保护保留{len(preserved_protected_fields)}? 实际移除{len(removed_fields)}? x5 cookies: {x5sec_cookies_str}")
+                            f"原有{len(current_cookies_dict)}个cookie项, 浏览器快照{len(cookies)}个, 合并后{len(updated_cookies)}个, 变更字段{len(changed_fields)}个, 新增字段{len(new_fields)}个, 保护保留{len(preserved_protected_fields)}个, 实际移除{len(removed_fields)}个, x5 cookies: {x5sec_cookies_str}")
 
                     except Exception as update_e:
                         logger.error(f"【{current_account_id}】自动更新数据库cookies失败: {self._safe_str(update_e)}")
@@ -6609,7 +6647,7 @@ class XianyuLive:
 
                         x5sec_cookies_str = "; ".join([f"{k}={v}" for k, v in x5sec_cookies.items()]) if x5sec_cookies else "?"
                         log_captcha_event(current_account_id, "滑块验证成功但数据库更新失败", False,
-                            f"更新异常: {self._safe_str(update_e)[:100]}, 变更字段{len(changed_fields)}? 新增字段{len(new_fields)}? 保护保留{len(preserved_protected_fields)}? 获取到的x5 cookies: {x5sec_cookies_str}")
+                            f"更新异常: {self._safe_str(update_e)[:100]}, 变更字段{len(changed_fields)}个, 新增字段{len(new_fields)}个, 保护保留{len(preserved_protected_fields)}个, 获取到的x5 cookies: {x5sec_cookies_str}")
 
                         await self.send_token_refresh_notification(
                             f"滑块验证成功但数据库更新失败: {self._safe_str(update_e)}",
@@ -6620,7 +6658,7 @@ class XianyuLive:
 
                     return cookies_str
                 else:
-                    logger.error(f"【{current_account_id}】滑块验证失?")
+                    logger.error(f"【{current_account_id}】滑块验证失败")
                     slider_error = getattr(slider_stealth, 'last_login_error', '') or "滑块验证失败，未获取到新Cookie"
                     self.last_token_refresh_status = "captcha_verification_failed"
                     self.last_token_refresh_error_message = slider_error
@@ -6646,10 +6684,10 @@ class XianyuLive:
 
             except ImportError as import_e:
                 logger.error(f"【{current_account_id}】XianyuSliderStealth导入失败: {import_e}")
-                logger.error(f"【{current_account_id}】请安装 CloakBrowser 运行? python -m cloakbrowser install")
+                logger.error(f"【{current_account_id}】请安装 CloakBrowser 运行时: python -m cloakbrowser install")
 
                 log_captcha_event(current_account_id, "XianyuSliderStealth导入失败", False,
-                    f"Playwright未安? 错误: {import_e}")
+                    f"Playwright未安装, 错误: {import_e}")
 
                 await self.send_token_refresh_notification(
                     f"滑块验证功能不可用，请安装Playwright。验证URL: {verification_url}",
@@ -6658,7 +6696,7 @@ class XianyuLive:
                 return None
 
             except Exception as stealth_e:
-                logger.error(f"【{current_account_id}】滑块验证异? {self._safe_str(stealth_e)}")
+                logger.error(f"【{current_account_id}】滑块验证异常: {self._safe_str(stealth_e)}")
                 self.last_token_refresh_status = "captcha_execution_error"
                 self.last_token_refresh_error_message = self._safe_str(stealth_e)
 
@@ -6690,18 +6728,18 @@ class XianyuLive:
     async def _update_cookies_and_restart(self, new_cookies_str: str):
         log_account_id = self._canonical_account_id() or "default"
         try:
-            logger.info(f"【{log_account_id}】开始更新cookies并重启任?..")
+            logger.info(f"【{log_account_id}】开始更新cookies并重启任务...")
 
             if not new_cookies_str or not new_cookies_str.strip():
-                logger.error(f"【{log_account_id}】新cookies为空，无法更?")
+                logger.error(f"【{log_account_id}】新cookies为空，无法更新")
                 return False
 
             try:
                 new_cookies_dict = trans_cookies(new_cookies_str)
                 if not new_cookies_dict:
-                    logger.error(f"【{log_account_id}】新cookies解析失败，无法更?")
+                    logger.error(f"【{log_account_id}】新cookies解析失败，无法更新")
                     return False
-                logger.info(f"【{log_account_id}】新cookies解析成功，包?{len(new_cookies_dict)} 个字?")
+                logger.info(f"【{log_account_id}】新cookies解析成功，包含 {len(new_cookies_dict)} 个字段")
             except Exception as parse_e:
                 logger.error(f"【{log_account_id}】新cookies解析异常: {self._safe_str(parse_e)}")
                 return False
@@ -6732,7 +6770,7 @@ class XianyuLive:
 
                 if merge_result['missing_required_fields']:
                     logger.error(
-                        f"【{log_account_id}】密码登录刷新后的Cookie仍缺失核心字段，放弃写回并重? {', '.join(merge_result['missing_required_fields'])}"
+                        f"【{log_account_id}】密码登录刷新后的Cookie仍缺失核心字段，放弃写回并重启: {', '.join(merge_result['missing_required_fields'])}"
                     )
                     return False
 
@@ -6741,7 +6779,7 @@ class XianyuLive:
 
             except Exception as merge_e:
                 logger.error(f"【{log_account_id}】cookies合并异常: {self._safe_str(merge_e)}")
-                logger.warning(f"【{log_account_id}】将使用原始新cookies（不合并?")
+                logger.warning(f"【{log_account_id}】将使用原始新cookies（不合并）")
 
             old_cookies_str = self.cookies_str
             old_cookies_dict = self.cookies.copy()
@@ -6756,7 +6794,7 @@ class XianyuLive:
                 await self.update_config_cookies()
                 logger.info(f"【{log_account_id}】数据库cookies更新成功")
 
-                logger.info(f"【{log_account_id}】cookies更新成功，准备重启任?..")
+                logger.info(f"【{log_account_id}】cookies更新成功，准备重启任务...")
 
                 logger.info(f"【{log_account_id}】过CookieManager触发重启...")
                 await self._restart_instance()
@@ -6774,7 +6812,7 @@ class XianyuLive:
                         source="password_login_refresh_rollback",
                     )
                     await self.update_config_cookies()
-                    logger.info(f"【{log_account_id}】cookies已回滚到原始状?")
+                    logger.info(f"【{log_account_id}】cookies已回滚到原始状态")
                 except Exception as rollback_e:
                     logger.error(f"【{log_account_id}】cookies回滚失败: {self._safe_str(rollback_e)}")
 
@@ -6809,8 +6847,8 @@ class XianyuLive:
                     logger.error(f"【{log_account_id}】更新数据库Cookie失败: {self._safe_str(e)}")
                     await self.send_token_refresh_notification(f"数据库Cookie更新失败: {str(e)}", "db_update_failed")
             else:
-                logger.warning("account_id不存在，无法更新数据?")
-                await self.send_token_refresh_notification("account_id不存在，无法更新数据?", "account_id_missing")
+                logger.warning("account_id不存在，无法更新数据")
+                await self.send_token_refresh_notification("account_id不存在，无法更新数据", "account_id_missing")
 
         except Exception as e:
             logger.error(f"【{self._canonical_account_id() or 'default'}】更新Cookie失败: {self._safe_str(e)}")
@@ -6828,9 +6866,9 @@ class XianyuLive:
         risk_log_started_at = time.time()
         runtime_account_id = self._canonical_account_id()
         log_account_id = runtime_account_id or "default"
-        logger.warning(f"【{log_account_id}】检测到{trigger_reason}，准备刷新Cookie并重启实?..")
+        logger.warning(f"【{log_account_id}】检测到{trigger_reason}，准备刷新Cookie并重启实例...")
         if not runtime_account_id:
-            logger.error("【default】密码登录刷新缺?canonical account_id，无法继续申请账号级浏览?runtime")
+            logger.error("【default】密码登录刷新缺少 canonical account_id，无法继续申请账号级浏览器 runtime")
             return False
         base_event_meta = {'account_id': runtime_account_id, 'trigger_reason': trigger_reason}
 
@@ -6852,10 +6890,10 @@ class XianyuLive:
                 event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
             )
         except Exception as log_e:
-            logger.error(f"【{log_account_id}】记录风控日志失? {log_e}")
+            logger.error(f"【{log_account_id}】记录风控日志失败: {log_e}")
 
         if self.is_manual_refresh_active(runtime_account_id, allow_handoff_recovery=True):
-            logger.warning(f"【{log_account_id}】手动刷新进行中，跳过自动密码登录刷?")
+            logger.warning(f"【{log_account_id}】手动刷新进行中，跳过自动密码登录刷新")
             if refresh_risk_log_id:
                 self._update_risk_log(
                     refresh_risk_log_id,
@@ -6882,13 +6920,13 @@ class XianyuLive:
                     ignore_slider_failed_backoff or self.consume_manual_refresh_slider_failed_bypass(runtime_account_id)
                 ):
                     logger.warning(
-                        f"【{log_account_id}】检测到朢近刚通过滑块或处于刷新交接恢复窗口，忽略丢次旧?slider_failed 逢避并继续尝试密码登录刷新"
+                        f"【{log_account_id}】检测到最近刚通过滑块或处于刷新交接恢复窗口，忽略一次旧的 slider_failed 退避并继续尝试密码登录刷新"
                     )
                     XianyuLive.clear_password_login_failure_backoff(runtime_account_id)
                     failure_backoff = None
                 else:
                     logger.warning(
-                        f"【{log_account_id}】密码登录失败避中（原? {backoff_reason}），还需等待 {remaining_time:.1f} ?"
+                        f"【{log_account_id}】密码登录失败退避中（原因: {backoff_reason}），还需等待 {remaining_time:.1f} 秒"
                     )
                     if refresh_risk_log_id:
                         self._update_risk_log(
@@ -6897,7 +6935,7 @@ class XianyuLive:
                             trigger_scene=trigger_scene,
                             result_code='password_login_backoff',
                             processing_status='failed',
-                            error_message=f"密码登录失败逢避中，剩余{remaining_time:.1f}?",
+                            error_message=f"密码登录失败退避中，剩余{remaining_time:.1f}秒",
                             duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
                             event_meta=self._build_risk_event_meta(
                                 trigger_scene=trigger_scene,
@@ -6911,7 +6949,7 @@ class XianyuLive:
 
         if last_password_login > 0 and time_since_last_login < XianyuLive._password_login_cooldown:
             remaining_time = XianyuLive._password_login_cooldown - time_since_last_login
-            logger.warning(f"【{log_account_id}】距离上次密码登录仅 {time_since_last_login:.1f} 秒，仍在冷却期内（还霢等待 {remaining_time:.1f} 秒），跳过密码登?")
+            logger.warning(f"【{log_account_id}】距离上次密码登录仅 {time_since_last_login:.1f} 秒，仍在冷却期内（还需等待 {remaining_time:.1f} 秒），跳过密码登录")
             logger.warning(f"【{log_account_id}】提示：如果新Cookie仍然无效，请棢查账号状态或手动更新Cookie")
             if refresh_risk_log_id:
                 self._update_risk_log(
@@ -6920,7 +6958,7 @@ class XianyuLive:
                     trigger_scene=trigger_scene,
                     result_code='password_login_cooldown',
                     processing_status='failed',
-                    error_message=f"密码登录冷却期内，剩余{remaining_time:.1f}?",
+                    error_message=f"密码登录冷却期内，剩余{remaining_time:.1f}秒",
                     duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
                     event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
                 )
@@ -6932,7 +6970,7 @@ class XianyuLive:
         )
         if not recovery_lock_acquired:
             existing_owner = (existing_lock or {}).get('owner', 'unknown')
-            logger.warning(f"【{log_account_id}】认证恢复流程已在执行中，跳过本次重复触? owner={existing_owner}")
+            logger.warning(f"【{log_account_id}】认证恢复流程已在执行中，跳过本次重复触发: owner={existing_owner}")
             if refresh_risk_log_id:
                 self._update_risk_log(
                     refresh_risk_log_id,
@@ -6949,14 +6987,14 @@ class XianyuLive:
                 )
             return False
 
-        log_captcha_event(runtime_account_id, f"{trigger_reason}触发Cookie刷新和实例重?", None,
-            f"棢测到{trigger_reason}，准备刷新Cookie并重启实?")
+        log_captcha_event(runtime_account_id, f"{trigger_reason}触发Cookie刷新和实例重启", None,
+            f"检测到{trigger_reason}，准备刷新Cookie并重启实例")
 
         try:
             account_info = db_manager.get_cookie_details(runtime_account_id)
 
             if not account_info:
-                logger.error(f"【{log_account_id}】无法获取账号信?")
+                logger.error(f"【{log_account_id}】无法获取账号信息")
                 self.last_token_refresh_error_message = "无法获取账号信息"
                 if refresh_risk_log_id:
                     self._update_risk_log(
@@ -7050,8 +7088,8 @@ class XianyuLive:
             slider.risk_trigger_scene = trigger_scene
             if reuse_account_persistent_profile:
                 logger.warning(
-                    f"【{log_account_id}】{reuse_account_persistent_profile_reason}?"
-                    "优先复用账号持久化画像，禁用干净上下?"
+                    f"【{log_account_id}】{reuse_account_persistent_profile_reason}，"
+                    "优先复用账号持久化画像，禁用干净上下文"
                 )
             result = await slider._run_sync_method_on_fresh_thread(
                 self._run_password_login_with_managed_runtime,
@@ -7111,27 +7149,27 @@ class XianyuLive:
 
                 result = merge_result['merged_cookies_dict']
 
-                logger.info(f"【{log_account_id}?========= 密码登录Cookie字段详情 ==========")
-                logger.info(f"【{log_account_id}】Cookie字段? {len(result)}")
+                logger.info(f"【{log_account_id}】========== 密码登录Cookie字段详情 ==========")
+                logger.info(f"【{log_account_id}】Cookie字段数: {len(result)}")
                 logger.info(f"【{log_account_id}】Cookie字段列表:")
                 for i, (key, value) in enumerate(result.items(), 1):
                     if len(str(value)) > 50:
-                        logger.info(f"【{log_account_id}? {i:2d}. {key}: {str(value)[:30]}...{str(value)[-20:]} (长度: {len(str(value))})")
+                        logger.info(f"【{log_account_id}】  {i:2d}. {key}: {str(value)[:30]}...{str(value)[-20:]} (长度: {len(str(value))})")
                     else:
-                        logger.info(f"【{log_account_id}? {i:2d}. {key}: {value}")
+                        logger.info(f"【{log_account_id}】  {i:2d}. {key}: {value}")
 
                 important_keys = list(REQUIRED_SESSION_COOKIE_FIELDS) + list(OBSERVED_SESSION_COOKIE_FIELDS)
-                logger.info(f"【{log_account_id}】关键字段检?")
+                logger.info(f"【{log_account_id}】关键字段检查:")
                 for key in important_keys:
                     if key in result:
                         val = result[key]
-                        logger.info(f"【{log_account_id}? ?{key}: {'存在' if val else '为空'} (长度: {len(str(val)) if val else 0})")
+                        logger.info(f"【{log_account_id}】  ✅ {key}: {'存在' if val else '为空'} (长度: {len(str(val)) if val else 0})")
                     else:
-                        logger.info(f"【{log_account_id}? ?{key}: 缺失")
-                logger.info(f"【{log_account_id}?=========================================")
+                        logger.info(f"【{log_account_id}】  ❌ {key}: 缺失")
+                logger.info(f"【{log_account_id}】==========================================")
 
                 new_cookies_str = '; '.join([f"{k}={v}" for k, v in result.items()])
-                logger.info(f"【{log_account_id}】Cookie字符串摘? {self._summarize_cookie_string(new_cookies_str)}")
+                logger.info(f"【{log_account_id}】Cookie字符串摘要: {self._summarize_cookie_string(new_cookies_str)}")
 
                 try:
                     preflight_xianyu = XianyuLive(
@@ -7145,7 +7183,7 @@ class XianyuLive:
                         new_cookies_str = preflight_xianyu.cookies_str
                         result = trans_cookies(new_cookies_str)
                         logger.info(f"【{log_account_id}】密码登录后的Token预检通过，将使用预检确认后的Cookie继续交接")
-                        logger.info(f"【{log_account_id}】预棢后Cookie字符串摘? {self._summarize_cookie_string(new_cookies_str)}")
+                        logger.info(f"【{log_account_id}】预检后Cookie字符串摘要: {self._summarize_cookie_string(new_cookies_str)}")
                 except Exception as preflight_err:
                     preflight_error = self._safe_str(preflight_err)
                     logger.error(f"【{log_account_id}】密码登录成功，但Token预检失败: {preflight_error}")
@@ -7164,7 +7202,7 @@ class XianyuLive:
                         )
                     return False
 
-                logger.warning(f"【{log_account_id}】已记录密码登录时间，冷却期 {XianyuLive._password_login_cooldown} ?")
+                logger.warning(f"【{log_account_id}】已记录密码登录时间，冷却期 {XianyuLive._password_login_cooldown} 秒")
 
                 try:
                     await self.send_token_refresh_notification(
@@ -7172,12 +7210,12 @@ class XianyuLive:
                         "cookie_refresh_success"
                     )
                 except Exception as notify_e:
-                    logger.warning(f"【{log_account_id}】发送知失败: {self._safe_str(notify_e)}")
+                    logger.warning(f"【{log_account_id}】发送通知失败: {self._safe_str(notify_e)}")
 
                 update_success = await self._update_cookies_and_restart(new_cookies_str)
 
                 if update_success:
-                    logger.info(f"【{log_account_id}】Cookie更新并重启任务成?")
+                    logger.info(f"【{log_account_id}】Cookie更新并重启任务成功")
                     if refresh_risk_log_id:
                         self._update_risk_log(
                             refresh_risk_log_id,
@@ -7211,7 +7249,7 @@ class XianyuLive:
                 backoff_reason, backoff_seconds = XianyuLive.classify_password_login_failure(login_error)
                 XianyuLive.set_password_login_failure_backoff(runtime_account_id, backoff_reason, backoff_seconds)
                 logger.warning(f"【{log_account_id}】密码登录失败，未获取到Cookie: {login_error}")
-                logger.warning(f"【{log_account_id}】已进入失败逢避期: {backoff_reason}, {backoff_seconds}?")
+                logger.warning(f"【{log_account_id}】已进入失败退避期: {backoff_reason}, {backoff_seconds}秒")
                 if refresh_risk_log_id:
                     self._update_risk_log(
                         refresh_risk_log_id,
@@ -7232,9 +7270,9 @@ class XianyuLive:
             self.last_token_refresh_error_message = self._safe_str(refresh_e)
             backoff_reason, backoff_seconds = XianyuLive.classify_password_login_failure(str(refresh_e))
             XianyuLive.set_password_login_failure_backoff(runtime_account_id, backoff_reason, backoff_seconds)
-            logger.error(f"【{log_account_id}】Cookie刷新或实例重启失? {self._safe_str(refresh_e)}")
+            logger.error(f"【{log_account_id}】Cookie刷新或实例重启失败: {self._safe_str(refresh_e)}")
             import traceback
-            logger.error(f"【{log_account_id}】详细堆?\n{traceback.format_exc()}")
+            logger.error(f"【{log_account_id}】详细堆栈:\n{traceback.format_exc()}")
             if refresh_risk_log_id:
                 self._update_risk_log(
                     refresh_risk_log_id,
@@ -7330,7 +7368,7 @@ class XianyuLive:
             )
 
     async def _verify_cookie_validity(self) -> dict:
-        logger.info(f"【{self.account_id}】开始验证Cookie有效性（使用真实API调用?..")
+        logger.info(f"【{self.account_id}】开始验证Cookie有效性（使用真实API调用）...")
 
         result = {
             'valid': True,
@@ -7343,7 +7381,7 @@ class XianyuLive:
         }
 
         try:
-            logger.info(f"?{self.account_id}???????API????????????...")
+            logger.info(f"【{self.account_id}】测试确认发货API（使用测试数据实际调用）...")
 
             if not self.session:
                 connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
@@ -7364,56 +7402,56 @@ class XianyuLive:
                 error_msg = str(response.get('error', ''))
                 success = response.get('success', False)
 
-                if 'Session??' in error_msg or 'SESSION_EXPIRED' in error_msg:
-                    logger.warning(f"?{self.account_id}?? ????API????: Session??")
+                if 'Session过期' in error_msg or 'SESSION_EXPIRED' in error_msg:
+                    logger.warning(f"【{self.account_id}】❌ 确认发货API验证失败: Session过期")
                     result['confirm_api'] = False
                     result['valid'] = False
-                    result['details'].append('????API: Session??')
-                elif '????' in error_msg or 'TOKEN_EXPIRED' in error_msg:
-                    logger.warning(f"?{self.account_id}?? ????API????: ????")
+                    result['details'].append('确认发货API: Session过期')
+                elif '令牌过期' in error_msg or 'TOKEN_EXPIRED' in error_msg:
+                    logger.warning(f"【{self.account_id}】❌ 确认发货API验证失败: 令牌过期")
                     result['confirm_api'] = False
                     result['valid'] = False
-                    result['details'].append('????API: ????')
+                    result['details'].append('确认发货API: 令牌过期')
                 elif success:
-                    logger.info(f"?{self.account_id}?? ????API????: API????")
+                    logger.info(f"【{self.account_id}】✅ 确认发货API验证通过: API调用成功")
                     result['confirm_api'] = True
-                    result['details'].append('????API: ????')
+                    result['details'].append('确认发货API: 通过验证')
                 elif error_msg and len(error_msg) > 0:
-                    logger.info(f"?{self.account_id}?? ????API????: Cookie????????? {error_msg[:50]}?")
+                    logger.info(f"【{self.account_id}】✅ 确认发货API验证通过: Cookie有效（返回业务错误: {error_msg[:50]}）")
                     result['confirm_api'] = True
-                    result['details'].append(f'????API: Cookie????????? ({error_msg[:50]})')
+                    result['details'].append(f'确认发货API: Cookie有效（返回业务错误: {error_msg[:50]}）')
                 else:
-                    logger.warning(f"?{self.account_id}??? ????API????: ?????")
+                    logger.warning(f"【{self.account_id}】⚠️ 确认发货API验证警告: 响应不明确")
                     result['confirm_api'] = None
                     result['inconclusive'] = True
                     if result['valid']:
                         result['relogin_recommended'] = False
-                    result['details'].append('????API: ?????')
+                    result['details'].append('确认发货API: 响应不明确')
             else:
-                logger.warning(f"?{self.account_id}??? ????API????: ???")
+                logger.warning(f"【{self.account_id}】⚠️ 确认发货API验证警告: 无响应")
                 result['confirm_api'] = None
                 result['inconclusive'] = True
                 if result['valid']:
                     result['relogin_recommended'] = False
-                result['details'].append('????API: ???')
+                result['details'].append('确认发货API: 无响应')
 
         except Exception as e:
             error_str = self._safe_str(e)
-            if 'Session??' in error_str or 'SESSION_EXPIRED' in error_str:
-                logger.warning(f"?{self.account_id}?? ????API????: Session??")
+            if 'Session过期' in error_str or 'SESSION_EXPIRED' in error_str:
+                logger.warning(f"【{self.account_id}】❌ 确认发货API验证失败: Session过期")
                 result['confirm_api'] = False
                 result['valid'] = False
-                result['details'].append('????API: Session??')
+                result['details'].append('确认发货API: Session过期')
             else:
-                logger.error(f"?{self.account_id}?????API????: {error_str}")
+                logger.error(f"【{self.account_id}】确认发货API验证异常: {error_str}")
                 result['confirm_api'] = None
                 result['inconclusive'] = True
                 if result['valid']:
                     result['relogin_recommended'] = False
-                result['details'].append(f'????API: ?????????? - {error_str[:50]}')
+                result['details'].append(f'确认发货API: 调用异常(可能非Cookie问题) - {error_str[:50]}')
 
         try:
-            logger.info(f"【{self.account_id}】测试网页登录（访问 IM 页面?..")
+            logger.info(f"【{self.account_id}】测试网页登录态（访问 IM 页面）...")
 
             if not self.session:
                 connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
@@ -7439,45 +7477,45 @@ class XianyuLive:
                 )
 
                 if redirected_to_login or response.status in (401, 403):
-                    logger.warning(f"【{self.account_id}】❌ 网页登录态验证失? 已进入登?验证?({final_url})")
+                    logger.warning(f"【{self.account_id}】❌ 网页登录态验证失败: 已进入登录/验证页 ({final_url})")
                     result['web_session_api'] = False
                     result['valid'] = False
-                    result['details'].append("网页登录? 已重定向到登?验证?")
+                    result['details'].append("网页登录态: 已重定向到登录/验证页")
                 elif response.status >= 500:
-                    logger.warning(f"【{self.account_id}】⚠?网页登录态验证遇到服务端异常: HTTP {response.status}")
+                    logger.warning(f"【{self.account_id}】⚠️ 网页登录态验证遇到服务端异常: HTTP {response.status}")
                     result['web_session_api'] = None
                     result['inconclusive'] = True
                     if result['valid']:
                         result['relogin_recommended'] = False
-                    result['details'].append(f"网页登录? 服务端异常，结果不确?(HTTP {response.status})")
+                    result['details'].append(f"网页登录态: 服务端异常，结果不确定 (HTTP {response.status})")
                 elif response.status == 200:
                     logger.info(f"【{self.account_id}】✅ 网页登录态验证过: {final_url}")
                     result['web_session_api'] = True
-                    result['details'].append("网页登录? 通过验证")
+                    result['details'].append("网页登录态: 通过验证")
                 else:
-                    logger.warning(f"【{self.account_id}】⚠?网页登录态验证结果不明确: HTTP {response.status}, URL={final_url}")
+                    logger.warning(f"【{self.account_id}】⚠️ 网页登录态验证结果不明确: HTTP {response.status}, URL={final_url}")
                     result['web_session_api'] = None
                     result['inconclusive'] = True
                     if result['valid']:
                         result['relogin_recommended'] = False
-                    result['details'].append(f"网页登录? 结果不明?(HTTP {response.status})")
+                    result['details'].append(f"网页登录态: 结果不明确 (HTTP {response.status})")
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             error_str = self._safe_str(e)
-            logger.warning(f"【{self.account_id}】⚠?网页登录态验证网络异? {error_str}")
+            logger.warning(f"【{self.account_id}】⚠️ 网页登录态验证网络异常: {error_str}")
             result['web_session_api'] = None
             result['inconclusive'] = True
             if result['valid']:
                 result['relogin_recommended'] = False
-            result['details'].append(f"网页登录? 网络异常，结果不确定 ({error_str[:50]})")
+            result['details'].append(f"网页登录态: 网络异常，结果不确定 ({error_str[:50]})")
         except Exception as e:
             error_str = self._safe_str(e)
-            logger.error(f"【{self.account_id}】网页登录验证异? {error_str}")
+            logger.error(f"【{self.account_id}】网页登录态验证异常: {error_str}")
             result['web_session_api'] = None
             result['inconclusive'] = True
             if result['valid']:
                 result['relogin_recommended'] = False
-            result['details'].append(f"网页登录? 验证异常，结果不确定 - {error_str[:50]}")
+            result['details'].append(f"网页登录态: 验证异常，结果不确定 - {error_str[:50]}")
 
         try:
             logger.info(f"【{self.account_id}】测试图片上传API（使用测试图片实际上传）...")
@@ -7513,7 +7551,7 @@ class XianyuLive:
                         is_retryable_auth = error_type == 'auth' and error_message == '返回登录页面' and result['web_session_api'] is not False
                         if attempt == 0 and is_retryable_auth:
                             logger.warning(
-                                f"【{self.account_id}】图片上传校验首次返回登录页，但网页登录态仍可访问，1.5秒后重试丢?"
+                                f"【{self.account_id}】图片上传校验首次返回登录页，但网页登录态仍可访问，1.5秒后重试一次"
                             )
                             await asyncio.sleep(1.5)
                             continue
@@ -7529,19 +7567,19 @@ class XianyuLive:
                     error_type = getattr(uploader, 'last_error_type', None)
                     error_message = getattr(uploader, 'last_error_message', None) or "未知原因"
                     if error_type == 'network':
-                        logger.warning(f"【{self.account_id}】⚠?图片上传API验证遇到网络异常，不判定为Cookie失效: {error_message}")
+                        logger.warning(f"【{self.account_id}】⚠️ 图片上传API验证遇到网络异常，不判定为Cookie失效: {error_message}")
                         result['image_api'] = None
                         result['inconclusive'] = True
                         if result['valid']:
                             result['relogin_recommended'] = False
                         result['details'].append(f"图片上传API: 网络异常，结果不确定 ({error_message[:50]})")
                     elif error_type == 'http' and getattr(uploader, 'last_http_status', None) and uploader.last_http_status >= 500:
-                        logger.warning(f"【{self.account_id}】⚠?图片上传API返回服务端异常，不判定为Cookie失效: HTTP {uploader.last_http_status}")
+                        logger.warning(f"【{self.account_id}】⚠️ 图片上传API返回服务端异常，不判定为Cookie失效: HTTP {uploader.last_http_status}")
                         result['image_api'] = None
                         result['inconclusive'] = True
                         if result['valid']:
                             result['relogin_recommended'] = False
-                        result['details'].append(f"图片上传API: 服务端异常，结果不确?(HTTP {uploader.last_http_status})")
+                        result['details'].append(f"图片上传API: 服务端异常，结果不确定 (HTTP {uploader.last_http_status})")
                     elif error_type == 'auth' and error_message == '返回登录页面':
                         logger.warning(
                             f"【{self.account_id}】❌ 图片上传接口返回登录页，按旧版严格策略判定Cookie失效"
@@ -7586,13 +7624,13 @@ class XianyuLive:
         elif result['web_session_api'] is False and result['image_api'] is True:
             logger.warning(f"【{self.account_id}】❌ 网页登录态与图片上传校验结果不一致，按严格策略判定Cookie失效")
             result['valid'] = False
-            result['details'].append("校验结果: 网页登录态与图片上传结果不一?")
+            result['details'].append("校验结果: 网页登录态与图片上传结果不一致")
 
         if result['valid']:
             if result['inconclusive']:
-                logger.warning(f"【{self.account_id}】⚠?Cookie验证结果不确? 未发现明确失效证据，但部分校验存在波动或结果矛盾")
+                logger.warning(f"【{self.account_id}】⚠️ Cookie验证结果不确定: 未发现明确失效证据，但部分校验存在波动或结果矛盾")
             else:
-                logger.info(f"【{self.account_id}】✅ Cookie验证通过: 扢有关键API均可?")
+                logger.info(f"【{self.account_id}】✅ Cookie验证通过: 所有关键API均可用")
         else:
             logger.warning(f"【{self.account_id}】❌ Cookie验证失败:")
             for detail in result['details']:
@@ -7605,18 +7643,18 @@ class XianyuLive:
         try:
             current_account_id = self._canonical_account_id()
             log_account_id = current_account_id or "default"
-            logger.info(f"【{log_account_id}】准备重启实?..")
+            logger.info(f"【{log_account_id}】准备重启实例...")
 
             from cookie_manager import manager as cookie_manager
 
             if not current_account_id:
-                logger.warning(f"【{log_account_id}】实例未绑定有效 account_id，拒绝触发重?")
+                logger.warning(f"【{log_account_id}】实例未绑定有效 account_id，拒绝触发重启")
                 return
 
             if cookie_manager:
-                logger.info(f"【{log_account_id}】过CookieManager重启实例...")
+                logger.info(f"【{log_account_id}】通过CookieManager重启实例...")
 
-                # cookie_manager.update_cookie() ??????????????????
+                # 延迟触发实例重启，避免与当前处理流程直接竞争。
                 import threading
 
                 def trigger_restart():
@@ -7624,31 +7662,31 @@ class XianyuLive:
                         import time
                         time.sleep(2.0)
 
-                        # save_to_db=False??? update_config_cookies ??????
+                        # update_config_cookies 已落库，这里只触发重启，不重复保存。
                         cookie_manager.update_cookie(current_account_id, self.cookies_str, save_to_db=False)
                         logger.info(f"【{log_account_id}】实例重启请求已触发")
                     except Exception as e:
-                        logger.error(f"【{log_account_id}】触发实例重启失? {e}")
+                        logger.error(f"【{log_account_id}】触发实例重启失败: {e}")
                         import traceback
-                        logger.error(f"【{log_account_id}】重启失败详?\n{traceback.format_exc()}")
+                        logger.error(f"【{log_account_id}】重启失败详情:\n{traceback.format_exc()}")
 
                 restart_thread = threading.Thread(target=trigger_restart, daemon=True)
                 restart_thread.start()
 
-                logger.info(f"【{log_account_id}】实例重启已触发，当前任务即将?..")
+                logger.info(f"【{log_account_id}】实例重启已触发，当前任务即将退出...")
                 logger.warning(f"【{log_account_id}】注意：重启请求已发送，CookieManager将在2秒后取消当前任务并启动新实例")
 
             else:
                 logger.warning(f"【{log_account_id}】CookieManager不可用，无法重启实例")
 
         except Exception as e:
-            logger.error(f"【{current_account_id or 'default'}】重启实例失? {self._safe_str(e)}")
+            logger.error(f"【{current_account_id or 'default'}】重启实例失败: {self._safe_str(e)}")
             import traceback
-            logger.error(f"【{current_account_id or 'default'}】重启失败堆?\n{traceback.format_exc()}")
+            logger.error(f"【{current_account_id or 'default'}】重启失败堆栈:\n{traceback.format_exc()}")
             try:
                 await self.send_token_refresh_notification(f"实例重启失败: {str(e)}", "instance_restart_failed")
             except Exception as notify_e:
-                logger.error(f"【{current_account_id or 'default'}】发送重启失败知时出? {self._safe_str(notify_e)}")
+                logger.error(f"【{current_account_id or 'default'}】发送重启失败通知时出错: {self._safe_str(notify_e)}")
 
     async def save_item_info_to_db(self, item_id: str, item_detail: str = None, item_title: str = None):
         try:
@@ -7661,14 +7699,14 @@ class XianyuLive:
                 return
 
             if not item_title or not item_detail:
-                logger.warning(f"跳过保存商品信息：商品标题或详情不完?- {item_id}")
+                logger.warning(f"跳过保存商品信息：商品标题或详情不完整 - {item_id}")
                 return
 
             from db_manager import db_manager
             current_account_id = self._canonical_account_id()
             if not current_account_id:
                 logger.error(
-                    f"【default】商品信息保存缺?canonical account_id，拒绝继续运? item_id={item_id}"
+                    f"【default】商品信息保存缺少 canonical account_id，拒绝继续运行 item_id={item_id}"
                 )
                 return
 
@@ -7676,7 +7714,7 @@ class XianyuLive:
 
             success = db_manager.save_item_info(current_account_id, item_id, item_data)
             if success:
-                logger.info(f"商品信息已保存到数据? {item_id}")
+                logger.info(f"商品信息已保存到数据库: {item_id}")
             else:
                 logger.warning(f"保存商品信息到数据库失败: {item_id}")
 
@@ -7689,14 +7727,14 @@ class XianyuLive:
             current_account_id = self._canonical_account_id()
             if not current_account_id:
                 logger.error(
-                    f"【default】商品详情保存缺?canonical account_id，拒绝继续运? item_id={item_id}"
+                    f"【default】商品详情保存缺少 canonical account_id，拒绝继续运行 item_id={item_id}"
                 )
                 return False
 
             success = db_manager.update_item_detail(current_account_id, item_id, item_detail)
 
             if success:
-                logger.info(f"商品详情已更? {item_id}")
+                logger.info(f"商品详情已更新: {item_id}")
             else:
                 logger.warning(f"更新商品详情失败: {item_id}")
 
@@ -7711,7 +7749,7 @@ class XianyuLive:
             auto_fetch_config = config.get('ITEM_DETAIL', {}).get('auto_fetch', {})
 
             if not auto_fetch_config.get('enabled', True):
-                logger.warning(f"自动获取商品详情功能已禁? {item_id}")
+                logger.warning(f"自动获取商品详情功能已禁用: {item_id}")
                 return ""
 
             if not force_refresh:
@@ -7722,20 +7760,20 @@ class XianyuLive:
                         current_time = time.time()
 
                         if current_time - cache_time < self._item_detail_cache_ttl:
-                            logger.info(f"从缓存获取商品详? {item_id}")
+                            logger.info(f"从缓存获取商品详情: {item_id}")
                             return cache_data['detail']
                         else:
                             logger.warning(f"缓存已过期，删除: {item_id}")
             else:
-                logger.info(f"强制刷新商品详情，跳过缓? {item_id}")
+                logger.info(f"强制刷新商品详情，跳过缓存: {item_id}")
 
             detail_from_browser = await self._fetch_item_detail_from_browser(item_id)
             if detail_from_browser:
                 await self._add_to_item_cache(item_id, detail_from_browser)
-                logger.info(f"成功通过浏览器获取商品详? {item_id}, 长度: {len(detail_from_browser)}")
+                logger.info(f"成功通过浏览器获取商品详情: {item_id}, 长度: {len(detail_from_browser)}")
                 return detail_from_browser
 
-            logger.warning(f"浏览器获取商品详情失? {item_id}")
+            logger.warning(f"浏览器获取商品详情失败: {item_id}")
             return ""
 
         except Exception as e:
@@ -7761,7 +7799,7 @@ class XianyuLive:
                 'timestamp': current_time,
                 'access_time': current_time
             }
-            logger.warning(f"添加商品详情到缓? {item_id}, 当前缓存大小: {len(self._item_detail_cache)}")
+            logger.warning(f"添加商品详情到缓存: {item_id}, 当前缓存大小: {len(self._item_detail_cache)}")
 
     @classmethod
     async def _cleanup_item_cache(cls):
@@ -7781,7 +7819,7 @@ class XianyuLive:
                     await asyncio.sleep(0)
 
                 if expired_items:
-                    logger.info(f"清理?{len(expired_items)} 个过期的商品详情缓存")
+                    logger.info(f"清理了 {len(expired_items)} 个过期的商品详情缓存")
 
                 return len(expired_items)
         except asyncio.CancelledError:
@@ -7794,7 +7832,7 @@ class XianyuLive:
         runtime_lease = None
         release_reason = "item_detail_fetch_failed"
         try:
-            logger.info(f"弢始使用浏览器获取商品详情: {item_id}")
+            logger.info(f"开始使用浏览器获取商品详情: {item_id}")
 
             current_account_id = self._canonical_account_id()
             if not current_account_id:
@@ -7852,21 +7890,21 @@ class XianyuLive:
                         if detail_element:
                             detail_text = await detail_element.inner_text()
                             if detail_text and len(detail_text.strip()) > 0:
-                                logger.info(f"成功获取商品详情（择? {selector}? {item_id}, 长度: {len(detail_text)}")
+                                logger.info(f"成功获取商品详情（选择器: {selector}）: {item_id}, 长度: {len(detail_text)}")
                                 release_reason = "item_detail_fetch_completed"
                                 return detail_text.strip()
                     except Exception as e:
-                        logger.debug(f"选择?{selector} 未找? {self._safe_str(e)}")
+                        logger.debug(f"选择器 {selector} 未找到: {self._safe_str(e)}")
                         continue
 
                 logger.warning(f"未找到特定详情元素，尝试获取整个页面内容: {item_id}")
                 body_text = await page.inner_text('body')
                 if body_text:
-                    logger.info(f"获取到页面整体内? {item_id}, 长度: {len(body_text)}")
+                    logger.info(f"获取到页面整体内容: {item_id}, 长度: {len(body_text)}")
                     release_reason = "item_detail_fetch_completed"
                     return body_text.strip()
                 else:
-                    logger.warning(f"未找到商品详情元? {item_id}")
+                    logger.warning(f"未找到商品详情元素: {item_id}")
 
             except Exception as e:
                 logger.warning(f"获取商品详情元素失败: {item_id}, 错误: {self._safe_str(e)}")
@@ -7875,7 +7913,7 @@ class XianyuLive:
             return ""
 
         except Exception as e:
-            logger.error(f"浏览器获取商品详情异? {item_id}, 错误: {self._safe_str(e)}")
+            logger.error(f"浏览器获取商品详情异常: {item_id}, 错误: {self._safe_str(e)}")
             return ""
         finally:
             try:
@@ -7897,7 +7935,7 @@ class XianyuLive:
             from db_manager import db_manager
             current_account_id = self._canonical_account_id()
             if not current_account_id:
-                logger.error("【default】批量保存商品信息缺?canonical account_id，拒绝继续运?")
+                logger.error("【default】批量保存商品信息缺少 canonical account_id，拒绝继续运行")
                 return 0
 
             batch_new_data = []
@@ -7960,12 +7998,12 @@ class XianyuLive:
 
             if batch_new_data:
                 new_count = db_manager.batch_save_item_basic_info(batch_new_data)
-                logger.info(f"新增商品信息: {new_count}/{len(batch_new_data)} ?")
+                logger.info(f"新增商品信息: {new_count}/{len(batch_new_data)} 个")
                 saved_count += new_count
 
             if batch_update_data:
                 update_count = db_manager.batch_update_item_title_price(batch_update_data)
-                logger.info(f"更新商品标题和价? {update_count}/{len(batch_update_data)} ?")
+                logger.info(f"更新商品标题和价格: {update_count}/{len(batch_update_data)} 个")
                 saved_count += update_count
 
             if items_need_detail:
@@ -7973,15 +8011,15 @@ class XianyuLive:
                 auto_fetch_config = config.get('ITEM_DETAIL', {}).get('auto_fetch', {})
 
                 if auto_fetch_config.get('enabled', True):
-                    action_text = '??????' if sync_item_details else '??????'
-                    logger.info(f"准备?{len(items_need_detail)} 个商品{action_text}...")
+                    action_text = '同步最新详情' if sync_item_details else '获取缺失详情'
+                    logger.info(f"准备为 {len(items_need_detail)} 个商品{action_text}...")
                     detail_success_count = await self._fetch_item_details(
                         items_need_detail,
                         force_refresh=sync_item_details,
                     )
-                    logger.info(f"成功?{detail_success_count}/{len(items_need_detail)} 个商品{action_text}")
+                    logger.info(f"成功为 {detail_success_count}/{len(items_need_detail)} 个商品{action_text}")
                 else:
-                    logger.info(f"?{len(items_need_detail)} 个商品需要获取详情，但自动获取功能已禁用")
+                    logger.info(f"有 {len(items_need_detail)} 个商品需要获取详情，但自动获取功能已禁用")
 
             return saved_count
 
@@ -8016,12 +8054,12 @@ class XianyuLive:
                         if item_detail_text:
                             success = await self.save_item_detail_only(item_id, item_detail_text)
                             if success:
-                                logger.info(f"?成功获取并保存商品详? {item_id} - {item_title}")
+                                logger.info(f"✅ 成功获取并保存商品详情: {item_id} - {item_title}")
                                 return 1
                             else:
-                                logger.warning(f"?获取详情成功但保存失? {item_id}")
+                                logger.warning(f"❌ 获取详情成功但保存失败: {item_id}")
                         else:
-                            logger.warning(f"?未能获取商品详情: {item_id} - {item_title}")
+                            logger.warning(f"❌ 未能获取商品详情: {item_id} - {item_title}")
 
                         await asyncio.sleep(retry_delay)
                         return 0
@@ -8047,8 +8085,8 @@ class XianyuLive:
 
     async def get_item_info(self, item_id, retry_count=0):
         if retry_count >= 4:
-            logger.error("???????????????")
-            return {"error": "获取商品信息失败，重试次数过?"}
+            logger.error("获取商品信息失败，重试次数过多")
+            return {"error": "获取商品信息失败，重试次数过多"}
 
         if not self.session:
             await self.create_session()
@@ -8099,7 +8137,7 @@ class XianyuLive:
                 if isinstance(res_json, dict):
                     ret_value = res_json.get('ret', [])
                     if not any('SUCCESS::调用成功' in ret for ret in ret_value):
-                        logger.warning(f"商品信息API调用失败，错误信? {ret_value}")
+                        logger.warning(f"商品信息API调用失败，错误信息: {ret_value}")
 
                         await asyncio.sleep(0.5)
                         return await self.get_item_info(item_id, retry_count + 1)
@@ -8200,7 +8238,7 @@ class XianyuLive:
 
             if isinstance(message, dict):
                 for key, value in message.items():
-                    logger.warning(f"  ?'{key}': {type(value)} - {str(value)[:100]}...")
+                    logger.warning(f"  键 '{key}': {type(value)} - {str(value)[:100]}...")
 
                     if key in ["1", "3"] and isinstance(value, dict):
                         logger.warning(f"    详细结构 '{key}':")
@@ -8210,7 +8248,7 @@ class XianyuLive:
                 logger.warning(f"  消息内容: {str(message)[:200]}...")
 
         except Exception as e:
-            logger.error(f"调试消息结构时发生错? {self._safe_str(e)}")
+            logger.error(f"调试消息结构时发生错误: {self._safe_str(e)}")
 
     async def get_item_specific_reply(self, send_user_name: str, send_user_id: str, send_message: str, item_id: str = None) -> str:
         if not item_id:
@@ -8220,7 +8258,7 @@ class XianyuLive:
             from db_manager import db_manager
             current_account_id = self._canonical_account_id()
             if not current_account_id:
-                logger.error("【default】指定商品回复读取缺?canonical account_id，拒绝继续运?")
+                logger.error("【default】指定商品回复读取缺少 canonical account_id，拒绝继续运行")
                 return None
 
             item_reply = db_manager.get_item_reply(current_account_id, item_id)
@@ -8228,7 +8266,7 @@ class XianyuLive:
                 return None
 
             reply_content = item_reply['reply_content']
-            logger.info(f"【{self.account_id}】使用指定商品回? 商品ID={item_id}")
+            logger.info(f"【{self.account_id}】使用指定商品回复: 商品ID={item_id}")
 
             try:
                 formatted_reply = reply_content.format(
@@ -8237,7 +8275,7 @@ class XianyuLive:
                     send_message=send_message,
                     item_id=item_id
                 )
-                logger.info(f"【{self.account_id}】指定商品回复内? {formatted_reply}")
+                logger.info(f"【{self.account_id}】指定商品回复内容: {formatted_reply}")
                 return formatted_reply
             except Exception as format_error:
                 logger.error(f"指定商品回复变量替换失败: {self._safe_str(format_error)}")
@@ -8252,13 +8290,13 @@ class XianyuLive:
             from db_manager import db_manager
             current_account_id = self._canonical_account_id()
             if not current_account_id:
-                logger.error("【default】默认回复读取缺?canonical account_id，拒绝继续运?")
+                logger.error("【default】默认回复读取缺少 canonical account_id，拒绝继续运行")
                 return None
 
             default_reply_settings = db_manager.get_default_reply(current_account_id)
 
             if not default_reply_settings or not default_reply_settings.get('enabled', False):
-                logger.warning(f"账号 {current_account_id} 未启用默认回?")
+                logger.warning(f"账号 {current_account_id} 未启用默认回复")
                 return None
 
             if default_reply_settings.get('reply_once', False) and chat_id:
@@ -8277,7 +8315,7 @@ class XianyuLive:
                     send_message=send_message
                 )
 
-                logger.info(f"【{current_account_id}】使用默认回? {formatted_reply}")
+                logger.info(f"【{current_account_id}】使用默认回复: {formatted_reply}")
                 return formatted_reply
             except Exception as format_error:
                 logger.error(f"默认回复变量替换失败: {self._safe_str(format_error)}")
@@ -8292,13 +8330,13 @@ class XianyuLive:
             from db_manager import db_manager
             current_account_id = self._canonical_account_id()
             if not current_account_id:
-                logger.error("【default】关键词回复读取缺少 canonical account_id，拒绝继续运?")
+                logger.error("【default】关键词回复读取缺少 canonical account_id，拒绝继续运行")
                 return None
 
             keywords = db_manager.get_keywords_with_type(current_account_id)
 
             if not keywords:
-                logger.warning(f"账号 {current_account_id} 没有配置关键?")
+                logger.warning(f"账号 {current_account_id} 没有配置关键词")
                 return None
 
             if item_id:
@@ -8310,13 +8348,13 @@ class XianyuLive:
                     image_url = keyword_data.get('image_url')
 
                     if keyword_item_id == item_id and keyword.lower() in send_message.lower():
-                        logger.info(f"商品ID关键词匹配成? 商品{item_id} '{keyword}' (类型: {keyword_type})")
+                        logger.info(f"商品ID关键词匹配成功: 商品{item_id} '{keyword}' (类型: {keyword_type})")
 
                         if keyword_type == 'image' and image_url:
                             return await self._handle_image_keyword(keyword, image_url, send_user_name, send_user_id, send_message)
                         else:
                             if not reply or (reply and reply.strip() == ''):
-                                logger.info(f"商品ID关键?'{keyword}' 回复内容为空，不进行回复")
+                                logger.info(f"商品ID关键词 '{keyword}' 回复内容为空，不进行回复")
                                 return "EMPTY_REPLY"
                             try:
                                 formatted_reply = reply.format(
@@ -8324,10 +8362,10 @@ class XianyuLive:
                                     send_user_id=send_user_id,
                                     send_message=send_message
                                 )
-                                logger.info(f"商品ID文本关键词回? {formatted_reply}")
+                                logger.info(f"商品ID文本关键词回复: {formatted_reply}")
                                 return formatted_reply
                             except Exception as format_error:
-                                logger.error(f"关键词回复变量替换失? {self._safe_str(format_error)}")
+                                logger.error(f"关键词回复变量替换失败: {self._safe_str(format_error)}")
                                 return reply
 
             for keyword_data in keywords:
@@ -8338,13 +8376,13 @@ class XianyuLive:
                 image_url = keyword_data.get('image_url')
 
                 if not keyword_item_id and keyword.lower() in send_message.lower():
-                    logger.info(f"通用关键词匹配成? '{keyword}' (类型: {keyword_type})")
+                    logger.info(f"通用关键词匹配成功: '{keyword}' (类型: {keyword_type})")
 
                     if keyword_type == 'image' and image_url:
                         return await self._handle_image_keyword(keyword, image_url, send_user_name, send_user_id, send_message)
                     else:
                         if not reply or (reply and reply.strip() == ''):
-                            logger.info(f"通用关键?'{keyword}' 回复内容为空，不进行回复")
+                            logger.info(f"通用关键词 '{keyword}' 回复内容为空，不进行回复")
                             return "EMPTY_REPLY"
                         try:
                             formatted_reply = reply.format(
@@ -8352,17 +8390,17 @@ class XianyuLive:
                                 send_user_id=send_user_id,
                                 send_message=send_message
                             )
-                            logger.info(f"通用文本关键词回? {formatted_reply}")
+                            logger.info(f"通用文本关键词回复: {formatted_reply}")
                             return formatted_reply
                         except Exception as format_error:
-                            logger.error(f"关键词回复变量替换失? {self._safe_str(format_error)}")
+                            logger.error(f"关键词回复变量替换失败: {self._safe_str(format_error)}")
                             return reply
 
-            logger.warning(f"未找到匹配的关键? {send_message}")
+            logger.warning(f"未找到匹配的关键词: {send_message}")
             return None
 
         except Exception as e:
-            logger.error(f"获取关键词回复失? {self._safe_str(e)}")
+            logger.error(f"获取关键词回复失败: {self._safe_str(e)}")
             return None
 
     async def _handle_image_keyword(self, keyword: str, image_url: str, send_user_name: str, send_user_id: str, send_message: str) -> str:
@@ -8387,11 +8425,11 @@ class XianyuLive:
                             image_url = cdn_url
                         else:
                             logger.error(f"图片上传失败: {local_image_path}")
-                            logger.error(f"?Cookie可能已失效！请检查配置并更新Cookie")
+                            logger.error(f"❌ Cookie可能已失效！请检查配置并更新Cookie")
                             return f"抱歉，图片发送失败（Cookie可能已失效，请检查日志）"
                 else:
-                    logger.error(f"本地图片文件不存? {local_image_path}")
-                    return f"抱歉，图片文件不存在?"
+                    logger.error(f"本地图片文件不存在: {local_image_path}")
+                    return f"抱歉，图片文件不存在。"
 
             else:
                 logger.info(f"使用外部图片链接: {image_url}")
@@ -8399,8 +8437,8 @@ class XianyuLive:
             return f"__IMAGE_SEND__{image_url}"
 
         except Exception as e:
-            logger.error(f"处理图片关键词失? {e}")
-            return f"抱歉，图片发送失? {str(e)}"
+            logger.error(f"处理图片关键词失败: {e}")
+            return f"抱歉，图片发送失败: {str(e)}"
 
     def _is_cdn_url(self, url: str) -> bool:
         if not url:
@@ -8432,7 +8470,7 @@ class XianyuLive:
             current_account_id = self._canonical_account_id()
             if not current_account_id:
                 logger.error(
-                    f"【default】关键词图片更新缺少 canonical account_id，拒绝继续运? keyword={keyword}"
+                    f"【default】关键词图片更新缺少 canonical account_id，拒绝继续运行 keyword={keyword}"
                 )
                 return
             success = db_manager.update_keyword_image_url(
@@ -8441,7 +8479,7 @@ class XianyuLive:
                 new_image_url,
             )
             if success:
-                logger.info(f"图片URL已更? {keyword} -> {new_image_url}")
+                logger.info(f"图片URL已更新: {keyword} -> {new_image_url}")
             else:
                 logger.warning(f"图片URL更新失败: {keyword}")
         except Exception as e:
@@ -8452,7 +8490,7 @@ class XianyuLive:
             from db_manager import db_manager
             success = db_manager.update_card_image_url(card_id, new_image_url)
             if success:
-                logger.info(f"卡券图片URL已更? 卡券ID={card_id} -> {new_image_url}")
+                logger.info(f"卡券图片URL已更新: 卡券ID={card_id} -> {new_image_url}")
             else:
                 logger.warning(f"卡券图片URL更新失败: 卡券ID={card_id}")
         except Exception as e:
@@ -8463,7 +8501,7 @@ class XianyuLive:
             from ai_reply_engine import ai_reply_engine
             current_account_id = self._canonical_account_id()
             if not current_account_id:
-                logger.error("【default】AI回复缺少 canonical account_id，拒绝继续运?")
+                logger.error("【default】AI回复缺少 canonical account_id，拒绝继续运行")
                 return None
 
             if not ai_reply_engine.is_ai_enabled(current_account_id):
@@ -8474,7 +8512,7 @@ class XianyuLive:
             item_info_raw = db_manager.get_item_info(current_account_id, item_id)
 
             if not item_info_raw:
-                logger.warning(f"数据库中无商品信? {item_id}")
+                logger.warning(f"数据库中无商品信息: {item_id}")
                 item_info = {
                     'title': '商品信息获取失败',
                     'price': 0,
@@ -8528,7 +8566,7 @@ class XianyuLive:
             import hashlib
             current_account_id = self._canonical_account_id()
             if not current_account_id:
-                logger.error("【default】消息知缺少 canonical account_id，拒绝继续运?")
+                logger.error("【default】消息通知缺少 canonical account_id，拒绝继续运行")
                 return
 
             system_messages = [
@@ -8537,7 +8575,7 @@ class XianyuLive:
             ]
 
             if send_message in system_messages:
-                logger.warning(f"📱 系统消息不发送知: {send_message}")
+                logger.warning(f"📱 系统消息不发送通知: {send_message}")
                 return
 
             notification_key = f"{chat_id or 'unknown'}_{send_user_id}_{send_message}"
@@ -8550,15 +8588,15 @@ class XianyuLive:
                     time_since_last = current_time - self.last_notification_time[notification_hash]
                     if time_since_last < self.notification_cooldown:
                         remaining_seconds = int(self.notification_cooldown - time_since_last)
-                        logger.warning(f"📱 通知在冷却期内（剩余 {remaining_seconds} 秒），跳过重复发?- 账号: {self.account_id}, 买家: {send_user_name}, 消息: {send_message[:30]}...")
+                        logger.warning(f"📱 通知在冷却期内（剩余 {remaining_seconds} 秒），跳过重复发送 - 账号: {self.account_id}, 买家: {send_user_name}, 消息: {send_message[:30]}...")
                         return
                 if reservation_key in self.pending_notification_keys:
-                    logger.warning(f"📱 相同消息通知正在发中，跳过重复发?- 账号: {self.account_id}, 买家: {send_user_name}")
+                    logger.warning(f"📱 相同消息通知正在发送中，跳过重复发送 - 账号: {self.account_id}, 买家: {send_user_name}")
                     return
                 self.pending_notification_keys.add(reservation_key)
 
             try:
-                logger.info(f"📱 弢始发送消息知 - 账号: {self.account_id}, 买家: {send_user_name}")
+                logger.info(f"📱 开始发送消息通知 - 账号: {self.account_id}, 买家: {send_user_name}")
 
                 notification_msg = render_notification_template(
                     'message',
@@ -8579,7 +8617,7 @@ class XianyuLive:
                 )
 
                 if not notification_sent:
-                    logger.warning(f"📱 消息通知未发送成功，不进入冷?- 账号: {self.account_id}, 买家: {send_user_name}")
+                    logger.warning(f"📱 消息通知未发送成功，不进入冷却 - 账号: {self.account_id}, 买家: {send_user_name}")
                     return
 
                 async with self.notification_lock:
@@ -8611,7 +8649,7 @@ class XianyuLive:
         try:
             import aiohttp
 
-            logger.info(f"📱 QQ通知 - 弢始处理配置数? {config_data}")
+            logger.info(f"📱 QQ通知 - 开始处理配置数据: {config_data}")
 
             qq_number = config_data.get('qq_number') or config_data.get('config', '')
             qq_number = qq_number.strip() if qq_number else ''
@@ -8619,7 +8657,7 @@ class XianyuLive:
             logger.info(f"📱 QQ通知 - 解析到QQ号码: {qq_number}")
 
             if not qq_number:
-                logger.warning("📱 QQ通知 - QQ号码配置为空，无法发送知")
+                logger.warning("📱 QQ通知 - QQ号码配置为空，无法发送通知")
                 return False
 
             api_url = (
@@ -8628,7 +8666,7 @@ class XianyuLive:
                 or str(os.getenv('QQ_NOTIFICATION_API_URL') or '').strip()
             )
             if not api_url:
-                logger.warning("📱 QQ通知 - 未配置QQ通知API地址，已跳过发?")
+                logger.warning("📱 QQ通知 - 未配置QQ通知API地址，已跳过发送")
                 return False
             params = {
                 'qq': qq_number,
@@ -8641,17 +8679,17 @@ class XianyuLive:
             async with aiohttp.ClientSession() as session:
                 async with session.get(api_url, params=params, timeout=10) as response:
                     response_text = await response.text()
-                    logger.info(f"📱 QQ通知 - 响应状? {response.status}")
+                    logger.info(f"📱 QQ通知 - 响应状态: {response.status}")
 
                     if response.status == 502:
-                        logger.info(f"📱 QQ通知发成? {qq_number} (状码: {response.status})")
+                        logger.info(f"📱 QQ通知发送成功: {qq_number} (状态码: {response.status})")
                         return True
                     elif response.status == 200:
-                        logger.info(f"📱 QQ通知发成? {qq_number} (状码: {response.status})")
+                        logger.info(f"📱 QQ通知发送成功: {qq_number} (状态码: {response.status})")
                         logger.warning(f"📱 QQ通知 - 响应内容: {response_text}")
                         return True
                     else:
-                        logger.warning(f"📱 QQ通知发失? HTTP {response.status}")
+                        logger.warning(f"📱 QQ通知发送失败: HTTP {response.status}")
                         logger.warning(f"📱 QQ通知 - 响应内容: {response_text}")
                         return False
 
@@ -8698,10 +8736,10 @@ class XianyuLive:
             async with aiohttp.ClientSession() as session:
                 async with session.post(webhook_url, json=data, timeout=10) as response:
                     if response.status == 200:
-                        logger.info(f"钉钉通知发成?")
+                        logger.info(f"钉钉通知发送成功")
                         return True
                     else:
-                        logger.warning(f"钉钉通知发失? {response.status}")
+                        logger.warning(f"钉钉通知发送失败: {response.status}")
                         return False
 
         except Exception as e:
@@ -8716,16 +8754,16 @@ class XianyuLive:
             import hashlib
             import base64
 
-            logger.info(f"📱 飞书通知 - 弢始处理配置数? {config_data}")
+            logger.info(f"📱 飞书通知 - 开始处理配置数据: {config_data}")
 
             webhook_url = config_data.get('webhook_url', '')
             secret = config_data.get('secret', '')
 
             logger.info(f"📱 飞书通知 - Webhook URL: {webhook_url[:50]}...")
-            logger.info(f"?? ???? - ???????: {'?' if secret else '?'}")
+            logger.info(f"📱 飞书通知 - 是否有签名密钥: {'是' if secret else '否'}")
 
             if not webhook_url:
-                logger.warning("📱 飞书通知 - Webhook URL配置为空，无法发送知")
+                logger.warning("📱 飞书通知 - Webhook URL配置为空，无法发送通知")
                 return False
 
             timestamp = str(int(time.time()))
@@ -8739,7 +8777,7 @@ class XianyuLive:
                     digestmod=hashlib.sha256
                 ).digest()
                 sign = base64.b64encode(hmac_code).decode('utf-8')
-                logger.info(f"📱 飞书通知 - 已生成签?")
+                logger.info(f"📱 飞书通知 - 已生成签名")
 
             data = {
                 "msg_type": "text",
@@ -8757,23 +8795,23 @@ class XianyuLive:
             async with aiohttp.ClientSession() as session:
                 async with session.post(webhook_url, json=data, timeout=10) as response:
                     response_text = await response.text()
-                    logger.info(f"📱 飞书通知 - 响应状? {response.status}")
+                    logger.info(f"📱 飞书通知 - 响应状态: {response.status}")
                     logger.info(f"📱 飞书通知 - 响应内容: {response_text}")
 
                     if response.status == 200:
                         try:
                             response_json = json.loads(response_text)
                             if response_json.get('code') == 0:
-                                logger.info(f"📱 飞书通知发成?")
+                                logger.info(f"📱 飞书通知发送成功")
                                 return True
                             else:
-                                logger.warning(f"📱 飞书通知发失? {response_json.get('msg', '未知错误')}")
+                                logger.warning(f"📱 飞书通知发送失败: {response_json.get('msg', '未知错误')}")
                                 return False
                         except json.JSONDecodeError:
-                            logger.info(f"📱 飞书通知发成功（响应格式异常?")
+                            logger.info(f"📱 飞书通知发送成功（响应格式异常）")
                             return True
                     else:
-                        logger.warning(f"📱 飞书通知发失? HTTP {response.status}, 响应: {response_text}")
+                        logger.warning(f"📱 飞书通知发送失败: HTTP {response.status}, 响应: {response_text}")
                         return False
 
         except Exception as e:
@@ -8788,7 +8826,7 @@ class XianyuLive:
             import json
             from urllib.parse import quote
 
-            logger.info(f"📱 Bark通知 - 弢始处理配置数? {config_data}")
+            logger.info(f"📱 Bark通知 - 开始处理配置数据: {config_data}")
 
             server_url = config_data.get('server_url', 'https://api.day.app').rstrip('/')
             device_key = config_data.get('device_key', '')
@@ -8798,12 +8836,12 @@ class XianyuLive:
             group = config_data.get('group', 'xianyu')
             url = config_data.get('url', '')
 
-            logger.info(f"📱 Bark通知 - 服务? {server_url}")
-            logger.info(f"📱 Bark通知 - 设备密钥: {device_key[:10]}..." if device_key else "📱 Bark通知 - 设备密钥: 未设?")
+            logger.info(f"📱 Bark通知 - 服务器: {server_url}")
+            logger.info(f"📱 Bark通知 - 设备密钥: {device_key[:10]}..." if device_key else "📱 Bark通知 - 设备密钥: 未设置")
             logger.info(f"📱 Bark通知 - 标题: {title}")
 
             if not device_key:
-                logger.warning("📱 Bark通知 - 设备密钥配置为空，无法发送知")
+                logger.warning("📱 Bark通知 - 设备密钥配置为空，无法发送通知")
                 return False
 
             api_url = f"{server_url}/push"
@@ -8827,27 +8865,27 @@ class XianyuLive:
             async with aiohttp.ClientSession() as session:
                 async with session.post(api_url, json=data, timeout=10) as response:
                     response_text = await response.text()
-                    logger.info(f"📱 Bark通知 - 响应状? {response.status}")
+                    logger.info(f"📱 Bark通知 - 响应状态: {response.status}")
                     logger.info(f"📱 Bark通知 - 响应内容: {response_text}")
 
                     if response.status == 200:
                         try:
                             response_json = json.loads(response_text)
                             if response_json.get('code') == 200:
-                                logger.info(f"📱 Bark通知发成?")
+                                logger.info(f"📱 Bark通知发送成功")
                                 return True
                             else:
-                                logger.warning(f"📱 Bark通知发失? {response_json.get('message', '未知错误')}")
+                                logger.warning(f"📱 Bark通知发送失败: {response_json.get('message', '未知错误')}")
                                 return False
                         except json.JSONDecodeError:
                             if 'success' in response_text.lower() or 'ok' in response_text.lower():
-                                logger.info(f"📱 Bark通知发成?")
+                                logger.info(f"📱 Bark通知发送成功")
                                 return True
                             else:
                                 logger.warning(f"📱 Bark通知响应格式异常: {response_text}")
                                 return False
                     else:
-                        logger.warning(f"📱 Bark通知发失? HTTP {response.status}, 响应: {response_text}")
+                        logger.warning(f"📱 Bark通知发送失败: HTTP {response.status}, 响应: {response_text}")
                         return False
 
         except Exception as e:
@@ -8871,7 +8909,7 @@ class XianyuLive:
             recipient_email = config_data.get('recipient_email', '')
             smtp_use_tls = config_data.get('smtp_use_tls', smtp_port == 587)
             if not all([smtp_server, email_user, email_password, recipient_email]):
-                logger.warning("邮件通知配置不完?")
+                logger.warning("邮件通知配置不完整")
                 return False
 
             msg = MIMEMultipart()
@@ -8891,13 +8929,13 @@ class XianyuLive:
                         img = MIMEImage(img_data)
                         img.add_header('Content-Disposition', 'attachment', filename=filename)
                         msg.attach(img)
-                        logger.info(f"已添加图片附? {filename}")
+                        logger.info(f"已添加图片附件: {filename}")
                     else:
                         from email.mime.application import MIMEApplication
                         attach = MIMEApplication(img_data)
                         attach.add_header('Content-Disposition', 'attachment', filename=filename)
                         msg.attach(attach)
-                        logger.info(f"已添加附? {filename}")
+                        logger.info(f"已添加附件: {filename}")
                 except Exception as attach_error:
                     logger.error(f"添加邮件附件失败: {self._safe_str(attach_error)}")
 
@@ -8916,25 +8954,25 @@ class XianyuLive:
                     error_code = auth_error.smtp_code if hasattr(auth_error, 'smtp_code') else None
                     error_msg = str(auth_error)
 
-                    logger.error(f"邮件SMTP认证失败 (错误? {error_code})")
+                    logger.error(f"邮件SMTP认证失败 (错误码: {error_code})")
                     logger.error(f"邮箱地址: {email_user}")
-                    logger.error(f"SMTP服务? {smtp_server}:{smtp_port}")
+                    logger.error(f"SMTP服务器: {smtp_server}:{smtp_port}")
                     logger.error(f"错误详情: {error_msg}")
 
                     suggestions = []
                     if 'qq.com' in email_user.lower() or 'qq' in smtp_server.lower():
-                        suggestions.append("QQ邮箱霢要使用授权码而不是登录密?")
-                        suggestions.append("请到QQ邮箱设置 -> 账户 -> 弢启SMTP服务 -> 生成授权?")
+                        suggestions.append("QQ邮箱需要使用授权码而不是登录密码")
+                        suggestions.append("请到QQ邮箱设置 -> 账户 -> 开启SMTP服务 -> 生成授权码")
                     elif 'gmail.com' in email_user.lower() or 'gmail' in smtp_server.lower():
-                        suggestions.append("Gmail霢要使用应用专用密?")
-                        suggestions.append("请到Google账户 -> 安全?-> 两步验证 -> 应用专用密码")
-                        suggestions.append("或启?允许不够安全的应用访?（不推荐?")
+                        suggestions.append("Gmail需要使用应用专用密码")
+                        suggestions.append("请到Google账户 -> 安全性 -> 两步验证 -> 应用专用密码")
+                        suggestions.append("或启用'允许不够安全的应用访问'（不推荐）")
                     elif '163.com' in email_user.lower() or '126.com' in email_user.lower() or 'yeah.net' in email_user.lower():
-                        suggestions.append("网易邮箱霢要使用授权码")
-                        suggestions.append("请到邮箱设置 -> POP3/SMTP/IMAP -> 弢启SMTP服务 -> 生成授权?")
+                        suggestions.append("网易邮箱需要使用授权码")
+                        suggestions.append("请到邮箱设置 -> POP3/SMTP/IMAP -> 开启SMTP服务 -> 生成授权码")
                     else:
-                        suggestions.append("请检查邮箱密?授权码是否正?")
-                        suggestions.append("某些邮箱服务商需要使用授权码而不是登录密?")
+                        suggestions.append("请检查邮箱密码/授权码是否正确")
+                        suggestions.append("某些邮箱服务商需要使用授权码而不是登录密码")
                         suggestions.append("请查看邮箱服务商的SMTP设置说明")
 
                     if suggestions:
@@ -8945,7 +8983,7 @@ class XianyuLive:
                     raise
 
                 server.send_message(msg)
-                logger.info(f"邮件通知发成? {recipient_email}")
+                logger.info(f"邮件通知发送成功: {recipient_email}")
                 return True
 
             finally:
@@ -8962,13 +9000,13 @@ class XianyuLive:
             return False
         except smtplib.SMTPException as smtp_error:
             logger.error(f"SMTP协议错误: {self._safe_str(smtp_error)}")
-            logger.error(f"SMTP服务? {smtp_server}:{smtp_port}")
-            logger.error(f"请检查SMTP服务器地坢和端口配置是否正?")
+            logger.error(f"SMTP服务器: {smtp_server}:{smtp_port}")
+            logger.error(f"请检查SMTP服务器地址和端口配置是否正确")
             return False
         except Exception as e:
             logger.error(f"发邮件知异常: {self._safe_str(e)}")
             import traceback
-            logger.error(f"邮件发详细错? {traceback.format_exc()}")
+            logger.error(f"邮件发送详细错误: {traceback.format_exc()}")
             return False
 
     async def _send_webhook_notification(self, config_data: dict, message: str):
@@ -9002,18 +9040,18 @@ class XianyuLive:
                 if http_method == 'POST':
                     async with session.post(webhook_url, json=data, headers=headers, timeout=10) as response:
                         if response.status == 200:
-                            logger.info(f"Webhook通知发成?")
+                            logger.info(f"Webhook通知发送成功")
                             return True
                         else:
-                            logger.warning(f"Webhook通知发失? {response.status}")
+                            logger.warning(f"Webhook通知发送失败: {response.status}")
                             return False
                 elif http_method == 'PUT':
                     async with session.put(webhook_url, json=data, headers=headers, timeout=10) as response:
                         if response.status == 200:
-                            logger.info(f"Webhook通知发成?")
+                            logger.info(f"Webhook通知发送成功")
                             return True
                         else:
-                            logger.warning(f"Webhook通知发失? {response.status}")
+                            logger.warning(f"Webhook通知发送失败: {response.status}")
                             return False
                 else:
                     logger.warning(f"不支持的HTTP方法: {http_method}")
@@ -9044,10 +9082,10 @@ class XianyuLive:
             async with aiohttp.ClientSession() as session:
                 async with session.post(webhook_url, json=data, timeout=10) as response:
                     if response.status == 200:
-                        logger.info(f"微信通知发成?")
+                        logger.info(f"微信通知发送成功")
                         return True
                     else:
-                        logger.warning(f"微信通知发失? {response.status}")
+                        logger.warning(f"微信通知发送失败: {response.status}")
                         return False
 
         except Exception as e:
@@ -9062,7 +9100,7 @@ class XianyuLive:
             chat_id = config_data.get('chat_id', '')
 
             if not all([bot_token, chat_id]):
-                logger.warning("Telegram通知配置不完?")
+                logger.warning("Telegram通知配置不完整")
                 return False
 
             api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -9076,10 +9114,10 @@ class XianyuLive:
             async with aiohttp.ClientSession() as session:
                 async with session.post(api_url, json=data, timeout=10) as response:
                     if response.status == 200:
-                        logger.info(f"Telegram通知发成?")
+                        logger.info(f"Telegram通知发送成功")
                         return True
                     else:
-                        logger.warning(f"Telegram通知发失? {response.status}")
+                        logger.warning(f"Telegram通知发送失败: {response.status}")
                         return False
 
         except Exception as e:
@@ -9090,7 +9128,7 @@ class XianyuLive:
         try:
             current_account_id = self._canonical_account_id()
             if not current_account_id:
-                logger.error("【default】Token刷新通知缺少 canonical account_id，拒绝继续运?")
+                logger.error("【default】Token刷新通知缺少 canonical account_id，拒绝继续运行")
                 return
             if notification_type != "token_scheduled_refresh_failed" and self._is_normal_token_expiry(error_message):
                 logger.warning(f"棢测到正常的令牌过期，跳过通知: {error_message}")
@@ -9112,7 +9150,7 @@ class XianyuLive:
                 current_time = time.time()
                 last_time = self.last_notification_time.get(notification_key, 0)
                 if notification_key in self.pending_notification_keys:
-                    logger.warning(f"Token刷新通知正在发中，跳过重复发? {notification_type}")
+                    logger.warning(f"Token刷新通知正在发送中，跳过重复发送: {notification_type}")
                     return
                 if current_time - last_time < cooldown_time:
                     remaining_time = cooldown_time - (current_time - last_time)
@@ -9123,17 +9161,17 @@ class XianyuLive:
                     if remaining_hours > 0:
                         time_desc = f"{remaining_hours}小时{remaining_minutes}分钟"
                     elif remaining_minutes > 0:
-                        time_desc = f"{remaining_minutes}分钟{remaining_seconds}?"
+                        time_desc = f"{remaining_minutes}分钟{remaining_seconds}秒"
                     else:
-                        time_desc = f"{remaining_seconds}?"
+                        time_desc = f"{remaining_seconds}秒"
 
-                    logger.warning(f"Token刷新通知在冷却期内，跳过发? {notification_type} (还需等待 {time_desc})")
+                    logger.warning(f"Token刷新通知在冷却期内，跳过发送: {notification_type} (还需等待 {time_desc})")
                     return
                 self.pending_notification_keys.add(notification_key)
 
             if notification_type in ("slider_success", "slider_recovered_success"):
                 slider_status_text = (
-                    "账号会话已恢?"
+                    "账号会话已恢复"
                     if notification_type == "slider_recovered_success"
                     else "cookies已自动更新到数据库"
                 )
@@ -9148,16 +9186,16 @@ class XianyuLive:
                     'password_login_success',
                     account_id=current_account_id,
                     time=time.strftime('%Y-%m-%d %H:%M:%S'),
-                    cookie_count='已获?'
+                    cookie_count='已获取'
                 )
             elif "刷新Cookie成功" in error_message or notification_type == "cookie_refresh_success":
                 notification_msg = render_notification_template(
                     'cookie_refresh_success',
                     account_id=current_account_id,
                     time=time.strftime('%Y-%m-%d %H:%M:%S'),
-                    cookie_count='已获?'
+                    cookie_count='已获取'
                 )
-            elif "????" in error_message or "????" in error_message or "????" in error_message or "????" in error_message or (verification_url and "passport" in verification_url):
+            elif "人脸验证" in error_message or "短信验证" in error_message or "二维码验证" in error_message or "身份验证" in error_message or (verification_url and "passport" in verification_url):
                 notification_msg = render_notification_template(
                     'face_verify',
                     account_id=current_account_id,
@@ -9182,7 +9220,7 @@ class XianyuLive:
                     verification_url='无'
                 )
 
-            logger.info(f"准备发Token刷新异常通知: {self.account_id}")
+            logger.info(f"准备发送Token刷新异常通知: {self.account_id}")
 
             notification_sent = await dispatch_account_notifications(
                 current_account_id,
@@ -9208,9 +9246,9 @@ class XianyuLive:
                     cooldown_desc = f"{self.notification_cooldown // 60}分钟"
 
                 next_send_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(next_send_time))
-                logger.info(f"Token刷新通知已发送，下次可发送时? {next_send_time_str} (冷却时间: {cooldown_desc})")
+                logger.info(f"Token刷新通知已发送，下次可发送时间: {next_send_time_str} (冷却时间: {cooldown_desc})")
             else:
-                logger.warning(f"【{self.account_id}】Token刷新通知未发送成功，不进入冷? {notification_type}")
+                logger.warning(f"【{self.account_id}】Token刷新通知未发送成功，不进入冷却: {notification_type}")
 
         except Exception as e:
             logger.error(f"处理Token刷新通知失败: {self._safe_str(e)}")
@@ -9228,8 +9266,8 @@ class XianyuLive:
             'TOKEN刷新异常',
             'FAIL_SYS_USER_VALIDATE',
             'RGV587_ERROR',
-            '哎哟?被挤爆啦',
-            '请稍后重',
+            '哎哟喂,被挤爆啦',
+            '请稍后重试',
             'punish?x5secdata',
             'captcha',
             '无法获取有效token',
@@ -9261,7 +9299,7 @@ class XianyuLive:
 
         if last_refresh_status == "token_expired_recovery_failed":
             detail = (self.last_token_refresh_error_message or "").lower()
-            if "session??" in detail or "??????" in detail:
+            if "session过期" in detail or "页面会话已失效" in detail:
                 return "Session已过期，系统自动恢复失败，请重新登录"
 
         return "Token定时刷新失败，将自动重试"
@@ -9270,7 +9308,7 @@ class XianyuLive:
         try:
             current_account_id = self._canonical_account_id()
             if not current_account_id:
-                logger.error("【default】自动发货失败知缺少 canonical account_id，拒绝继续运?")
+                logger.error("【default】自动发货失败通知缺少 canonical account_id，拒绝继续运行")
                 return
             notification_message = render_notification_template(
                 'delivery',
@@ -9290,7 +9328,7 @@ class XianyuLive:
                 notification_type='delivery',
             )
             if not notification_sent:
-                logger.warning(f"【{self.account_id}】自动发货知未发送成?")
+                logger.warning(f"【{self.account_id}】自动发货通知未发送成功")
 
         except Exception as e:
             logger.error(f"发自动发货知异常: {self._safe_str(e)}")
@@ -9301,7 +9339,7 @@ class XianyuLive:
             current_account_id = self._canonical_account_id()
             if not current_account_id:
                 logger.error(
-                    f"【default】确认发货缺?canonical account_id，拒绝继续运? {order_id}"
+                    f"【default】确认发货缺少 canonical account_id，拒绝继续运行 {order_id}"
                 )
                 return {"success": False, "error": "missing canonical account_id for auto_confirm", "order_id": order_id}
 
@@ -9331,7 +9369,7 @@ class XianyuLive:
             return result
 
         except Exception as e:
-            logger.error(f"【{self.account_id}】加密确认模块调用失? {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】加密确认模块调用失败: {self._safe_str(e)}")
             return {"error": f"加密确认模块调用失败: {self._safe_str(e)}", "order_id": order_id}
 
     async def auto_freeshipping(self, order_id, item_id, buyer_id, retry_count=0):
@@ -9340,7 +9378,7 @@ class XianyuLive:
             current_account_id = self._canonical_account_id()
             if not current_account_id:
                 logger.error(
-                    f"【default】免拼发货缺?canonical account_id，拒绝继续运? {order_id}"
+                    f"【default】免拼发货缺少 canonical account_id，拒绝继续运行 {order_id}"
                 )
                 return {"success": False, "error": "missing canonical account_id for auto_freeshipping", "order_id": order_id}
 
@@ -9370,7 +9408,7 @@ class XianyuLive:
             return result
 
         except Exception as e:
-            logger.error(f"【{self.account_id}】免拼发货模块调用失? {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】免拼发货模块调用失败: {self._safe_str(e)}")
             return {"error": f"免拼发货模块调用失败: {self._safe_str(e)}", "order_id": order_id}
 
     async def fetch_order_detail_info(self, order_id: str, item_id: str = None, buyer_id: str = None, debug_headless: bool = None, sid: str = None, force_refresh: bool = False, buyer_nick: str = None, buyer_id_source: str = None):
@@ -9399,17 +9437,17 @@ class XianyuLive:
             if lock_loop is not None and lock_loop is not current_loop:
                 order_detail_lock = asyncio.Lock()
                 self._order_detail_locks[order_detail_scope_key] = order_detail_lock
-                logger.info(f"【{current_account_id}】订单详情锁 {order_id} 事件循环不匹配，已重?")
+                logger.info(f"【{current_account_id}】订单详情锁 {order_id} 事件循环不匹配，已重建")
         except RuntimeError:
             pass
 
         self._order_detail_lock_times[order_detail_scope_key] = time.time()
 
         async with order_detail_lock:
-            logger.info(f"🔍 【{current_account_id}】获取订单详情锁 {order_id}，开始处?..")
+            logger.info(f"🔍 【{current_account_id}】获取订单详情锁 {order_id}，开始处理...")
 
             try:
-                logger.info(f"【{self.account_id}】开始获取订单详? {order_id}, sid={sid}")
+                logger.info(f"【{self.account_id}】开始获取订单详情: {order_id}, sid={sid}")
 
                 from utils.order_detail_fetcher import fetch_order_detail_simple
                 from db_manager import db_manager
@@ -9435,10 +9473,10 @@ class XianyuLive:
                     if retry_task and retry_task is not current_task and not retry_task.done():
                         retry_task.cancel()
                         self.order_detail_retry_tasks.pop(order_detail_scope_key, None)
-                        logger.info(f"【{current_account_id}】订单详情已成功获取，取消待执行的补抓任? {order_id}")
+                        logger.info(f"【{current_account_id}】订单详情已成功获取，取消待执行的补抓任务: {order_id}")
 
-                    logger.info(f"【{self.account_id}】订单详情获取成? {order_id}")
-                    logger.info(f"【{self.account_id}】页面标? {result.get('title', '未知')}")
+                    logger.info(f"【{self.account_id}】订单详情获取成功: {order_id}")
+                    logger.info(f"【{self.account_id}】页面标题: {result.get('title', '未知')}")
 
                     def _normalize_optional_text(value):
                         if value is None:
@@ -9477,7 +9515,7 @@ class XianyuLive:
                     item_config = db_manager.get_item_info(current_account_id, item_id) if item_id else None
                     item_config_multi_spec = bool(item_config and item_config.get('is_multi_spec'))
                     item_config_detail = _normalize_optional_text(item_config.get('item_detail')) if item_config else None
-                    is_coin_deduction_item = bool(item_config_detail and '?????' in item_config_detail)
+                    is_coin_deduction_item = bool(item_config_detail and '闲鱼币抵扣' in item_config_detail)
                     configured_item_amount = _normalize_amount_text(item_config.get('item_price')) if item_config else None
                     configured_item_amount_value = _parse_amount_float(configured_item_amount)
 
@@ -9485,7 +9523,7 @@ class XianyuLive:
                         [spec_name, spec_value, spec_name_2, spec_value_2]
                     ):
                         logger.warning(
-                            f"【{self.account_id}】商品配置为无规格，刷新订单详情时忽略解析到的规格信? "
+                            f"【{self.account_id}】商品配置为无规格，刷新订单详情时忽略解析到的规格信息: "
                             f"order_id={order_id}, item_id={item_id}, "
                             f"spec={spec_name or ''}:{spec_value or ''}, spec2={spec_name_2 or ''}:{spec_value_2 or ''}"
                         )
@@ -9498,7 +9536,7 @@ class XianyuLive:
                         spec_name_2 = ''
                         spec_value_2 = ''
                         logger.info(
-                            f"【{self.account_id}】订单详情明确解析为单规格，允许清空历史残留的第二规格字? "
+                            f"【{self.account_id}】订单详情明确解析为单规格，允许清空历史残留的第二规格字段: "
                             f"order_id={order_id}, item_id={item_id}, spec={spec_name}:{spec_value}"
                         )
 
@@ -9506,25 +9544,25 @@ class XianyuLive:
                     order_status_source = _normalize_optional_text(result.get('order_status_source')) or 'unknown'
                     order_status = raw_order_status if raw_order_status and raw_order_status.lower() != 'unknown' else None
                     if order_status:
-                        logger.info(f"【{self.account_id}】?订单状? {order_status} (source={order_status_source})")
+                        logger.info(f"【{self.account_id}】📊 订单状态: {order_status} (source={order_status_source})")
                     elif raw_order_status and raw_order_status.lower() == 'unknown':
-                        logger.warning(f"【{self.account_id}】订单状态解析为unknown，跳过状态字段写?")
+                        logger.warning(f"【{self.account_id}】订单状态解析为unknown，跳过状态字段写库")
 
                     if spec_name and spec_value:
-                        logger.info(f"【{self.account_id}】?规格名称: {spec_name}")
-                        logger.info(f"【{self.account_id}】?规格? {spec_value}")
+                        logger.info(f"【{self.account_id}】📋 规格名称: {spec_name}")
+                        logger.info(f"【{self.account_id}】📝 规格值: {spec_value}")
                         if spec_name_2 and spec_value_2:
-                            logger.info(f"【{self.account_id}】?规格2名称: {spec_name_2}")
-                            logger.info(f"【{self.account_id}】?规格2? {spec_value_2}")
-                            print(f"🛍?【{self.account_id}】订?{order_id} 规格信息: {spec_name} -> {spec_value}, {spec_name_2} -> {spec_value_2}")
+                            logger.info(f"【{self.account_id}】📋 规格2名称: {spec_name_2}")
+                            logger.info(f"【{self.account_id}】📝 规格2值: {spec_value_2}")
+                            print(f"🛍️ 【{self.account_id}】订单 {order_id} 规格信息: {spec_name} -> {spec_value}, {spec_name_2} -> {spec_value_2}")
                         else:
-                            print(f"🛍?【{self.account_id}】订?{order_id} 规格信息: {spec_name} -> {spec_value}")
+                            print(f"🛍️ 【{self.account_id}】订单 {order_id} 规格信息: {spec_name} -> {spec_value}")
                     else:
                         logger.warning(f"【{self.account_id}】未获取到有效的规格信息")
-                        print(f"⚠️ 【{self.account_id}】订?{order_id} 规格信息获取失败")
+                        print(f"⚠️ 【{self.account_id}】订单 {order_id} 规格信息获取失败")
 
                     if amount:
-                        logger.info(f"【{self.account_id}】?订单金额: {amount} (source={amount_source})")
+                        logger.info(f"【{self.account_id}】💰 订单金额: {amount} (source={amount_source})")
 
                     try:
                         existing_order = db_manager.get_order_by_id(order_id, account_id=current_account_id)
@@ -9554,7 +9592,7 @@ class XianyuLive:
                             abs(incoming_amount_value - configured_item_amount_value) <= 0.009
                         ):
                             logger.warning(
-                                f"【{self.account_id}】闲鱼币抵扣订单返回原价，保留已有实付金? "
+                                f"【{self.account_id}】闲鱼币抵扣订单返回原价，保留已有实付金额: "
                                 f"order_id={order_id}, existing_amount={existing_amount}, incoming_amount={amount}, "
                                 f"configured_amount={configured_item_amount}, amount_source={amount_source}"
                             )
@@ -9573,7 +9611,7 @@ class XianyuLive:
                                 amount_source = 'preserved_existing'
                             else:
                                 logger.warning(
-                                    f"【{self.account_id}】订单详情返回低置信度金额，且缺少规?状佐证，跳过写库: "
+                                    f"【{self.account_id}】订单详情返回低置信度金额，且缺少规格/状态佐证，跳过写库: "
                                     f"order_id={order_id}, incoming_amount={amount}, amount_source={amount_source}"
                                 )
                                 amount = None
@@ -9632,7 +9670,7 @@ class XianyuLive:
                             normalized_current_order_status != normalized_incoming_order_status
                         ):
                             logger.info(
-                                f"【{self.account_id}】保留订单现有状态，跳过详情页覆? "
+                                f"【{self.account_id}】保留订单现有状态，跳过详情页覆盖: "
                                 f"order_id={order_id}, current={current_order_status}, incoming={order_status}"
                             )
 
@@ -9650,7 +9688,7 @@ class XianyuLive:
 
                         cookie_info = db_manager.get_cookie_by_id(current_account_id)
                         if not cookie_info:
-                            logger.warning(f"账号ID {current_account_id} 不存在于cookies表中，丢弃订?{order_id}")
+                            logger.warning(f"账号ID {current_account_id} 不存在于cookies表中，丢弃订单 {order_id}")
                         else:
                             success = db_manager.insert_or_update_order(
                                 order_id=order_id,
@@ -9691,26 +9729,26 @@ class XianyuLive:
                                 except Exception as e:
                                     logger.error(f"【{self.account_id}】订单状态处理器调用失败: {self._safe_str(e)}")
                                     import traceback
-                                    logger.error(f"【{self.account_id}】详细错误信? {traceback.format_exc()}")
+                                    logger.error(f"【{self.account_id}】详细错误信息: {traceback.format_exc()}")
                             else:
-                                logger.warning(f"【{self.account_id}】订单状态处理器调用条件不满? success={success}, handler_exists={self.order_status_handler is not None}")
+                                logger.warning(f"【{self.account_id}】订单状态处理器调用条件不满足: success={success}, handler_exists={self.order_status_handler is not None}")
 
                             if success:
                                 logger.info(f"【{self.account_id}】订单信息已保存到数据库: {order_id}")
-                                print(f"💾 【{self.account_id}】订?{order_id} 信息已保存到数据?")
+                                print(f"💾 【{self.account_id}】订单 {order_id} 信息已保存到数据库")
                             else:
-                                logger.warning(f"【{self.account_id}】订单信息保存失? {order_id}")
+                                logger.warning(f"【{self.account_id}】订单信息保存失败: {order_id}")
 
                     except Exception as db_e:
-                        logger.error(f"【{self.account_id}】保存订单信息到数据库失? {self._safe_str(db_e)}")
+                        logger.error(f"【{self.account_id}】保存订单信息到数据库失败: {self._safe_str(db_e)}")
 
                     return result
                 else:
-                    logger.warning(f"【{self.account_id}】订单详情获取失? {order_id}")
+                    logger.warning(f"【{self.account_id}】订单详情获取失败: {order_id}")
                     return None
 
             except Exception as e:
-                logger.error(f"【{self.account_id}】获取订单详情异? {self._safe_str(e)}")
+                logger.error(f"【{self.account_id}】获取订单详情异常: {self._safe_str(e)}")
                 return None
 
     async def _auto_delivery(self, item_id: str, item_title: str = None, order_id: str = None, send_user_id: str = None,
@@ -9769,11 +9807,11 @@ class XianyuLive:
 
             if not current_account_id:
                 logger.error(
-                    "【default】自动发货缺?canonical account_id，拒绝继续运?"
+                    "【default】自动发货缺少 canonical account_id，拒绝继续运行"
                 )
-                return build_result(False, error="自动发货缺少 canonical account_id，无法继?")
+                return build_result(False, error="自动发货缺少 canonical account_id，无法继续")
 
-            logger.info(f"弢始自动发货检? 商品ID={item_id}")
+            logger.info(f"开始自动发货检查: 商品ID={item_id}")
 
             item_info = None
             search_text = item_title
@@ -9791,15 +9829,15 @@ class XianyuLive:
                             auto_fetch_config = config.get('ITEM_DETAIL', {}).get('auto_fetch', {})
 
                             if auto_fetch_config.get('enabled', True):
-                                logger.info(f"数据库中商品详情为空，尝试自动获? {item_id}")
+                                logger.info(f"数据库中商品详情为空，尝试自动获取: {item_id}")
                                 try:
                                     fetched_detail = await self.fetch_item_detail_from_api(item_id)
                                     if fetched_detail:
                                         await self.save_item_detail_only(item_id, fetched_detail)
                                         item_detail_db = fetched_detail
-                                        logger.info(f"成功获取并保存商品详? {item_id}")
+                                        logger.info(f"成功获取并保存商品详情: {item_id}")
                                     else:
-                                        logger.warning(f"未能获取到商品详? {item_id}")
+                                        logger.warning(f"未能获取到商品详情: {item_id}")
                                 except Exception as api_e:
                                     logger.warning(f"获取商品详情失败: {item_id}, 错误: {self._safe_str(api_e)}")
                             else:
@@ -9813,13 +9851,13 @@ class XianyuLive:
 
                         if search_parts:
                             search_text = ' '.join(search_parts)
-                            logger.info(f"使用数据库商品标?详情作为搜索文本: 标题='{item_title_db}', 详情长度={len(item_detail_db)}")
+                            logger.info(f"使用数据库商品标题+详情作为搜索文本: 标题='{item_title_db}', 详情长度={len(item_detail_db)}")
                             logger.warning(f"完整搜索文本: {search_text[:200]}...")
                         else:
                             logger.warning(f"数据库中商品标题和详情都为空: {item_id}")
                             search_text = item_title or item_id
                     else:
-                        logger.warning(f"数据库中未找到商品信? {item_id}")
+                        logger.warning(f"数据库中未找到商品信息: {item_id}")
                         search_text = item_title or item_id
 
                 except Exception as db_e:
@@ -9873,13 +9911,13 @@ class XianyuLive:
                 return 'no_spec'
 
             if order_id:
-                logger.info(f"棢测到订单ID，获取订单详情用于规则匹? {order_id}")
+                logger.info(f"检测到订单ID，获取订单详情用于规则匹配: {order_id}")
                 max_detail_attempts = 3 if item_config_multi_spec else 1
                 for attempt in range(1, max_detail_attempts + 1):
                     try:
                         force_refresh = attempt > 1
                         if force_refresh:
-                            logger.info(f"订单规格信息缺失，开始强刷重?({attempt}/{max_detail_attempts}): {order_id}")
+                            logger.info(f"订单规格信息缺失，开始强刷重试 ({attempt}/{max_detail_attempts}): {order_id}")
 
                         order_detail = await self.fetch_order_detail_info(
                             order_id,
@@ -9889,9 +9927,9 @@ class XianyuLive:
                         )
 
                         if _apply_spec_from_order_detail(order_detail):
-                            logger.info(f"获取到规格信? {spec_name} = {spec_value}")
+                            logger.info(f"获取到规格信息: {spec_name} = {spec_value}")
                             if spec_name_2 and spec_value_2:
-                                logger.info(f"获取到规?信息: {spec_name_2} = {spec_value_2}")
+                                logger.info(f"获取到规格2信息: {spec_name_2} = {spec_value_2}")
                             break
 
                         if item_config_multi_spec:
@@ -9899,7 +9937,7 @@ class XianyuLive:
                                 f"订单详情已获取但未解析到有效规格信息 (尝试 {attempt}/{max_detail_attempts})"
                             )
                         else:
-                            logger.info("无规格商品未解析到规格信息，按普通规则继?")
+                            logger.info("无规格商品未解析到规格信息，按普通规则继续")
                     except Exception as e:
                         logger.error(
                             f"获取订单详情失败 (尝试 {attempt}/{max_detail_attempts}): {self._safe_str(e)}"
@@ -9926,7 +9964,7 @@ class XianyuLive:
 
             if order_spec_mode != 'no_spec' and item_info is not None and not item_config_multi_spec:
                 logger.warning(
-                    f"商品已配置为无规格，忽略订单解析到的规格并按普规则匹? "
+                    f"商品已配置为无规格，忽略订单解析到的规格并按普通规则匹配: "
                     f"order_spec_mode={order_spec_mode}, item_id={item_id or 'unknown'}, "
                     f"order_id={order_id or 'unknown'}, spec={spec_name}:{spec_value}"
                 )
@@ -9937,7 +9975,7 @@ class XianyuLive:
                 order_spec_mode = _get_order_spec_mode()
             elif order_spec_mode == 'no_spec' and item_config_multi_spec:
                 block_reason = (
-                    f"商品已开启规格匹配，但订单未解析到有效规格信息，已阻断自动发? "
+                    f"商品已开启规格匹配，但订单未解析到有效规格信息，已阻断自动发货: "
                     f"order_id={order_id or 'unknown'}, item_id={item_id or 'unknown'}"
                 )
                 logger.error(block_reason)
@@ -9973,7 +10011,7 @@ class XianyuLive:
                 match_mode = 'one_spec_exact'
                 match_mode_context = match_mode
                 logger.info(
-                    f"尝试精确匹配丢组规格发货规? {search_text[:50]}... "
+                    f"尝试精确匹配两组规格发货规则: {search_text[:50]}... "
                     f"[{spec_name}:{spec_value}]"
                 )
                 delivery_rules = db_manager.get_delivery_rules_by_keyword_and_spec(
@@ -9987,7 +10025,7 @@ class XianyuLive:
                 )
                 if not delivery_rules:
                     logger.warning(
-                        f"丢组规格订单未找到精确规格规则，尝试降级匹配普通发货规? {search_text[:50]}..."
+                        f"一组规格订单未找到精确规格规则，尝试降级匹配普通发货规则: {search_text[:50]}..."
                     )
                     fallback_rules = db_manager.get_delivery_rules_by_keyword(
                         search_text,
@@ -9995,7 +10033,7 @@ class XianyuLive:
                         only_non_multi_spec=True
                     )
                     if not fallback_rules:
-                        error_message = "丢组规格订单未找到匹配的发货规?"
+                        error_message = "一组规格订单未找到匹配的发货规则"
                         logger.warning(f"{error_message}: {search_text[:50]}...")
                         return build_result(False, error=error_message, match_mode_value='blocked_no_rule')
                     if len(fallback_rules) != 1:
@@ -10010,20 +10048,20 @@ class XianyuLive:
                     match_mode = 'one_spec_fallback_no_spec'
                     match_mode_context = match_mode
                     logger.warning(
-                        f"丢组规格订单已降级命中唯一普规? order_id={order_id or 'unknown'}, "
+                        f"一组规格订单已降级命中唯一普通规则: order_id={order_id or 'unknown'}, "
                         f"item_id={item_id or 'unknown'}, rule_id={delivery_rules[0].get('id')}"
                     )
             else:
                 match_mode = 'no_spec_match'
                 match_mode_context = match_mode
-                logger.info(f"无规格订单，尝试匹配普发货规? {search_text[:50]}...")
+                logger.info(f"无规格订单，尝试匹配普通发货规则: {search_text[:50]}...")
                 delivery_rules = db_manager.get_delivery_rules_by_keyword(
                     search_text,
                     user_id=self.user_id,
                     only_non_multi_spec=True
                 )
                 if not delivery_rules:
-                    error_message = "无规格订单未找到匹配的普通发货规?"
+                    error_message = "无规格订单未找到匹配的普通发货规则"
                     logger.warning(f"{error_message}: {search_text[:50]}...")
                     return build_result(False, error=error_message, match_mode_value='blocked_no_rule')
                 if len(delivery_rules) != 1:
@@ -10051,7 +10089,7 @@ class XianyuLive:
 
             if rule_spec_mode != order_spec_mode and not allow_one_spec_fallback:
                 block_reason = (
-                    f"订单规格模式与命中规则模式不丢致，已阻断自动发? "
+                    f"订单规格模式与命中规则模式不一致，已阻断自动发货: "
                     f"order_spec_mode={order_spec_mode}, rule_spec_mode={rule_spec_mode}, "
                     f"order_id={order_id or 'unknown'}, item_id={item_id or 'unknown'}, rule_id={rule.get('id')}"
                 )
@@ -10066,31 +10104,31 @@ class XianyuLive:
             except Exception:
                 pass
             await self.save_item_info_to_db(item_id, search_text, item_title_for_save)
-            logger.warning(f"跳过保存商品信息：缺少商品标?- {item_id}")
+            logger.warning(f"跳过保存商品信息：缺少商品标题 - {item_id}")
 
             if order_spec_mode == 'two_spec':
                 rule_spec_info = f"{rule['spec_name']}:{rule['spec_value']}, {rule['spec_name_2']}:{rule['spec_value_2']}"
                 order_spec_info = f"{spec_name}:{spec_value}, {spec_name_2}:{spec_value_2}"
                 logger.info(f"🎯 精确匹配两组规格发货规则: {rule['keyword']} -> {rule['card_name']} [{rule_spec_info}]")
-                logger.info(f"📋 订单规格: {order_spec_info} ?匹配卡券规格: {rule_spec_info}")
+                logger.info(f"📋 订单规格: {order_spec_info} ✅ 匹配卡券规格: {rule_spec_info}")
             elif match_mode == 'one_spec_fallback_no_spec':
                 order_spec_info = f"{spec_name}:{spec_value}"
                 logger.warning(
-                    f"⚠️ 单规格订单降级匹配普通发货规? {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})"
+                    f"⚠️ 单规格订单降级匹配普通发货规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})"
                 )
-                logger.warning(f"📋 订单规格: {order_spec_info}，精确规格未命中，已降级到普通规?")
+                logger.warning(f"📋 订单规格: {order_spec_info}，精确规格未命中，已降级到普通规则")
             elif order_spec_mode == 'one_spec':
                 rule_spec_info = f"{rule['spec_name']}:{rule['spec_value']}"
                 order_spec_info = f"{spec_name}:{spec_value}"
-                logger.info(f"🎯 精确匹配丢组规格发货规? {rule['keyword']} -> {rule['card_name']} [{rule_spec_info}]")
-                logger.info(f"📋 订单规格: {order_spec_info} ?匹配卡券规格: {rule_spec_info}")
+                logger.info(f"🎯 精确匹配两组规格发货规则: {rule['keyword']} -> {rule['card_name']} [{rule_spec_info}]")
+                logger.info(f"📋 订单规格: {order_spec_info} ✅ 匹配卡券规格: {rule_spec_info}")
             else:
-                logger.info(f"?匹配无规格发货规? {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
+                logger.info(f"✅ 匹配无规格发货规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
 
             delay_seconds = rule.get('card_delay_seconds', 0)
 
             if delay_seconds and delay_seconds > 0:
-                logger.info(f"棢测到发货延时设置: {delay_seconds}秒，弢始延?..")
+                logger.info(f"检测到发货延时设置: {delay_seconds}秒，开始延时...")
                 await asyncio.sleep(delay_seconds)
                 logger.info(f"延时完成")
 
@@ -10099,21 +10137,21 @@ class XianyuLive:
                     from db_manager import db_manager
 
                     if send_user_id and send_user_id == self.myid:
-                        logger.info(f"【{self.account_id}】跳过买家订?{order_id}，buyer_id={send_user_id} 等于自己的ID")
+                        logger.info(f"【{self.account_id}】跳过买家订单 {order_id}，buyer_id={send_user_id} 等于自己的ID")
                     else:
                         cookie_info = db_manager.get_cookie_by_id(current_account_id)
                         if not cookie_info:
-                            logger.warning(f"账号ID {current_account_id} 不存在于cookies表中，丢弃订?{order_id}")
+                            logger.warning(f"账号ID {current_account_id} 不存在于cookies表中，丢弃订单 {order_id}")
                         else:
                             existing_order = db_manager.get_order_by_id(order_id, account_id=current_account_id)
                             if not existing_order:
                                 logger.warning(
-                                    f"【{current_account_id}】订?{order_id} 未验证归属，跳过自动发货前的基础订单首写"
+                                    f"【{current_account_id}】订单 {order_id} 未验证归属，跳过自动发货前的基础订单首写"
                                 )
                 except Exception as db_e:
                     logger.error(f"保存基本订单信息失败: {self._safe_str(db_e)}")
 
-                logger.info(f"弢始处理发货内容，规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
+                logger.info(f"开始处理发货内容，规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
 
                 delivery_content = None
                 data_line = None
@@ -10146,7 +10184,7 @@ class XianyuLive:
                     image_url = rule.get('image_url')
                     if image_url:
                         delivery_content = f"__IMAGE_SEND__{rule['card_id']}|{image_url}"
-                        logger.info(f"准备发图? {image_url} (卡券ID: {rule['card_id']})")
+                        logger.info(f"准备发送图片: {image_url} (卡券ID: {rule['card_id']})")
                     else:
                         logger.error(f"图片卡券缺少图片URL: 卡券ID={rule['card_id']}")
                         delivery_content = None
@@ -10162,7 +10200,7 @@ class XianyuLive:
                     else:
                         final_content = delivery_content
 
-                    logger.info(f"自动发货内容准备成功: 规则ID={rule['id']}, 步骤?{len(delivery_steps)}")
+                    logger.info(f"自动发货内容准备成功: 规则ID={rule['id']}, 步骤数={len(delivery_steps)}")
 
                     result = build_result(
                         True,
@@ -10183,15 +10221,15 @@ class XianyuLive:
                     logger.warning(f"获取发货内容失败: 规则ID={rule['id']}")
                     return build_result(False, error=f"获取发货内容失败: 规则ID={rule['id']}", matched_rule=rule, match_mode_value=match_mode)
             else:
-                logger.info(f"⚠️ 未检测到订单ID，跳过发货内容处理规? {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
-                return build_result(False, error="未检测到订单ID，跳过发货内容处?", matched_rule=rule, match_mode_value=match_mode)
+                logger.info(f"⚠️ 未检测到订单ID，跳过发货内容处理。规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
+                return build_result(False, error="未检测到订单ID，跳过发货内容处理", matched_rule=rule, match_mode_value=match_mode)
 
         except Exception as e:
             error_text = self._safe_str(e)
             if matched_rule_context:
                 rule_label = matched_rule_context.get('keyword') or f"规则ID={matched_rule_context.get('id')}"
                 card_type = matched_rule_context.get('card_type') or 'unknown'
-                error_message = f"规则已命?{rule_label})，但{card_type}发货处理异常: {error_text}"
+                error_message = f"规则已命中({rule_label})，但{card_type}发货处理异常: {error_text}"
             else:
                 error_message = f"自动发货异常: {error_text}"
             logger.error(error_message)
@@ -10284,7 +10322,7 @@ class XianyuLive:
     def _format_delivery_unit_text(self, text: str, unit_index: int, total_units: int) -> str:
         safe_total_units = max(1, int(total_units or 1))
         safe_unit_index = max(1, int(unit_index or 1))
-        prefix = f"【{safe_unit_index}/{safe_total_units}?"
+        prefix = f"【{safe_unit_index}/{safe_total_units}】"
         content = (text or '').strip()
         return f"{prefix}{content}" if content else prefix
 
@@ -10297,7 +10335,7 @@ class XianyuLive:
             return delivery_steps or []
 
         steps = [dict(step or {}) for step in (delivery_steps or [])]
-        prefix = f"【{max(1, int(unit_index or 1))}/{max(1, int(total_units or 1))}?"
+        prefix = f"【{max(1, int(unit_index or 1))}/{max(1, int(total_units or 1))}】"
 
         for step in steps:
             if step.get('type') == 'text':
@@ -10369,7 +10407,7 @@ class XianyuLive:
             if len(numbered_text) > max_chars_per_message:
                 flush_current_batch()
                 logger.warning(
-                    f"【{self.account_id}】发货单?{prepared_unit.get('unit_index')} 文本长度 {len(numbered_text)} 超过批量阈?{max_chars_per_message}，回逢为单条发?"
+                    f"【{self.account_id}】发货单元 {prepared_unit.get('unit_index')} 文本长度 {len(numbered_text)} 超过批量阈值 {max_chars_per_message}，回退为单条发送"
                 )
                 groups.append({
                     'mode': 'single',
@@ -10424,12 +10462,12 @@ class XianyuLive:
 
                 await self.send_image_msg(websocket, chat_id, user_id, image_url, card_id=image_card_id)
                 logger.info(
-                    f"【{log_prefix}】步?{index}/{total_steps} 已向 {user_url} 发图? {image_url}"
+                    f"【{log_prefix}】步骤 {index}/{total_steps} 已向 {user_url} 发送图片: {image_url}"
                 )
             else:
                 await self.send_msg(websocket, chat_id, user_id, step_content)
                 logger.info(
-                    f"【{log_prefix}】步?{index}/{total_steps} 已向 {user_url} 发文本内?"
+                    f"【{log_prefix}】步骤 {index}/{total_steps} 已向 {user_url} 发送文本内容"
                 )
 
             if total_steps > 1 and index < total_steps:
@@ -10439,7 +10477,7 @@ class XianyuLive:
         max_retries = 4
 
         if retry_count >= max_retries:
-            logger.error(f"API调用失败，已达到朢大重试次?{max_retries})")
+            logger.error(f"API调用失败，已达到最大重试次数({max_retries})")
             return None
 
         try:
@@ -10501,7 +10539,7 @@ class XianyuLive:
                 except Exception:
                     content = response_text
 
-                logger.info(f"API调用成功，返回内容长? {len(content)}")
+                logger.info(f"API调用成功，返回内容长度: {len(content)}")
                 return content
             else:
                 logger.warning(f"API调用失败: {status_code} - {response_text[:200]}...")
@@ -10524,7 +10562,7 @@ class XianyuLive:
                 await asyncio.sleep(wait_time)
                 return await self._get_api_card_content(rule, order_id, item_id, buyer_id, spec_name, spec_value, retry_count + 1)
             else:
-                logger.error(f"API调用网络异常，已达到朢大重试次? {self._safe_str(e)}")
+                logger.error(f"API调用网络异常，已达到最大重试次数: {self._safe_str(e)}")
                 return None
 
         except Exception as e:
@@ -10566,7 +10604,7 @@ class XianyuLive:
 
             recharge_account = None
             if require_account:
-                logger.info(f"亦凡API霢要充值账号，弢始询问流?")
+                logger.info(f"亦凡API需要充值账号，开始询问流程")
                 recharge_account = await self._ask_for_recharge_account(chat_id, buyer_id, rule, order_id, item_id)
                 if recharge_account == "__WAITING_ACCOUNT__":
                     logger.info(f"已设置等待账号输入状态，暂停发货流程")
@@ -10574,7 +10612,7 @@ class XianyuLive:
                 elif not recharge_account:
                     logger.error(f"获取充账号失败，取消发货")
                     return None
-                logger.info(f"获取到充值账? {recharge_account}")
+                logger.info(f"获取到充值账号: {recharge_account}")
 
             timestamp = str(int(time.time()))
             params = {
@@ -10595,12 +10633,12 @@ class XianyuLive:
             sign_string = '&'.join([f"{key}={sign_params[key]}" for key in sorted_keys])
             sign_string += user_key
 
-            logger.info(f"亦凡API签名字符? {sign_string}")
+            logger.info(f"亦凡API签名字符串: {sign_string}")
 
             sign = hashlib.md5(sign_string.encode('utf-8')).hexdigest().lower()
             params['sign'] = sign
 
-            logger.info(f"????API: ??ID={user_id}, ??ID={goods_id}, ????={recharge_account}, ??URL={callback_url if callback_url else '?'}")
+            logger.info(f"调用亦凡API: 商户ID={user_id}, 商品ID={goods_id}, 充值账号={recharge_account}, 回调URL={callback_url if callback_url else '无'}")
 
             if not self.session:
                 await self.create_session()
@@ -10622,21 +10660,21 @@ class XianyuLive:
                             order_no = data.get('orderno', '')
                             us_order_no = data.get('usorderno', '')
 
-                            success_msg = f"?自动发货订单已提交成功\n\n"
+                            success_msg = f"✅ 自动发货订单已提交成功\n\n"
                             success_msg += f"📋 订单信息：\n"
-                            success_msg += f"平台订单? {order_no}\n"
+                            success_msg += f"平台订单号: {order_no}\n"
                             if us_order_no:
-                                success_msg += f"商家订单? {us_order_no}\n"
+                                success_msg += f"商家订单号: {us_order_no}\n"
 
                             query_url = YIFAN_API.get('query_url', 'http://116.196.116.76/yifan.php')
                             success_msg += f"\n🔍 查询卡密：\n"
                             success_msg += f"{query_url}\n"
-                            success_msg += f"(输入订单号查?\n"
+                            success_msg += f"(输入订单号查询)\n"
 
-                            success_msg += f"\n?温馨提示：\n"
-                            success_msg += f"订单处理霢要一定时间，请心等待。\n"
+                            success_msg += f"\n⏰ 温馨提示：\n"
+                            success_msg += f"订单处理需要一定时间，请耐心等待。\n"
                             success_msg += f"如果1小时后仍未看到卡密信息，\n"
-                            success_msg += f"请联系客服处理?"
+                            success_msg += f"请联系客服处理。"
 
                             logger.info(f"亦凡API调用成功: order_no={order_no}")
 
@@ -10645,7 +10683,7 @@ class XianyuLive:
                                     from db_manager import db_manager
                                     if not canonical_account_id:
                                         logger.error(
-                                            "【default】亦凡订单绑定缺?canonical account_id，拒绝回填订单归?"
+                                            "【default】亦凡订单绑定缺少 canonical account_id，拒绝回填订单归属"
                                         )
                                     else:
                                         db_manager.update_order_yifan_status(
@@ -10656,7 +10694,7 @@ class XianyuLive:
                                         )
                                         if chat_id:
                                             db_manager.update_order_chat_id(order_id, chat_id, account_id=canonical_account_id)
-                                        logger.info(f"已记录亦凡订单信? order_id={order_id}, yifan_orderno={order_no}")
+                                        logger.info(f"已记录亦凡订单信息: order_id={order_id}, yifan_orderno={order_no}")
                                 except Exception as e:
                                     logger.error(f"记录亦凡订单信息失败: {e}")
 
@@ -10667,7 +10705,7 @@ class XianyuLive:
 
                             if chat_id and buyer_id:
                                 from db_manager import db_manager
-                                notification_msg = f"?自动发货失败\n错误信息: {error_msg}\n请联系客服处?"
+                                notification_msg = f"❌ 自动发货失败\n错误信息: {error_msg}\n请联系客服处理"
                                 await self.send_notification("系统", buyer_id, notification_msg, item_id or "unknown", chat_id)
 
                             return None
@@ -10703,7 +10741,7 @@ class XianyuLive:
             callback_url = api_config.get('callback_url', '')
 
             if not user_id or not user_key or not goods_id:
-                logger.error(f"亦凡API配置不完?")
+                logger.error(f"亦凡API配置不完整")
                 return None
 
             timestamp = str(int(time.time()))
@@ -10723,12 +10761,12 @@ class XianyuLive:
             sign_string = '&'.join([f"{key}={sign_params[key]}" for key in sorted_keys])
             sign_string += user_key
 
-            logger.info(f"亦凡API签名字符? {sign_string}")
+            logger.info(f"亦凡API签名字符串: {sign_string}")
 
             sign = hashlib.md5(sign_string.encode('utf-8')).hexdigest().lower()
             params['sign'] = sign
 
-            logger.info(f"????API: ??ID={user_id}, ??ID={goods_id}, ????={account}, ??URL={callback_url if callback_url else '?'}")
+            logger.info(f"调用亦凡API: 商户ID={user_id}, 商品ID={goods_id}, 充值账号={account}, 回调URL={callback_url if callback_url else '无'}")
 
             if not self.session:
                 await self.create_session()
@@ -10750,13 +10788,13 @@ class XianyuLive:
                             order_no = data.get('orderno', '')
                             us_order_no = data.get('usorderno', '')
 
-                            success_msg = f"?下单成功\n"
-                            success_msg += f"订单? {order_no}\n"
+                            success_msg = f"✅ 下单成功\n"
+                            success_msg += f"订单号: {order_no}\n"
                             if us_order_no:
-                                success_msg += f"用户订单? {us_order_no}\n"
-                            success_msg += f"充账? {account}\n"
+                                success_msg += f"用户订单号: {us_order_no}\n"
+                            success_msg += f"充值账号: {account}\n"
                             success_msg += f"返回信息: {result.get('msg', '提交成功')}\n"
-                            success_msg += f"有任何问题，请及时联系客服处理?"
+                            success_msg += f"有任何问题，请及时联系客服处理。"
 
                             logger.info(f"亦凡API调用成功: {success_msg}")
                             return success_msg
@@ -10766,7 +10804,7 @@ class XianyuLive:
 
                             if chat_id and buyer_id:
                                 from db_manager import db_manager
-                                notification_msg = f"?自动发货失败\n错误信息: {error_msg}\n请联系客服处?"
+                                notification_msg = f"❌ 自动发货失败\n错误信息: {error_msg}\n请联系客服处理"
                                 await self.send_notification("系统", buyer_id, notification_msg, item_id or "unknown", chat_id)
 
                             return None
@@ -10795,14 +10833,14 @@ class XianyuLive:
                     'retry_count': 0
                 }
 
-            ask_message = "请单独发送您的充值账号，不要有任何其他的文字。如果因为您输错的原因导致错误下单，概不逢款?"
+            ask_message = "请单独发送您的充值账号，不要有任何其他的文字。如果因为您输错的原因导致错误下单，概不退款。"
             await self.send_msg(self.ws, chat_id, buyer_id, ask_message)
             logger.info(f"已发送充值账号询问消息，等待用户回复")
 
             return "__WAITING_ACCOUNT__"
 
         except Exception as e:
-            logger.error(f"询问充账号异? {self._safe_str(e)}")
+            logger.error(f"询问充值账号异常: {self._safe_str(e)}")
             return None
 
     async def _replace_api_dynamic_params(self, params, order_id=None, item_id=None, buyer_id=None, spec_name=None, spec_value=None):
@@ -10818,7 +10856,7 @@ class XianyuLive:
             needs_account_scoped_lookup = bool(order_id or item_id)
             if needs_account_scoped_lookup and not canonical_account_id:
                 logger.warning(
-                    "API动参数替换缺?canonical account_id，跳过订?商品读取"
+                    "API动态参数替换缺少 canonical account_id，跳过订单/商品读取"
                 )
             else:
                 from db_manager import db_manager
@@ -10827,7 +10865,7 @@ class XianyuLive:
                     try:
                         order_info = db_manager.get_order_by_id(order_id, account_id=canonical_account_id)
                         if order_info:
-                            logger.warning(f"从数据库获取到订单信? {order_id}")
+                            logger.warning(f"从数据库获取到订单信息: {order_id}")
                         else:
                             logger.warning(f"无法从数据库获取订单信息: {order_id}")
                     except Exception as e:
@@ -10837,7 +10875,7 @@ class XianyuLive:
                     try:
                         item_info = db_manager.get_item_info(canonical_account_id, item_id)
                         if item_info:
-                            logger.warning(f"从数据库获取到商品信? {item_id}")
+                            logger.warning(f"从数据库获取到商品信息: {item_id}")
                         else:
                             logger.warning(f"无法从数据库获取商品信息: {item_id}")
                     except Exception as e:
@@ -10882,13 +10920,13 @@ class XianyuLive:
                     replaced_keys.append(key)
 
             if replaced_keys:
-                logger.info(f"API动参数替换完成，替换的参? {replaced_keys}")
+                logger.info(f"API动态参数替换完成，替换的参数: {replaced_keys}")
                 logger.warning(f"参数映射: {param_mapping}")
 
             return replaced_params
 
         except Exception as e:
-            logger.error(f"替换API动参数失? {self._safe_str(e)}")
+            logger.error(f"替换API动态参数失败: {self._safe_str(e)}")
             return params
 
     def _recursive_replace_params(self, obj, param_mapping):
@@ -10919,7 +10957,7 @@ class XianyuLive:
 
                     current_time = time.time()
                     if current_time - self.last_session_keepalive_time >= self.session_keepalive_interval:
-                        logger.info(f"【{self.account_id}】开始执行轻量会话保?..")
+                        logger.info(f"【{self.account_id}】开始执行轻量会话保活...")
                         keepalive_ok = await self.keep_session_alive()
                         if keepalive_ok:
                             await self._interruptible_sleep(60)
@@ -10944,33 +10982,33 @@ class XianyuLive:
                                     "token_scheduled_refresh_failed"
                                 )
                             logger.warning(
-                                f"【{self.account_id}】重型Token恢复失败(status={last_refresh_status})?"
+                                f"【{self.account_id}】重型Token恢复失败(status={last_refresh_status})，"
                                 f"{self.token_retry_interval} 秒后重试"
                             )
                             await self._interruptible_sleep(self.token_retry_interval)
                         else:
                             logger.warning(
-                                f"【{self.account_id}】轻量保活失?status={keepalive_status})?"
+                                f"【{self.account_id}】轻量保活失败(status={keepalive_status})，"
                                 f"{self.session_keepalive_retry_interval} 秒后重试"
                             )
                             await self._interruptible_sleep(self.session_keepalive_retry_interval)
                         continue
                     await self._interruptible_sleep(60)
                 except asyncio.CancelledError:
-                    logger.info(f"【{self.account_id}】Token刷新循环收到取消信号，准备?")
+                    logger.info(f"【{self.account_id}】Token刷新循环收到取消信号，准备退出")
                     raise
                 except Exception as e:
                     logger.error(f"Token刷新循环出错: {self._safe_str(e)}")
                     try:
                         await self._interruptible_sleep(60)
                     except asyncio.CancelledError:
-                        logger.info(f"【{self.account_id}】Token刷新循环在重试等待时收到取消信号，准备?")
+                        logger.info(f"【{self.account_id}】Token刷新循环在重试等待时收到取消信号，准备退出")
                         raise
         except asyncio.CancelledError:
-            logger.info(f"【{self.account_id}】Token刷新循环已取消，正在逢?..")
+            logger.info(f"【{self.account_id}】Token刷新循环已取消，正在退出...")
             raise
         finally:
-            logger.info(f"【{self.account_id}】Token刷新循环已?")
+            logger.info(f"【{self.account_id}】Token刷新循环已退出")
 
     async def create_chat(self, ws, toid, item_id='891198795482'):
         msg = {
@@ -11100,7 +11138,7 @@ class XianyuLive:
             ]
         }
         await ws.send(json.dumps(msg))
-        logger.info(f'【{self.account_id}】连接注册完?')
+        logger.info(f'【{self.account_id}】连接注册完成')
 
     async def list_all_conversations(self, cid: str, page_size: int = 20):
         headers = self._build_websocket_headers()
@@ -11190,7 +11228,7 @@ class XianyuLive:
 
     async def send_heartbeat(self, ws):
         if ws.closed:
-            raise ConnectionError("WebSocket连接已关闭，无法发心?")
+            raise ConnectionError("WebSocket连接已关闭，无法发送心跳")
 
         heartbeat_mid = generate_mid()
         msg = {
@@ -11204,9 +11242,9 @@ class XianyuLive:
             self.pending_heartbeat_mids.append(heartbeat_mid)
             await asyncio.wait_for(ws.send(json.dumps(msg)), timeout=2.0)
             self.last_heartbeat_time = time.time()
-            logger.warning(f"【{self.account_id}】心跳包已发?[ID:{heartbeat_mid}]")
+            logger.warning(f"【{self.account_id}】心跳包已发送 [ID:{heartbeat_mid}]")
         except asyncio.TimeoutError:
-            raise ConnectionError("心跳发超时，WebSocket可能已断弢")
+            raise ConnectionError("心跳发送超时，WebSocket可能已断开")
         except asyncio.CancelledError:
             raise
 
@@ -11218,7 +11256,7 @@ class XianyuLive:
             while True:
                 try:
                     if not self._is_current_account_enabled():
-                        logger.info(f"【{self.account_id}】账号已禁用，停止心跳循?")
+                        logger.info(f"【{self.account_id}】账号已禁用，停止心跳循环")
                         break
 
                     if ws.closed:
@@ -11231,11 +11269,11 @@ class XianyuLive:
                     await self._interruptible_sleep(self.heartbeat_interval)
 
                 except asyncio.CancelledError:
-                    logger.info(f"【{self.account_id}】心跳循环收到取消信号，准备逢?")
+                    logger.info(f"【{self.account_id}】心跳循环收到取消信号，准备退出")
                     raise
                 except Exception as e:
                     consecutive_failures += 1
-                    logger.error(f"心跳发失?({consecutive_failures}/{max_failures}): {self._safe_str(e)}")
+                    logger.error(f"心跳发送失败 ({consecutive_failures}/{max_failures}): {self._safe_str(e)}")
 
                     if consecutive_failures >= max_failures:
                         logger.error(f"【{self.account_id}】心跳连续失败{max_failures}次，停止心跳循环")
@@ -11244,13 +11282,13 @@ class XianyuLive:
                     try:
                         await self._interruptible_sleep(5)
                     except asyncio.CancelledError:
-                        logger.info(f"【{self.account_id}】心跳循环在重试等待时收到取消信号，准备逢?")
+                        logger.info(f"【{self.account_id}】心跳循环在重试等待时收到取消信号，准备退出")
                         raise
         except asyncio.CancelledError:
-            logger.info(f"【{self.account_id}】心跳循环已取消，正在?..")
+            logger.info(f"【{self.account_id}】心跳循环已取消，正在退出...")
             raise
         finally:
-            logger.info(f"【{self.account_id}】心跳循环已逢?")
+            logger.info(f"【{self.account_id}】心跳循环已退出")
 
     async def handle_heartbeat_response(self, message_data):
         try:
@@ -11276,7 +11314,7 @@ class XianyuLive:
                 self.pending_heartbeat_mids.remove(response_mid)
             except ValueError:
                 pass
-            logger.warning(f"【{self.account_id}】心跳响应正?[ID:{response_mid}]")
+            logger.warning(f"【{self.account_id}】心跳响应正常 [ID:{response_mid}]")
             return True
         except Exception as e:
             logger.error(f"处理心跳响应出错: {self._safe_str(e)}")
@@ -11287,7 +11325,7 @@ class XianyuLive:
             while True:
                 try:
                     if not self._is_current_account_enabled():
-                        logger.info(f"【{self.account_id}】账号已禁用，停止清理循?")
+                        logger.info(f"【{self.account_id}】账号已禁用，停止清理循环")
                         break
 
                     pause_manager.cleanup_expired_pauses()
@@ -11312,14 +11350,14 @@ class XianyuLive:
                     except asyncio.CancelledError:
                         raise
                     except Exception as qr_clean_e:
-                        logger.warning(f"【{self.account_id}】清理QR登录会话时出? {qr_clean_e}")
+                        logger.warning(f"【{self.account_id}】清理QR登录会话时出错: {qr_clean_e}")
 
                     try:
                         await self._cleanup_playwright_cache()
                     except asyncio.CancelledError:
                         raise
                     except Exception as pw_clean_e:
-                        logger.warning(f"【{self.account_id}】清理Playwright缓存时出? {pw_clean_e}")
+                        logger.warning(f"【{self.account_id}】清理Playwright缓存时出错: {pw_clean_e}")
 
                     try:
                         cleaned_logs = await self._cleanup_old_logs(retention_days=7)
@@ -11387,36 +11425,36 @@ class XianyuLive:
                                 else:
                                     logger.error(f"【{self.account_id}】数据库清理失败: {stats['error']}")
                             except asyncio.CancelledError:
-                                logger.warning(f"【{self.account_id}】数据库清理被取?")
+                                logger.warning(f"【{self.account_id}】数据库清理被取消")
                                 raise
                     except asyncio.CancelledError:
                         raise
                     except Exception as db_clean_e:
-                        logger.error(f"【{self.account_id}】清理数据库历史数据时出? {db_clean_e}")
+                        logger.error(f"【{self.account_id}】清理数据库历史数据时出错: {db_clean_e}")
 
                     await self._interruptible_sleep(300)
                 except asyncio.CancelledError:
-                    logger.info(f"【{self.account_id}】清理循环收到取消信号，准备逢?")
+                    logger.info(f"【{self.account_id}】清理循环收到取消信号，准备退出")
                     raise
                 except Exception as e:
-                    logger.error(f"【{self.account_id}】清理任务失? {self._safe_str(e)}")
+                    logger.error(f"【{self.account_id}】清理任务失败: {self._safe_str(e)}")
                     try:
                         await self._interruptible_sleep(300)
                     except asyncio.CancelledError:
-                        logger.info(f"【{self.account_id}】清理循环在重试等待时收到取消信号，准备逢?")
+                        logger.info(f"【{self.account_id}】清理循环在重试等待时收到取消信号，准备退出")
                         raise
         except asyncio.CancelledError:
-            logger.info(f"【{self.account_id}】清理循环已取消，正在?..")
+            logger.info(f"【{self.account_id}】清理循环已取消，正在退出...")
             raise
         finally:
-            logger.info(f"【{self.account_id}】清理循环已逢?")
+            logger.info(f"【{self.account_id}】清理循环已退出")
 
 
     async def cookie_refresh_loop(self):
         try:
             canonical_account_id = self._canonical_account_id()
             if not canonical_account_id:
-                logger.error("【default】Cookie刷新循环缺少 canonical account_id，拒绝继续运?")
+                logger.error("【default】Cookie刷新循环缺少 canonical account_id，拒绝继续运行")
                 return
             current_account_id = canonical_account_id
             while True:
@@ -11442,7 +11480,7 @@ class XianyuLive:
                             remaining_time = self.message_cookie_refresh_cooldown - time_since_last_message
                             remaining_minutes = int(remaining_time // 60)
                             remaining_seconds = int(remaining_time % 60)
-                            logger.warning(f"【{self.account_id}】收到消息后冷却中，还需等待 {remaining_minutes}分{remaining_seconds}?才能执行Cookie刷新")
+                            logger.warning(f"【{self.account_id}】收到消息后冷却中，还需等待 {remaining_minutes}分{remaining_seconds}秒 才能执行Cookie刷新")
                         elif self.cookie_refresh_lock.locked():
                             logger.warning(f"【{self.account_id}】Cookie刷新任务已在执行中，跳过本次触发")
                         else:
@@ -11451,20 +11489,20 @@ class XianyuLive:
 
                     await self._interruptible_sleep(60)
                 except asyncio.CancelledError:
-                    logger.info(f"【{self.account_id}】Cookie刷新循环收到取消信号，准备?")
+                    logger.info(f"【{self.account_id}】Cookie刷新循环收到取消信号，准备退出")
                     raise
                 except Exception as e:
                     logger.error(f"【{self.account_id}】Cookie刷新循环失败: {self._safe_str(e)}")
                     try:
                         await self._interruptible_sleep(60)
                     except asyncio.CancelledError:
-                        logger.info(f"【{self.account_id}】Cookie刷新循环在重试等待时收到取消信号，准备?")
+                        logger.info(f"【{self.account_id}】Cookie刷新循环在重试等待时收到取消信号，准备退出")
                         raise
         except asyncio.CancelledError:
-            logger.info(f"【{self.account_id}】Cookie刷新循环已取消，正在逢?..")
+            logger.info(f"【{self.account_id}】Cookie刷新循环已取消，正在退出...")
             raise
         finally:
-            logger.info(f"【{self.account_id}】Cookie刷新循环已?")
+            logger.info(f"【{self.account_id}】Cookie刷新循环已退出")
 
     async def _execute_cookie_refresh(self, current_time):
 
@@ -11474,7 +11512,7 @@ class XianyuLive:
             try:
                 canonical_account_id = self._canonical_account_id()
                 if not canonical_account_id:
-                    logger.error("【default】执行Cookie刷新任务缺少 canonical account_id，拒绝继续运?")
+                    logger.error("【default】执行Cookie刷新任务缺少 canonical account_id，拒绝继续运行")
                     return
                 current_account_id = canonical_account_id
                 if self.is_manual_refresh_active(current_account_id):
@@ -11496,14 +11534,14 @@ class XianyuLive:
                     )
 
                 if heartbeat_was_running and self.ws and not self.ws.closed:
-                    logger.warning(f"【{self.account_id}】重新启动心跳任?")
+                    logger.warning(f"【{self.account_id}】重新启动心跳任务")
                     self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
 
                 if success:
                     self.last_cookie_refresh_time = current_time
                     logger.info(f"【{self.account_id}】Cookie刷新任务完成，心跳已恢复")
 
-                    logger.info(f"【{self.account_id}】开始验证刷新后的Cookie有效?..")
+                    logger.info(f"【{self.account_id}】开始验证刷新后的Cookie有效性...")
                     try:
                         validation_result = await self._verify_cookie_validity()
 
@@ -11512,22 +11550,22 @@ class XianyuLive:
                             if validation_result.get('relogin_recommended', True):
                                 logger.warning(f"【{self.account_id}】检测到Cookie可能无法用于关键API，尝试过密码登录重新获取...")
 
-                                password_refresh_success = await self._try_password_login_refresh("Cookie验证失败(关键API不可?")
+                                password_refresh_success = await self._try_password_login_refresh("Cookie验证失败(关键API不可用)")
 
                                 if password_refresh_success:
-                                    logger.info(f"【{self.account_id}】✅ 密码登录刷新成功，Cookie已更?")
+                                    logger.info(f"【{self.account_id}】✅ 密码登录刷新成功，Cookie已更新")
                                     clear_message_received_flag = True
                                 else:
-                                    logger.warning(f"【{self.account_id}】⚠?密码登录刷新失败，Cookie可能仍然无效")
+                                    logger.warning(f"【{self.account_id}】⚠️ 密码登录刷新失败，Cookie可能仍然无效")
                                     await self.send_token_refresh_notification(
                                         f"Cookie验证失败且密码登录刷新也失败\n验证详情: {validation_result['details']}",
                                         "cookie_validation_failed"
                                     )
                             else:
-                                logger.warning(f"【{self.account_id}】Cookie验证失败，但当前错误更像网络/环境问题，跳过密码登录刷?")
+                                logger.warning(f"【{self.account_id}】Cookie验证失败，但当前错误更像网络/环境问题，跳过密码登录刷新")
                         else:
                             if validation_result.get('inconclusive'):
-                                logger.warning(f"【{self.account_id}】⚠?Cookie验证结果不确定，保留当前消息冷却标志，等待后续保活再次确? {validation_result['details']}")
+                                logger.warning(f"【{self.account_id}】⚠️ Cookie验证结果不确定，保留当前消息冷却标志，等待后续保活再次确认: {validation_result['details']}")
                             else:
                                 logger.info(f"【{self.account_id}】✅ Cookie验证通过: {validation_result['details']}")
                                 clear_message_received_flag = True
@@ -11535,7 +11573,7 @@ class XianyuLive:
                     except Exception as verify_e:
                         logger.error(f"【{self.account_id}】Cookie验证过程异常: {self._safe_str(verify_e)}")
                         import traceback
-                        logger.error(f"【{self.account_id}】详细堆?\n{traceback.format_exc()}")
+                        logger.error(f"【{self.account_id}】详细堆栈:\n{traceback.format_exc()}")
                 else:
                     logger.warning(f"【{self.account_id}】Cookie刷新任务失败")
                     self.last_cookie_refresh_time = current_time
@@ -11548,7 +11586,7 @@ class XianyuLive:
             finally:
                 if (refresh_flow_entered and self.ws and not self.ws.closed and
                     (not self.heartbeat_task or self.heartbeat_task.done())):
-                    logger.info(f"【{self.account_id}】Cookie刷新完成，心跳任务正常运?")
+                    logger.info(f"【{self.account_id}】Cookie刷新完成，心跳任务正常运行")
                     self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
 
                 if clear_message_received_flag:
@@ -11586,19 +11624,19 @@ class XianyuLive:
         canonical_account_id = self._canonical_account_id()
         target_account_id = explicit_account_id or canonical_account_id
         if not target_account_id:
-            logger.error("【default】扫码登录Cookie刷新缺少 account_id，无法继续申请账号级浏览?runtime")
+            logger.error("【default】扫码登录Cookie刷新缺少 account_id，无法继续申请账号级浏览器 runtime")
             return False
         if explicit_account_id and canonical_account_id and explicit_account_id != canonical_account_id:
             logger.error(
-                f"【{canonical_account_id}】扫码登录Cookie刷新拒绝跨账号请? "
-                    f"account_id={explicit_account_id}"
+                f"【{canonical_account_id}】扫码登录Cookie刷新拒绝跨账号请求: "
+                f"account_id={explicit_account_id}"
                 )
             return False
         if runtime_lease is not None:
             lease_account_id = self._normalize_account_scope(getattr(runtime_lease, "account_id", None))
             if not lease_account_id:
                 logger.warning(
-                    f"【{target_account_id}】扫码登录Cookie刷新收到缺少 account_id ?managed_runtime_lease?"
+                    f"【{target_account_id}】扫码登录Cookie刷新收到缺少 account_id 的 managed_runtime_lease，"
                     "放弃上游 handoff，改走账号持久化画像"
                 )
                 browser = None
@@ -11607,7 +11645,7 @@ class XianyuLive:
                 runtime_lease = None
             elif lease_account_id != target_account_id:
                 logger.error(
-                    f"【{target_account_id}】扫码登录Cookie刷新拒绝跨账?managed runtime handoff: "
+                    f"【{target_account_id}】扫码登录Cookie刷新拒绝跨账号 managed runtime handoff: "
                     f"lease_account_id={lease_account_id}"
                 )
                 browser = None
@@ -11616,7 +11654,7 @@ class XianyuLive:
                 runtime_lease = None
             elif getattr(runtime_lease, "released", False):
                 logger.warning(
-                    f"【{target_account_id}】扫码登录Cookie刷新收到已释放的 managed_runtime_lease?"
+                    f"【{target_account_id}】扫码登录Cookie刷新收到已释放的 managed_runtime_lease，"
                     "放弃上游 handoff，重新申请同账号 runtime"
                 )
                 browser = None
@@ -11629,13 +11667,13 @@ class XianyuLive:
                 lease_browser = getattr(lease_context, "browser", None) or getattr(lease_runtime, "browser", None)
                 if lease_context is None:
                     reason_suffix = (
-                        "，且传入?managed_context 无法证明归属?lease"
+                        "，且传入的 managed_context 无法证明归属于该 lease"
                         if context is not None else ""
                     )
                     logger.warning(
-                        f"【{target_account_id}】扫码登录Cookie刷新收到缺少 context ?managed_runtime_lease"
-                        f"{reason_suffix}?"
-                        "先释放失?handoff lease，再重新申请同账?runtime"
+                        f"【{target_account_id}】扫码登录Cookie刷新收到缺少 context 的 managed_runtime_lease"
+                        f"{reason_suffix}。"
+                        "先释放失效 handoff lease，再重新申请同账号 runtime"
                     )
                     try:
                         await account_browser_runtime_manager.release_runtime(
@@ -11644,7 +11682,7 @@ class XianyuLive:
                         )
                     except Exception as release_error:
                         logger.warning(
-                            f"【{target_account_id}】释放失?handoff lease 失败，继续按账号持久化画像重? "
+                            f"【{target_account_id}】释放失效 handoff lease 失败，继续按账号持久化画像重试: "
                             f"{self._safe_str(release_error)}"
                         )
                     browser = None
@@ -11653,8 +11691,8 @@ class XianyuLive:
                     runtime_lease = None
                 elif context is not None and context is not lease_context:
                     logger.warning(
-                        f"【{target_account_id}】扫码登录Cookie刷新收到不属于当?runtime lease ?managed_context?"
-                        "忽略上游页面句柄并回逢?lease 自身上下?"
+                        f"【{target_account_id}】扫码登录Cookie刷新收到不属于当前 runtime lease 的 managed_context，"
+                        "忽略上游页面句柄并回退到 lease 自身上下文"
                     )
                     browser = lease_browser
                     context = lease_context
@@ -11664,19 +11702,19 @@ class XianyuLive:
                     if page is not None:
                         if not isinstance(lease_pages, list):
                             logger.warning(
-                                f"【{target_account_id}】扫码登录Cookie刷新收到缺少 pages 跟踪信息?managed_runtime_lease?"
-                                "不复用上?managed_page，改为向同账?lease 申请 fresh page"
+                                f"【{target_account_id}】扫码登录Cookie刷新收到缺少 pages 跟踪信息的 managed_runtime_lease，"
+                                "不复用上游 managed_page，改为向同账号 lease 申请 fresh page"
                             )
                             page = None
                         elif page not in lease_pages:
                             logger.warning(
-                                f"【{target_account_id}】扫码登录Cookie刷新收到未被 runtime lease 跟踪?managed_page?"
+                                f"【{target_account_id}】扫码登录Cookie刷新收到未被 runtime lease 跟踪的 managed_page，"
                                 "改为向同账号 lease 申请 fresh page"
                             )
                             page = None
         elif context is not None:
             logger.warning(
-                f"【{target_account_id}】扫码登录Cookie刷新传入 managed_context 但缺?managed_runtime_lease?"
+                f"【{target_account_id}】扫码登录Cookie刷新传入 managed_context 但缺少 managed_runtime_lease，"
                 "无法校验账号归属，改走账号持久化画像"
             )
             browser = None
@@ -11687,16 +11725,16 @@ class XianyuLive:
         try:
             if explicit_account_id and not canonical_account_id:
                 logger.error(
-                    f"【{target_account_id}】扫码登录Cookie刷新拒绝缺少 canonical account_id 的实例接管显式账号请?"
+                    f"【{target_account_id}】扫码登录Cookie刷新拒绝缺少 canonical account_id 的实例接管显式账号请求"
                 )
                 return False
             from utils.xianyu_utils import trans_cookies
 
-            logger.info(f"【{target_account_id}】开始使用扫码登?Cookie 获取真实 Cookie...")
-            logger.info(f"【{target_account_id}】扫?Cookie 长度: {len(qr_cookies_str)}")
+            logger.info(f"【{target_account_id}】开始使用扫码登录cookie获取真实cookie...")
+            logger.info(f"【{target_account_id}】扫码cookie长度: {len(qr_cookies_str)}")
 
             qr_cookies_dict = trans_cookies(qr_cookies_str)
-            logger.info(f"【{target_account_id}】扫?Cookie 字段? {len(qr_cookies_dict)}")
+            logger.info(f"【{target_account_id}】扫码 Cookie 字段数: {len(qr_cookies_dict)}")
 
             if runtime_lease is not None and context is None:
                 runtime = getattr(runtime_lease, "runtime", None)
@@ -11704,13 +11742,13 @@ class XianyuLive:
                 browser = browser or getattr(context, "browser", None) or getattr(runtime, "browser", None)
 
             if page is not None and context is None:
-                logger.warning(f"【{target_account_id}】传?managed_page 但缺?managed_context，忽略该页面复用")
+                logger.warning(f"【{target_account_id}】传入 managed_page 但缺少 managed_context，忽略该页面复用")
                 page = None
 
             if context is None:
                 if browser is not None:
                     logger.warning(
-                        f"【{target_account_id}】传?managed_runtime 但缺?managed_context?"
+                        f"【{target_account_id}】传入 managed_runtime 但缺少 managed_context，"
                         "不再创建匿名 new_context，改走账号持久化画像"
                     )
                 runtime_lease, browser, context, _ = await self._open_browser_recovery_context(
@@ -11726,8 +11764,8 @@ class XianyuLive:
 
             if runtime_lease is None:
                 logger.error(
-                    f"【{target_account_id}】扫码登录Cookie刷新未获取受?runtime_lease?"
-                    "拒绝?lease 外创建页面或注入 Cookie"
+                    f"【{target_account_id}】扫码登录Cookie刷新未获取受管 runtime_lease，"
+                    "拒绝在 lease 外创建页面或注入 Cookie"
                 )
                 return False
 
@@ -11736,7 +11774,7 @@ class XianyuLive:
             await context.add_cookies(cookies)
             logger.info(f"【{target_account_id}】已设置 {len(cookies)} 个扫码Cookie到浏览器")
 
-            logger.info(f"【{target_account_id}?== 设置到浏览器的扫码Cookie ===")
+            logger.info(f"【{target_account_id}】=== 设置到浏览器的扫码Cookie ===")
             for i, cookie in enumerate(cookies, 1):
                 logger.info(f"【{target_account_id}】{i:2d}. {cookie['name']}: {cookie['value'][:50]}{'...' if len(cookie['value']) > 50 else ''}")
 
@@ -11752,17 +11790,17 @@ class XianyuLive:
 
             try:
                 await page.goto(target_url, wait_until='domcontentloaded', timeout=15000)
-                logger.info(f"【{target_account_id}】页面访问成?")
+                logger.info(f"【{target_account_id}】页面访问成功")
             except Exception as e:
                 if 'timeout' in str(e).lower():
                     logger.warning(f"【{target_account_id}】页面访问超时，尝试降级策略...")
                     try:
                         await page.goto(target_url, wait_until='load', timeout=20000)
-                        logger.info(f"【{target_account_id}】页面访问成功（降级策略?")
+                        logger.info(f"【{target_account_id}】页面访问成功（降级策略）")
                     except Exception as e2:
                         logger.warning(f"【{target_account_id}】降级策略也失败，尝试最基本访问...")
                         await page.goto(target_url, timeout=25000)
-                        logger.info(f"【{target_account_id}】页面访问成功（朢基本策略?")
+                        logger.info(f"【{target_account_id}】页面访问成功（最基本策略）")
                 else:
                     raise e
 
@@ -11772,12 +11810,12 @@ class XianyuLive:
             logger.info(f"【{target_account_id}】执行页面刷新获取最新cookie...")
             try:
                 await page.reload(wait_until='domcontentloaded', timeout=12000)
-                logger.info(f"【{target_account_id}】页面刷新成?")
+                logger.info(f"【{target_account_id}】页面刷新成功")
             except Exception as e:
                 if 'timeout' in str(e).lower():
                     logger.warning(f"【{target_account_id}】页面刷新超时，使用降级策略...")
                     await page.reload(wait_until='load', timeout=15000)
-                    logger.info(f"【{target_account_id}】页面刷新成功（降级策略?")
+                    logger.info(f"【{target_account_id}】页面刷新成功（降级策略）")
                 else:
                     raise e
             await asyncio.sleep(1)
@@ -11796,7 +11834,7 @@ class XianyuLive:
                 try:
                     existing_cookies_dict = trans_cookies(existing_cookie_value) or {}
                 except Exception as merge_e:
-                    logger.warning(f"【{target_account_id}】解析现有账号Cookie失败，按空基线继? {self._safe_str(merge_e)}")
+                    logger.warning(f"【{target_account_id}】解析现有账号Cookie失败，按空基线继续: {self._safe_str(merge_e)}")
 
             merge_result = self.protected_merge_cookie_dicts(existing_cookies_dict, real_cookies_dict)
             real_cookies_dict = merge_result['merged_cookies_dict']
@@ -11815,9 +11853,9 @@ class XianyuLive:
             if merge_result['updated_fields']:
                 logger.info(f"【{target_account_id}】扫码登录合并更新Cookie字段: {', '.join(merge_result['updated_fields'])}")
             if merge_result['preserved_fields']:
-                logger.info(f"【{target_account_id}】扫码登录保留现有Cookie字段 ({len(merge_result['preserved_fields'])}?: {', '.join(merge_result['preserved_fields'])}")
+                logger.info(f"【{target_account_id}】扫码登录保留现有Cookie字段 ({len(merge_result['preserved_fields'])}个): {', '.join(merge_result['preserved_fields'])}")
             if merge_result['preserved_protected_fields']:
-                logger.warning(f"【{target_account_id}】扫码登录保护保留关键字? {', '.join(merge_result['preserved_protected_fields'])}")
+                logger.warning(f"【{target_account_id}】扫码登录保护性保留关键字段: {', '.join(merge_result['preserved_protected_fields'])}")
             if merge_result['account_switched']:
                 logger.warning(f"【{target_account_id}】扫码登录检测到unb变化，按账号切换处理，不保留旧账号Cookie字段")
 
@@ -11828,32 +11866,32 @@ class XianyuLive:
 
             real_cookies_str = '; '.join([f"{k}={v}" for k, v in real_cookies_dict.items()])
 
-            logger.info(f"【{target_account_id}】真实Cookie已获取，包含 {len(real_cookies_dict)} 个字?")
+            logger.info(f"【{target_account_id}】真实Cookie已获取，包含 {len(real_cookies_dict)} 个字段")
 
-            logger.info(f"【{target_account_id}?========= 扫码登录真实Cookie字段详情 ==========")
-            logger.info(f"【{target_account_id}】Cookie字段? {len(real_cookies_dict)}")
+            logger.info(f"【{target_account_id}】========== 扫码登录真实Cookie字段详情 ==========")
+            logger.info(f"【{target_account_id}】Cookie字段数: {len(real_cookies_dict)}")
             logger.info(f"【{target_account_id}】Cookie字段列表:")
             for i, (key, value) in enumerate(real_cookies_dict.items(), 1):
                 if len(str(value)) > 50:
-                    logger.info(f"【{target_account_id}? {i:2d}. {key}: {str(value)[:30]}...{str(value)[-20:]} (长度: {len(str(value))})")
+                    logger.info(f"【{target_account_id}】  {i:2d}. {key}: {str(value)[:30]}...{str(value)[-20:]} (长度: {len(str(value))})")
                 else:
                     logger.info(f"【{target_account_id}? {i:2d}. {key}: {value}")
 
             important_keys = list(REQUIRED_SESSION_COOKIE_FIELDS) + list(OBSERVED_SESSION_COOKIE_FIELDS)
-            logger.info(f"【{target_account_id}】关键字段检?")
+            logger.info(f"【{target_account_id}】关键字段检查:")
             for key in important_keys:
                 if key in real_cookies_dict:
                     val = real_cookies_dict[key]
-                    logger.info(f"【{target_account_id}? ?{key}: {'存在' if val else '为空'} (长度: {len(str(val)) if val else 0})")
+                    logger.info(f"【{target_account_id}】  ✅ {key}: {'存在' if val else '为空'} (长度: {len(str(val)) if val else 0})")
                 else:
-                    logger.info(f"【{target_account_id}? ?{key}: 缺失")
-            logger.info(f"【{target_account_id}?=========================================")
+                    logger.info(f"【{target_account_id}】  ❌ {key}: 缺失")
+            logger.info(f"【{target_account_id}】==========================================")
 
-            logger.info(f"【{target_account_id}?== 真实Cookie摘要 ===")
-            logger.info(f"【{target_account_id}】Cookie字符串长? {len(real_cookies_str)}")
+            logger.info(f"【{target_account_id}】=== 真实Cookie摘要 ===")
+            logger.info(f"【{target_account_id}】Cookie字符串长度: {len(real_cookies_str)}")
             logger.info(f"【{target_account_id}】Cookie摘要: {self._summarize_cookie_string(real_cookies_str)}")
 
-            logger.info(f"【{target_account_id}?== Cookie字段详细信息 ===")
+            logger.info(f"【{target_account_id}】=== Cookie字段详细信息 ===")
             for i, (name, value) in enumerate(real_cookies_dict.items(), 1):
                 if len(value) > 50:
                     display_value = f"{value[:20]}...{value[-20:]}"
@@ -11861,13 +11899,13 @@ class XianyuLive:
                     display_value = value
                 logger.info(f"【{target_account_id}】{i:2d}. {name}: {display_value}")
 
-            logger.info(f"【{target_account_id}?== 扫码Cookie对比 ===")
+            logger.info(f"【{target_account_id}】=== 扫码Cookie对比 ===")
             logger.info(f"【{target_account_id}】扫码Cookie长度: {len(qr_cookies_str)}")
-            logger.info(f"【{target_account_id}】扫码Cookie字段? {len(qr_cookies_dict)}")
+            logger.info(f"【{target_account_id}】扫码Cookie字段数: {len(qr_cookies_dict)}")
             logger.info(f"【{target_account_id}】真实Cookie长度: {len(real_cookies_str)}")
-            logger.info(f"【{target_account_id}】真实Cookie字段? {len(real_cookies_dict)}")
-            logger.info(f"【{target_account_id}】长度增? {len(real_cookies_str) - len(qr_cookies_str)} 字符")
-            logger.info(f"【{target_account_id}】字段增? {len(real_cookies_dict) - len(qr_cookies_dict)} ?")
+            logger.info(f"【{target_account_id}】真实Cookie字段数: {len(real_cookies_dict)}")
+            logger.info(f"【{target_account_id}】长度增加: {len(real_cookies_str) - len(qr_cookies_str)} 字符")
+            logger.info(f"【{target_account_id}】字段增加: {len(real_cookies_dict) - len(qr_cookies_dict)} 个")
 
             changed_cookies = []
             new_cookies = []
@@ -11879,14 +11917,14 @@ class XianyuLive:
                     changed_cookies.append(name)
 
             if changed_cookies:
-                logger.info(f"【{target_account_id}】发生变化的Cookie字段 ({len(changed_cookies)}?: {', '.join(changed_cookies)}")
+                logger.info(f"【{target_account_id}】发生变化的Cookie字段 ({len(changed_cookies)}个): {', '.join(changed_cookies)}")
             if new_cookies:
-                logger.info(f"【{target_account_id}】新增的Cookie字段 ({len(new_cookies)}?: {', '.join(new_cookies)}")
+                logger.info(f"【{target_account_id}】新增的Cookie字段 ({len(new_cookies)}个): {', '.join(new_cookies)}")
             if not changed_cookies and not new_cookies:
-                logger.info(f"【{target_account_id}】Cookie无变?")
+                logger.info(f"【{target_account_id}】Cookie无变化")
 
             important_cookies = ['_m_h5_tk', '_m_h5_tk_enc', 'cookie2', 't', 'sgcookie', 'unb', 'uc1', 'uc3', 'uc4']
-            logger.info(f"【{target_account_id}?== 重要Cookie字段完整详情 ===")
+            logger.info(f"【{target_account_id}】=== 重要Cookie字段完整详情 ===")
             for cookie_name in important_cookies:
                 if cookie_name in real_cookies_dict:
                     cookie_value = real_cookies_dict[cookie_name]
@@ -11895,13 +11933,13 @@ class XianyuLive:
 
                     logger.info(f"【{target_account_id}】{cookie_name}{change_mark}:")
                     logger.info(f"【{target_account_id}? ? {self._mask_secret_value(cookie_value, head=8, tail=6)}")
-                    logger.info(f"【{target_account_id}? 长度: {len(cookie_value)}")
+                    logger.info(f"【{target_account_id}】  长度: {len(cookie_value)}")
 
                     if cookie_name in qr_cookies_dict:
                         old_value = qr_cookies_dict[cookie_name]
                         if old_value != cookie_value:
-                            logger.info(f"【{target_account_id}? 原? {self._mask_secret_value(old_value, head=8, tail=6)}")
-                            logger.info(f"【{target_account_id}? 原长? {len(old_value)}")
+                            logger.info(f"【{target_account_id}】  原值: {self._mask_secret_value(old_value, head=8, tail=6)}")
+                            logger.info(f"【{target_account_id}】  原长度: {len(old_value)}")
                     logger.info(f"【{target_account_id}? ---")
                 else:
                     logger.info(f"【{target_account_id}】{cookie_name}: [不存在]")
@@ -11913,7 +11951,7 @@ class XianyuLive:
                 success = db_manager.save_cookie(target_account_id, real_cookies_str, target_user_id)
 
             if success:
-                logger.info(f"【{target_account_id}】真实Cookie已成功保存到数据?")
+                logger.info(f"【{target_account_id}】真实Cookie已成功保存到数据库")
 
                 if target_account_id == self._canonical_account_id():
                     self._set_runtime_cookie_state(
@@ -11924,7 +11962,7 @@ class XianyuLive:
                 logger.info(f"【{target_account_id}】已更新当前实例的Cookie信息")
 
                 self.last_qr_cookie_refresh_time = time.time()
-                logger.info(f"【{target_account_id}】已更新扫码登录Cookie刷新时间标志，_refresh_cookies_via_browser将等待{self.qr_cookie_refresh_cooldown//60}分钟后执?")
+                logger.info(f"【{target_account_id}】已更新扫码登录Cookie刷新时间标志，_refresh_cookies_via_browser将等待{self.qr_cookie_refresh_cooldown//60}分钟后执行")
 
                 return True
             else:
@@ -11954,7 +11992,7 @@ class XianyuLive:
                         close_page=close_page,
                     )
             except Exception as cleanup_e:
-                logger.warning(f"【{target_account_id}】清理浏览器资源时出? {self._safe_str(cleanup_e)}")
+                logger.warning(f"【{target_account_id}】清理浏览器资源时出错: {self._safe_str(cleanup_e)}")
 
     def _build_browser_cookie_payload(self, cookies_str: str) -> List[Dict[str, str]]:
         cross_domain_cookie_names = {
@@ -12060,7 +12098,7 @@ class XianyuLive:
     def _resolve_account_browser_profile_dir(self, profile_key: Optional[str] = None) -> str:
         resolved_key = str(profile_key or "").strip() or self._canonical_account_id()
         if not resolved_key:
-            raise RuntimeError("缺少 canonical account_id，无法解析账号级浏览器画像目?")
+            raise RuntimeError("缺少 canonical account_id，无法解析账号级浏览器画像目录")
         safe_key = re.sub(r"[^0-9A-Za-z_.-]+", "_", resolved_key)
         profile_dir = os.path.join(os.getcwd(), 'browser_data', f'user_{safe_key}')
         os.makedirs(profile_dir, exist_ok=True)
@@ -12103,8 +12141,8 @@ class XianyuLive:
             if self._has_recent_slider_success():
                 window_seconds = getattr(self, 'slider_success_reentry_window', None)
                 if window_seconds:
-                    return True, f"朢近{int(window_seconds)}秒内刚过滑块"
-                return True, "朢近刚通过滑块"
+                    return True, f"最近{int(window_seconds)}秒内刚过滑块"
+                return True, "最近刚通过滑块"
         except Exception:
             pass
 
@@ -12124,7 +12162,7 @@ class XianyuLive:
         )
         canonical_account_id = self._canonical_account_id()
         if not canonical_account_id:
-            logger.error(f"【default】{recovery_label}缺少 canonical account_id，无法申请账号级浏览?runtime")
+            logger.error(f"【default】{recovery_label}缺少 canonical account_id，无法申请账号级浏览器 runtime")
             return None, None, None, False
 
         for scope_name, scope_value in (
@@ -12143,7 +12181,7 @@ class XianyuLive:
 
         if prefer_persistent_profile:
             if not resolved_account_id:
-                logger.error(f"【default】{recovery_label}缺少 account_id，无法申请账号级浏览?runtime")
+                logger.error(f"【default】{recovery_label}缺少 account_id，无法申请账号级浏览器 runtime")
                 return None, None, None, False
             profile_dir = account_browser_runtime_manager.resolve_profile_dir(resolved_account_id)
             persistent_context_options = dict(context_options)
@@ -12178,11 +12216,11 @@ class XianyuLive:
                         )
                     except Exception as release_error:
                         logger.warning(
-                            f"【{resolved_account_id}】{recovery_label}释放跨账?runtime 失败，继续按失败关闭处理: "
+                            f"【{resolved_account_id}】{recovery_label}释放跨账号 runtime 失败，继续按失败关闭处理: "
                             f"{self._safe_str(release_error)}"
                         )
                     logger.error(
-                        f"【{resolved_account_id}】{recovery_label}拿到的账号级 runtime 归属不匹配，已放弃使? "
+                        f"【{resolved_account_id}】{recovery_label}拿到的账号级 runtime 归属不匹配，已放弃使用: "
                         f"lease_account_id={lease_account_id or 'default'}"
                     )
                     return None, None, None, False
@@ -12200,8 +12238,8 @@ class XianyuLive:
                     )
                     return None, None, None, False
                 logger.info(
-                    f"【{resolved_account_id}】{recovery_label}复用账号持久化画? {profile_dir}"
-                    f"（原? {reuse_reason}?"
+                    f"【{resolved_account_id}】{recovery_label}复用账号持久化画像: {profile_dir}"
+                    f"（原因: {reuse_reason}）"
                 )
                 return lease, browser, context, True
             except Exception as persistent_launch_error:
@@ -12240,7 +12278,7 @@ class XianyuLive:
                 return
             except Exception as release_error:
                 logger.warning(
-                    f"【{release_account_id}】释放账号级浏览?runtime 失败，避免误关受管资源，保留?runtime manager 后续回收: "
+                    f"【{release_account_id}】释放账号级浏览器 runtime 失败，避免误关受管资源，保留 runtime manager 后续回收: "
                     f"{self._safe_str(release_error)}"
                 )
                 return
@@ -12261,7 +12299,7 @@ class XianyuLive:
         runtime_lease = None
         canonical_account_id = self._canonical_account_id()
         if not canonical_account_id:
-            logger.error("【default】浏览器稳定化缺?canonical account_id，拒绝继续执行账号级浏览器链?")
+            logger.error("【default】浏览器稳定化缺少 canonical account_id，拒绝继续执行账号级浏览器链路")
             return False
         log_account_id = canonical_account_id or "default"
 
@@ -12272,7 +12310,7 @@ class XianyuLive:
             logger.info(f"【{log_account_id}】当前cookie长度: {len(current_cookies_str)}")
 
             current_cookies_dict = trans_cookies(current_cookies_str)
-            logger.info(f"【{log_account_id}】当前cookie字段? {len(current_cookies_dict)}")
+            logger.info(f"【{log_account_id}】当前cookie字段数: {len(current_cookies_dict)}")
             runtime_lease, browser, context, _ = await self._open_browser_recovery_context(
                 "浏览器稳定化",
                 runtime_purpose="cookie_refresh",
@@ -12294,17 +12332,17 @@ class XianyuLive:
 
             try:
                 await page.goto(target_url, wait_until='domcontentloaded', timeout=15000)
-                logger.info(f"【{log_account_id}】页面访问成?")
+                logger.info(f"【{log_account_id}】页面访问成功")
             except Exception as e:
                 if 'timeout' in str(e).lower():
                     logger.warning(f"【{log_account_id}】页面访问超时，尝试降级策略...")
                     try:
                         await page.goto(target_url, wait_until='load', timeout=20000)
-                        logger.info(f"【{log_account_id}】页面访问成功（降级策略?")
+                        logger.info(f"【{log_account_id}】页面访问成功（降级策略）")
                     except Exception as e2:
                         logger.warning(f"【{log_account_id}】降级策略也失败，尝试最基本访问...")
                         await page.goto(target_url, timeout=25000)
-                        logger.info(f"【{log_account_id}】页面访问成功（朢基本策略?")
+                        logger.info(f"【{log_account_id}】页面访问成功（最基本策略）")
                 else:
                     raise e
 
@@ -12314,12 +12352,12 @@ class XianyuLive:
             logger.info(f"【{log_account_id}】执行页面刷新获取最新cookie...")
             try:
                 await page.reload(wait_until='domcontentloaded', timeout=12000)
-                logger.info(f"【{log_account_id}】页面刷新成?")
+                logger.info(f"【{log_account_id}】页面刷新成功")
             except Exception as e:
                 if 'timeout' in str(e).lower():
                     logger.warning(f"【{log_account_id}】页面刷新超时，使用降级策略...")
                     await page.reload(wait_until='load', timeout=15000)
-                    logger.info(f"【{log_account_id}】页面刷新成功（降级策略?")
+                    logger.info(f"【{log_account_id}】页面刷新成功（降级策略）")
                 else:
                     raise e
             await asyncio.sleep(1)
@@ -12337,7 +12375,7 @@ class XianyuLive:
 
             real_cookies_str = '; '.join([f"{k}={v}" for k, v in real_cookies_dict.items()])
 
-            logger.info(f"【{log_account_id}】真实Cookie已获取，包含 {len(real_cookies_dict)} 个字?")
+            logger.info(f"【{log_account_id}】真实Cookie已获取，包含 {len(real_cookies_dict)} 个字段")
             logger.info(f"【{log_account_id}】真实Cookie摘要: {self._summarize_cookie_string(real_cookies_str)}")
 
             self._log_cookie_merge_summary(
@@ -12357,7 +12395,7 @@ class XianyuLive:
             )
 
             if merge_result['missing_required_fields']:
-                logger.error(f"【{log_account_id}】浏览器稳定化后的Cookie仍缺失核心字段，放弃写回数据? {', '.join(merge_result['missing_required_fields'])}")
+                logger.error(f"【{log_account_id}】浏览器稳定化后的Cookie仍缺失核心字段，放弃写回数据库: {', '.join(merge_result['missing_required_fields'])}")
                 return False
 
             changed_cookies = []
@@ -12371,23 +12409,23 @@ class XianyuLive:
 
             if not changed_cookies and not new_cookies:
                 if restart_on_success:
-                    logger.warning(f"【{log_account_id}】Cookie无变化，可能当前cookie已失?")
+                    logger.warning(f"【{log_account_id}】Cookie无变化，可能当前cookie已失效")
                     return False
                 logger.info(f"【{log_account_id}】Cookie字段无变化，但浏览器稳定化访问已完成")
 
-            logger.info(f"【{log_account_id}】发生变化的Cookie字段 ({len(changed_cookies)}?: {', '.join(changed_cookies[:10])}")
+            logger.info(f"【{log_account_id}】发生变化的Cookie字段 ({len(changed_cookies)}个): {', '.join(changed_cookies[:10])}")
             if new_cookies:
-                logger.info(f"【{log_account_id}】新增的Cookie字段 ({len(new_cookies)}?: {', '.join(new_cookies[:10])}")
+                logger.info(f"【{log_account_id}】新增的Cookie字段 ({len(new_cookies)}个): {', '.join(new_cookies[:10])}")
 
             if restart_on_success:
-                logger.info(f"【{log_account_id}】开始更新Cookie并重启任?..")
+                logger.info(f"【{log_account_id}】开始更新Cookie并重启任务...")
                 update_success = await self._update_cookies_and_restart(real_cookies_str)
 
                 if update_success:
-                    logger.info(f"【{log_account_id}】过访问指定页面成功更新Cookie并重启任?")
+                    logger.info(f"【{log_account_id}】通过访问指定页面成功更新Cookie并重启任务")
                     return True
                 else:
-                    logger.error(f"【{log_account_id}】更新Cookie或重启任务失?")
+                    logger.error(f"【{log_account_id}】更新Cookie或重启任务失败")
                     return False
 
             old_cookies_str = self.cookies_str
@@ -12399,7 +12437,7 @@ class XianyuLive:
                     source="stabilize_cookie_snapshot",
                 )
                 await self.update_config_cookies()
-                logger.info(f"【{log_account_id}】过访问指定页面成功稳定当前Cookie（不重启任务?")
+                logger.info(f"【{log_account_id}】通过访问指定页面成功稳定当前Cookie（不重启任务）")
                 return True
             except Exception as update_e:
                 self._set_runtime_cookie_state(
@@ -12424,7 +12462,7 @@ class XianyuLive:
                         reason="browser_stabilization_completed",
                     )
             except Exception as cleanup_e:
-                logger.warning(f"【{log_account_id}】清理浏览器资源时出? {self._safe_str(cleanup_e)}")
+                logger.warning(f"【{log_account_id}】清理浏览器资源时出错: {self._safe_str(cleanup_e)}")
 
     def reset_qr_cookie_refresh_flag(self):
         self.last_qr_cookie_refresh_time = 0
@@ -12445,7 +12483,7 @@ class XianyuLive:
         runtime_lease = None
         canonical_account_id = self._canonical_account_id()
         if not canonical_account_id:
-            logger.error("【default】浏览器刷新Cookie缺少 canonical account_id，拒绝继续执行账号级浏览器链?")
+            logger.error("【default】浏览器刷新Cookie缺少 canonical account_id，拒绝继续执行账号级浏览器链路")
             return False
         log_account_id = canonical_account_id or "default"
         try:
@@ -12458,13 +12496,13 @@ class XianyuLive:
                 remaining_minutes = int(remaining_time // 60)
                 remaining_seconds = int(remaining_time % 60)
 
-                logger.info(f"【{log_account_id}】扫码登录Cookie刷新冷却中，还需等待 {remaining_minutes}分{remaining_seconds}?")
+                logger.info(f"【{log_account_id}】扫码登录Cookie刷新冷却中，还需等待 {remaining_minutes}分{remaining_seconds}秒")
                 logger.info(f"【{log_account_id}】跳过本次浏览器Cookie刷新")
                 return False
 
-            logger.info(f"【{log_account_id}】开始过浏览器刷新Cookie...")
+            logger.info(f"【{log_account_id}】开始通过浏览器刷新Cookie...")
             logger.info(f"【{log_account_id}】刷新前Cookie长度: {len(self.cookies_str)}")
-            logger.info(f"【{log_account_id}】刷新前Cookie字段? {len(self.cookies)}")
+            logger.info(f"【{log_account_id}】刷新前Cookie字段数: {len(self.cookies)}")
             runtime_lease, browser, context, _ = await self._open_browser_recovery_context(
                 "浏览器刷新Cookie",
                 runtime_purpose="cookie_refresh",
@@ -12482,36 +12520,36 @@ class XianyuLive:
             await asyncio.sleep(0.1)
 
             target_url = "https://www.goofish.com/im"
-            logger.info(f"【{log_account_id}】访问页? {target_url}")
+            logger.info(f"【{log_account_id}】访问页面: {target_url}")
 
             try:
                 await page.goto(target_url, wait_until='domcontentloaded', timeout=15000)
-                logger.info(f"【{log_account_id}】页面访问成?")
+                logger.info(f"【{log_account_id}】页面访问成功")
             except Exception as e:
                 if 'timeout' in str(e).lower():
                     logger.warning(f"【{log_account_id}】页面访问超时，尝试降级策略...")
                     try:
                         await page.goto(target_url, wait_until='load', timeout=20000)
-                        logger.info(f"【{log_account_id}】页面访问成功（降级策略?")
+                        logger.info(f"【{log_account_id}】页面访问成功（降级策略）")
                     except Exception as e2:
                         logger.warning(f"【{log_account_id}】降级策略也失败，尝试最基本访问...")
                         await page.goto(target_url, timeout=25000)
-                        logger.info(f"【{log_account_id}】页面访问成功（朢基本策略?")
+                        logger.info(f"【{log_account_id}】页面访问成功（最基本策略）")
                 else:
                     raise e
 
-            logger.info(f"【{log_account_id}】页面加载完成，弢始刷?..")
+            logger.info(f"【{log_account_id}】页面加载完成，开始刷新...")
             await asyncio.sleep(1)
 
-            logger.info(f"【{log_account_id}】执行第丢次刷?..")
+            logger.info(f"【{log_account_id}】执行第一次刷新...")
             try:
                 await page.reload(wait_until='domcontentloaded', timeout=12000)
-                logger.info(f"【{log_account_id}】第丢次刷新成?")
+                logger.info(f"【{log_account_id}】第一次刷新成功")
             except Exception as e:
                 if 'timeout' in str(e).lower():
-                    logger.warning(f"【{log_account_id}】第丢次刷新超时，使用降级策略...")
+                    logger.warning(f"【{log_account_id}】第一次刷新超时，使用降级策略...")
                     await page.reload(wait_until='load', timeout=15000)
-                    logger.info(f"【{log_account_id}】第丢次刷新成功（降级策略?")
+                    logger.info(f"【{log_account_id}】第一次刷新成功（降级策略）")
                 else:
                     raise e
             await asyncio.sleep(1)
@@ -12522,7 +12560,7 @@ class XianyuLive:
                 logger.info(f"【{log_account_id}】第二次刷新成功")
             except Exception as e:
                 if 'timeout' in str(e).lower():
-                    logger.warning(f"【{log_account_id}】第二次刷新超时，使用降级策?..")
+                    logger.warning(f"【{log_account_id}】第二次刷新超时，使用降级策略...")
                     await page.reload(wait_until='load', timeout=15000)
                     logger.info(f"【{log_account_id}】第二次刷新成功（降级策略）")
                 else:
@@ -12533,7 +12571,7 @@ class XianyuLive:
             updated_cookies = await context.cookies()
 
             page_title = await page.title()
-            logger.info(f"【{log_account_id}】当前页面标? {page_title}")
+            logger.info(f"【{log_account_id}】当前页面标题: {page_title}")
 
             new_cookies_dict = {}
             for cookie in updated_cookies:
@@ -12581,14 +12619,14 @@ class XianyuLive:
                 source="browser_cookie_refresh",
             )
 
-            logger.info(f"【{log_account_id}】Cookie已更新，包含 {len(new_cookies_dict)} 个字?")
+            logger.info(f"【{log_account_id}】Cookie已更新，包含 {len(new_cookies_dict)} 个字段")
 
             if changed_cookies:
-                logger.info(f"【{log_account_id}】发生变化的Cookie字段 ({len(changed_cookies)}?: {', '.join(changed_cookies)}")
+                logger.info(f"【{log_account_id}】发生变化的Cookie字段 ({len(changed_cookies)}个): {', '.join(changed_cookies)}")
             if new_cookies:
-                logger.info(f"【{log_account_id}】新增的Cookie字段 ({len(new_cookies)}?: {', '.join(new_cookies)}")
+                logger.info(f"【{log_account_id}】新增的Cookie字段 ({len(new_cookies)}个): {', '.join(new_cookies)}")
             if not changed_cookies and not new_cookies:
-                logger.info(f"【{log_account_id}】Cookie无变?")
+                logger.info(f"【{log_account_id}】Cookie无变化")
 
             logger.info(f"【{log_account_id}】更新后的Cookie摘要: {self._summarize_cookie_string(self.cookies_str)}")
 
@@ -12623,14 +12661,14 @@ class XianyuLive:
                 try:
                     self.restarted_in_browser_refresh = True
 
-                    logger.info(f"【{log_account_id}】Cookie刷新成功，准备重启实?..(via _refresh_cookies_via_browser)")
+                    logger.info(f"【{log_account_id}】Cookie刷新成功，准备重启实例...(via _refresh_cookies_via_browser)")
                     await self._restart_instance()
 
                     logger.info(f"【{log_account_id}】重启请求已触发(via _refresh_cookies_via_browser)")
 
                     self.connection_restart_flag = True
                 except Exception as e:
-                    logger.error(f"【{log_account_id}】兜底重启失? {self._safe_str(e)}")
+                    logger.error(f"【{log_account_id}】兜底重启失败: {self._safe_str(e)}")
             else:
                 logger.info(f"【{log_account_id}】由定时任务触发，不设置浏览器Cookie刷新成功标志")
 
@@ -12651,7 +12689,7 @@ class XianyuLive:
                         reason="browser_cookie_refresh_completed",
                     )
             except Exception as cleanup_e:
-                logger.warning(f"【{log_account_id}】创建浏览器关闭任务时出? {self._safe_str(cleanup_e)}")
+                logger.warning(f"【{log_account_id}】创建浏览器关闭任务时出错: {self._safe_str(cleanup_e)}")
 
     async def _async_close_browser(
         self,
@@ -12680,17 +12718,17 @@ class XianyuLive:
                     await asyncio.wait_for(browser.close(), timeout=5.0)
                     logger.info(f"【{self.account_id}】浏览器关闭完成")
                 except asyncio.TimeoutError:
-                    logger.warning(f"【{self.account_id}】浏览器关闭超时，尝试强制关?")
+                    logger.warning(f"【{self.account_id}】浏览器关闭超时，尝试强制关闭")
                     try:
                         if hasattr(browser, '_connection'):
                             browser._connection.dispose()
                     except Exception:
                         pass
                 except Exception as e:
-                    logger.warning(f"【{self.account_id}】关闭浏览器时出? {self._safe_str(e)}")
+                    logger.warning(f"【{self.account_id}】关闭浏览器时出错: {self._safe_str(e)}")
             logger.info(f"【{self.account_id}】浏览器正常关闭完成")
         except asyncio.TimeoutError:
-            logger.warning(f"【{self.account_id}】正常关闭超时，弢始强制关?..")
+            logger.warning(f"【{self.account_id}】正常关闭超时，开始强制关闭...")
             await self._force_close_resources(
                 browser=browser,
                 context=context,
@@ -12700,7 +12738,7 @@ class XianyuLive:
                 close_page=close_page,
             )
         except Exception as e:
-            logger.warning(f"【{self.account_id}】异步关闭时出错，强制关? {self._safe_str(e)}")
+            logger.warning(f"【{self.account_id}】异步关闭时出错，强制关闭: {self._safe_str(e)}")
             await self._force_close_resources(
                 browser=browser,
                 context=context,
@@ -12723,7 +12761,7 @@ class XianyuLive:
             if close_page and page:
                 try:
                     await asyncio.wait_for(page.close(), timeout=5.0)
-                    logger.info(f"【{self.account_id}】页面关闭完?")
+                    logger.info(f"【{self.account_id}】页面关闭完成")
                 except asyncio.TimeoutError:
                     logger.warning(f"【{self.account_id}】页面关闭超时，尝试强制关闭")
                     try:
@@ -12737,7 +12775,7 @@ class XianyuLive:
             if close_context and context:
                 try:
                     await asyncio.wait_for(context.close(), timeout=5.0)
-                    logger.info(f"【{self.account_id}】浏览器上下文关闭完?")
+                    logger.info(f"【{self.account_id}】浏览器上下文关闭完成")
                 except asyncio.TimeoutError:
                     logger.warning(f"【{self.account_id}】浏览器上下文关闭超时，尝试强制关闭")
                     try:
@@ -12752,14 +12790,14 @@ class XianyuLive:
                     await asyncio.wait_for(browser.close(), timeout=5.0)
                     logger.info(f"【{self.account_id}】浏览器关闭完成")
                 except asyncio.TimeoutError:
-                    logger.warning(f"【{self.account_id}】浏览器关闭超时，尝试强制关?")
+                    logger.warning(f"【{self.account_id}】浏览器关闭超时，尝试强制关闭")
                     try:
                         if hasattr(browser, '_connection'):
                             browser._connection.dispose()
                     except Exception:
                         pass
                 except Exception as e:
-                    logger.warning(f"【{self.account_id}】关闭浏览器时出? {self._safe_str(e)}")
+                    logger.warning(f"【{self.account_id}】关闭浏览器时出错: {self._safe_str(e)}")
         except Exception as e:
             logger.error(f"【{self.account_id}】正常关闭时出现异常: {self._safe_str(e)}")
             raise
@@ -12774,14 +12812,14 @@ class XianyuLive:
         close_page=True,
     ):
         try:
-            logger.warning(f"【{self.account_id}】开始强制关闭资?..")
+            logger.warning(f"【{self.account_id}】开始强制关闭资源...")
             resources = []
             if close_page and page:
                 resources.append(("页面", page))
             if close_context and context:
                 resources.append(("浏览器上下文", context))
             if close_browser and browser:
-                resources.append(("浏览?", browser))
+                resources.append(("浏览器", browser))
 
             if not resources:
                 logger.info(f"【{self.account_id}】没有需要强制关闭的资源")
@@ -12791,21 +12829,21 @@ class XianyuLive:
                 try:
                     await asyncio.wait_for(resource.close(), timeout=3.0)
                 except Exception:
-                    logger.warning(f"【{self.account_id}】{resource_name}强制关闭失败，尝试直接清理连?")
+                    logger.warning(f"【{self.account_id}】{resource_name}强制关闭失败，尝试直接清理连接")
                     try:
                         if hasattr(resource, '_connection'):
                             resource._connection.dispose()
                     except Exception:
                         pass
 
-            logger.info(f"【{self.account_id}】强制关闭完?")
+            logger.info(f"【{self.account_id}】强制关闭完成")
         except Exception as e:
-            logger.warning(f"【{self.account_id}】强制关闭时出现异常（已忽略? {self._safe_str(e)}")
+            logger.warning(f"【{self.account_id}】强制关闭时出现异常（已忽略）: {self._safe_str(e)}")
 
     async def send_msg_once(self, toid, item_id, text):
         headers = self._build_websocket_headers()
 
-        logger.info(f"【{self.account_id}】开始单次发送消? toid={toid}, item_id={item_id}")
+        logger.info(f"【{self.account_id}】开始单次发送消息: toid={toid}, item_id={item_id}")
 
         try:
             async with websockets.connect(
@@ -12815,14 +12853,14 @@ class XianyuLive:
             ) as websocket:
                 result = await self._handle_websocket_connection(websocket, toid, item_id, text)
                 if result:
-                    logger.info(f"【{self.account_id}】单次发送消息成?")
+                    logger.info(f"【{self.account_id}】单次发送消息成功")
                 else:
-                    raise Exception("消息发失?")
+                    raise Exception("消息发送失败")
         except TypeError as e:
             error_msg = self._safe_str(e)
 
             if "extra_headers" in error_msg:
-                logger.warning("websockets库不支持extra_headers参数，使用兼容模?")
+                logger.warning("websockets库不支持extra_headers参数，使用兼容模式")
                 async with websockets.connect(
                     self.base_url,
                     additional_headers=headers,
@@ -12830,21 +12868,21 @@ class XianyuLive:
                 ) as websocket:
                     result = await self._handle_websocket_connection(websocket, toid, item_id, text)
                     if result:
-                        logger.info(f"【{self.account_id}】单次发送消息成?兼容模式)")
+                        logger.info(f"【{self.account_id}】单次发送消息成功(兼容模式)")
                     else:
-                        raise Exception("消息发失?")
+                        raise Exception("消息发送失败")
             else:
                 raise
         except websockets.exceptions.ConnectionClosedError as e:
             logger.warning(f"【{self.account_id}】WebSocket连接关闭: {self._safe_str(e)}")
         except Exception as e:
-            logger.error(f"?{self.account_id}?????????: {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】处理WebSocket消息异常: {self._safe_str(e)}")
             raise
 
     async def send_delivery_steps_once(self, toid, item_id, delivery_steps):
         headers = self._build_websocket_headers()
 
-        logger.info(f"【{self.account_id}】开始单次发送发货步? toid={toid}, item_id={item_id}, steps={len(delivery_steps or [])}")
+        logger.info(f"【{self.account_id}】开始单次发送发货步骤: toid={toid}, item_id={item_id}, steps={len(delivery_steps or [])}")
 
         try:
             async with websockets.connect(
@@ -12854,14 +12892,14 @@ class XianyuLive:
             ) as websocket:
                 result = await self._handle_websocket_connection_steps(websocket, toid, item_id, delivery_steps)
                 if result:
-                    logger.info(f"【{self.account_id}】单次发送发货步骤成?")
+                    logger.info(f"【{self.account_id}】单次发送发货步骤成功")
                 else:
-                    raise Exception("发货步骤发失?")
+                    raise Exception("发货步骤发送失败")
         except TypeError as e:
             error_msg = self._safe_str(e)
 
             if "extra_headers" in error_msg:
-                logger.warning("websockets库不支持extra_headers参数，使用兼容模式发送发货步?")
+                logger.warning("websockets库不支持extra_headers参数，使用兼容模式发送发货步骤")
                 async with websockets.connect(
                     self.base_url,
                     additional_headers=headers,
@@ -12869,15 +12907,15 @@ class XianyuLive:
                 ) as websocket:
                     result = await self._handle_websocket_connection_steps(websocket, toid, item_id, delivery_steps)
                     if result:
-                        logger.info(f"【{self.account_id}】单次发送发货步骤成?兼容模式)")
+                        logger.info(f"【{self.account_id}】单次发送发货步骤成功(兼容模式)")
                     else:
-                        raise Exception("发货步骤发失?")
+                        raise Exception("发货步骤发送失败")
             else:
                 raise
         except websockets.exceptions.ConnectionClosedError as e:
             logger.warning(f"【{self.account_id}】WebSocket连接关闭: {self._safe_str(e)}")
         except Exception as e:
-            logger.error(f"【{self.account_id}】单次发送发货步骤异? {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】单次发送发货步骤异常: {self._safe_str(e)}")
             raise
 
     async def _handle_websocket_connection_steps(self, websocket, toid, item_id, delivery_steps):
@@ -12910,10 +12948,10 @@ class XianyuLive:
                 except KeyError:
                     continue
                 except Exception as e:
-                    logger.warning(f"【{self.account_id}】处理消息异? {self._safe_str(e)}")
+                    logger.warning(f"【{self.account_id}】处理消息异常: {self._safe_str(e)}")
                     continue
 
-            logger.warning(f"【{self.account_id}】WebSocket连接关闭，未能发送发货步?")
+            logger.warning(f"【{self.account_id}】WebSocket连接关闭，未能发送发货步骤")
             return False
         except Exception as e:
             logger.error(f"【{self.account_id}】WebSocket发货步骤处理异常: {self._safe_str(e)}")
@@ -12923,7 +12961,7 @@ class XianyuLive:
         import websockets
 
         websockets_version = getattr(websockets, '__version__', '未知')
-        logger.info(f"【{self.account_id}】websockets库版? {websockets_version}")
+        logger.info(f"【{self.account_id}】websockets库版本: {websockets_version}")
 
         proxy_url = self._get_proxy_url()
         proxy_sock = None
@@ -12971,10 +13009,10 @@ class XianyuLive:
                             server_hostname=dest_host
                         )
 
-                    logger.info(f"【{self.account_id}】代理连接建立成?")
+                    logger.info(f"【{self.account_id}】代理连接建立成功")
 
             except ImportError as e:
-                logger.warning(f"【{self.account_id}】代理连接需要安?python-socks: pip install python-socks[asyncio]")
+                logger.warning(f"【{self.account_id}】代理连接需要安装 python-socks: pip install python-socks[asyncio]")
                 logger.warning(f"【{self.account_id}】将尝试不使用代理进行WebSocket连接")
                 proxy_sock = None
             except Exception as e:
@@ -13016,7 +13054,7 @@ class XianyuLive:
 
                     if "additional_headers" in error_msg2 or "unexpected keyword argument" in error_msg2:
                         raise RuntimeError(
-                            f"当前websockets库不支持header参数，无法安全建立鉴权连? {error_msg2}"
+                            f"当前websockets库不支持header参数，无法安全建立鉴权连接: {error_msg2}"
                         )
                     else:
                         raise e2
@@ -13047,10 +13085,10 @@ class XianyuLive:
                 except KeyError:
                     continue
                 except Exception as e:
-                    logger.warning(f"【{self.account_id}】处理消息异? {self._safe_str(e)}")
+                    logger.warning(f"【{self.account_id}】处理消息异常: {self._safe_str(e)}")
                     continue
 
-            logger.warning(f"【{self.account_id}】WebSocket连接关闭，未能发送消?")
+            logger.warning(f"【{self.account_id}】WebSocket连接关闭，未能发送消息")
             return False
         except Exception as e:
             logger.error(f"【{self.account_id}】WebSocket连接处理异常: {self._safe_str(e)}")
@@ -13104,7 +13142,7 @@ class XianyuLive:
                             rdns=True
                         )
                     except ImportError:
-                        logger.error(f"【{self.account_id}】SOCKS5代理霢要安?aiohttp-socks: pip install aiohttp-socks")
+                        logger.error(f"【{self.account_id}】SOCKS5代理需要安装 aiohttp-socks: pip install aiohttp-socks")
                         connector = None
                 else:
                     connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
@@ -13134,7 +13172,7 @@ class XianyuLive:
             timeout = aiohttp.ClientTimeout(total=api_config.get('timeout', 10))
             current_account_id = self._canonical_account_id()
             if not current_account_id:
-                logger.error("【default】API 回复缺少 canonical account_id，拒绝继续运?")
+                logger.error("【default】API 回复缺少 canonical account_id，拒绝继续运行")
                 return None
 
             payload = {
@@ -13292,14 +13330,14 @@ class XianyuLive:
         if expired_processed_ids:
             logger.info(f"【{self.account_id}】已清理 {len(expired_processed_ids)} 个过期消息ID")
         if expired_pending_ids:
-            logger.warning(f"【{self.account_id}】已清理 {len(expired_pending_ids)} 个超时未完成的消息预?")
+            logger.warning(f"【{self.account_id}】已清理 {len(expired_pending_ids)} 个超时未完成的消息预占")
 
         if len(self.processed_message_ids) > self.processed_message_ids_max_size:
             sorted_ids = sorted(self.processed_message_ids.items(), key=lambda x: x[1])
             remove_count = len(sorted_ids) // 2
             for msg_id, _ in sorted_ids[:remove_count]:
                 del self.processed_message_ids[msg_id]
-            logger.info(f"【{self.account_id}】消息ID去重字典过大，已清理 {remove_count} 个最旧记?")
+            logger.info(f"【{self.account_id}】消息ID去重字典过大，已清理 {remove_count} 个最旧记录")
 
     async def _reserve_message_reply(self, message_id: str) -> bool:
         async with self.processed_message_ids_lock:
@@ -13310,13 +13348,13 @@ class XianyuLive:
                 last_process_time = self.processed_message_ids[message_id]
                 time_elapsed = current_time - last_process_time
                 remaining_time = int(max(0, self.message_expire_time - time_elapsed))
-                logger.warning(f"【{self.account_id}】消息ID {message_id[:50]}... 已处理过，距离可重复回复还需 {remaining_time} ?")
+                logger.warning(f"【{self.account_id}】消息ID {message_id[:50]}... 已处理过，距离可重复回复还需 {remaining_time} 秒")
                 return False
 
             if message_id in self.pending_message_ids:
                 time_elapsed = current_time - self.pending_message_ids[message_id]
                 remaining_time = int(max(0, self.pending_message_expire_time - time_elapsed))
-                logger.warning(f"【{self.account_id}】消息ID {message_id[:50]}... 正在处理中，预占剩余?{remaining_time} ?")
+                logger.warning(f"【{self.account_id}】消息ID {message_id[:50]}... 正在处理中，预占剩余约 {remaining_time} 秒")
                 return False
 
             self.pending_message_ids[message_id] = current_time
@@ -13330,7 +13368,7 @@ class XianyuLive:
             self._cleanup_message_reply_state(current_time)
 
         if reason:
-            logger.info(f"【{self.account_id}】消息ID {message_id[:50]}... 已完成处? {reason}")
+            logger.info(f"【{self.account_id}】消息ID {message_id[:50]}... 已完成处理: {reason}")
 
     async def _release_message_reply(self, message_id: str, reason: str = ""):
         async with self.processed_message_ids_lock:
@@ -13375,13 +13413,13 @@ class XianyuLive:
 
         for attempt, delay in enumerate(retry_delays, start=1):
             if delay > 0:
-                logger.warning(f"【{self.account_id}】自动回复发送将?{delay} 秒后重试（第 {attempt} 次尝试）")
+                logger.warning(f"【{self.account_id}】自动回复发送将在 {delay} 秒后重试（第 {attempt} 次尝试）")
                 await asyncio.sleep(delay)
 
             active_ws = await self._wait_for_reply_websocket(websocket, timeout=8.0)
             if not active_ws:
                 last_error = RuntimeError("当前没有可用的WebSocket连接")
-                logger.warning(f"【{self.account_id}】自动回复发送失败（?{attempt} 次尝试）：{last_error}")
+                logger.warning(f"【{self.account_id}】自动回复发送失败（第 {attempt} 次尝试）：{last_error}")
                 continue
 
             try:
@@ -13392,9 +13430,9 @@ class XianyuLive:
                 return
             except Exception as e:
                 last_error = e
-                logger.warning(f"【{self.account_id}】自动回复发送失败（?{attempt} 次尝试）：{self._safe_str(e)}")
+                logger.warning(f"【{self.account_id}】自动回复发送失败（第 {attempt} 次尝试）：{self._safe_str(e)}")
 
-        raise last_error or RuntimeError("自动回复发失?")
+        raise last_error or RuntimeError("自动回复发送失败")
 
     def _record_default_reply_once_after_success(self, chat_id: str):
         if not chat_id:
@@ -13404,14 +13442,14 @@ class XianyuLive:
             from db_manager import db_manager
             current_account_id = self._canonical_account_id()
             if not current_account_id:
-                logger.error("【default】默认回?reply_once 记录缺少 canonical account_id，拒绝继续运?")
+                logger.error("【default】默认回复 reply_once 记录缺少 canonical account_id，拒绝继续运行")
                 return
             default_reply_settings = db_manager.get_default_reply(current_account_id)
             if default_reply_settings and default_reply_settings.get('enabled', False) and default_reply_settings.get('reply_once', False):
                 db_manager.add_default_reply_record(current_account_id, chat_id)
-                logger.info(f"【{current_account_id}】记录默认回复成功发? chat_id={chat_id}")
+                logger.info(f"【{current_account_id}】记录默认回复成功发送: chat_id={chat_id}")
         except Exception as e:
-            logger.error(f"【{self.account_id}】记录默认回复发送成功状态失? {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】记录默认回复发送成功状态失败: {self._safe_str(e)}")
 
     async def _schedule_debounced_reply(self, chat_id: str, message_data: dict, websocket,
                                        send_user_name: str, send_user_id: str, send_message: str,
@@ -13475,14 +13513,14 @@ class XianyuLive:
 
                         debounce_info = self.message_debounce_tasks[chat_id]
                         if saved_timer != debounce_info['timer']:
-                            logger.warning(f"【{self.account_id}】chat_id {chat_id} 在防抖期间有新消息，跳过旧消息处?")
+                            logger.warning(f"【{self.account_id}】chat_id {chat_id} 在防抖期间有新消息，跳过旧消息处理")
                             return
 
                         last_msg = debounce_info['last_message']
 
                         del self.message_debounce_tasks[chat_id]
 
-                    logger.info(f"【{self.account_id}】防抖延迟结束，弢始处理chat_id {chat_id} 的最后一条消? {last_msg['send_message'][:30]}...")
+                    logger.info(f"【{self.account_id}】防抖延迟结束，开始处理chat_id {chat_id} 的最后一条消息: {last_msg['send_message'][:30]}...")
                     reply_processed = await self._process_chat_message_reply(
                         last_msg['message_data'],
                         last_msg['websocket'],
@@ -13494,7 +13532,7 @@ class XianyuLive:
                         last_msg['msg_time']
                     )
                     if reply_processed:
-                        await self._finalize_message_reply(last_msg['message_id'], reason="回复链处理完?")
+                        await self._finalize_message_reply(last_msg['message_id'], reason="回复链处理完成")
                     else:
                         await self._release_message_reply(last_msg['message_id'], reason="回复发失败，等待后续重试")
 
@@ -13527,7 +13565,7 @@ class XianyuLive:
 
             task = self._create_tracked_task(debounce_task())
             self.message_debounce_tasks[chat_id]['task'] = task
-            logger.warning(f"【{self.account_id}】为chat_id {chat_id} 创建防抖任务，延?{self.message_debounce_delay} ?")
+            logger.warning(f"【{self.account_id}】为chat_id {chat_id} 创建防抖任务，延迟 {self.message_debounce_delay} 秒")
 
     async def _process_chat_message_reply(self, message_data: dict, websocket, send_user_name: str,
                                          send_user_id: str, send_message: str, item_id: str,
@@ -13546,7 +13584,7 @@ class XianyuLive:
                 )
                 remaining_minutes = remaining_time // 60
                 remaining_seconds = remaining_time % 60
-                logger.info(f"[{msg_time}] 【{self.account_id}】系统chat_id {chat_id} 自动回复已暂停，剩余时间: {remaining_minutes}分{remaining_seconds}?")
+                logger.info(f"[{msg_time}] 【{self.account_id}】系统chat_id {chat_id} 自动回复已暂停，剩余时间: {remaining_minutes}分{remaining_seconds}秒")
                 return True
 
             reply = None
@@ -13558,10 +13596,10 @@ class XianyuLive:
             else:
                 reply = await self.get_keyword_reply(send_user_name, send_user_id, send_message, item_id)
                 if reply == "EMPTY_REPLY":
-                    logger.info(f"[{msg_time}] 【{self.account_id}】匹配到空回复关键词，跳过自动回?")
+                    logger.info(f"[{msg_time}] 【{self.account_id}】匹配到空回复关键词，跳过自动回复")
                     return True
                 elif reply:
-                    reply_source = '关键?  # 标记为关键词回复'
+                    reply_source = '关键词'  # 标记为关键词回复
                 else:
                     reply = await self.get_default_reply(send_user_name, send_user_id, send_message, chat_id, item_id)
                     if reply == "EMPTY_REPLY":
@@ -13588,19 +13626,19 @@ class XianyuLive:
                             image_url=image_url,
                         )
                         msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                        logger.info(f"[{msg_time}] 【{reply_source}图片发出】用? {send_user_name} (ID: {send_user_id}), 商品({item_id}): 图片 {image_url}")
+                        logger.info(f"[{msg_time}] 【{reply_source}图片发出】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): 图片 {image_url}")
                         if reply_source == '默认':
                             self._record_default_reply_once_after_success(chat_id)
                     except Exception as e:
-                        logger.error(f"图片发失? {self._safe_str(e)}")
+                        logger.error(f"图片发送失败: {self._safe_str(e)}")
                         await self._send_auto_reply_with_retry(
                             websocket,
                             chat_id,
                             send_user_id,
-                            text="抱歉，图片发送失败，请稍后重试?"
+                            text="抱歉，图片发送失败，请稍后重试试。"
                         )
                         msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                        logger.error(f"[{msg_time}] 【{reply_source}图片发失败用? {send_user_name} (ID: {send_user_id}), 商品({item_id})")
+                        logger.error(f"[{msg_time}] 【{reply_source}图片发送失败】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id})")
                         if reply_source == '默认':
                             self._record_default_reply_once_after_success(chat_id)
                 else:
@@ -13611,28 +13649,28 @@ class XianyuLive:
                         text=reply
                     )
                     msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                    logger.info(f"[{msg_time}] 【{reply_source}发出】用? {send_user_name} (ID: {send_user_id}), 商品({item_id}): {reply}")
+                    logger.info(f"[{msg_time}] 【{reply_source}发出】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): {reply}")
                     if reply_source == '默认':
                         self._record_default_reply_once_after_success(chat_id)
             else:
                 msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                logger.info(f"[{msg_time}] 【{self.account_id}】系统未找到匹配的回复规则，不回?")
+                logger.info(f"[{msg_time}] 【{self.account_id}】【系统】未找到匹配的回复规则，不回复")
             return True
         except Exception as e:
-            logger.error(f"处理聊天消息回复时发生错? {self._safe_str(e)}")
+            logger.error(f"处理聊天消息回复时发生错误: {self._safe_str(e)}")
             return False
 
     async def handle_message(self, message_data, websocket, msg_id="unknown"):
         msg_size = len(json.dumps(message_data)) if message_data else 0
         canonical_account_id = self._canonical_account_id()
-        logger.info(f"【{self.account_id}】[{msg_id}] 🚀 弢始处理消?({msg_size}字节)")
+        logger.info(f"【{self.account_id}】[{msg_id}] 🚀 开始处理消息 ({msg_size}字节)")
 
         def _has_canonical_order_scope() -> bool:
             return bool(canonical_account_id)
 
         def _log_missing_canonical_order_scope(operation_label: str):
             logger.error(
-                f"【default】消息订单链缺少 canonical account_id，拒绝继续运? {operation_label}"
+                f"【default】消息订单链缺少 canonical account_id，拒绝继续运行 {operation_label}"
             )
 
         try:
@@ -13660,26 +13698,26 @@ class XianyuLive:
                 logger.debug(f"【{self.account_id}】[{msg_id}] 发ACK失败: {e}")
 
             if not self.is_sync_package(message_data):
-                logger.debug(f"【{self.account_id}】[{msg_id}] ⏹️ 非同步包消息，处理结?")
+                logger.debug(f"【{self.account_id}】[{msg_id}] ⏹️ 非同步包消息，处理结束")
                 return
 
             sync_data = message_data["body"]["syncPushPackage"]["data"][0]
 
             if "data" not in sync_data:
-                logger.warning(f"【{self.account_id}】[{msg_id}] ⚠️ 同步包中无data字段，消息内? {sync_data}")
-                logger.warning(f"【{self.account_id}】[{msg_id}] ⏹️ 消息处理结束（缺少data字段?")
+                logger.warning(f"【{self.account_id}】[{msg_id}] ⚠️ 同步包中无data字段，消息内容: {sync_data}")
+                logger.warning(f"【{self.account_id}】[{msg_id}] ⏹️ 消息处理结束（缺少data字段）")
                 return
 
             message = None
             try:
                 data = sync_data["data"]
-                logger.debug(f"【{self.account_id}】[{msg_id}] 弢始解密同步包数据...")
+                logger.debug(f"【{self.account_id}】[{msg_id}] 开始解密同步包数据...")
                 try:
                     data = base64.b64decode(data).decode("utf-8")
                     parsed_data = json.loads(data)
                     msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                     if isinstance(parsed_data, dict) and 'chatType' in parsed_data:
-                        logger.warning(f"【{self.account_id}】[{msg_id}] ⚠️ 棢测到chatType消息，完整内? {parsed_data}")
+                        logger.warning(f"【{self.account_id}】[{msg_id}] ⚠️ 检测到chatType消息，完整内容: {parsed_data}")
                         if 'operation' in parsed_data and 'content' in parsed_data['operation']:
                             content = parsed_data['operation']['content']
                             if 'sessionArouse' in content:
@@ -13690,54 +13728,54 @@ class XianyuLive:
                                 logger.info(f"[{msg_time}] 【{self.account_id}】[{msg_id}] ⏹️ 系统引导消息处理完成")
                                 return
                             elif 'contentType' in content:
-                                logger.warning(f"[{msg_time}] 【{self.account_id}】[{msg_id}] 【系统其他类型消? {content}")
+                                logger.warning(f"[{msg_time}] 【{self.account_id}】[{msg_id}] 【系统】其他类型消息: {content}")
                         logger.warning(f"【{self.account_id}】[{msg_id}] ⚠️ chatType消息但不是引导消息，继续处理...")
                         message = parsed_data
                     else:
-                        logger.debug(f"【{self.account_id}】[{msg_id}] 解密成功，正常消?")
+                        logger.debug(f"【{self.account_id}】[{msg_id}] 解密成功，正常消息")
                         message = parsed_data
                 except Exception as e:
-                    logger.debug(f"【{self.account_id}】[{msg_id}] JSON解析失败，尝试解?..")
+                    logger.debug(f"【{self.account_id}】[{msg_id}] JSON解析失败，尝试解密...")
                     decrypted_data = decrypt(data)
                     message = json.loads(decrypted_data)
                     logger.debug(f"【{self.account_id}】[{msg_id}] 解密成功")
             except Exception as e:
-                logger.error(f"【{self.account_id}】[{msg_id}] ?消息解密失败: {self._safe_str(e)}")
+                logger.error(f"【{self.account_id}】[{msg_id}] ❌ 消息解密失败: {self._safe_str(e)}")
                 if msg_size > 3000:
-                    logger.error(f"【{self.account_id}】[{msg_id}] ⚠️⚠️⚠️ 大消?{msg_size}字节)解密失败，完整sync_data: {sync_data}")
+                    logger.error(f"【{self.account_id}】[{msg_id}] ⚠️⚠️⚠️ 大消息({msg_size}字节)解密失败，完整sync_data: {sync_data}")
                     try:
                         raw_data = sync_data.get("data", "")
                         logger.error(f"【{self.account_id}】[{msg_id}] Base64数据长度: {len(raw_data)}")
-                        logger.error(f"【{self.account_id}】[{msg_id}] Base64?00字符: {raw_data[:100]}")
-                        logger.error(f"【{self.account_id}】[{msg_id}] Base64?00字符: {raw_data[-100:]}")
+                        logger.error(f"【{self.account_id}】[{msg_id}] Base64前100字符: {raw_data[:100]}")
+                        logger.error(f"【{self.account_id}】[{msg_id}] Base64前100字符: {raw_data[-100:]}")
                     except Exception:
                         pass
                 logger.error(f"【{self.account_id}】[{msg_id}] ⏹️ 消息处理结束（解密失败）")
                 return
 
             if message is None:
-                logger.error(f"【{self.account_id}】[{msg_id}] ?消息解析后为?")
+                logger.error(f"【{self.account_id}】[{msg_id}] ❌ 消息解析后为空")
                 if msg_size > 3000:
-                    logger.error(f"【{self.account_id}】[{msg_id}] ⚠️⚠️⚠️ 大消?{msg_size}字节)解析后为空！")
-                logger.error(f"【{self.account_id}】[{msg_id}] ⏹️ 消息处理结束（解析后为空?")
+                    logger.error(f"【{self.account_id}】[{msg_id}] ⚠️⚠️⚠️ 大消息({msg_size}字节)解析后为空！")
+                logger.error(f"【{self.account_id}】[{msg_id}] ⏹️ 消息处理结束（解析后为空）")
                 return
 
             if not isinstance(message, dict):
-                logger.error(f"【{self.account_id}】[{msg_id}] ?消息格式错误，期望字典但得到: {type(message)}")
+                logger.error(f"【{self.account_id}】[{msg_id}] ❌ 消息格式错误，期望字典但得到: {type(message)}")
                 logger.warning(f"【{self.account_id}】[{msg_id}] 消息内容: {message}")
                 logger.error(f"【{self.account_id}】[{msg_id}] ⏹️ 消息处理结束（格式错误）")
                 return
 
             self.last_message_received_time = time.time()
-            logger.warning(f"【{self.account_id}】[{msg_id}] ?弢始处理消?")
+            logger.warning(f"【{self.account_id}】[{msg_id}] ✅ 开始处理消息")
 
             order_id = None
             try:
-                logger.info(f"【{self.account_id}】[{msg_id}] 🔍 弢始提取订单ID，消息类? {type(message)}")
+                logger.info(f"【{self.account_id}】[{msg_id}] 🔍 开始提取订单ID，消息类型: {type(message)}")
                 order_id = self._extract_order_id(message, message_data)
                 if order_id:
                     msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ?棢测到订单ID: {order_id}，开始获取订单详?')
+                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ✅ 检测到订单ID: {order_id}，开始获取订单详情')
 
                     order_context = self._extract_order_message_context(message, msg_id=msg_id)
                     temp_user_id = order_context.get('buyer_id')
@@ -13766,9 +13804,9 @@ class XianyuLive:
                                 )
                                 logger.info(f"【{self.account_id}】订单状态处理器.on_order_id_extracted调用成功: {order_id}")
                             except Exception as e:
-                                logger.error(f"【{self.account_id}】知订单状处理器订单ID提取失败: {self._safe_str(e)}")
+                                logger.error(f"【{self.account_id}】通知订单状态处理器订单ID提取失败: {self._safe_str(e)}")
                                 import traceback
-                                logger.error(f"【{self.account_id}】详细错误信? {traceback.format_exc()}")
+                                logger.error(f"【{self.account_id}】详细错误信息: {traceback.format_exc()}")
                     else:
                         logger.warning(f"【{self.account_id}】订单状态处理器为None，跳过订单ID提取通知: {order_id}")
 
@@ -13800,7 +13838,7 @@ class XianyuLive:
                             if order_detail:
                                 logger.info(f'[{msg_time}] 【{self.account_id}】✅ 订单详情获取成功: {order_id}')
                             else:
-                                logger.warning(f'[{msg_time}] 【{self.account_id}】⚠?订单详情获取失败: {order_id}')
+                                logger.warning(f'[{msg_time}] 【{self.account_id}】⚠️ 订单详情获取失败: {order_id}')
                                 if basic_order_saved:
                                     self._schedule_order_detail_retry(
                                         order_id,
@@ -13861,10 +13899,10 @@ class XianyuLive:
 
                 if not item_id:
                     item_id = f"auto_{user_id}_{int(time.time())}"
-                    logger.warning(f"无法提取商品ID，使用默认? {item_id}")
+                    logger.warning(f"无法提取商品ID，使用默认值: {item_id}")
 
             except Exception as e:
-                logger.error(f"提取商品ID时发生错? {self._safe_str(e)}")
+                logger.error(f"提取商品ID时发生错误: {self._safe_str(e)}")
                 item_id = f"auto_{user_id}_{int(time.time())}"
             try:
                 logger.info(f"【{self.account_id}】[{msg_id}] 消息内容: {message}")
@@ -13876,17 +13914,17 @@ class XianyuLive:
 
                 if red_reminder == '等待买家付款':
                     user_url = f'https://www.goofish.com/personal?userId={user_id}'
-                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 【系统等待买?{user_url} 付款')
+                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 【系统】等待买家 {user_url} 付款')
                     logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（等待买家付款）")
                     return
                 elif red_reminder == '交易关闭':
                     user_url = f'https://www.goofish.com/personal?userId={user_id}'
-                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 【系统买?{user_url} 交易关闭')
+                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 【系统】买家 {user_url} 交易关闭')
 
                     if self.order_status_handler:
                         if not _has_canonical_order_scope():
                             _log_missing_canonical_order_scope(
-                                f"跳过交易关闭状回? buyer_id={user_id or 'unknown'}"
+                                f"跳过交易关闭状态回填 buyer_id={user_id or 'unknown'}"
                             )
                         else:
                             try:
@@ -13903,30 +13941,30 @@ class XianyuLive:
                                     }
                                 )
                             except Exception as e:
-                                logger.error(f"【{self.account_id}】更新交易关闭订单状态失? {self._safe_str(e)}")
+                                logger.error(f"【{self.account_id}】更新交易关闭订单状态失败: {self._safe_str(e)}")
 
                     logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（交易关闭）")
                     return
                 elif red_reminder == '等待卖家发货':
                     user_url = f'https://www.goofish.com/personal?userId={user_id}'
-                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 【系统交易成?{user_url} 等待卖家发货')
+                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 【系统】交易成功 {user_url} 等待卖家发货')
 
                     if isinstance(message.get('1'), str):
                         if not _has_canonical_order_scope():
                             _log_missing_canonical_order_scope(
-                                f"跳过箢化待发货自动发货: sid={message.get('1') or 'unknown'}"
+                                f"跳过简化待发货自动发货: sid={message.get('1') or 'unknown'}"
                             )
                             return
-                        logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 🔔 棢测到箢化结构的发货通知消息，延迟处?')
+                        logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 🔔 检测到简化结构的发货通知消息，延迟处理')
                         await asyncio.sleep(30)
-                        logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 🔔 延迟30秒后处理箢化发?')
+                        logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 🔔 延迟30秒后处理简化发货')
                         if self.is_auto_confirm_enabled():
-                            logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ?自动确认发货已启用，弢始处?')
+                            logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ✅ 自动确认发货已启用，开始处理')
 
                             simple_sid = message.get('1', '')
                             session_id_str = simple_sid.split('@')[0] if '@' in str(simple_sid) else simple_sid
 
-                            logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 🔍 箢化消息解? sid={simple_sid}, session_id={session_id_str}')
+                            logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 🔍 简化消息解析: sid={simple_sid}, session_id={session_id_str}')
 
                             log_prefix = f'[{msg_time}] 【{self.account_id}】[{msg_id}]'
                             sid_lookup_minutes = 5
@@ -13953,17 +13991,17 @@ class XianyuLive:
                                 order_id = recent_order.get('order_id')
                                 real_item_id = recent_order.get('item_id')
                                 simple_user_id = recent_order.get('buyer_id', user_id)
-                                logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ?通过sid从数据库找到订单: order_id={order_id}, item_id={real_item_id}, buyer_id={simple_user_id}')
+                                logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ✅ 通过sid从数据库找到订单: order_id={order_id}, item_id={real_item_id}, buyer_id={simple_user_id}')
 
                                 if sid_match_type == 'bargain_ready':
                                     logger.info(
-                                        f'[{msg_time}] 【{self.account_id}】[{msg_id}] ?小刀订单缺少完整待发货卡片，'
+                                        f'[{msg_time}] 【{self.account_id}】[{msg_id}] ✅ 小刀订单缺少完整待发货卡片，'
                                         f'使用sid+小刀成功证据兜底进入自动发货: order_id={order_id}'
                                     )
 
                                 if not self.can_auto_delivery(order_id):
-                                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 🔒 订单 {order_id} 已在冷却期内（可能完整消息已处理），跳过箢化消息发?')
-                                    logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（订单已处理?")
+                                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 🔒 订单 {order_id} 已在冷却期内（可能完整消息已处理），跳过简化消息发货')
+                                    logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（订单已处理）")
                                     return
 
                                 delivery_lock_key = self._compose_order_delivery_scope_key(
@@ -13972,12 +14010,12 @@ class XianyuLive:
                                 )
                                 if not delivery_lock_key:
                                     _log_missing_canonical_order_scope(
-                                        f"跳过箢化消息延迟锁棢? order_id={order_id}"
+                                        f"跳过简化消息延迟锁作用域: order_id={order_id}"
                                     )
                                     return
 
                                 if self.is_lock_held(delivery_lock_key):
-                                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 🔒 订单 {order_id} 延迟锁已被持有（可能完整消息正在处理），跳过箢化消息发?')
+                                    logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 🔒 订单 {order_id} 延迟锁已被持有（可能完整消息正在处理），跳过简化消息发货')
                                     logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（订单正在处理）")
                                     return
 
@@ -13999,22 +14037,22 @@ class XianyuLive:
                                 order_status = recent_order.get('order_status') or 'unknown'
                                 if sid_match_type == 'already_processed':
                                     logger.info(
-                                        f'[{msg_time}] 【{self.account_id}】[{msg_id}] ℹ️ sid命中的订单已处理完成，跳过重复发? '
+                                        f'[{msg_time}] 【{self.account_id}】[{msg_id}] ℹ️ sid命中的订单已处理完成，跳过重复发货: '
                                         f'order_id={order_id}, status={order_status}'
                                     )
-                                    logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（订单已处理?")
+                                    logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（订单已处理）")
                                 elif sid_match_type == 'cancelled':
                                     logger.info(
-                                        f'[{msg_time}] 【{self.account_id}】[{msg_id}] ℹ️ sid命中的订单已关闭，跳过自动发? '
+                                        f'[{msg_time}] 【{self.account_id}】[{msg_id}] ℹ️ sid命中的订单已关闭，跳过自动发货: '
                                         f'order_id={order_id}'
                                     )
-                                    logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（订单已关闭?")
+                                    logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（订单已关闭）")
                                 else:
                                     logger.info(
-                                        f'[{msg_time}] 【{self.account_id}】[{msg_id}] ℹ️ sid命中的订单当前状态不适合箢化消息兜底发货，等待后续完整消息: '
+                                        f'[{msg_time}] 【{self.account_id}】[{msg_id}] ℹ️ sid命中的订单当前状态不适合简化消息兜底发货，等待后续完整消息: '
                                         f'order_id={order_id}, status={order_status}'
                                     )
-                                    logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（订单状态未就绪?")
+                                    logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（订单状态未就绪）")
                                 return
                             elif sid_match_type.startswith('ambiguous_'):
                                 logger.warning(
@@ -14024,12 +14062,12 @@ class XianyuLive:
                                 logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（sid候歧义）")
                                 return
                             else:
-                                logger.warning(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ?未找到sid {simple_sid} 的最近订单，跳过自动发货')
-                                logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（未找到订单?")
+                                logger.warning(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ❌ 未找到sid {simple_sid} 的最近订单，跳过自动发货')
+                                logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（未找到订单）")
                                 return
                         else:
                             logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] ⚠️ 未启用自动确认发货，跳过')
-                            logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（未启用自动发货?")
+                            logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（未启用自动发货）")
                             return
             except Exception:
                 pass
@@ -14040,13 +14078,13 @@ class XianyuLive:
 
             try:
                 if not (isinstance(message, dict) and "1" in message and isinstance(message["1"], dict)):
-                    logger.error(f"【{self.account_id}】[{msg_id}] ?消息格式错误：缺少必要的字段结构")
+                    logger.error(f"【{self.account_id}】[{msg_id}] ❌ 消息格式错误：缺少必要的字段结构")
                     logger.error(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（格式错误）")
                     return
 
                 message_1 = message["1"]
                 if not isinstance(message_1.get("10"), dict):
-                    logger.error(f"【{self.account_id}】[{msg_id}] ?消息格式错误：缺少消息详情字?")
+                    logger.error(f"【{self.account_id}】[{msg_id}] ❌ 消息格式错误：缺少消息详情字段")
                     logger.error(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（缺少详情字段）")
                     return
 
@@ -14061,7 +14099,7 @@ class XianyuLive:
                 chat_id = chat_id_raw.split('@')[0] if '@' in str(chat_id_raw) else str(chat_id_raw)
 
             except Exception as e:
-                logger.error(f"【{self.account_id}】[{msg_id}] ?提取聊天消息信息失败: {self._safe_str(e)}")
+                logger.error(f"【{self.account_id}】[{msg_id}] ❌ 提取聊天消息信息失败: {self._safe_str(e)}")
                 logger.error(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（提取信息失败）")
                 return
 
@@ -14085,10 +14123,11 @@ class XianyuLive:
             content_type = message_route_info.get('content_type', 0)
             card_title = str(message_route_info.get('card_title') or '').strip()
             special_flow_card_titles = {
-                '我已小刀，待刢',
-                '我已小刀,待刀',
+                '我已小刀，待刀成',
+                self._legacy_replace_tail('我已小刀，待刀成', '刀成', '\u5222'),
+                self._legacy_drop_last_char('我已小刀,待刀成'),
                 '我已成功小刀，待发货',
-                '我已成功小刀,待发',
+                self._legacy_drop_last_char('我已成功小刀,待发货'),
             }
 
             logger.info(
@@ -14099,11 +14138,11 @@ class XianyuLive:
             )
 
             if send_user_id == self.myid and not is_system_message:
-                logger.info(f"[{msg_time}] 【{self.account_id}】[{msg_id}] 【手动发出?商品({item_id}): {send_message}")
+                logger.info(f"[{msg_time}] 【{self.account_id}】[{msg_id}] 【手动发出】 商品({item_id}): {send_message}")
 
                 if not canonical_account_id:
                     logger.error(
-                        f"【default】手动发消息暂停链缺?canonical account_id，拒绝继续暂?chat: {chat_id}"
+                        f"【default】手动发消息暂停链缺少 canonical account_id，拒绝继续暂停 chat: {chat_id}"
                     )
                     return
                 pause_manager.pause_chat(chat_id, canonical_account_id)
@@ -14112,11 +14151,11 @@ class XianyuLive:
                 return
             elif send_user_id == self.myid and is_system_message:
                 logger.info(
-                    f"[{msg_time}] 【{self.account_id}】[{msg_id}] 棢测到系统消息(sender=自己ID)，继续执行状态处?"
+                    f"[{msg_time}] 【{self.account_id}】[{msg_id}] 检测到系统消息(sender=自己ID)，继续执行状态处理 "
                     f"(direction={message_direction}, contentType={content_type})"
                 )
             else:
-                logger.info(f"[{msg_time}] 【收到用? {send_user_name} (ID: {send_user_id}), 商品({item_id}): {send_message}")
+                logger.info(f"[{msg_time}] 【收到】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): {send_message}")
                 if message_route == 'user_chat':
                     self.last_user_chat_time = time.time()
 
@@ -14125,7 +14164,7 @@ class XianyuLive:
                         waiting_info = self.yifan_account_waiting[chat_id]
 
                         if time.time() - waiting_info['create_time'] > 1800:
-                            logger.warning(f"账号输入等待超时，清除等待状?")
+                            logger.warning(f"账号输入等待超时，清除等待状态")
                             del self.yifan_account_waiting[chat_id]
                         elif waiting_info['buyer_id'] == send_user_id:
                             message_1 = message.get('1', {})
@@ -14161,9 +14200,9 @@ class XianyuLive:
                                 if account:
                                     waiting_info['state'] = 'waiting_confirm'
 
-                                    confirm_msg = f"{account}\n这是您要充的账号，请回答\"是\"，进行确认下单，如果账号不对，请重新输入正确的账号，如果因为您账号输错，导致错误下单，概不款?"
+                                    confirm_msg = f"{account}\n这是您要充值的账号，请回答\"是\"，进行确认下单，如果账号不对，请重新输入正确的账号，如果因为您账号输错，导致错误下单，概不退款。"
                                     await self.send_msg(self.ws, chat_id, send_user_id, confirm_msg)
-                                    logger.info(f"【{self.account_id}】[{msg_id}] 已保存充值账? {account}，等待用户确?")
+                                    logger.info(f"【{self.account_id}】[{msg_id}] 已保存充值账号: {account}，等待用户确认")
                                     logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（等待账号确认）")
                                     return
                             elif waiting_info['state'] == 'waiting_confirm':
@@ -14224,8 +14263,8 @@ class XianyuLive:
                                                         'card_type': rule.get('card_type')
                                                     }
                                                 )
-                                                await self.send_msg(self.ws, chat_id, send_user_id, "发货消息已发送，但确认发货失败，请稍后刷新订单状态?")
-                                                logger.error(f"亦凡API自动发货副作用提交失? {finalize_result.get('error')}")
+                                                await self.send_msg(self.ws, chat_id, send_user_id, "发货消息已发送，但确认发货失败，请稍后刷新订单状态。")
+                                                logger.error(f"亦凡API自动发货副作用提交失败: {finalize_result.get('error')}")
                                                 return
 
                                             if order_id_saved:
@@ -14238,7 +14277,7 @@ class XianyuLive:
                                                     self._activate_delivery_lock(delivery_lock_key, delay_minutes=10)
                                                 else:
                                                     _log_missing_canonical_order_scope(
-                                                        f"跳过亦凡账号确认发货延迟锁激? order_id={order_id_saved}"
+                                                        f"跳过亦凡账号确认发货延迟锁激活 order_id={order_id_saved}"
                                                     )
 
                                             self._record_delivery_log(
@@ -14256,10 +14295,10 @@ class XianyuLive:
                                             )
                                             logger.info(f"亦凡API自动发货成功")
                                         else:
-                                            await self.send_msg(self.ws, chat_id, send_user_id, "抱歉，自动发货失败，请联系客服处理?")
+                                            await self.send_msg(self.ws, chat_id, send_user_id, "抱歉，自动发货失败，请联系客服处理。")
                                     except Exception as e:
                                         logger.error(f"亦凡API发货异常: {self._safe_str(e)}")
-                                        await self.send_msg(self.ws, chat_id, send_user_id, "系统异常，请联系客服处理?")
+                                        await self.send_msg(self.ws, chat_id, send_user_id, "系统异常，请联系客服处理。")
 
                                     return
 
@@ -14270,15 +14309,15 @@ class XianyuLive:
                                         waiting_info['retry_count'] += 1
 
                                         if waiting_info['retry_count'] >= 5:
-                                            logger.warning(f"【{self.account_id}】[{msg_id}] 账号确认重试次数过多，取消发?")
+                                            logger.warning(f"【{self.account_id}】[{msg_id}] 账号确认重试次数过多，取消发货")
                                             del self.yifan_account_waiting[chat_id]
-                                            await self.send_msg(self.ws, chat_id, send_user_id, "账号确认失败次数过多，已取消发货，请重新下单?")
+                                            await self.send_msg(self.ws, chat_id, send_user_id, "账号确认失败次数过多，已取消发货，请重新下单。")
                                             logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（重试次数过多）")
                                             return
 
-                                        confirm_msg = f"{new_account}\n这是您要充的账号，请回答\"是\"，进行确认下单，如果账号不对，请重新输入正确的账号，如果因为您账号输错，导致错误下单，概不款?"
+                                        confirm_msg = f"{new_account}\n这是您要充值的账号，请回答\"是\"，进行确认下单，如果账号不对，请重新输入正确的账号，如果因为您账号输错，导致错误下单，概不退款。"
                                         await self.send_msg(self.ws, chat_id, send_user_id, confirm_msg)
-                                        logger.info(f"【{self.account_id}】[{msg_id}] 用户重新输入账号: {new_account}，再次等待确?")
+                                        logger.info(f"【{self.account_id}】[{msg_id}] 用户重新输入账号: {new_account}，再次等待确认")
                                         logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（等待账号重新确认）")
                                         return
 
@@ -14289,7 +14328,7 @@ class XianyuLive:
                         await self.send_notification(send_user_name, send_user_id, send_message, item_id, chat_id)
                     else:
                         logger.info(
-                            f"📱 当前消息不发送知: route={message_route}, "
+                            f"📱 当前消息不发送通知: route={message_route}, "
                             f"status_signal={order_status_signal or 'none'}, message={send_message}"
                         )
                 except Exception as notify_error:
@@ -14303,7 +14342,7 @@ class XianyuLive:
                     handled = False
                     if not _has_canonical_order_scope():
                         _log_missing_canonical_order_scope(
-                            f"跳过系统订单状处? msg_id={msg_id}"
+                            f"跳过系统订单状态处理 msg_id={msg_id}"
                         )
                     else:
                         try:
@@ -14319,7 +14358,7 @@ class XianyuLive:
                                 }
                             )
                         except Exception as e:
-                            logger.error(f"【{self.account_id}】处理系统消息失? {self._safe_str(e)}")
+                            logger.error(f"【{self.account_id}】处理系统消息失败: {self._safe_str(e)}")
                             handled = False
 
                     if not handled and _has_canonical_order_scope():
@@ -14343,12 +14382,12 @@ class XianyuLive:
                                             }
                                         )
                                     except Exception as e:
-                                        logger.error(f"【{self.account_id}】处理红色提醒消息失? {self._safe_str(e)}")
+                                        logger.error(f"【{self.account_id}】处理红色提醒消息失败: {self._safe_str(e)}")
                         except Exception as red_e:
                             logger.warning(f"处理红色提醒消息失败: {self._safe_str(red_e)}")
 
                 except Exception as e:
-                    logger.error(f"订单状处理失? {self._safe_str(e)}")
+                    logger.error(f"订单状态处理失败: {self._safe_str(e)}")
 
             if order_id and order_status_signal in {'pending_ship', 'shipped', 'completed', 'cancelled', 'refunding'}:
                 try:
@@ -14369,7 +14408,7 @@ class XianyuLive:
                     )
                 except Exception as refresh_e:
                     logger.error(
-                        f"【{self.account_id}】[{msg_id}] 状消息触发订单详情补刷失? {self._safe_str(refresh_e)}"
+                        f"【{self.account_id}】[{msg_id}] 状态消息触发订单详情补刷失败: {self._safe_str(refresh_e)}"
                     )
 
             fallback_ignore_keywords = [
@@ -14383,12 +14422,12 @@ class XianyuLive:
                 '温馨提醒：商品信息近期有过变',
             ]
             if send_message == '[我已拍下，待付款]':
-                logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 系统消息不处?')
+                logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 系统消息不处理')
                 logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（系统消息：待付款）")
                 return
-            elif send_message == '[你关闭了订单，钱款已原路逢返]':
-                logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 系统消息不处?')
-                logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（系统消息：订单关闭?")
+            elif send_message == '[你关闭了订单，钱款已原路退返]':
+                logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 系统消息不处理')
+                logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（系统消息：订单关闭）")
                 return
             elif send_message in [
                 '快给ta丢个评价吧~',
@@ -14400,7 +14439,7 @@ class XianyuLive:
                 return
             elif message_route == 'system_notice' or any(keyword in send_message for keyword in fallback_ignore_keywords):
                 logger.info(
-                    f'[{msg_time}] 【{self.account_id}】[{msg_id}] ⏹️ 系统提示消息不处? '
+                    f'[{msg_time}] 【{self.account_id}】[{msg_id}] ⏹️ 系统提示消息不处理: '
                     f'route={message_route}, message={send_message}'
                 )
                 return
@@ -14412,18 +14451,18 @@ class XianyuLive:
                         f'[{msg_time}] 【{self.account_id}】[{msg_id}] ⚠️ 自动发货关键字来自非系统消息，已忽略 '
                         f'(direction={message_direction}, contentType={content_type})'
                     )
-                    logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（非系统触发?")
+                    logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（非系统触发）")
                     return
 
                 if not _has_canonical_order_scope():
                     _log_missing_canonical_order_scope(
-                        f"跳过订单状自动发? message={send_message or 'unknown'}"
+                        f"跳过订单状态自动发货 message={send_message or 'unknown'}"
                     )
                     return
 
                 if not self.is_auto_confirm_enabled():
                     logger.info(f'[{msg_time}] 【{self.account_id}】[{msg_id}] 未启用自动确认发货，跳过自动发货')
-                    logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（未启用自动发货?")
+                    logger.info(f"【{self.account_id}】[{msg_id}] ⏹️ 处理结束（未启用自动发货）")
                     return
                 await self._handle_auto_delivery(websocket, message, send_user_name, send_user_id,
                                                item_id, chat_id, msg_time, message_data)
@@ -14478,11 +14517,11 @@ class XianyuLive:
                         )
                         return
 
-                    waiting_bargain_titles = {"我已小刀，待刢?", "我已小刀,待刀?"}
-                    ready_to_ship_titles = {"我已成功小刀，待发货", "我已成功小刀,待发?"}
+                    waiting_bargain_titles = {"我已小刀，待刀成", "我已小刀,待刀成"}
+                    ready_to_ship_titles = {"我已成功小刀，待发货", "我已成功小刀,待发货"}
 
                     if card_title in waiting_bargain_titles:
-                        logger.info(f'[{msg_time}] 【{self.account_id}】系统检测到"{card_title}"，执行免拼流?')
+                        logger.info(f'[{msg_time}] 【{self.account_id}】【系统】检测到"{card_title}"，执行免拼流程')
                         if not _has_canonical_order_scope():
                             _log_missing_canonical_order_scope(
                                 f"跳过小刀免拼流程: title={card_title or 'waiting_bargain'}"
@@ -14490,25 +14529,25 @@ class XianyuLive:
                             return
 
                         if not self.is_auto_confirm_enabled():
-                            logger.info(f'[{msg_time}] 【{self.account_id}】未启用自动确认发货，跳过自动小刢和自动发?')
+                            logger.info(f'[{msg_time}] 【{self.account_id}】未启用自动确认发货，跳过自动小刀和自动发货')
                             return
 
                         if item_id and item_id != "未知商品":
                             try:
                                 if not await self._ensure_item_owned_by_current_account(
                                     item_id,
-                                    log_prefix=f'[{msg_time}] 【{self.account_id}?'
+                                    log_prefix=f'[{msg_time}] 【{self.account_id}】'
                                 ):
                                     logger.warning(f'[{msg_time}] 【{self.account_id}】❌ 商品 {item_id} 不属于当前账号，跳过免拼发货')
                                     return
                                 logger.warning(f'[{msg_time}] 【{self.account_id}】✅ 商品 {item_id} 归属验证通过')
                             except Exception as e:
-                                logger.error(f'[{msg_time}] 【{self.account_id}】检查商品归属失? {self._safe_str(e)}，跳过免拼发?')
+                                logger.error(f'[{msg_time}] 【{self.account_id}】检查商品归属失败: {self._safe_str(e)}，跳过免拼发货')
                                 return
 
                         order_id = self._extract_order_id(message, message_data)
                         if not order_id:
-                            logger.warning(f'[{msg_time}] 【{self.account_id}】❌ 未能提取到订单ID，无法执行免拼发?')
+                            logger.warning(f'[{msg_time}] 【{self.account_id}】❌ 未能提取到订单ID，无法执行免拼发货')
                             return
 
                         self._mark_order_bargain_flow(
@@ -14518,7 +14557,7 @@ class XianyuLive:
                             context=card_title or 'waiting_bargain',
                         )
 
-                        logger.info(f'[{msg_time}] 【{self.account_id}】延?秒后执行免拼发货...')
+                        logger.info(f'[{msg_time}] 【{self.account_id}】延迟2秒后执行免拼发货...')
                         await asyncio.sleep(2)
                         result = await self.auto_freeshipping(order_id, item_id, send_user_id)
                         if result.get('success'):
@@ -14535,14 +14574,14 @@ class XianyuLive:
                             return
                         else:
                             logger.warning(f'[{msg_time}] 【{self.account_id}】❌ 自动免拼发货失败: {result.get("error", "未知错误")}')
-                            logger.info(f'[{msg_time}] 【{self.account_id}】⏹?免拼失败，不执行自动发货')
+                            logger.info(f'[{msg_time}] 【{self.account_id}】⏹️ 免拼失败，不执行自动发货')
                             return
 
                     elif card_title in ready_to_ship_titles:
-                        logger.info(f'[{msg_time}] 【{self.account_id}】系统检测到"{card_title}"，开始自动发?')
+                        logger.info(f'[{msg_time}] 【{self.account_id}】【系统】检测到"{card_title}"，开始自动发货')
                         if not _has_canonical_order_scope():
                             _log_missing_canonical_order_scope(
-                                f"跳过小刀待发货自动发? title={card_title or 'ready_to_ship'}"
+                                f"跳过小刀待发货自动发货 title={card_title or 'ready_to_ship'}"
                             )
                             return
 
@@ -14558,14 +14597,14 @@ class XianyuLive:
                             )
 
                         if not self.is_auto_confirm_enabled():
-                            logger.info(f'[{msg_time}] 【{self.account_id}】未启用自动确认发货，跳过自动发?')
+                            logger.info(f'[{msg_time}] 【{self.account_id}】未启用自动确认发货，跳过自动发货')
                             return
 
                         await self._handle_auto_delivery(
                             websocket, message, send_user_name, send_user_id,
                             item_id, chat_id, msg_time, message_data
                         )
-                        logger.info(f'[{msg_time}] 【{self.account_id}】⏹?小刀成功待发货卡片处理完?')
+                        logger.info(f'[{msg_time}] 【{self.account_id}】⏹️ 小刀成功待发货卡片处理完成')
                         return
                     else:
                         logger.info(f'[{msg_time}] 【{self.account_id}】收到卡片消息，标题: {card_title or "未知"}')
@@ -14616,9 +14655,9 @@ class XianyuLive:
             )
 
         except Exception as e:
-            logger.error(f"【{self.account_id}】[{msg_id}] ?处理消息时发生异? {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】[{msg_id}] ❌ 处理消息时发生异常: {self._safe_str(e)}")
             if msg_size > 3000:
-                logger.error(f"【{self.account_id}】[{msg_id}] ⚠️⚠️⚠️ 大消?{msg_size}字节)处理异常?")
+                logger.error(f"【{self.account_id}】[{msg_id}] ⚠️⚠️⚠️ 大消息({msg_size}字节)处理异常！")
             logger.warning(f"【{self.account_id}】[{msg_id}] 原始消息: {message_data}")
             import traceback
             logger.error(f"【{self.account_id}】[{msg_id}] 异常堆栈: {traceback.format_exc()}")
@@ -14627,7 +14666,7 @@ class XianyuLive:
 
     async def main(self):
         try:
-            logger.info(f"【{self.account_id}】开始启动XianyuLive主程?..")
+            logger.info(f"【{self.account_id}】开始启动XianyuLive主程序...")
             await self.create_session()
             logger.info(f"【{self.account_id}】Session创建完成，开始WebSocket连接循环...")
 
@@ -14644,9 +14683,9 @@ class XianyuLive:
                     circuit_until = init_auth_state.get('circuit_until', 0)
                     if circuit_until and time.time() < circuit_until:
                         remaining_seconds = max(1, int(circuit_until - time.time()))
-                        self._set_connection_state(ConnectionState.RECONNECTING, f"初始化鉴权冷静期剩余{remaining_seconds}?")
+                        self._set_connection_state(ConnectionState.RECONNECTING, f"初始化鉴权冷静期剩余{remaining_seconds}秒")
                         logger.warning(
-                            f"【{self.account_id}】初始化鉴权失败熔断中，暂停发起新的WebSocket连接，剩?{remaining_seconds} ?"
+                            f"【{self.account_id}】初始化鉴权失败熔断中，暂停发起新的WebSocket连接，剩余 {remaining_seconds} 秒"
                         )
                         await self._interruptible_sleep(remaining_seconds)
                         continue
@@ -14669,26 +14708,26 @@ class XianyuLive:
                             self.last_successful_connection = time.time()
                             self._reset_stream_activity_state(self.last_successful_connection)
 
-                            logger.warning(f"【{self.account_id}】准备启动后台任?- 当前状? heartbeat={self.heartbeat_task}, token_refresh={self.token_refresh_task}, cleanup={self.cleanup_task}, cookie_refresh={self.cookie_refresh_task}, stream_watchdog={self.stream_watchdog_task}")
+                            logger.warning(f"【{self.account_id}】准备启动后台任务 - 当前状态: heartbeat={self.heartbeat_task}, token_refresh={self.token_refresh_task}, cleanup={self.cleanup_task}, cookie_refresh={self.cookie_refresh_task}, stream_watchdog={self.stream_watchdog_task}")
 
                             if self.heartbeat_task:
-                                logger.warning(f"【{self.account_id}】检测到旧心跳任务引用，先清?..")
+                                logger.warning(f"【{self.account_id}】检测到旧心跳任务引用，先清理...")
                                 self._reset_background_tasks()
 
-                            logger.info(f"【{self.account_id}】启动心跳任?..")
+                            logger.info(f"【{self.account_id}】启动心跳任务...")
                             self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(websocket))
 
                             tasks_started = []
 
                             if not self.token_refresh_task or self.token_refresh_task.done():
-                                logger.info(f"【{self.account_id}】启动会话保活任?..")
+                                logger.info(f"【{self.account_id}】启动会话保活任务...")
                                 self.token_refresh_task = asyncio.create_task(self.token_refresh_loop())
                                 tasks_started.append("会话保活")
                             else:
-                                logger.info(f"【{self.account_id}】Token刷新任务已在运行，跳过启?")
+                                logger.info(f"【{self.account_id}】Token刷新任务已在运行，跳过启动")
 
                             if not self.cleanup_task or self.cleanup_task.done():
-                                logger.info(f"【{self.account_id}】启动暂停记录清理任?..")
+                                logger.info(f"【{self.account_id}】启动暂停记录清理任务...")
                                 self.cleanup_task = asyncio.create_task(self.pause_cleanup_loop())
                                 tasks_started.append("暂停清理")
                             else:
@@ -14699,10 +14738,10 @@ class XianyuLive:
                                 self.cookie_refresh_task = asyncio.create_task(self.cookie_refresh_loop())
                                 tasks_started.append("Cookie刷新")
                             else:
-                                logger.info(f"【{self.account_id}】Cookie刷新任务已在运行，跳过启?")
+                                logger.info(f"【{self.account_id}】Cookie刷新任务已在运行，跳过启动")
 
                             if not self.stream_watchdog_task or self.stream_watchdog_task.done():
-                                logger.info(f"【{self.account_id}】启动业务流看门狗任?..")
+                                logger.info(f"【{self.account_id}】启动业务流看门狗任务...")
                                 self.stream_watchdog_task = asyncio.create_task(self.message_stream_watchdog_loop())
                                 tasks_started.append("业务流看门狗")
                             else:
@@ -14714,11 +14753,18 @@ class XianyuLive:
 
                             if tasks_started:
                                 logger.info(f"【{self.account_id}】✅ 新启动的任务: {', '.join(tasks_started)}")
-                            logger.info(f"?{self.account_id}?? ????????: ??({'???' if self.heartbeat_task and not self.heartbeat_task.done() else '???'}), ????({'???' if self.token_refresh_task and not self.token_refresh_task.done() else '???'}), ????({'???' if self.cleanup_task and not self.cleanup_task.done() else '???'}), Cookie??({'???' if self.cookie_refresh_task and not self.cookie_refresh_task.done() else '???'}), ??????({'???' if self.stream_watchdog_task and not self.stream_watchdog_task.done() else '???'})")
+                            logger.info(
+                                f"【{self.account_id}】✅ 所有后台任务状态: "
+                                f"心跳(已启动), "
+                                f"会话保活({'运行中' if self.token_refresh_task and not self.token_refresh_task.done() else '已启动'}), "
+                                f"暂停清理({'运行中' if self.cleanup_task and not self.cleanup_task.done() else '已启动'}), "
+                                f"Cookie刷新({'运行中' if self.cookie_refresh_task and not self.cookie_refresh_task.done() else '已启动'}), "
+                                f"业务流看门狗({'运行中' if self.stream_watchdog_task and not self.stream_watchdog_task.done() else '已启动'})"
+                            )
 
                             logger.info(f"【{self.account_id}】开始监听WebSocket消息...")
-                            logger.info(f"【{self.account_id}】WebSocket连接状正常，等待服务器消?..")
-                            logger.info(f"【{self.account_id}】准备进入消息循?..")
+                            logger.info(f"【{self.account_id}】WebSocket连接状态正常，等待服务器消息...")
+                            logger.info(f"【{self.account_id}】准备进入消息循环...")
 
                             async for message in websocket:
                                 try:
@@ -14737,7 +14783,7 @@ class XianyuLive:
                                     except Exception:
                                         pass
 
-                                    logger.info(f"【{self.account_id}】?收到消息 [ID:{msg_id}] {msg_preview} {len(message) if message else 0}字节")
+                                    logger.info(f"【{self.account_id}】📨 收到消息 [ID:{msg_id}] {msg_preview} {len(message) if message else 0}字节")
 
                                     if await self.handle_heartbeat_response(message_data):
                                         continue
@@ -14755,12 +14801,12 @@ class XianyuLive:
                                     continue
                         finally:
                             if self.message_queue_enabled and self.message_queue_running:
-                                logger.info(f"【{self.account_id}】正在停止消息队列工作协?..")
+                                logger.info(f"【{self.account_id}】正在停止消息队列工作协程...")
                                 await self._stop_message_queue_workers()
 
                             if self.ws == websocket:
                                 self.ws = None
-                                logger.info(f"【{self.account_id}】WebSocket连接已出，引用已清?")
+                                logger.info(f"【{self.account_id}】WebSocket连接已退出，引用已清理")
 
                 except InitAuthError as e:
                     error_msg = self._safe_str(e)
@@ -14770,7 +14816,7 @@ class XianyuLive:
                     if current_account_id:
                         init_auth_state = self.record_init_auth_failure(current_account_id, error_msg)
                     self.init_auth_failures = int(init_auth_state.get('count', 0))
-                    self._set_connection_state(ConnectionState.RECONNECTING, f"初始化鉴权失败第{self.init_auth_failures}?")
+                    self._set_connection_state(ConnectionState.RECONNECTING, f"初始化鉴权失败第{self.init_auth_failures}次")
                     logger.error(f"【{self.account_id}】初始化鉴权失败 ({self.init_auth_failures}/{self._init_auth_failure_threshold})")
                     logger.error(f"【{self.account_id}】初始化失败原因: {error_msg}")
 
@@ -14780,14 +14826,14 @@ class XianyuLive:
                         circuit_wait = max(1, int(circuit_until - time.time()))
                         retry_delay = max(retry_delay, circuit_wait)
                         logger.warning(
-                            f"【{self.account_id}】初始化鉴权失败已达到阈值，进入冷静?{circuit_wait} 秒后再重?"
+                            f"【{self.account_id}】初始化鉴权失败已达到阈值，进入冷静期 {circuit_wait} 秒后再重试"
                         )
                     else:
-                        logger.warning(f"【{self.account_id}】将?{retry_delay} 秒后重试初始化鉴?..")
+                        logger.warning(f"【{self.account_id}】将在 {retry_delay} 秒后重试初始化鉴权...")
 
                     self._reset_background_tasks()
                     await self._interruptible_sleep(retry_delay)
-                    logger.info(f"【{self.account_id}】初始化鉴权重试等待完成，准备重新建立连?..")
+                    logger.info(f"【{self.account_id}】初始化鉴权重试等待完成，准备重新建立连接...")
                     continue
 
                 except Exception as e:
@@ -14803,15 +14849,15 @@ class XianyuLive:
                     )
 
                     if is_connection_closed:
-                        logger.warning(f"【{self.account_id}】WebSocket连接已关?({self.connection_failures + 1}/{self.max_connection_failures})")
-                        logger.warning(f"【{self.account_id}】关闭原? {error_msg}")
+                        logger.warning(f"【{self.account_id}】WebSocket连接已关闭 ({self.connection_failures + 1}/{self.max_connection_failures})")
+                        logger.warning(f"【{self.account_id}】关闭原因: {error_msg}")
                     else:
                         self.connection_failures += 1
-                    self._set_connection_state(ConnectionState.RECONNECTING, f"第{self.connection_failures}次失?")
+                    self._set_connection_state(ConnectionState.RECONNECTING, f"第{self.connection_failures}次失败")
                     logger.error(f"【{self.account_id}】WebSocket连接异常 ({self.connection_failures}/{self.max_connection_failures})")
-                    logger.error(f"【{self.account_id}】异常类? {error_type}")
-                    logger.error(f"【{self.account_id}】异常信? {error_msg}")
-                    logger.warning(f"【{self.account_id}】异常堆?\n{traceback.format_exc()}")
+                    logger.error(f"【{self.account_id}】异常类型: {error_type}")
+                    logger.error(f"【{self.account_id}】异常信息: {error_msg}")
+                    logger.warning(f"【{self.account_id}】异常堆栈:\n{traceback.format_exc()}")
 
                     if self.ws:
                         try:
@@ -14824,24 +14870,24 @@ class XianyuLive:
                             pass
                         finally:
                             self.ws = None
-                            logger.info(f"【{self.account_id}】WebSocket引用已清?")
+                            logger.info(f"【{self.account_id}】WebSocket引用已清理")
 
                     if is_connection_closed:
                         self.connection_failures += 1
-                        self._set_connection_state(ConnectionState.RECONNECTING, f"连接关闭，第{self.connection_failures}次重?")
+                        self._set_connection_state(ConnectionState.RECONNECTING, f"连接关闭，第{self.connection_failures}次重连")
 
                     if self.connection_failures >= self.max_connection_failures:
-                        self._set_connection_state(ConnectionState.FAILED, f"连续失败{self.max_connection_failures}?")
+                        self._set_connection_state(ConnectionState.FAILED, f"连续失败{self.max_connection_failures}次")
                         logger.warning(f"【{self.account_id}】连续失败{self.max_connection_failures}次，尝试通过密码登录刷新Cookie...")
 
                         try:
                             refresh_success = await self._try_password_login_refresh(
-                                f"连续失败{self.max_connection_failures}?",
+                                f"连续失败{self.max_connection_failures}次",
                                 ignore_slider_failed_backoff=self._has_recent_slider_success(),
                             )
 
                             if refresh_success:
-                                logger.info(f"【{self.account_id}】✅ 密码登录刷新成功，将重置失败计数并继续重?")
+                                logger.info(f"【{self.account_id}】✅ 密码登录刷新成功，将重置失败计数并继续重连")
                                 self.connection_failures = 0
                                 self._set_connection_state(ConnectionState.RECONNECTING, "Cookie已刷新，准备重连")
                                 await asyncio.sleep(2)
@@ -14849,13 +14895,13 @@ class XianyuLive:
                             else:
                                 logger.warning(f"【{self.account_id}】❌ 密码登录刷新失败，将重启实例...")
                         except Exception as refresh_e:
-                            logger.error(f"【{self.account_id}】密码登录刷新过程异? {self._safe_str(refresh_e)}")
+                            logger.error(f"【{self.account_id}】密码登录刷新过程异常: {self._safe_str(refresh_e)}")
                             logger.warning(f"【{self.account_id}】将重启实例...")
 
-                        logger.error(f"【{self.account_id}】准备重启实?..")
+                        logger.error(f"【{self.account_id}】准备重启实例...")
                         self.connection_failures = 0
 
-                        logger.info(f"【{self.account_id}】重启前先清理后台任?..")
+                        logger.info(f"【{self.account_id}】重启前先清理后台任务...")
                         try:
                             await asyncio.wait_for(
                                 self._cancel_background_tasks(),
@@ -14865,25 +14911,25 @@ class XianyuLive:
                         except asyncio.TimeoutError:
                             logger.warning(f"【{self.account_id}】后台任务清理超时，强制继续重启")
                         except Exception as cleanup_e:
-                            logger.error(f"【{self.account_id}】后台任务清理失? {self._safe_str(cleanup_e)}")
+                            logger.error(f"【{self.account_id}】后台任务清理失败: {self._safe_str(cleanup_e)}")
 
                         await self._restart_instance()
 
-                        logger.info(f"【{self.account_id}】重启请求已触发，主程序即将逢出，新实例将自动启动")
+                        logger.info(f"【{self.account_id}】重启请求已触发，主程序即将退出，新实例将自动启动")
                         return
                     retry_delay = self._calculate_retry_delay(error_msg)
-                    logger.warning(f"【{self.account_id}】将?{retry_delay} 秒后重试连接...")
+                    logger.warning(f"【{self.account_id}】将在 {retry_delay} 秒后重试连接...")
 
                     try:
                         if self.current_token:
-                            logger.warning(f"【{self.account_id}】清空当前token，重新连接时将重新获?")
+                            logger.warning(f"【{self.account_id}】清空当前token，重新连接时将重新获取")
                             self.current_token = None
 
                         logger.info(f"【{self.account_id}】准备重置后台任务引用（快重连模式）...")
                         self._reset_background_tasks()
-                        logger.info(f"【{self.account_id}】后台任务引用已重置，可以立即重?")
+                        logger.info(f"【{self.account_id}】后台任务引用已重置，可以立即重连")
 
-                        logger.info(f"【{self.account_id}】开始等?{retry_delay} ?..")
+                        logger.info(f"【{self.account_id}】开始等待 {retry_delay} 秒...")
                         try:
                             sys.stdout.flush()
                         except Exception:
@@ -14900,37 +14946,37 @@ class XianyuLive:
                                 remaining -= sleep_time
                                 elapsed = time.time() - start_time
                                 if remaining > 0:
-                                    logger.info(f"【{self.account_id}】等待中... 已等?{elapsed:.1f} 秒，剩余 {remaining:.1f} ?")
+                                    logger.info(f"【{self.account_id}】等待中... 已等待 {elapsed:.1f} 秒，剩余 {remaining:.1f} 秒")
                                     try:
                                         sys.stdout.flush()
                                     except Exception:
                                         pass
                             except asyncio.CancelledError:
-                                logger.warning(f"【{self.account_id}】等待期间收到取消信?")
+                                logger.warning(f"【{self.account_id}】等待期间收到取消信号")
                                 raise
                             except Exception as sleep_error:
-                                logger.error(f"【{self.account_id}】等待期间发生异? {self._safe_str(sleep_error)}")
-                                logger.warning(f"【{self.account_id}】等待异常堆?\n{traceback.format_exc()}")
+                                logger.error(f"【{self.account_id}】等待期间发生异常: {self._safe_str(sleep_error)}")
+                                logger.warning(f"【{self.account_id}】等待异常堆栈:\n{traceback.format_exc()}")
                                 if remaining > 0:
                                     await asyncio.sleep(remaining)
                                 break
 
-                        logger.info(f"【{self.account_id}】等待完成（总时 {time.time() - start_time:.1f} 秒），准备重新连?..")
+                        logger.info(f"【{self.account_id}】等待完成（总耗时 {time.time() - start_time:.1f} 秒），准备重新连接...")
                         try:
                             sys.stdout.flush()
                         except Exception:
                             pass
 
                     except Exception as cleanup_error:
-                        logger.error(f"【{self.account_id}】清理过程出? {self._safe_str(cleanup_error)}")
-                        logger.warning(f"【{self.account_id}】清理异常堆?\n{traceback.format_exc()}")
+                        logger.error(f"【{self.account_id}】清理过程出错 {self._safe_str(cleanup_error)}")
+                        logger.warning(f"【{self.account_id}】清理异常堆栈\n{traceback.format_exc()}")
                         self.heartbeat_task = None
                         self.token_refresh_task = None
                         self.cleanup_task = None
                         self.cookie_refresh_task = None
                         self.stream_watchdog_task = None
-                        logger.warning(f"【{self.account_id}】清理失败，已强制重置所有任务引?")
-                        logger.info(f"【{self.account_id}】清理失败后弢始等?{retry_delay} ?..")
+                        logger.warning(f"【{self.account_id}】清理失败，已强制重置所有任务引用")
+                        logger.info(f"【{self.account_id}】清理失败后开始等待 {retry_delay} 秒...")
                         chunk_size = 5.0
                         remaining = retry_delay
                         start_time = time.time()
@@ -14941,7 +14987,7 @@ class XianyuLive:
                                 await asyncio.sleep(sleep_time)
                                 remaining -= sleep_time
                                 if remaining > 0:
-                                    logger.info(f"【{self.account_id}】清理失败后等待?.. 剩余 {remaining:.1f} ?")
+                                    logger.info(f"【{self.account_id}】清理失败后等待... 剩余 {remaining:.1f} 秒")
                             except asyncio.CancelledError:
                                 logger.warning(f"【{self.account_id}】清理失败后等待期间收到取消信号")
                                 raise
@@ -14956,10 +15002,10 @@ class XianyuLive:
                     logger.info(f"【{self.account_id}】开始新丢轮WebSocket连接尝试...")
                     continue
         finally:
-            self._set_connection_state(ConnectionState.CLOSED, "程序逢?")
+            self._set_connection_state(ConnectionState.CLOSED, "程序退出")
 
             if self.current_token:
-                logger.info(f"【{self.account_id}】程序出，清空当前token")
+                logger.info(f"【{self.account_id}】程序退出，清空当前token")
                 self.current_token = None
 
             has_pending_tasks = any([
@@ -14971,16 +15017,16 @@ class XianyuLive:
             ])
 
             if has_pending_tasks:
-                logger.info(f"【{self.account_id}】检测到未完成的后台任务，执行清?..")
+                logger.info(f"【{self.account_id}】检测到未完成的后台任务，执行清理...")
                 try:
                     await asyncio.wait_for(
                         self._cancel_background_tasks(),
                         timeout=10.0
                     )
                 except asyncio.TimeoutError:
-                    logger.error(f"【{self.account_id}】程序出时任务取消超时，强制继?")
+                    logger.error(f"【{self.account_id}】程序退出时任务取消超时，强制继续")
                 except Exception as e:
-                    logger.error(f"【{self.account_id}】程序出时任务取消失败: {self._safe_str(e)}")
+                    logger.error(f"【{self.account_id}】程序退出时任务取消失败: {self._safe_str(e)}")
                 finally:
                     self.heartbeat_task = None
                     self.token_refresh_task = None
@@ -14988,7 +15034,7 @@ class XianyuLive:
                     self.cookie_refresh_task = None
                     self.stream_watchdog_task = None
             else:
-                logger.info(f"【{self.account_id}】所有后台任务已清理完成，跳过重复清?")
+                logger.info(f"【{self.account_id}】所有后台任务已清理完成，跳过重复清理")
                 self.heartbeat_task = None
                 self.token_refresh_task = None
                 self.cleanup_task = None
@@ -14996,7 +15042,7 @@ class XianyuLive:
                 self.stream_watchdog_task = None
 
             if self.background_tasks:
-                logger.info(f"【{self.account_id}】等?{len(self.background_tasks)} 个后台任务完?..")
+                logger.info(f"【{self.account_id}】等待 {len(self.background_tasks)} 个后台任务完成...")
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(*self.background_tasks, return_exceptions=True),
@@ -15008,12 +15054,12 @@ class XianyuLive:
             await self.close_session()
 
             self._unregister_instance()
-            logger.info(f"【{self.account_id}】XianyuLive主程序已完全逢?")
+            logger.info(f"【{self.account_id}】XianyuLive主程序已完全退出")
 
     async def get_item_list_info(self, page_number=1, page_size=20, retry_count=0, sync_item_details=False):
         if retry_count >= 4:
-            logger.error("???????????????")
-            return {"error": "获取商品信息失败，重试次数过?"}
+            logger.error("获取商品信息失败，重试次数过多")
+            return {"error": "获取商品信息失败，重试次数过多"}
 
         if not self.session:
             await self.create_session()
@@ -15094,10 +15140,10 @@ class XianyuLive:
                             }
                             items_list.append(item_info)
 
-                    logger.info(f"成功获取?{len(items_list)} 个商?")
+                    logger.info(f"成功获取 {len(items_list)} 个商品")
 
                     print("\n" + "="*80)
-                    print(f"📦 账号 {self.myid} 的商品列?(第{page_number}页，{len(items_list)} 个商?")
+                    print(f"📦 账号 {self.myid} 的商品列表(第{page_number}页，{len(items_list)} 个商品")
                     print("="*80)
 
                     for i, item in enumerate(items_list, 1):
@@ -15106,7 +15152,7 @@ class XianyuLive:
                         print(f"   商品标题: {item.get('title', 'N/A')}")
                         print(f"   价格: {item.get('price_text', 'N/A')}")
                         print(f"   分类ID: {item.get('category_id', 'N/A')}")
-                        print(f"   商品状? {item.get('item_status', 'N/A')}")
+                        print(f"   商品状态: {item.get('item_status', 'N/A')}")
                         print(f"   拍卖类型: {item.get('auction_type', 'N/A')}")
                         print(f"   详情链接: {item.get('detail_url', 'N/A')}")
                         if item.get('pic_info'):
@@ -15116,7 +15162,7 @@ class XianyuLive:
                         print(f"   完整信息: {json.dumps(item, ensure_ascii=False, indent=2)}")
 
                     print("\n" + "="*80)
-                    print("?商品列表获取完成")
+                    print("商品列表获取完成")
                     print("="*80)
 
                     if items_list:
@@ -15124,7 +15170,7 @@ class XianyuLive:
                             items_list,
                             sync_item_details=sync_item_details,
                         )
-                        logger.info(f"已将 {saved_count} 个商品信息保存到数据?")
+                        logger.info(f"已将 {saved_count} 个商品信息保存到数据库")
 
                     return {
                         "success": True,
@@ -15138,7 +15184,7 @@ class XianyuLive:
                 else:
                     error_msg = res_json.get('ret', [''])[0] if res_json.get('ret') else ''
                     if 'FAIL_SYS_TOKEN_EXOIRED' in error_msg or 'token' in error_msg.lower():
-                        logger.warning(f"Token失效，准备重? {error_msg}")
+                        logger.warning(f"Token失效，准备重试 {error_msg}")
                         await asyncio.sleep(0.5)
                         return await self.get_item_list_info(
                             page_number,
@@ -15165,14 +15211,14 @@ class XianyuLive:
         page_number = 1
         total_saved = 0
 
-        logger.info(f"弢始获取所有商品信息，每页{page_size}?")
+        logger.info(f"开始获取所有商品信息，每页{page_size}条")
 
         while True:
             if max_pages and page_number > max_pages:
-                logger.info(f"达到朢大页数限?{max_pages}，停止获?")
+                logger.info(f"达到最大页数限制{max_pages}，停止获取")
                 break
 
-            logger.info(f"正在获取?{page_number} ?..")
+            logger.info(f"正在获取第{page_number} 页...")
             result = await self.get_item_list_info(
                 page_number,
                 page_size,
@@ -15180,28 +15226,28 @@ class XianyuLive:
             )
 
             if not result.get("success"):
-                logger.error(f"获取?{page_number} 页失? {result}")
+                logger.error(f"获取第{page_number} 页失败 {result}")
                 break
 
             current_items = result.get("items", [])
             if not current_items:
-                logger.info(f"?{page_number} 页没有数据，获取完成")
+                logger.info(f"第{page_number} 页没有数据，获取完成")
                 break
 
             all_items.extend(current_items)
             total_saved += result.get("saved_count", 0)
 
-            logger.info(f"?{page_number} 页获取到 {len(current_items)} 个商?")
+            logger.info(f"第{page_number} 页获取到 {len(current_items)} 个商品")
 
             if len(current_items) < page_size:
-                logger.info(f"?{page_number} 页商品数?{len(current_items)})少于页面大小({page_size})，获取完?")
+                logger.info(f"第{page_number} 页商品数({len(current_items)})少于页面大小({page_size})，获取完成")
                 break
 
             page_number += 1
 
             await asyncio.sleep(1)
 
-        logger.info(f"扢有商品获取完成，?{len(all_items)} 个商品，保存?{total_saved} ?")
+        logger.info(f"所有商品获取完成，共 {len(all_items)} 个商品，保存了 {total_saved} 条")
 
         return {
             "success": True,
@@ -15260,16 +15306,16 @@ class XianyuLive:
                             except Exception as e:
                                 logger.warning(f"【{self.account_id}】获取图片尺寸失败，使用默认尺寸: {e}")
                         else:
-                            logger.error(f"【{self.account_id}】图片上传失? {local_image_path}")
+                            logger.error(f"【{self.account_id}】图片上传失败 {local_image_path}")
                             logger.error(f"【{self.account_id}】❌ Cookie可能已失效！请检查配置并更新Cookie")
                             raise Exception(f"图片上传失败（Cookie可能已失效）: {local_image_path}")
                 else:
                     logger.error(f"【{self.account_id}】本地图片文件不存在: {local_image_path}")
-                    raise Exception(f"本地图片文件不存? {local_image_path}")
+                    raise Exception(f"本地图片文件不存在 {local_image_path}")
             else:
                 logger.warning(f"【{self.account_id}】未知的图片URL格式: {image_url}")
 
-            logger.info(f"【{self.account_id}】准备发送图片消?")
+            logger.info(f"【{self.account_id}】准备发送图片消息")
             logger.info(f"  - 原始URL: {original_url}")
             logger.info(f"  - CDN URL: {image_url}")
             logger.info(f"  - 图片尺寸: {width}x{height}")
@@ -15334,15 +15380,15 @@ class XianyuLive:
             }
 
             await ws.send(json.dumps(msg))
-            logger.info(f"【{self.account_id}】图片消息发送成? {image_url}")
+            logger.info(f"【{self.account_id}】图片消息发送成功 {image_url}")
 
         except Exception as e:
-            logger.error(f"【{self.account_id}】发送图片消息失? {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】发送图片消息失败 {self._safe_str(e)}")
             raise
 
     async def send_image_from_file(self, ws, cid, toid, image_path):
         try:
-            logger.info(f"【{self.account_id}】开始上传图? {image_path}")
+            logger.info(f"【{self.account_id}】开始上传图片 {image_path}")
 
             from utils.image_uploader import ImageUploader
             uploader = ImageUploader(self.cookies_str)
@@ -15357,19 +15403,19 @@ class XianyuLive:
                     with Image.open(image_path) as img:
                         width, height = img.size
                 except Exception as e:
-                    logger.warning(f"无法获取图片尺寸，使用默认? {e}")
+                    logger.warning(f"无法获取图片尺寸，使用默认值: {e}")
                     width, height = 800, 600
 
                 await self.send_image_msg(ws, cid, toid, image_url, width, height)
-                logger.info(f"【{self.account_id}】图片发送完? {image_path} -> {image_url}")
+                logger.info(f"【{self.account_id}】图片发送完成 {image_path} -> {image_url}")
                 return True
             else:
-                logger.error(f"【{self.account_id}】图片上传失? {image_path}")
+                logger.error(f"【{self.account_id}】图片上传失败 {image_path}")
                 logger.error(f"【{self.account_id}】❌ Cookie可能已失效！请检查配置并更新Cookie")
                 return False
 
         except Exception as e:
-            logger.error(f"【{self.account_id}】从文件发图片失? {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】从文件发图片失败 {self._safe_str(e)}")
             return False
 
 if __name__ == '__main__':

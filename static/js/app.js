@@ -15773,7 +15773,7 @@ async function loadUserSystemStats() {
         document.getElementById('totalUserCards').textContent = statsData.cards.total;
 
     } catch (error) {
-        console.error('????????:', error);
+        console.error('加载系统统计失败:', error);
     }
 }
 

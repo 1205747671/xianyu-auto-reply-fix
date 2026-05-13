@@ -96,6 +96,8 @@ global_config.local.yml
 # 测试文件
 test_*.py
 *_test.py
+!tests/source_text_integrity_test.py
+!tests/xianyu_async_text_integrity_test.py
 keywords_sample.xlsx
 
 # 备份文件

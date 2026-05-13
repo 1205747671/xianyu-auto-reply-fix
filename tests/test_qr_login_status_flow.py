@@ -866,7 +866,7 @@ class ReplyServerQrLoginStatusFlowTest(unittest.TestCase):
                     "phase": "browser_cookie_ready",
                     "handoff_status": "pending",
                     "verification_type": "face_verify",
-                    "verification_type_label": "浜鸿劯楠岃瘉",
+                    "verification_type_label": "人脸验证",
                     "success_stage": "browser_complete",
                     "browser_alive": False,
                 }
@@ -895,7 +895,7 @@ class ReplyServerQrLoginStatusFlowTest(unittest.TestCase):
         self.assertEqual(result["handoff_status"], "failed")
         self.assertEqual(result["phase"], "browser_cookie_ready")
         self.assertEqual(result["verification_type"], "face_verify")
-        self.assertEqual(result["verification_type_label"], "浜鸿劯楠岃瘉")
+        self.assertEqual(result["verification_type_label"], "人脸验证")
         self.assertEqual(result["success_stage"], "browser_complete")
         self.assertFalse(result["browser_alive"])
         self.assertIn("Cookie", result["message"])

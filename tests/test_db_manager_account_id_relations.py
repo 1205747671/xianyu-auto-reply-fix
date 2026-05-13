@@ -72,6 +72,30 @@ class DBManagerAccountIdRelationsTest(unittest.TestCase):
         source = Path("db_manager.py").read_text(encoding="utf-8")
         self.assertNotIn("cookie_id", source)
 
+    def test_db_manager_source_has_no_mojibake_account_messages(self):
+        source = Path("db_manager.py").read_text(encoding="utf-8")
+        expected_messages = (
+            "保存关键词失败",
+            "获取账号启用状态失败",
+            "暂无滑块验证记录",
+            "处理超时，自动标记失败",
+            "备份数据格式无效",
+            "已绑定用户",
+        )
+        unexpected_mojibake = (
+            "淇濆瓨鍏抽敭瀛楀け璐",
+            "鑾峰彇璐﹀彿鍚敤鐘舵€佸け璐",
+            "鏆傛棤婊戝潡楠岃瘉璁板綍",
+            "澶勭悊瓒呮椂锛岃嚜鍔ㄦ爣璁板け璐",
+            "澶囦唤鏁版嵁鏍煎紡鏃犳晥",
+            "宸茬粦瀹氱敤鎴",
+        )
+
+        for message in expected_messages:
+            self.assertIn(message, source)
+        for mojibake in unexpected_mojibake:
+            self.assertNotIn(mojibake, source)
+
     def test_delivery_tables_use_account_id_columns(self):
         for table_name in ("delivery_logs", "delivery_finalization_states", "data_card_reservations"):
             columns = self._columns(table_name)

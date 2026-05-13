@@ -318,7 +318,7 @@ class OrderStatusHandlerAccountIdTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             self.handler.handle_system_message(
                 message={},
-                send_message="浜ゆ槗鎴愬姛",
+                send_message="交易成功",
                 cookie_id="acc-legacy-keyword",
                 msg_time="13:00:00",
             )
@@ -482,7 +482,7 @@ class OrderStatusHandlerAccountIdTest(unittest.TestCase):
         ]
         self.handler._pending_system_messages["acc-ambiguous-queue"] = [
             {
-                "send_message": "浜ゆ槗鎴愬姛",
+                "send_message": "交易成功",
                 "msg_time": "15:00:00",
                 "new_status": "completed",
                 "account_id": "acc-ambiguous-queue",
@@ -606,7 +606,7 @@ class OrderStatusHandlerAccountIdTest(unittest.TestCase):
         ]
         self.handler._pending_system_messages["acc-queue-a"] = [
             {
-                "send_message": "浜ゆ槗鎴愬姛",
+                "send_message": "交易成功",
                 "msg_time": "12:30:00",
                 "new_status": "completed",
                 "account_id": "acc-queue-a",

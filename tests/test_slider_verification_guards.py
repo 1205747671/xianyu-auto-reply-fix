@@ -131,7 +131,7 @@ class _RecoverablePunishPage(_FakePage):
 class _DelayedPunishSliderPage(_FakePage):
     def __init__(self):
         super().__init__(
-            title="楠岃瘉鐮佹嫤鎴?",
+            title="验证码拦截",
             url="https://h5api.m.goofish.com/mtop.taobao.idlemessage.pc.login.token/punish?x5secdata=abc123&x5step=2&action=captcha&pureCaptcha=",
         )
         self.phase = 0
@@ -144,8 +144,8 @@ class _DelayedPunishSliderPage(_FakePage):
         if selector != "body":
             raise AssertionError(f"unexpected selector: {selector}")
         if self.phase >= self.ready_phase:
-            return "浜诧紝璇锋寜浣忔粦鍧楋紝鎷栧姩鍒版渶鍙宠竟"
-        return "浜诧紝璇锋嫋鍔ㄤ笅鏂规粦鍧楀畬鎴愰獙璇?"
+            return "亲，请按住滑块，拖动到最右边"
+        return "亲，请拖动下方滑块完成验证"
 
     def content(self):
         return self.inner_text("body")
@@ -837,7 +837,7 @@ class SliderVerificationGuardsTest(unittest.TestCase):
             slider.last_verification_feedback = {
                 "status": "failure",
                 "source": "keyword",
-                "message": "楠岃瘉澶辫触",
+                "message": "验证失败",
                 "fail_code": "unit_delayed",
             }
             return False
@@ -1380,7 +1380,7 @@ class SliderVerificationGuardsTest(unittest.TestCase):
 
     def test_detect_post_slider_blocking_state_ignores_detached_punish_frame(self):
         page = _FakePage(
-            title="闂查奔娑堟伅",
+            title="闲鱼消息",
             url="https://www.goofish.com/im",
         )
         detached_frame = _DetachedPunishFrame()

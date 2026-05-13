@@ -514,7 +514,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 main_block = node.body
                 break
 
-        self.assertIsNotNone(main_block, "XianyuAutoAsync.py 缂哄皯 __main__ 鍏ュ彛")
+        self.assertIsNotNone(main_block, "XianyuAutoAsync.py 缺少 __main__ 入口")
 
         compiled_main = compile(
             ast.Module(body=main_block, type_ignores=[]),
@@ -1303,9 +1303,29 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         live.connection_failures = 0
         live.init_auth_failures = 2
 
-        retry_delay = live._calculate_retry_delay("Token鑾峰彇澶辫触(status=captcha_verification_failed)")
+        retry_delay = live._calculate_retry_delay("Token获取失败(status=captcha_verification_failed)")
 
         self.assertEqual(retry_delay, 10)
+
+    def test_classify_password_login_failure_keeps_legacy_garbled_keywords_compatible(self):
+        cases = [
+            ("滑块验证失败", ("slider_failed", 600)),
+            (XianyuLive._legacy_gbk_mojibake("滑块验证失败"), ("slider_failed", 600)),
+            ("未找到滑块容器", ("slider_failed", 600)),
+            (XianyuLive._legacy_missing_tail("未找到滑块容器"), ("slider_failed", 600)),
+            ("未找到登录表单", ("login_form_missing", 90)),
+            (XianyuLive._legacy_missing_tail("未找到登录表单"), ("login_form_missing", 90)),
+            ("session过期且清理会话状态后未找到登录表单", ("login_form_missing", 90)),
+            (XianyuLive._legacy_missing_tail("session过期且清理会话状态后未找到登录表单"), ("login_form_missing", 90)),
+            ("session验证异常且清理会话状态后未找到登录表单", ("login_form_missing", 90)),
+            (XianyuLive._legacy_missing_tail("session验证异常且清理会话状态后未找到登录表单"), ("login_form_missing", 90)),
+            ("页面会话已失效", ("unknown", 180)),
+            (XianyuLive._legacy_missing_tail("页面会话已失效"), ("unknown", 180)),
+        ]
+
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(XianyuLive.classify_password_login_failure(message), expected)
 
     async def test_async_close_browser_closes_context_before_browser(self):
         close_order = []
@@ -4617,20 +4637,20 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         fake_db = mock.Mock()
         fake_db.get_default_reply.return_value = {
             "enabled": True,
-            "reply_content": "浣犲ソ {send_user_name}",
+            "reply_content": "你好 {send_user_name}",
             "reply_once": True,
         }
         fake_db.has_default_reply_record.return_value = False
 
         with mock.patch("db_manager.db_manager", fake_db):
             reply = await live.get_default_reply(
-                send_user_name="寮犱笁",
+                send_user_name="张三",
                 send_user_id="buyer-1",
-                send_message="浣犲ソ",
+                send_message="你好",
                 chat_id="chat-1",
             )
 
-        self.assertEqual(reply, "浣犲ソ 寮犱笁")
+        self.assertEqual(reply, "你好 张三")
         fake_db.get_default_reply.assert_called_once_with("acc-default-reply-1")
         fake_db.has_default_reply_record.assert_called_once_with("acc-default-reply-1", "chat-1")
 
@@ -4647,9 +4667,9 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch("db_manager.db_manager", fake_db):
             reply = await live.get_default_reply(
-                send_user_name="寮犱笁",
+                send_user_name="张三",
                 send_user_id="buyer-1",
-                send_message="浣犲ソ",
+                send_message="你好",
                 chat_id="chat-1",
             )
 
@@ -6609,7 +6629,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 "10": {
                     "senderNick": "Buyer Alias",
                     "senderUserId": "buyer-msg-1",
-                    "reminderContent": "你好，在吗?",
+                    "reminderContent": "你好，在吗？",
                 },
             }
         }
@@ -6691,7 +6711,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 "10": {
                     "senderNick": "Buyer Blank",
                     "senderUserId": "buyer-msg-scope-blank",
-                    "reminderContent": "你好，在吗?",
+                    "reminderContent": "你好，在吗？",
                 },
             }
         }
@@ -6811,9 +6831,9 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 "5": 1710000000000,
                 "7": 1,
                 "10": {
-                    "senderNick": "绯荤粺娑堟伅",
+                    "senderNick": "系统消息",
                     "senderUserId": "buyer-system-blank",
-                    "reminderContent": "[绯荤粺鎻愮ず]",
+                    "reminderContent": "[系统提示]",
                 },
             },
             "3": {
@@ -7125,7 +7145,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                     "item": {
                         "main": {
                             "exContent": {
-                                "title": "我已小刀，待刢?",
+                                "title": "我已小刀，待刀成",
                             }
                         }
                     }
@@ -7139,9 +7159,9 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 "5": 1710000000000,
                 "7": 1,
                 "10": {
-                    "senderNick": "绯荤粺鎻愰啋",
+                    "senderNick": "系统提醒",
                     "senderUserId": "buyer-bargain-card-blank",
-                    "reminderContent": "[鍗＄墖娑堟伅]",
+                    "reminderContent": "[卡片消息]",
                 },
                 "6": {
                     "3": {
@@ -7213,7 +7233,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                     "item": {
                         "main": {
                             "exContent": {
-                                "title": "鎴戝凡鎴愬姛灏忓垁锛屽緟鍙戣揣",
+                                "title": "我已成功小刀，待发货",
                             }
                         }
                     }
@@ -7227,9 +7247,9 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 "5": 1710000000000,
                 "7": 1,
                 "10": {
-                    "senderNick": "绯荤粺鎻愰啋",
+                    "senderNick": "系统提醒",
                     "senderUserId": "buyer-ready-ship-card-blank",
-                    "reminderContent": "[鍗＄墖娑堟伅]",
+                    "reminderContent": "[卡片消息]",
                 },
                 "6": {
                     "3": {
@@ -7289,9 +7309,9 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 "5": 1710000000000,
                 "7": 1,
                 "10": {
-                    "senderNick": "绯荤粺娑堟伅",
+                    "senderNick": "系统消息",
                     "senderUserId": "buyer-system-1",
-                    "reminderContent": "[绯荤粺鎻愮ず]",
+                    "reminderContent": "[系统提示]",
                 },
             }
         }
@@ -7308,7 +7328,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         live.order_status_handler.handle_system_message.assert_called_once_with(
             message=message,
-            send_message="[绯荤粺鎻愮ず]",
+            send_message="[系统提示]",
             account_id="acc-msg-handle-3",
             msg_time=mock.ANY,
             match_context={
@@ -7349,9 +7369,9 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 "5": 1710000000000,
                 "7": 2,
                 "10": {
-                    "senderNick": "鍗栧鑷繁",
+                    "senderNick": "卖家自己",
                     "senderUserId": "seller-self",
-                    "reminderContent": "鎵嬪姩鍥炰竴鍙?",
+                    "reminderContent": "手动回一句",
                 },
             }
         }
@@ -7446,9 +7466,9 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                         "5": 1710000000000,
                         "7": 2,
                         "10": {
-                            "senderNick": "鍗栧鑷繁",
+                            "senderNick": "卖家自己",
                             "senderUserId": "seller-self",
-                            "reminderContent": "鎵嬪姩鍥炰竴鍙?",
+                            "reminderContent": "手动回一句",
                         },
                     }
                 }
@@ -7520,13 +7540,13 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 "5": 1710000000000,
                 "7": 1,
                 "10": {
-                    "senderNick": "绯荤粺鎻愰啋",
+                    "senderNick": "系统提醒",
                     "senderUserId": "buyer-red-1",
-                    "reminderContent": "[鎻愰啋娑堟伅]",
+                    "reminderContent": "[提醒消息]",
                 },
             },
             "3": {
-                "redReminder": "鍗栧宸插彂璐?",
+                "redReminder": "卖家已发货",
                 "userId": "buyer-red-1",
             },
         }
@@ -7543,7 +7563,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         live.order_status_handler.handle_red_reminder_message.assert_called_once_with(
             message=message,
-            red_reminder="鍗栧宸插彂璐?",
+            red_reminder="卖家已发货",
             user_id="buyer-red-1",
             account_id="acc-msg-handle-5",
             msg_time=mock.ANY,
@@ -8615,7 +8635,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                  new=mock.AsyncMock(side_effect=AssertionError("should not launch clean browser")),
                  create=True,
              ) as launch_browser_safe:
-            lease, browser, context, reused_profile = await live._open_browser_recovery_context("娴忚鍣ㄦ仮澶嶆祴璇?")
+            lease, browser, context, reused_profile = await live._open_browser_recovery_context("浏览器恢复测试")
 
         self.assertIsNone(lease)
         self.assertIsNone(browser)
@@ -8655,7 +8675,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                  create=True,
              ) as launch_browser_safe:
             lease_result, browser, context, reused_profile = await live._open_browser_recovery_context(
-                "娴忚鍣ㄦ仮澶嶆祴璇?",
+                "浏览器恢复测试",
                 target_account_id="account-context-missing",
             )
 
@@ -8720,7 +8740,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
              ) as launch_browser_safe:
             with self.assertRaises(TypeError):
                 await live._open_browser_recovery_context(
-                    "娴忚鍣ㄦ仮澶嶆祴璇?",
+                    "浏览器恢复测试",
                     target_cookie_id="alias-recovery-account-1",
                 )
 
@@ -8764,7 +8784,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
              ) as launch_browser_safe:
             lease_result, browser, context_result, reused_profile = (
                 await live._open_browser_recovery_context(
-                    "娴忚鍣ㄦ仮澶嶆祴璇?",
+                    "浏览器恢复测试",
                     target_account_id="default",
                 )
             )
@@ -8822,7 +8842,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
              ) as launch_browser_safe:
             lease_result, browser, context_result, reused_profile = (
                 await live._open_browser_recovery_context(
-                    "娴忚鍣ㄦ仮澶嶆祴璇?",
+                    "浏览器恢复测试",
                     target_account_id="foreign-recovery-account",
                 )
             )
@@ -9758,7 +9778,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
              mock.patch.dict(sys.modules, {
                  "utils.xianyu_slider_stealth": types.SimpleNamespace(XianyuSliderStealth=_FakeSlider),
              }):
-            success = await live._try_password_login_refresh("婊戝潡楠岃瘉澶辫触", trigger_scene="token_refresh")
+            success = await live._try_password_login_refresh("滑块验证失败", trigger_scene="token_refresh")
 
         self.assertFalse(success)
         self.assertTrue(captured["init_kwargs"]["use_account_persistent_profile"])
@@ -9813,7 +9833,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
              mock.patch.dict(sys.modules, {
                  "utils.xianyu_slider_stealth": types.SimpleNamespace(XianyuSliderStealth=_FakeSlider),
              }):
-            success = await live._try_password_login_refresh("鎵嬪姩鍒锋柊浜ゆ帴鎭㈠绐楀彛", trigger_scene="token_refresh")
+            success = await live._try_password_login_refresh("手动刷新交接恢复窗口", trigger_scene="token_refresh")
 
         self.assertFalse(success)
         self.assertTrue(captured["init_kwargs"]["use_account_persistent_profile"])
@@ -9868,7 +9888,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
              mock.patch.dict(sys.modules, {
                  "utils.xianyu_slider_stealth": types.SimpleNamespace(XianyuSliderStealth=_FakeSlider),
              }):
-            success = await live._try_password_login_refresh("鏈€杩戝垰閫氳繃婊戝潡", trigger_scene="token_refresh")
+            success = await live._try_password_login_refresh("最近刚通过滑块", trigger_scene="token_refresh")
 
         self.assertFalse(success)
         self.assertTrue(captured["init_kwargs"]["use_account_persistent_profile"])
@@ -9953,7 +9973,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
              mock.patch.dict(sys.modules, {
                  "utils.xianyu_slider_stealth": types.SimpleNamespace(XianyuSliderStealth=_FakeSlider),
              }):
-            success = await live._try_password_login_refresh("瀵嗙爜鎭㈠闇€瑕佸彈绠untime", trigger_scene="token_refresh")
+            success = await live._try_password_login_refresh("密码恢复需要受管runtime", trigger_scene="token_refresh")
 
         self.assertFalse(success)
         self.assertEqual(captured["init_kwargs"]["user_id"], "account-managed-id")
@@ -10118,7 +10138,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                  {"utils.xianyu_slider_stealth": types.SimpleNamespace(XianyuSliderStealth=_FakeSlider)},
              ):
             success = await live._try_password_login_refresh(
-                "瀵嗙爜鎭㈠鎴愬姛鏃ュ織楠岃瘉",
+                "密码恢复成功日志验证",
                 trigger_scene="token_refresh",
             )
 
@@ -10156,7 +10176,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                  side_effect=AssertionError("should not acquire recovery lock without canonical account_id"),
              ) as acquire_auth_recovery_lock:
             success = await live._try_password_login_refresh(
-                "瀵嗙爜鎭㈠闇€瑕佸彈绠untime",
+                "密码恢复需要受管runtime",
                 trigger_scene="token_refresh",
             )
 
@@ -10441,7 +10461,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
              mock.patch.dict(sys.modules, {
                  "utils.xianyu_slider_stealth": types.SimpleNamespace(XianyuSliderStealth=_FakeSlider),
              }):
-            success = await live._try_password_login_refresh("attach 澶辫触涔熷緱閲婃斁 runtime", trigger_scene="token_refresh")
+            success = await live._try_password_login_refresh("attach 失败也得释放 runtime", trigger_scene="token_refresh")
 
         self.assertFalse(success)
         self.assertFalse(captured["login_called"])
@@ -11932,7 +11952,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         page = mock.Mock()
         page.goto = mock.AsyncMock()
         page.reload = mock.AsyncMock()
-        page.title = mock.AsyncMock(return_value="鑱婂ぉ_闂查奔")
+        page.title = mock.AsyncMock(return_value="聊天_闲鱼")
 
         context = mock.Mock()
         context.add_cookies = mock.AsyncMock()
@@ -12022,7 +12042,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         page = mock.Mock()
         page.goto = mock.AsyncMock()
         page.reload = mock.AsyncMock()
-        page.title = mock.AsyncMock(return_value="鑱婂ぉ_闂查奔")
+        page.title = mock.AsyncMock(return_value="聊天_闲鱼")
 
         context = mock.Mock()
         context.add_cookies = mock.AsyncMock()
