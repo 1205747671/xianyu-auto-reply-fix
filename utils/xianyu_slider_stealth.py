@@ -862,19 +862,8 @@ class SliderConcurrencyManager:
             return True
     
     def _extract_pure_user_id(self, user_id: str) -> str:
-        """提取纯用户ID（移除时间戳部分）"""
-        if '_' in user_id:
-            # 检查最后一部分是否为数字（时间戳）
-            parts = user_id.split('_')
-            if len(parts) >= 2 and parts[-1].isdigit() and len(parts[-1]) >= 10:
-                # 最后一部分是时间戳，移除它
-                return '_'.join(parts[:-1])
-            else:
-                # 不是时间戳格式，使用原始ID
-                return user_id
-        else:
-            # 没有下划线，直接使用
-            return user_id
+        """提取账号作用域ID，保留用户自定义 account_id 的完整后缀。"""
+        return str(user_id or "").strip() or "default"
     
     def get_stats(self):
         """获取统计信息"""
@@ -1069,7 +1058,7 @@ class XianyuSliderStealth:
         self._concurrency_slot_registered = False
         self._managed_runtime_binding = None
         
-        # 提取纯用户ID（移除时间戳部分）
+        # account_id 是账号级浏览器隔离主键，不能再擅自截断用户自定义后缀。
         self.pure_user_id = concurrency_manager._extract_pure_user_id(user_id)
         
         # 检查日期限制
@@ -1077,7 +1066,8 @@ class XianyuSliderStealth:
             raise Exception(f"【{self.pure_user_id}】日期验证失败，功能已过期")
         
         # 为每个实例创建独立的临时目录
-        self.temp_dir = tempfile.mkdtemp(prefix=f"slider_{user_id}_")
+        safe_temp_user_id = re.sub(r"[^0-9A-Za-z_.-]+", "_", self.pure_user_id or "default")
+        self.temp_dir = tempfile.mkdtemp(prefix=f"slider_{safe_temp_user_id}_")
         logger.debug(f"【{self.pure_user_id}】创建临时目录: {self.temp_dir}")
         
         # 等待可用槽位（排队机制）
@@ -2397,8 +2387,11 @@ class XianyuSliderStealth:
     def _resolve_account_persistent_profile_dir(self) -> str:
         profile_dir = str(getattr(self, "account_persistent_profile_dir", None) or "").strip()
         if not profile_dir:
-            profile_dir = os.path.join(os.getcwd(), 'browser_data', f'user_{self.pure_user_id}')
-        os.makedirs(profile_dir, exist_ok=True)
+            from utils.account_browser_runtime import account_browser_runtime_manager
+
+            profile_dir = account_browser_runtime_manager.resolve_profile_dir(self.pure_user_id)
+        else:
+            os.makedirs(profile_dir, exist_ok=True)
         return profile_dir
 
     def _build_playwright_context_options(self, browser_features: Dict[str, Any]) -> Dict[str, Any]:
@@ -10634,13 +10627,11 @@ class XianyuSliderStealth:
             if force_clean_context:
                 logger.warning(f"【{self.pure_user_id}】刷新模式启用干净上下文，不复用历史浏览器会话")
             else:
+                user_data_dir = self._resolve_account_persistent_profile_dir()
                 if self._should_use_account_persistent_profile():
-                    user_data_dir = self._resolve_account_persistent_profile_dir()
                     logger.info(f"【{self.pure_user_id}】使用账号持久化画像目录: {user_data_dir}")
                 else:
-                    user_data_dir = os.path.join(os.getcwd(), 'browser_data', f'user_{self.pure_user_id}')
-                    os.makedirs(user_data_dir, exist_ok=True)
-                    logger.info(f"【{self.pure_user_id}】使用用户数据目录: {user_data_dir}")
+                    logger.info(f"【{self.pure_user_id}】使用账号级浏览器画像目录: {user_data_dir}")
             
             # 在启动Playwright之前，重新检查和设置浏览器路径
             # 确保使用正确的浏览器版本（避免版本不匹配问题）

@@ -308,6 +308,88 @@ class SliderVerificationGuardsTest(unittest.TestCase):
             },
         }
 
+    def test_extract_pure_user_id_preserves_timestamp_like_account_id(self):
+        from utils.xianyu_slider_stealth import concurrency_manager
+
+        self.assertEqual(
+            concurrency_manager._extract_pure_user_id("shop_202605130001"),
+            "shop_202605130001",
+        )
+
+    def test_resolve_account_persistent_profile_dir_uses_runtime_manager_for_exact_account_id(self):
+        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
+        slider.account_persistent_profile_dir = None
+        slider.pure_user_id = "shop_202605130001"
+
+        expected = os.path.join(os.getcwd(), "browser_data", "user_shop_202605130001")
+
+        with mock.patch(
+            "utils.account_browser_runtime.account_browser_runtime_manager.resolve_profile_dir",
+            return_value=expected,
+        ) as resolve_profile_dir:
+            profile_dir = slider._resolve_account_persistent_profile_dir()
+
+        self.assertEqual(profile_dir, expected)
+        resolve_profile_dir.assert_called_once_with("shop_202605130001")
+
+    @mock.patch("utils.xianyu_slider_stealth.launch_browser_persistent_context")
+    def test_login_with_password_browser_uses_runtime_manager_profile_dir_without_persistent_flag(
+        self,
+        mock_launch_persistent,
+    ):
+        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
+        slider.pure_user_id = "shop_202605130001"
+        slider.use_account_persistent_profile = False
+        slider.account_persistent_profile_dir = None
+        slider.headless = True
+        slider.browser = None
+        slider.context = None
+        slider.page = None
+        slider.playwright = None
+        slider.browser_channel = None
+        slider.executable_path = None
+        slider.risk_trigger_scene = None
+        slider._managed_runtime_binding = None
+        slider._check_date_validity = lambda: True
+        slider._should_prefer_project_browser_for_playwright = lambda: False
+        slider._build_browser_proxy_settings = lambda: None
+        slider._build_browser_launch_args = lambda: ["--unit-test"]
+        slider._sanitize_provider_launch_options = lambda options: options
+        slider._apply_provider_launch_defaults = lambda options: options
+        slider._get_random_browser_features = lambda: {
+            "user_agent": "unit-test-agent",
+            "viewport_width": 1600,
+            "viewport_height": 900,
+            "device_scale_factor": 1.0,
+        }
+        slider._build_browser_features = lambda: {"user_agent": "unit-test-agent"}
+        slider._build_browser_context_options = lambda _features: {"locale": "zh-CN"}
+        slider._build_persistent_context_options = (
+            lambda _features, context_options=None: {"locale": "zh-CN"}
+        )
+        slider._is_profile_in_use_launch_error = lambda exc: False
+        slider._release_concurrency_slot = lambda *_args, **_kwargs: None
+        slider._fail_login = mock.Mock(return_value=None)
+
+        expected_profile_dir = os.path.join(
+            os.getcwd(),
+            "browser_data",
+            "managed_shop_202605130001",
+        )
+        mock_launch_persistent.side_effect = RuntimeError("stop-launch-after-profile-dir")
+
+        with mock.patch(
+            "utils.account_browser_runtime.account_browser_runtime_manager.resolve_profile_dir",
+            return_value=expected_profile_dir,
+        ) as resolve_profile_dir:
+            slider.login_with_password_browser("user", "pass", show_browser=False)
+
+        resolve_profile_dir.assert_called_once_with("shop_202605130001")
+        self.assertEqual(
+            mock_launch_persistent.call_args.kwargs["user_data_dir"],
+            expected_profile_dir,
+        )
+
     def test_check_page_changed_does_not_treat_punish_url_as_success(self):
         page = _FakePage(
             title="闲鱼",

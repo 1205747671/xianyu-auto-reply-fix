@@ -992,6 +992,27 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             os.path.join(os.getcwd(), "browser_data", "user_account-2095002164"),
         )
 
+    def test_resolve_account_browser_profile_dir_uses_runtime_manager_for_exact_account_id(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live._legacy_cookie_id = "legacy-cookie-2095002164"
+        live.account_id = "shop_202605130001"
+        live.cookies_str = "unb=qr-unb"
+
+        expected = os.path.join(os.getcwd(), "browser_data", "user_shop_202605130001")
+        runtime_manager = types.SimpleNamespace(
+            resolve_profile_dir=mock.Mock(return_value=expected),
+        )
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "account_browser_runtime_manager",
+            new=runtime_manager,
+        ):
+            profile_dir = live._resolve_account_browser_profile_dir()
+
+        self.assertEqual(profile_dir, expected)
+        runtime_manager.resolve_profile_dir.assert_called_once_with("shop_202605130001")
+
     def test_resolve_account_browser_profile_dir_does_not_fallback_to_unb(self):
         live = XianyuLive.__new__(XianyuLive)
         live.account_id = ""
@@ -9912,6 +9933,9 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             acquire_runtime_sync=mock.Mock(return_value=lease),
             get_fresh_page_sync=mock.Mock(return_value=(page, context)),
             release_runtime_sync=mock.Mock(return_value=None),
+            resolve_profile_dir=mock.Mock(
+                return_value=os.path.join(os.getcwd(), "browser_data", "user_account-managed-id")
+            ),
         )
 
         class _FakeSlider:
@@ -10254,6 +10278,9 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             acquire_runtime_sync=mock.Mock(return_value=lease),
             get_fresh_page_sync=mock.Mock(return_value=(page, context)),
             release_runtime_sync=mock.Mock(return_value=None),
+            resolve_profile_dir=mock.Mock(
+                return_value=os.path.join(os.getcwd(), "browser_data", "user_attach-fail-account")
+            ),
         )
 
         class _FakeSlider:
@@ -10401,6 +10428,9 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             acquire_runtime_sync=mock.Mock(return_value=lease),
             get_fresh_page_sync=mock.Mock(return_value=(page, context)),
             release_runtime_sync=mock.Mock(return_value=None),
+            resolve_profile_dir=mock.Mock(
+                return_value=os.path.join(os.getcwd(), "browser_data", "user_attach-fail-account")
+            ),
         )
         captured = {"login_called": False}
 

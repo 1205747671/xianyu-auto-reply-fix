@@ -244,8 +244,9 @@ class ReplyServerAccountScopeContractTest(_ReplyServerModuleBindingMixin, unitte
         start_source = (REPO_ROOT / "Start.py").read_text(encoding="utf-8")
 
         self.assertNotIn("account_id: Cookie ID", db_manager_source)
-        self.assertIn("account_id = entry.get('id')", start_source)
-        self.assertNotIn("cid = entry.get('id')", start_source)
+        self.assertIn("account_id = str(entry.get('account_id') or '').strip()", start_source)
+        self.assertNotIn("account_id = entry.get('id')", start_source)
+        self.assertNotIn("cid = entry.get('account_id')", start_source)
         self.assertNotIn("manager.add_cookie(cid, val, kw_list)", start_source)
 
     def test_runtime_and_cookie_responses_use_account_id_fields(self):
@@ -296,6 +297,55 @@ class ReplyServerAccountScopeContractTest(_ReplyServerModuleBindingMixin, unitte
                         invalid_account_id,
                         action_text="unit test",
                     )
+
+    def test_require_runtime_account_id_rejects_invalid_format_scope(self):
+        for invalid_account_id in ("bad scope!", "scope/1", "中文账号"):
+            with self.subTest(account_id=invalid_account_id):
+                with self.assertRaisesRegex(ValueError, "account_id"):
+                    reply_server._require_runtime_account_id(
+                        invalid_account_id,
+                        action_text="unit test",
+                    )
+
+    def test_ensure_account_access_rejects_invalid_format_before_cookie_lookup(self):
+        with mock.patch.object(
+            reply_server,
+            "_get_user_cookies_map",
+            side_effect=AssertionError("invalid account_id should be rejected before account lookup"),
+        ) as get_user_cookies_map:
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                reply_server._ensure_account_access(
+                    "bad scope!",
+                    {"user_id": 1, "username": "admin"},
+                    "访问",
+                )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("account_id", raised.exception.detail)
+        get_user_cookies_map.assert_not_called()
+
+    def test_add_cookie_rejects_invalid_account_id_before_db_access(self):
+        current_user = {"user_id": 1, "username": "admin"}
+
+        with mock.patch.object(reply_server.cookie_manager, "manager", mock.Mock()), mock.patch.object(
+            reply_server.db_manager,
+            "get_all_cookies",
+            side_effect=AssertionError("invalid account_id should be rejected before cookie lookup"),
+        ) as get_all_cookies, mock.patch.object(reply_server, "log_with_user"):
+            for invalid_account_id in ("default", "bad scope!"):
+                with self.subTest(account_id=invalid_account_id):
+                    with self.assertRaises(reply_server.HTTPException) as raised:
+                        reply_server.add_cookie(
+                            reply_server.AccountCookieUpsertIn(
+                                account_id=invalid_account_id,
+                                value="unb=test_user; cookie2=test_cookie2",
+                            ),
+                            current_user=current_user,
+                        )
+                    self.assertEqual(raised.exception.status_code, 400)
+                    self.assertIn("account_id", raised.exception.detail)
+
+        get_all_cookies.assert_not_called()
 
     def test_prepare_manual_refresh_runtime_account_id_marks_handoff_with_normalized_scope(self):
         with mock.patch("XianyuAutoAsync.XianyuLive.mark_manual_refresh_handoff") as handoff:

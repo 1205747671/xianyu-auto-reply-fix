@@ -28,7 +28,7 @@ import cookie_manager
 from db_manager import db_manager
 from file_log_collector import setup_file_logging, get_file_log_collector
 from ai_reply_engine import ai_reply_engine
-from utils.account_browser_runtime import account_browser_runtime_manager
+from utils.account_browser_runtime import ACCOUNT_ID_PATTERN, account_browser_runtime_manager
 from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
@@ -2526,10 +2526,22 @@ def _get_user_cookies_map(current_user: Dict[str, Any]) -> Dict[str, str]:
     return db_manager.get_all_cookies(user_id)
 
 
-def _ensure_account_access(account_id: str, current_user: Dict[str, Any], action_text: str = "操作") -> str:
+def _normalize_request_account_id(account_id: Any) -> str:
     normalized_account_id = str(account_id or '').strip()
     if not normalized_account_id:
-        raise HTTPException(status_code=400, detail="缺少账号ID")
+        raise ValueError("account_id 不能为空")
+    if normalized_account_id == 'default':
+        raise ValueError("account_id 不能为 default")
+    if not ACCOUNT_ID_PATTERN.fullmatch(normalized_account_id):
+        raise ValueError("account_id 只能包含英文字母、数字、下划线和短横线")
+    return normalized_account_id
+
+
+def _ensure_account_access(account_id: str, current_user: Dict[str, Any], action_text: str = "操作") -> str:
+    try:
+        normalized_account_id = _normalize_request_account_id(account_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     user_cookies = _get_user_cookies_map(current_user)
     if normalized_account_id not in user_cookies:
@@ -2545,6 +2557,8 @@ def _require_runtime_account_id(account_id: Any, *, action_text: str = "runtime 
     normalized_account_id = str(account_id or '').strip()
     if not normalized_account_id or normalized_account_id == 'default':
         raise ValueError(f"{action_text} requires non-empty, non-default account_id")
+    if not ACCOUNT_ID_PATTERN.fullmatch(normalized_account_id):
+        raise ValueError(f"{action_text} requires account_id matching ^[A-Za-z0-9_-]+$")
     return normalized_account_id
 
 
@@ -3239,9 +3253,10 @@ def add_cookie(item: AccountCookieUpsertIn, current_user: Dict[str, Any] = Depen
         user_id = current_user['user_id']
         from db_manager import db_manager
 
-        account_id = str(item.account_id or '').strip()
-        if not account_id:
-            raise HTTPException(status_code=400, detail="账号ID(account_id)不能为空")
+        try:
+            account_id = _normalize_request_account_id(item.account_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         log_with_user('info', f"尝试添加Cookie: {account_id}, 当前用户ID: {user_id}, 用户名: {current_user.get('username', 'unknown')}", current_user)
 
@@ -3274,7 +3289,10 @@ def update_cookie(account_id: str, item: AccountCookieUpsertIn, current_user: Di
         raise HTTPException(status_code=500, detail='CookieManager 未就绪')
     try:
         account_id = _ensure_account_access(account_id, current_user, "操作")
-        request_account_id = str(item.account_id or '').strip()
+        try:
+            request_account_id = _normalize_request_account_id(item.account_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if request_account_id != account_id:
             raise HTTPException(status_code=400, detail="请求体中的account_id与路径不一致")
 
@@ -5515,7 +5533,7 @@ async def generate_qr_code(
             )
         except ValueError as account_scope_error:
             raise HTTPException(status_code=400, detail=str(account_scope_error)) from account_scope_error
-        if not re.fullmatch(r'^[A-Za-z0-9_-]+$', account_id):
+        if not ACCOUNT_ID_PATTERN.fullmatch(account_id):
             raise HTTPException(status_code=400, detail='account_id只能包含英文字母、数字、下划线和短横线')
 
         user_id = current_user.get('user_id')
@@ -5921,7 +5939,7 @@ async def process_qr_login_cookies(
             )
         except ValueError as account_scope_error:
             raise _build_qr_login_chain_error(str(account_scope_error)) from account_scope_error
-        if not re.fullmatch(r'^[A-Za-z0-9_-]+$', account_id):
+        if not ACCOUNT_ID_PATTERN.fullmatch(account_id):
             raise _build_qr_login_chain_error("account_id格式非法")
 
         binding_info = db_manager.get_cookie_binding_info(account_id)

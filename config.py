@@ -1,4 +1,5 @@
 import os
+import warnings
 import yaml
 from typing import Dict, Any
 
@@ -88,9 +89,31 @@ class Config:
 # 创建全局配置实例
 config = Config()
 
+
+def _normalize_cookie_entries(raw_entries: Any) -> list[dict[str, Any]]:
+    if raw_entries is None:
+        return []
+    if not isinstance(raw_entries, list):
+        warnings.warn(
+            "global_config.yml 中 COOKIES 现在只支持列表格式；旧的 COOKIES.value 配置已停用。",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return []
+
+    normalized_entries: list[dict[str, Any]] = []
+    for index, entry in enumerate(raw_entries):
+        if not isinstance(entry, dict):
+            warnings.warn(
+                f"global_config.yml 中 COOKIES[{index}] 必须是对象，当前条目已跳过。",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            continue
+        normalized_entries.append(entry)
+    return normalized_entries
+
 # 导出常用配置项
-COOKIES_STR = config.get('COOKIES.value', '')
-COOKIES_LAST_UPDATE = config.get('COOKIES.last_update_time', '')
 WEBSOCKET_URL = config.get('WEBSOCKET_URL', 'wss://wss-goofish.dingtalk.com/')
 HEARTBEAT_INTERVAL = config.get('HEARTBEAT_INTERVAL', 15)
 HEARTBEAT_TIMEOUT = config.get('HEARTBEAT_TIMEOUT', 30)
@@ -122,10 +145,4 @@ YIFAN_API = config.get('YIFAN_API', {
     'callback_url': 'http://116.196.116.76/yifan.php',
     'query_url': 'http://116.196.116.76/yifan.php'
 })
-_cookies_raw = config.get('COOKIES', [])
-if isinstance(_cookies_raw, list):
-    COOKIES_LIST = _cookies_raw
-else:
-    # 兼容旧格式，仅有 value 字段
-    val = _cookies_raw.get('value') if isinstance(_cookies_raw, dict) else None
-    COOKIES_LIST = [{'id': 'default', 'value': val}] if val else []
+COOKIES_LIST = _normalize_cookie_entries(config.get('COOKIES', []))

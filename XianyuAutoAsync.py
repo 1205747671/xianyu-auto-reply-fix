@@ -20,7 +20,7 @@ from utils.xianyu_utils import (
 from config import (
     WEBSOCKET_URL, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
     TOKEN_REFRESH_INTERVAL, TOKEN_RETRY_INTERVAL,
-    SESSION_KEEPALIVE_INTERVAL, SESSION_KEEPALIVE_RETRY_INTERVAL, COOKIES_STR,
+    SESSION_KEEPALIVE_INTERVAL, SESSION_KEEPALIVE_RETRY_INTERVAL,
     LOG_CONFIG, AUTO_REPLY, DEFAULT_HEADERS, WEBSOCKET_HEADERS,
     APP_CONFIG, API_ENDPOINTS, YIFAN_API
 )
@@ -1541,9 +1541,7 @@ class XianyuLive:
         logger.info(f"【{init_log_account_id}】开始初始化XianyuLive...")
 
         if not cookies_str:
-            cookies_str = COOKIES_STR
-        if not cookies_str:
-            raise ValueError("未提供cookies，请在global_config.yml中配置COOKIES_STR或过参数传入")
+            raise ValueError("未提供cookies_str，请显式传入账号 Cookie 内容")
 
         cookies_str = str(cookies_str).replace("\ufeff", "").strip()
 
@@ -12099,10 +12097,7 @@ class XianyuLive:
         resolved_key = str(profile_key or "").strip() or self._canonical_account_id()
         if not resolved_key:
             raise RuntimeError("缺少 canonical account_id，无法解析账号级浏览器画像目录")
-        safe_key = re.sub(r"[^0-9A-Za-z_.-]+", "_", resolved_key)
-        profile_dir = os.path.join(os.getcwd(), 'browser_data', f'user_{safe_key}')
-        os.makedirs(profile_dir, exist_ok=True)
-        return profile_dir
+        return account_browser_runtime_manager.resolve_profile_dir(resolved_key)
 
     def _should_prefer_account_persistent_profile_for_browser_recovery(self) -> Tuple[bool, str]:
         canonical_account_id = self._canonical_account_id()

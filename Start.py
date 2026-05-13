@@ -319,9 +319,23 @@ async def main():
     # 2) 如果配置文件中有新的 Cookie，也加载它们
     pending_account_registrations = []
     for entry in COOKIES_LIST:
-        account_id = entry.get('id')
-        cookie_value = entry.get('value')
-        if not account_id or not cookie_value or account_id in manager.cookies:
+        if not isinstance(entry, dict):
+            logger.warning(f"跳过非法 COOKIES 配置条目，期望对象，实际为: {type(entry).__name__}")
+            continue
+
+        account_id = str(entry.get('account_id') or '').strip()
+        cookie_value = str(entry.get('value') or '').strip()
+        if not account_id or not cookie_value:
+            logger.warning("跳过缺少 account_id 或 value 的 COOKIES 配置条目")
+            continue
+
+        try:
+            db_manager._require_account_id(account_id)
+        except ValueError as account_id_error:
+            logger.warning(f"跳过非法 account_id 的 COOKIES 配置条目: {account_id_error}")
+            continue
+
+        if account_id in manager.cookies:
             continue
         
         kw_file = entry.get('keywords_file')
@@ -331,13 +345,26 @@ async def main():
             pending_account_registrations.append(registration)
         logger.info(f"从配置文件加载账号凭证: {account_id}")
 
-    # 3) 若老环境变量仍提供单账号 Cookie，则作为 default 账号
+    # 3) 若环境变量提供单账号 Cookie，必须显式绑定 ACCOUNT_ID
     env_cookie = os.getenv('COOKIES_STR')
-    if env_cookie and 'default' not in manager.list_cookies():
-        registration = manager.add_cookie('default', env_cookie)
-        if isinstance(registration, asyncio.Future):
-            pending_account_registrations.append(registration)
-        logger.info("从环境变量加载 default Cookie")
+    env_account_id = str(os.getenv('ACCOUNT_ID') or '').strip()
+    if env_cookie:
+        if not env_account_id:
+            logger.warning("检测到 COOKIES_STR，但缺少 ACCOUNT_ID，跳过环境变量账号加载")
+        else:
+            try:
+                db_manager._require_account_id(env_account_id)
+            except ValueError as account_id_error:
+                logger.warning(
+                    f"检测到 COOKIES_STR，但 ACCOUNT_ID 非法，跳过环境变量账号加载: {account_id_error}"
+                )
+            elif env_account_id in manager.list_cookies():
+                logger.info(f"环境变量账号已存在，跳过重复加载: {env_account_id}")
+            else:
+                registration = manager.add_cookie(env_account_id, env_cookie)
+                if isinstance(registration, asyncio.Future):
+                    pending_account_registrations.append(registration)
+                logger.info(f"从环境变量加载账号 Cookie: {env_account_id}")
 
     if pending_account_registrations:
         logger.info(f"等待 {len(pending_account_registrations)} 个启动期账号注册完成")

@@ -72,6 +72,12 @@ class DBManagerAccountIdRelationsTest(unittest.TestCase):
         source = Path("db_manager.py").read_text(encoding="utf-8")
         self.assertNotIn("cookie_id", source)
 
+    def test_save_cookie_rejects_default_or_invalid_account_id(self):
+        for invalid_account_id in ("default", "bad scope!", "中文账号"):
+            with self.subTest(account_id=invalid_account_id):
+                with self.assertRaisesRegex(ValueError, "account_id"):
+                    self.db.save_cookie(invalid_account_id, "a=1; b=2", user_id=1)
+
     def test_db_manager_source_has_no_mojibake_account_messages(self):
         source = Path("db_manager.py").read_text(encoding="utf-8")
         expected_messages = (

@@ -29,9 +29,12 @@ ITEM_DETAIL:
 YIFAN_API:
   callback_url: http://116.196.116.76/yifan.php  # 亦凡API回调地址（中转服务器）
   query_url: http://116.196.116.76/yifan.php  # 订单查询页面地址
-COOKIES:
-  last_update_time: ''
-  value: ''
+COOKIES: []
+# 如需启动时预加载账号，可改成：
+# COOKIES:
+#   - account_id: account_demo
+#     value: your_cookie_string
+#     keywords_file: data/keywords.txt
 DEFAULT_HEADERS:
   accept: application/json
   accept-language: zh-CN,zh;q=0.9

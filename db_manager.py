@@ -17,6 +17,8 @@ from urllib.parse import parse_qs, urlparse
 from cryptography.fernet import Fernet, InvalidToken
 from loguru import logger
 
+ACCOUNT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
 class DBManager:
     """SQLite数据库管理，持久化存储Cookie和关键字"""
     
@@ -5536,6 +5538,10 @@ Cookie数量: {cookie_count}
         normalized_account_id = str(account_id or "").strip()
         if not normalized_account_id:
             raise ValueError("account_id 不能为空")
+        if normalized_account_id == "default":
+            raise ValueError("account_id 不能为 default")
+        if not ACCOUNT_ID_PATTERN.fullmatch(normalized_account_id):
+            raise ValueError("account_id 只能包含英文字母、数字、下划线和短横线")
         return normalized_account_id
 
     def _expand_order_status_filter(self, status: str) -> List[str]:
