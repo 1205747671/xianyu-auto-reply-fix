@@ -19,7 +19,7 @@ def _read_cookie(args: argparse.Namespace) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="单次手动 Cookie 滑块调试入口")
     parser.add_argument("--url", help="当前触发滑块的 verification_url；不传则先用 Cookie 预检拿最新的")
-    parser.add_argument("--cookie-id", default="manual_cookie_debug", help="日志里的账号标识")
+    parser.add_argument("--account-id", default="manual_cookie_debug", help="日志里的账号标识")
     parser.add_argument("--cookie", help="完整 Cookie 字符串")
     parser.add_argument("--cookie-file", help="包含完整 Cookie 字符串的文本文件")
     parser.add_argument("--headless", action="store_true", help="强制无头。默认有头，方便本地盯着看")
@@ -54,7 +54,7 @@ def main() -> int:
     target_url = args.url or resolve_verification_url_from_cookie(cookie, proxy)
     print(f"verification_url={target_url}")
 
-    print(f"cookie_id={args.cookie_id}")
+    print(f"account_id={args.account_id}")
     print(f"headless={args.headless}")
     print(f"browser_channel={args.browser_channel or ''}")
     print(f"browser_path={args.browser_path or ''}")
@@ -64,7 +64,7 @@ def main() -> int:
     print(f"open_only={args.open_only}")
 
     slider = XianyuSliderStealth(
-        user_id=args.cookie_id,
+        user_id=args.account_id,
         enable_learning=True,
         headless=args.headless,
         initial_cookies=cookie,

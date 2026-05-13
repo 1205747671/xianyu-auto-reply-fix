@@ -136,12 +136,18 @@ def _extract_set_cookie_updates(response_headers) -> Dict[str, str]:
 
 
 class OrderHistoryPageFetcher:
-    def __init__(self, cookie_string: str, cookie_id_for_log: str = 'unknown', headless: bool = True):
-        self.cookie_id_for_log = cookie_id_for_log or 'unknown'
+    def __init__(self, cookie_string: str, account_id: str, headless: bool = True):
+        self.account_id = str(account_id or '').strip()
+        if not self.account_id:
+            raise ValueError('OrderHistoryPageFetcher 缺少 account_id')
         self.headless = headless
         self.cookie_string = str(cookie_string or '').strip()
         self.cookies: Dict[str, str] = trans_cookies(self.cookie_string) if self.cookie_string else {}
-        self.fetcher = OrderDetailFetcher(self.cookie_string, headless=headless, cookie_id_for_log=self.cookie_id_for_log)
+        self.fetcher = OrderDetailFetcher(
+            self.cookie_string,
+            headless=headless,
+            account_id=self.account_id,
+        )
         self.session: Optional[aiohttp.ClientSession] = None
 
     def _is_auth_failure_ret(self, ret_value: Any) -> bool:
@@ -178,15 +184,15 @@ class OrderHistoryPageFetcher:
         return True
 
     async def _persist_cookie_update(self) -> None:
-        if not self.cookie_string or self.cookie_id_for_log == 'unknown':
+        if not self.cookie_string:
             return
 
         try:
             from db_manager import db_manager
 
-            db_manager.update_cookie_account_info(self.cookie_id_for_log, cookie_value=self.cookie_string)
+            db_manager.update_cookie_account_info(self.account_id, cookie_value=self.cookie_string)
         except Exception as exc:
-            logger.warning(f"【{self.cookie_id_for_log}】保存刷新后的 Cookie 失败: {exc}")
+            logger.warning(f"【{self.account_id}】保存刷新后的 Cookie 失败: {exc}")
 
     async def _apply_response_cookie_updates(self, response_headers) -> bool:
         updates = _extract_set_cookie_updates(response_headers)
@@ -226,7 +232,7 @@ class OrderHistoryPageFetcher:
     def _build_request_params(self, data_val: str) -> Dict[str, str]:
         token = self.cookies.get('_m_h5_tk', '').split('_')[0]
         if not token:
-            raise ValueError(f'【{self.cookie_id_for_log}】Cookie 缺少 _m_h5_tk，无法请求历史订单列表')
+            raise ValueError(f'【{self.account_id}】Cookie 缺少 _m_h5_tk，无法请求历史订单列表')
 
         params = {
             'jsv': '2.7.2',
@@ -275,7 +281,7 @@ class OrderHistoryPageFetcher:
             except Exception as exc:
                 response_text = await response.text()
                 raise RuntimeError(
-                    f'【{self.cookie_id_for_log}】历史订单列表返回非 JSON: status={response.status}, body={response_text[:300]}'
+                    f'【{self.account_id}】历史订单列表返回非 JSON: status={response.status}, body={response_text[:300]}'
                 ) from exc
 
             cookies_updated = await self._apply_response_cookie_updates(response.headers)
@@ -285,10 +291,10 @@ class OrderHistoryPageFetcher:
             return res_json
 
         if allow_retry and cookies_updated and self._is_auth_failure_ret(ret_value):
-            logger.warning(f"【{self.cookie_id_for_log}】历史订单列表鉴权失败，Cookie 更新后重试第 {page_number} 页")
+            logger.warning(f"【{self.account_id}】历史订单列表鉴权失败，Cookie 更新后重试第 {page_number} 页")
             return await self._request_order_page(page_number, allow_retry=False)
 
-        raise RuntimeError(f"【{self.cookie_id_for_log}】历史订单列表 API 调用失败: {ret_value or res_json}")
+        raise RuntimeError(f"【{self.account_id}】历史订单列表 API 调用失败: {ret_value or res_json}")
 
     def _normalize_order_candidate(self, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not isinstance(raw, dict):
@@ -406,7 +412,7 @@ class OrderHistoryPageFetcher:
                     break
 
             logger.info(
-                f"【{self.cookie_id_for_log}】历史订单列表第 {page_number} 页抓取完成: "
+                f"【{self.account_id}】历史订单列表第 {page_number} 页抓取完成: "
                 f"page_items={len(items)}, scanned={page_scanned_count}, in_range={page_in_range_count}, "
                 f"before_range={page_before_count}, after_range={page_after_count}, unknown_anchor={page_unknown_count}, "
                 f"captured={len(captured_orders)}, totalCount={total_count}, nextPage={next_page}"
@@ -424,7 +430,7 @@ class OrderHistoryPageFetcher:
             ):
                 stopped_by_range = True
                 logger.info(
-                    f"【{self.cookie_id_for_log}】历史订单列表在第 {page_number} 页已全部早于开始时间，停止继续翻页"
+                    f"【{self.account_id}】历史订单列表在第 {page_number} 页已全部早于开始时间，停止继续翻页"
                 )
                 break
 

@@ -1,0 +1,1611 @@
+import asyncio
+import reply_server
+from pathlib import Path
+import sys
+from types import SimpleNamespace
+import unittest
+from unittest import mock
+
+import reply_server
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+_PROJECT_MODULE_REFERENCES = {
+    "reply_server": reply_server,
+    "db_manager": sys.modules.get("db_manager"),
+    "XianyuAutoAsync": sys.modules.get("XianyuAutoAsync"),
+}
+_PROJECT_REPLY_SERVER_DB_MANAGER = getattr(reply_server, "db_manager", None)
+
+
+class _ReplyServerModuleBindingMixin:
+    def setUp(self):
+        super().setUp()
+        original_modules = {
+            name: sys.modules.get(name)
+            for name in _PROJECT_MODULE_REFERENCES
+        }
+        for name, module in _PROJECT_MODULE_REFERENCES.items():
+            if module is not None:
+                sys.modules[name] = module
+
+        original_reply_server_db_manager = getattr(reply_server, "db_manager", None)
+        if _PROJECT_REPLY_SERVER_DB_MANAGER is not None:
+            reply_server.db_manager = _PROJECT_REPLY_SERVER_DB_MANAGER
+
+        def _restore_module_binding():
+            for name, original_module in original_modules.items():
+                if original_module is None:
+                    expected_module = _PROJECT_MODULE_REFERENCES.get(name)
+                    if expected_module is not None and sys.modules.get(name) is expected_module:
+                        sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = original_module
+
+            reply_server.db_manager = original_reply_server_db_manager
+
+        self.addCleanup(_restore_module_binding)
+
+
+class ReplyServerAccountScopeContractTest(_ReplyServerModuleBindingMixin, unittest.TestCase):
+    def test_item_routes_use_account_id_contract(self):
+        source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+
+        self.assertIn('@app.get("/items/account/{account_id}")', source)
+        self.assertNotIn('@app.get("/items/{account_id}")', source)
+        self.assertNotIn('@app.get("/items/cookie/{account_id}")', source)
+        self.assertIn('@app.get("/items/{account_id}/{item_id}")', source)
+        self.assertIn('@app.put("/items/{account_id}/{item_id}")', source)
+        self.assertIn('@app.delete("/items/{account_id}/{item_id}")', source)
+        self.assertIn('@app.put("/items/{account_id}/{item_id}/multi-spec")', source)
+        self.assertIn('@app.put("/items/{account_id}/{item_id}/multi-quantity-delivery")', source)
+
+    def test_ai_reply_routes_use_account_id_contract(self):
+        source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+
+        self.assertIn('@app.get("/ai-reply-settings/{account_id}")', source)
+        self.assertIn('@app.put("/ai-reply-settings/{account_id}")', source)
+        self.assertIn('@app.post("/ai-reply-test/{account_id}")', source)
+        self.assertIn('detail="无权限访问该账号"', source)
+        self.assertIn('detail="无权限操作该账号"', source)
+        self.assertIn("account_id=account_id", source)
+
+    def test_item_reply_routes_and_batch_body_use_account_id_contract(self):
+        source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+
+        self.assertIn('@app.get("/itemReplays/account/{account_id}")', source)
+        self.assertNotIn('@app.get("/itemReplays/cookie/{account_id}")', source)
+        self.assertIn('@app.put("/item-reply/{account_id}/{item_id}")', source)
+        self.assertIn('@app.delete("/item-reply/{account_id}/{item_id}")', source)
+        self.assertIn('@app.get("/item-reply/{account_id}/{item_id}")', source)
+        self.assertIn("account_id: str", source)
+        self.assertNotIn('"cookie_id": account_id', source)
+        self.assertNotIn("item_reply.get('account_id') or item_reply.get('cookie_id') or account_id", source)
+
+    def test_qr_cooldown_routes_use_account_id_contract(self):
+        source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+
+        self.assertIn('@app.post("/qr-login/reset-cooldown/{account_id}")', source)
+        self.assertIn('@app.get("/qr-login/cooldown-status/{account_id}")', source)
+        self.assertIn("'account_id': account_id", source)
+        self.assertNotIn(
+            "instance = cookie_manager.manager.get_xianyu_instance(account_id) if cookie_manager.manager else None",
+            source,
+        )
+
+    def test_order_history_sync_request_prefers_account_id(self):
+        source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+        history_sync = (REPO_ROOT / "utils" / "order_history_sync.py").read_text(encoding="utf-8")
+        order_detail_fetcher = (REPO_ROOT / "utils" / "order_detail_fetcher.py").read_text(encoding="utf-8")
+        xianyu_async = (REPO_ROOT / "XianyuAutoAsync.py").read_text(encoding="utf-8")
+
+        self.assertIn("class OrderHistorySyncRequest(BaseModel):", source)
+        self.assertIn("account_id: Optional[str] = None", source)
+        self.assertNotIn("cookie_id: Optional[str] = None", source)
+        self.assertIn("'account_id': account_id", source)
+        self.assertIn("request_data.get('account_id')", source)
+        self.assertNotIn("request_data.get('cookie_id')", source)
+        self.assertIn('OrderHistoryPageFetcher(cookie_string, account_id=account_id, headless=True)', source)
+        self.assertIn("detail_result = await _run_managed_live_instance_call(", source)
+        self.assertNotIn("live_instance = cookie_manager.manager.get_xianyu_instance(account_id)", source)
+        self.assertIn("def __init__(self, cookie_string: str, account_id: str, headless: bool = True):", history_sync)
+        self.assertNotIn("account_id_for_log", history_sync)
+        self.assertIn("def __init__(self, cookie_string: str = None, headless: bool = True, account_id: str = None):", order_detail_fetcher)
+        self.assertNotIn("account_id_for_log", order_detail_fetcher)
+        self.assertNotIn("account_id_for_log=self.cookie_id", xianyu_async)
+
+    def test_item_sync_endpoints_accept_account_id_request_field(self):
+        source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+
+        self.assertIn("request.get('account_id')", source)
+        self.assertNotIn("request.get('account_id') or request.get('cookie_id')", source)
+        self.assertIn('缺少account_id参数', source)
+
+    def test_risk_log_and_slider_filters_use_account_id_contract(self):
+        source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+
+        self.assertIn("account_id: str = None,", source)
+        self.assertIn("target_account_id = str(account_id or '').strip() or None", source)
+        self.assertIn("target_account_id = str(account_id or '').strip()", source)
+        self.assertIn("target_account_ids = [target_account_id]", source)
+        self.assertIn("stats = db_manager.get_slider_verification_session_stats(account_ids=target_account_ids, range_key=normalized_range)", source)
+        self.assertIn("'selected_account_id': target_account_id", source)
+        self.assertNotIn("event_meta=_build_risk_event_meta({'account_id': cookie_id})", source)
+        self.assertNotIn("'selected_cookie_id': target_account_id", source)
+        self.assertNotIn("target_cookie_ids =", source)
+        self.assertNotIn("log.get('account_id') or log.get('cookie_id')", source)
+
+    def test_send_message_and_auto_reply_endpoints_use_account_id_contract(self):
+        source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+        xianyu_async = (REPO_ROOT / "XianyuAutoAsync.py").read_text(encoding="utf-8")
+
+        self.assertIn("class SendMessageRequest(BaseModel):\n    api_key: str\n    account_id: str", source)
+        self.assertIn("class RequestModel(BaseModel):\n    account_id: str", source)
+        self.assertIn("cleaned_account_id = clean_param(request.account_id)", source)
+        self.assertNotIn("cleaned_cookie_id = clean_param(request.cookie_id)", source)
+        self.assertNotIn("live_instance = _get_managed_live_instance(cleaned_account_id)", source)
+        self.assertIn("await _run_managed_live_instance_call(", source)
+        self.assertNotIn("live_instance = XianyuLive.get_instance(cleaned_account_id)", source)
+        self.assertIn("msg_template = match_reply(req.account_id, req.send_message)", source)
+        self.assertIn("default_reply_settings = db_manager.get_default_reply(req.account_id)", source)
+        self.assertIn("db_manager.has_default_reply_record(req.account_id, req.chat_id)", source)
+        self.assertIn('"account_id": current_account_id', xianyu_async)
+        self.assertNotIn('"cookie_id": self.cookie_id', xianyu_async)
+
+    def test_item_sync_batch_payloads_use_account_id_contract(self):
+        xianyu_async = (REPO_ROOT / "XianyuAutoAsync.py").read_text(encoding="utf-8")
+
+        self.assertIn("batch_update_data.append({\n                        'account_id': current_account_id,", xianyu_async)
+        self.assertIn("batch_new_data.append({\n                        'account_id': current_account_id,", xianyu_async)
+        self.assertNotIn("batch_update_data.append({\n                        'cookie_id': self.cookie_id,", xianyu_async)
+        self.assertNotIn("batch_new_data.append({\n                        'cookie_id': self.cookie_id,", xianyu_async)
+
+    def test_xianyu_async_runtime_messages_drop_cookie_id_fallback_wording(self):
+        xianyu_async = (REPO_ROOT / "XianyuAutoAsync.py").read_text(encoding="utf-8")
+
+        self.assertNotIn("拒绝按旧 cookie_id", xianyu_async)
+        self.assertNotIn("跳过按旧 cookie_id", xianyu_async)
+        self.assertNotIn("回退旧 cookie_id", xianyu_async)
+        self.assertNotIn("cookie_id_missing", xianyu_async)
+        self.assertNotIn("检查cookie_id是否在cookies表中存在", xianyu_async)
+        self.assertNotIn("如果当前实例的cookie_id匹配", xianyu_async)
+
+    def test_xianyu_async_source_has_no_cookie_id_residue(self):
+        xianyu_async = (REPO_ROOT / "XianyuAutoAsync.py").read_text(encoding="utf-8")
+        self.assertNotIn("cookie_id", xianyu_async)
+
+    def test_browser_modules_do_not_keep_direct_browser_launch_bypasses(self):
+        xianyu_async = (REPO_ROOT / "XianyuAutoAsync.py").read_text(encoding="utf-8")
+        order_detail_fetcher = (REPO_ROOT / "utils" / "order_detail_fetcher.py").read_text(encoding="utf-8")
+        qr_login = (REPO_ROOT / "utils" / "qr_login.py").read_text(encoding="utf-8")
+
+        self.assertNotIn("def _launch_browser_safe(", xianyu_async)
+        self.assertNotIn("launch_browser_async,", xianyu_async)
+        self.assertNotIn("launch_browser_persistent_context_async,", xianyu_async)
+        self.assertNotIn("async def launch_browser_persistent_context_async", (REPO_ROOT / "utils" / "item_search.py").read_text(encoding="utf-8"))
+        self.assertNotIn("launch_browser_async", order_detail_fetcher)
+        self.assertNotIn("launch_browser_persistent_context_async", qr_login)
+
+    def test_slider_business_entrypoints_require_managed_runtime(self):
+        reply_server_source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+        xianyu_async = (REPO_ROOT / "XianyuAutoAsync.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "runtime_lease = _acquire_slider_managed_runtime_sync(\n"
+            "                    account_id,\n"
+            "                    'password_login',\n"
+            "                    slider_instance,\n"
+            "                )\n"
+            "                cookies_dict = slider_instance.login_with_password_browser(\n"
+            "                    account=account,\n"
+            "                    password=password,\n"
+            "                    show_browser=show_browser,\n"
+            "                    notification_callback=notification_callback,\n"
+            "                    force_clean_context=is_refresh_mode,\n"
+            "                    require_managed_runtime=True,\n"
+            "                )",
+            reply_server_source,
+        )
+        self.assertIn(
+            "runtime_lease = _acquire_slider_managed_runtime_sync(\n"
+            "                    account_id,\n"
+            "                    'manual_cookie_import',\n"
+            "                    slider_instance,\n"
+            "                )\n"
+            "                success, cookies_dict = slider_instance.run(\n"
+            "                    target_url,\n"
+            "                    notification_callback=notification_callback,\n"
+            "                    notification_scene='手动导入 Cookie',\n"
+            "                    require_managed_runtime=True,\n"
+            "                )",
+            reply_server_source,
+        )
+        self.assertIn(
+            "return await slider.async_run(\n"
+            "                verification_url,\n"
+            "                require_managed_runtime=True,\n"
+            "            )",
+            xianyu_async,
+        )
+        self.assertIn(
+            "return slider.login_with_password_browser(\n"
+            "                account=account,\n"
+            "                password=password,\n"
+            "                show_browser=show_browser,\n"
+            "                notification_callback=notification_callback,\n"
+            "                force_clean_context=force_clean_context,\n"
+            "                require_managed_runtime=True,\n"
+            "            )",
+            xianyu_async,
+        )
+
+    def test_db_manager_and_startup_drop_cookie_id_identity_wording(self):
+        db_manager_source = (REPO_ROOT / "db_manager.py").read_text(encoding="utf-8")
+        start_source = (REPO_ROOT / "Start.py").read_text(encoding="utf-8")
+
+        self.assertNotIn("account_id: Cookie ID", db_manager_source)
+        self.assertIn("account_id = entry.get('id')", start_source)
+        self.assertNotIn("cid = entry.get('id')", start_source)
+        self.assertNotIn("manager.add_cookie(cid, val, kw_list)", start_source)
+
+    def test_runtime_and_cookie_responses_use_account_id_fields(self):
+        source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+
+        self.assertIn("def _get_managed_live_instance(account_id: str):", source)
+        self.assertIn("async def _run_managed_live_instance_call(", source)
+        self.assertIn("def _build_live_runtime_status(account_id: str)", source)
+        self.assertNotIn("def _build_live_runtime_status(cookie_id: str)", source)
+        self.assertIn("live_instance = _get_managed_live_instance(normalized_account_id)", source)
+        self.assertNotIn("getattr(cookie_manager.manager, 'live_instances', {})", source)
+        self.assertIn('@app.get("/accounts/{account_id}/details")', source)
+        self.assertIn('@app.get("/accounts/{account_id}/runtime-status")', source)
+        self.assertIn('@app.get("/accounts/{account_id}/conversations/{conversation_id}/history")', source)
+        self.assertIn('@app.post("/accounts/{account_id}/session-keepalive")', source)
+        self.assertNotIn('@app.get("/cookie/{account_id}/details")', source)
+        self.assertNotIn('@app.get("/cookies/{account_id}/runtime-status")', source)
+        self.assertNotIn('@app.get("/cookies/{account_id}/conversations/{conversation_id}/history")', source)
+        self.assertNotIn('@app.post("/cookies/{account_id}/session-keepalive")', source)
+        self.assertNotIn("def _ensure_cookie_access(", source)
+        self.assertIn('_ensure_account_access(account_id, current_user, "访问")', source)
+        self.assertNotIn("live_instance = XianyuLive.get_instance(account_id)", source)
+        self.assertIn("'account_id': account_id,\n            'runtime_status': await _build_live_runtime_status(account_id),", source)
+        self.assertNotIn("'cookie_id': account_id,\n            'runtime_status': await _build_live_runtime_status(account_id),", source)
+        self.assertIn("'account_id': account_id,\n            'conversation_id': normalized_conversation_id,", source)
+        self.assertIn("'account_id': account_id,\n            'message': '轻量会话保活成功' if keepalive_ok else '轻量会话保活失败',", source)
+        self.assertIn("'account_id': account_id,\n                    'user_id': user_id,", source)
+        self.assertIn("'account_id': account_id,\n            'value': mask_cookie_value(cookie_value),", source)
+        self.assertNotIn("'id': cookie_id,\n            'value': mask_cookie_value(cookie_value),", source)
+
+    def test_xianyu_live_callers_use_account_id_keyword_contract(self):
+        source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+
+        self.assertIn("account_id=runtime_account_id", source)
+        self.assertNotIn("cookie_id=runtime_account_id", source)
+        self.assertIn("XianyuLive(cookies_str, account_id=account_id, register_instance=False)", source)
+        self.assertNotIn("XianyuLive(cookies_str, account_id, register_instance=False)", source)
+
+    def test_require_runtime_account_id_rejects_blank_or_default_scope(self):
+        self.assertEqual(
+            reply_server._require_runtime_account_id("  acc-runtime-1  ", action_text="unit test"),
+            "acc-runtime-1",
+        )
+        for invalid_account_id in ("   ", "default"):
+            with self.subTest(account_id=invalid_account_id):
+                with self.assertRaisesRegex(ValueError, "non-empty, non-default account_id"):
+                    reply_server._require_runtime_account_id(
+                        invalid_account_id,
+                        action_text="unit test",
+                    )
+
+    def test_prepare_manual_refresh_runtime_account_id_marks_handoff_with_normalized_scope(self):
+        with mock.patch("XianyuAutoAsync.XianyuLive.mark_manual_refresh_handoff") as handoff:
+            runtime_account_id = reply_server._prepare_manual_refresh_runtime_account_id(
+                "  acc-runtime-2  ",
+                manual_refresh_owner="unit-test-owner",
+            )
+
+        self.assertEqual(runtime_account_id, "acc-runtime-2")
+        handoff.assert_called_once_with("acc-runtime-2", source="unit-test-owner")
+
+    def test_prepare_manual_refresh_runtime_account_id_rejects_invalid_scope_before_handoff(self):
+        with mock.patch("XianyuAutoAsync.XianyuLive.mark_manual_refresh_handoff") as handoff:
+            for invalid_account_id in ("   ", "default"):
+                with self.subTest(account_id=invalid_account_id):
+                    with self.assertRaisesRegex(ValueError, "non-empty, non-default account_id"):
+                        reply_server._prepare_manual_refresh_runtime_account_id(
+                            invalid_account_id,
+                            manual_refresh_owner="unit-test-owner",
+                        )
+
+        handoff.assert_not_called()
+
+    def test_password_login_rejects_default_account_id_before_refresh_state(self):
+        async def invoke():
+            return await reply_server.password_login(
+                {
+                    "account_id": "default",
+                    "account": "unit-user",
+                    "password": "unit-password",
+                    "refresh_mode": True,
+                },
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_details",
+            side_effect=AssertionError("default account_id should be rejected before cookie lookup"),
+        ), mock.patch(
+            "XianyuAutoAsync.XianyuLive.is_manual_refresh_active",
+            side_effect=AssertionError("default account_id should be rejected before refresh state check"),
+        ), mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertFalse(result["success"])
+        self.assertIn("non-empty, non-default account_id", result["message"])
+
+    def test_manual_cookie_import_rejects_default_account_id_before_db_access(self):
+        async def invoke():
+            return await reply_server.manual_cookie_import(
+                reply_server.ManualCookieImportRequest(
+                    account_id="default",
+                    cookie="unb=test_user; cookie2=test_cookie2",
+                    show_browser=False,
+                ),
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_all_cookies",
+            side_effect=AssertionError("default account_id should be rejected before cookie lookup"),
+        ), mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertFalse(result["success"])
+        self.assertIn("non-empty, non-default account_id", result["message"])
+
+    def test_account_management_routes_use_account_id_placeholders(self):
+        source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+
+        self.assertIn('@app.get("/accounts")', source)
+        self.assertIn('@app.post("/accounts")', source)
+        self.assertIn('@app.get("/accounts/details")', source)
+        self.assertIn('@app.post("/accounts/{account_id}/account-info")', source)
+        self.assertIn('@app.get("/accounts/{account_id}/proxy")', source)
+        self.assertIn('@app.post("/accounts/{account_id}/proxy")', source)
+        self.assertIn("@app.put('/accounts/{account_id}')", source)
+        self.assertIn("@app.put('/accounts/{account_id}/status')", source)
+        self.assertIn('@app.delete("/accounts/{account_id}")', source)
+        self.assertIn('@app.put("/accounts/{account_id}/auto-confirm")', source)
+        self.assertIn('@app.get("/accounts/{account_id}/auto-confirm")', source)
+        self.assertIn('@app.put("/accounts/{account_id}/auto-comment")', source)
+        self.assertIn('@app.get("/accounts/{account_id}/auto-comment")', source)
+        self.assertIn('@app.get("/accounts/{account_id}/comment-templates")', source)
+        self.assertIn('@app.post("/accounts/{account_id}/comment-templates")', source)
+        self.assertIn('@app.put("/accounts/{account_id}/comment-templates/{template_id}")', source)
+        self.assertIn('@app.delete("/accounts/{account_id}/comment-templates/{template_id}")', source)
+        self.assertIn('@app.put("/accounts/{account_id}/comment-templates/{template_id}/activate")', source)
+        self.assertIn('@app.put("/accounts/{account_id}/remark")', source)
+        self.assertIn('@app.get("/accounts/{account_id}/remark")', source)
+        self.assertIn('@app.put("/accounts/{account_id}/pause-duration")', source)
+        self.assertIn('@app.get("/accounts/{account_id}/pause-duration")', source)
+        self.assertIn('@app.get("/accounts/check")', source)
+        self.assertIn("@app.get('/admin/accounts')", source)
+        self.assertNotIn('@app.post("/cookie/{account_id}/account-info")', source)
+        self.assertNotIn('@app.get("/cookie/{account_id}/proxy")', source)
+        self.assertNotIn('@app.post("/cookie/{account_id}/proxy")', source)
+        self.assertNotIn('@app.get("/cookies")', source)
+        self.assertNotIn('@app.post("/cookies")', source)
+        self.assertNotIn("@app.put('/cookies/{account_id}')", source)
+        self.assertNotIn("@app.put('/cookies/{account_id}/status')", source)
+        self.assertNotIn('@app.delete("/cookies/{account_id}")', source)
+        self.assertNotIn('@app.put("/cookies/{account_id}/auto-confirm")', source)
+        self.assertNotIn('@app.get("/cookies/{account_id}/auto-confirm")', source)
+        self.assertNotIn('@app.put("/cookies/{account_id}/auto-comment")', source)
+        self.assertNotIn('@app.get("/cookies/{account_id}/auto-comment")', source)
+        self.assertNotIn('@app.get("/cookies/{account_id}/comment-templates")', source)
+        self.assertNotIn('@app.post("/cookies/{account_id}/comment-templates")', source)
+        self.assertNotIn('@app.put("/cookies/{account_id}/comment-templates/{template_id}")', source)
+        self.assertNotIn('@app.delete("/cookies/{account_id}/comment-templates/{template_id}")', source)
+        self.assertNotIn('@app.put("/cookies/{account_id}/comment-templates/{template_id}/activate")', source)
+        self.assertNotIn('@app.put("/cookies/{account_id}/remark")', source)
+        self.assertNotIn('@app.get("/cookies/{account_id}/remark")', source)
+        self.assertNotIn('@app.put("/cookies/{account_id}/pause-duration")', source)
+        self.assertNotIn('@app.get("/cookies/{account_id}/pause-duration")', source)
+        self.assertNotIn('@app.get("/cookies/check")', source)
+        self.assertNotIn("@app.get('/admin/cookies')", source)
+        self.assertIn('@app.get(\'/default-replies/{account_id}\')', source)
+
+    def test_account_upsert_request_model_uses_account_id_field(self):
+        source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+
+        self.assertIn("class AccountCookieUpsertIn(BaseModel):", source)
+        self.assertIn("account_id: str", source)
+        self.assertIn("value: str", source)
+        self.assertNotIn("class CookieIn(BaseModel):", source)
+        self.assertNotIn("\n    id: str\n    value: str", source)
+
+    def test_reply_server_lifecycle_hooks_account_browser_runtime_janitor(self):
+        source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+
+        self.assertIn('async def account_browser_runtime_janitor(', source)
+        self.assertIn('async def start_account_browser_runtime_janitor()', source)
+        self.assertIn('app.state.account_browser_runtime_janitor_task', source)
+        self.assertIn('async def stop_account_browser_runtime_janitor()', source)
+        self.assertIn('@app.put(\'/default-replies/{account_id}\')', source)
+        self.assertIn('@app.delete(\'/default-replies/{account_id}\')', source)
+        self.assertIn('@app.post(\'/default-replies/{account_id}/clear-records\')', source)
+        self.assertIn('@app.get(\'/message-notifications/{account_id}\')', source)
+        self.assertIn('@app.post(\'/message-notifications/{account_id}\')', source)
+        self.assertIn('@app.delete(\'/message-notifications/account/{account_id}\')', source)
+        self.assertIn('@app.get("/keywords/{account_id}")', source)
+        self.assertIn('@app.get("/keywords-with-item-id/{account_id}")', source)
+        self.assertIn('@app.post("/keywords/{account_id}")', source)
+        self.assertIn('@app.post("/keywords-with-item-id/{account_id}")', source)
+        self.assertIn('@app.get("/items/account/{account_id}")', source)
+        self.assertIn('@app.get("/keywords-export/{account_id}")', source)
+        self.assertIn('@app.post("/keywords-import/{account_id}")', source)
+        self.assertIn('@app.post("/keywords/{account_id}/image")', source)
+        self.assertIn('@app.post("/keywords/{account_id}/image-batch")', source)
+        self.assertIn('@app.get("/keywords-with-type/{account_id}")', source)
+        self.assertIn('@app.delete("/keywords/{account_id}/{index}")', source)
+        self.assertNotIn('{cid}', source)
+
+    def test_frontend_items_requests_use_single_account_scoped_contract(self):
+        source = (REPO_ROOT / "static/js/app.js").read_text(encoding="utf-8")
+
+        self.assertNotIn('`${apiBase}/items/${accountId}`', source)
+        self.assertIn('`${apiBase}/items/account/${encodeURIComponent(accountId)}`', source)
+
+    def test_order_routes_use_account_id_db_boundary(self):
+        source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+
+        self.assertIn("db_manager.get_orders_by_account(account_id, limit=1000)", source)
+        self.assertNotIn("db_manager.get_orders_by_cookie(account_id, limit=1000)", source)
+        self.assertNotIn("or normalized_order.get('cookie_id')", source)
+        self.assertNotIn("cookie_id=account_id", source)
+        self.assertNotIn("cookie_id = order.get('cookie_id')", source)
+
+    def test_order_action_routes_require_account_id_scoped_lookup(self):
+        source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+
+        self.assertIn("def _get_scoped_order_for_current_user(", source)
+        self.assertIn("db_manager.get_order_by_id(order_id, account_id=normalized_account_id, user_id=user_id)", source)
+        self.assertIn("def delete_user_order(", source)
+        self.assertIn("async def manual_deliver_order(", source)
+        self.assertIn("async def refresh_order_status(", source)
+        self.assertIn("account_id: str = None,", source)
+        self.assertNotIn("order = db_manager.get_order_by_id(order_id, user_id=user_id)", source)
+        self.assertIn("_get_scoped_order_for_current_user(order_id, account_id, current_user", source)
+
+    def test_sales_queries_use_orders_account_id_column(self):
+        source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+
+        self.assertIn("FROM orders WHERE account_id IN", source)
+        self.assertIn("AND account_id IN", source)
+        self.assertNotIn("FROM orders WHERE cookie_id IN", source)
+        self.assertNotIn("AND cookie_id IN", source)
+
+    def test_delivery_chain_uses_account_id_contract(self):
+        reply_server = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+        xianyu_async = (REPO_ROOT / "XianyuAutoAsync.py").read_text(encoding="utf-8")
+        order_event_hub = (REPO_ROOT / "order_event_hub.py").read_text(encoding="utf-8")
+
+        self.assertNotIn("cookie_id=order_account_id", reply_server)
+        self.assertNotIn("cookie_id=cookie_id", reply_server)
+        self.assertIn("account_id=order_account_id", reply_server)
+        self.assertIn("expected_quantity=expected_quantity,", reply_server)
+        self.assertIn("log['account_id'] = str(log.get('account_id') or '').strip()", reply_server)
+        self.assertNotIn("log.pop('cookie_id', None)", reply_server)
+        self.assertNotIn("current_account_id = self._current_account_id()", xianyu_async)
+        self.assertIn("canonical_account_id = self._canonical_account_id()", xianyu_async)
+        self.assertIn("db_manager.create_delivery_log(\n                user_id=self.user_id,\n                account_id=current_account_id,", xianyu_async)
+        self.assertNotIn("db_manager.create_delivery_log(\n                user_id=self.user_id,\n                account_id=self.cookie_id,", xianyu_async)
+        self.assertIn("return db_manager.upsert_delivery_finalization_state(\n            order_id=normalized_order_id,\n            unit_index=unit_index,\n            account_id=current_account_id,", xianyu_async)
+        self.assertNotIn("return db_manager.upsert_delivery_finalization_state(\n            order_id=normalized_order_id,\n            unit_index=unit_index,\n            account_id=self.cookie_id,", xianyu_async)
+        self.assertIn("summary = self._summarize_delivery_progress(normalized_order_id, expected_quantity=expected_quantity)", xianyu_async)
+        self.assertIn("account_id=canonical_account_id,", xianyu_async)
+        self.assertIn("publish_order_update_event(order_id, account_id=order_account_id, source='manual_delivery_finalize')", reply_server)
+        self.assertIn("publish_order_update_event(order_id, account_id=order_account_id, source='manual_delivery')", reply_server)
+        self.assertIn("publish_order_update_event(\n                        normalized_order_id,\n                        account_id=canonical_account_id,\n                        source='delivery_progress_sync',", xianyu_async)
+        self.assertIn("def publish_order_update_event(", order_event_hub)
+        self.assertIn("account_id: str = None,", order_event_hub)
+        self.assertNotIn("db_manager.get_order_by_id(order_id)", order_event_hub)
+        self.assertIn("data_reservation = db_manager.reserve_batch_data(\n                        card_id=rule['card_id'],\n                        order_id=order_id,\n                        unit_index=delivery_unit_index,\n                        account_id=current_account_id,", xianyu_async)
+        self.assertNotIn("data_reservation = db_manager.reserve_batch_data(\n                        card_id=rule['card_id'],\n                        order_id=order_id,\n                        unit_index=delivery_unit_index,\n                        cookie_id=self.cookie_id,", xianyu_async)
+
+
+class FrontendAccountScopeContractTest(unittest.TestCase):
+    def test_frontend_global_state_uses_account_id_names(self):
+        app_js = (REPO_ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("let currentAccountId = '';", app_js)
+        self.assertIn("let editAccountId = '';", app_js)
+        self.assertNotIn("let currentCookieId = '';", app_js)
+        self.assertNotIn("let editCookieId = '';", app_js)
+
+    def test_item_and_item_reply_dom_drop_cookie_id_aliases(self):
+        app_js = (REPO_ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("item.account_id", app_js)
+        self.assertIn("account_id: selectedAccountId", app_js)
+        self.assertIn("account_id: checkbox.dataset.accountId", app_js)
+        self.assertIn("document.getElementById('editItemAccountId').value = item.account_id;", app_js)
+        self.assertIn("document.getElementById('editItemAccountIdDisplay').value = item.account_id;", app_js)
+        self.assertIn("document.getElementById('editReplyAccountIdSelect').value = data.account_id;", app_js)
+        self.assertIn("async function onAccountChangeForReply()", app_js)
+        self.assertNotIn("item.cookie_id", app_js)
+        self.assertNotIn("selectedCookieId", app_js)
+        self.assertNotIn("editItemCookieId", app_js)
+        self.assertNotIn("data.cookie_id", app_js)
+        self.assertNotIn("async function onCookieChangeForReply()", app_js)
+
+
+class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_get_managed_live_instance_rejects_calls_outside_manager_loop(self):
+        fake_manager = SimpleNamespace(
+            get_xianyu_instance=mock.Mock(return_value=object()),
+            loop=SimpleNamespace(
+                is_closed=mock.Mock(return_value=False),
+                is_running=mock.Mock(return_value=True),
+            ),
+        )
+
+        with mock.patch.object(reply_server.cookie_manager, "manager", fake_manager):
+            with self.assertRaisesRegex(RuntimeError, "manager loop"):
+                reply_server._get_managed_live_instance("acc-runtime-guard-1")
+
+        fake_manager.get_xianyu_instance.assert_not_called()
+
+    async def test_build_live_runtime_status_does_not_fallback_to_xianyulive_global_registry(self):
+        manager_loop_state = {"active": False}
+
+        def get_instance_only_on_manager_loop(_account_id):
+            if not manager_loop_state["active"]:
+                raise AssertionError("runtime lookup should stay inside manager loop")
+            return None
+
+        fake_manager = SimpleNamespace(
+            get_xianyu_instance=mock.Mock(side_effect=get_instance_only_on_manager_loop),
+            loop=SimpleNamespace(
+                is_closed=mock.Mock(return_value=False),
+                is_running=mock.Mock(return_value=True),
+            ),
+        )
+
+        async def execute_on_manager_loop(_account_id, coroutine_factory, timeout=None):
+            manager_loop_state["active"] = True
+            access_token = reply_server._MANAGED_LIVE_INSTANCE_ACCESS.set(True)
+            try:
+                return await coroutine_factory()
+            finally:
+                reply_server._MANAGED_LIVE_INSTANCE_ACCESS.reset(access_token)
+                manager_loop_state["active"] = False
+
+        with mock.patch.object(reply_server, "_run_live_instance_on_manager_loop", side_effect=execute_on_manager_loop), \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch("XianyuAutoAsync.XianyuLive.get_instance", side_effect=AssertionError("global fallback should stay unused")), \
+             mock.patch("XianyuAutoAsync.XianyuLive.is_manual_refresh_active", return_value=False):
+            runtime_status = await reply_server._build_live_runtime_status("acc-runtime-1")
+
+        self.assertFalse(runtime_status["instance_exists"])
+        self.assertFalse(runtime_status["running"])
+        fake_manager.get_xianyu_instance.assert_called_once_with("acc-runtime-1")
+
+    async def test_send_message_api_uses_managed_account_runtime_without_global_fallback(self):
+        from XianyuAutoAsync import ConnectionState
+
+        current_live = SimpleNamespace(
+            connection_state=ConnectionState.CONNECTED,
+            ws=object(),
+            send_msg=mock.AsyncMock(),
+        )
+        manager_loop_state = {"active": False}
+
+        def get_instance_only_on_manager_loop(_account_id):
+            if not manager_loop_state["active"]:
+                raise AssertionError("runtime lookup should stay inside manager loop")
+            return current_live
+
+        fake_manager = SimpleNamespace(
+            get_xianyu_instance=mock.Mock(side_effect=get_instance_only_on_manager_loop),
+            loop=SimpleNamespace(
+                is_closed=mock.Mock(return_value=False),
+                is_running=mock.Mock(return_value=True),
+            ),
+        )
+        request = reply_server.SendMessageRequest(
+            api_key="real-key",
+            account_id="acc-send-1",
+            chat_id="chat-send-1",
+            to_user_id="buyer-send-1",
+            message="hello",
+        )
+
+        async def execute_on_manager_loop(_account_id, coroutine_factory, timeout=None):
+            manager_loop_state["active"] = True
+            access_token = reply_server._MANAGED_LIVE_INSTANCE_ACCESS.set(True)
+            try:
+                return await coroutine_factory()
+            finally:
+                reply_server._MANAGED_LIVE_INSTANCE_ACCESS.reset(access_token)
+                manager_loop_state["active"] = False
+
+        with mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "verify_api_key", return_value=True), \
+             mock.patch.object(reply_server, "_run_live_instance_on_manager_loop", side_effect=execute_on_manager_loop) as run_mock, \
+             mock.patch("XianyuAutoAsync.XianyuLive.get_instance", side_effect=AssertionError("global fallback should stay unused")):
+            response = await reply_server.send_message_api(request)
+
+        self.assertTrue(response.success)
+        self.assertEqual(fake_manager.get_xianyu_instance.call_count, 1)
+        current_live.send_msg.assert_awaited_once()
+        run_mock.assert_awaited_once()
+
+    async def test_get_conversation_history_uses_managed_account_runtime_without_global_fallback(self):
+        current_live = SimpleNamespace(
+            list_all_conversations=mock.AsyncMock(return_value=[{"id": "m-1"}]),
+        )
+        manager_loop_state = {"active": False}
+
+        def get_instance_only_on_manager_loop(_account_id):
+            if not manager_loop_state["active"]:
+                raise AssertionError("runtime lookup should stay inside manager loop")
+            return current_live
+
+        fake_manager = SimpleNamespace(
+            get_xianyu_instance=mock.Mock(side_effect=get_instance_only_on_manager_loop),
+            loop=SimpleNamespace(
+                is_closed=mock.Mock(return_value=False),
+                is_running=mock.Mock(return_value=True),
+            ),
+        )
+
+        async def execute_on_manager_loop(_account_id, coroutine_factory, timeout=None):
+            manager_loop_state["active"] = True
+            access_token = reply_server._MANAGED_LIVE_INSTANCE_ACCESS.set(True)
+            try:
+                return await coroutine_factory()
+            finally:
+                reply_server._MANAGED_LIVE_INSTANCE_ACCESS.reset(access_token)
+                manager_loop_state["active"] = False
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-history-1"), \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "log_with_user"), \
+             mock.patch.object(reply_server, "_run_live_instance_on_manager_loop", side_effect=execute_on_manager_loop) as run_mock, \
+             mock.patch("XianyuAutoAsync.XianyuLive.get_instance", side_effect=AssertionError("global fallback should stay unused")):
+            response = await reply_server.get_conversation_history(
+                "acc-history-1",
+                "conv-history-1@ali",
+                page_size=20,
+                current_user={"user_id": 1},
+            )
+
+        self.assertTrue(response["success"])
+        self.assertEqual(response["account_id"], "acc-history-1")
+        self.assertEqual(response["conversation_id"], "conv-history-1")
+        self.assertEqual(response["count"], 1)
+        self.assertEqual(fake_manager.get_xianyu_instance.call_count, 2)
+        current_live.list_all_conversations.assert_awaited_once_with(
+            "conv-history-1",
+            page_size=20,
+        )
+        self.assertEqual(run_mock.await_count, 2)
+
+    async def test_trigger_session_keepalive_uses_managed_account_runtime_without_global_fallback(self):
+        current_live = SimpleNamespace(
+            keep_session_alive=mock.AsyncMock(return_value=True),
+        )
+        manager_loop_state = {"active": False}
+
+        def get_instance_only_on_manager_loop(_account_id):
+            if not manager_loop_state["active"]:
+                raise AssertionError("runtime lookup should stay inside manager loop")
+            return current_live
+
+        fake_manager = SimpleNamespace(
+            get_xianyu_instance=mock.Mock(side_effect=get_instance_only_on_manager_loop),
+        )
+
+        async def execute_on_manager_loop(_account_id, coroutine_factory, timeout=None):
+            manager_loop_state["active"] = True
+            access_token = reply_server._MANAGED_LIVE_INSTANCE_ACCESS.set(True)
+            try:
+                return await coroutine_factory()
+            finally:
+                reply_server._MANAGED_LIVE_INSTANCE_ACCESS.reset(access_token)
+                manager_loop_state["active"] = False
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-keepalive-1"), \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "log_with_user"), \
+             mock.patch.object(reply_server, "_run_live_instance_on_manager_loop", side_effect=execute_on_manager_loop) as run_mock, \
+             mock.patch("XianyuAutoAsync.XianyuLive.get_instance", side_effect=AssertionError("global fallback should stay unused")):
+            response = await reply_server.trigger_session_keepalive(
+                "acc-keepalive-1",
+                current_user={"user_id": 1},
+            )
+
+        self.assertTrue(response["success"])
+        self.assertEqual(response["account_id"], "acc-keepalive-1")
+        self.assertEqual(fake_manager.get_xianyu_instance.call_count, 2)
+        current_live.keep_session_alive.assert_awaited_once_with()
+        self.assertEqual(run_mock.await_count, 2)
+
+    async def test_reset_qr_cookie_refresh_cooldown_routes_runtime_call_via_manager_loop(self):
+        live_instance = SimpleNamespace(
+            get_qr_cookie_refresh_remaining_time=mock.Mock(return_value=123),
+            reset_qr_cookie_refresh_flag=mock.Mock(),
+        )
+        fake_manager = SimpleNamespace(
+            get_xianyu_instance=mock.Mock(return_value=live_instance),
+            loop=SimpleNamespace(
+                is_closed=mock.Mock(return_value=False),
+                is_running=mock.Mock(return_value=True),
+            ),
+        )
+
+        async def execute_on_manager_loop(_account_id, coroutine_factory, timeout=None):
+            access_token = reply_server._MANAGED_LIVE_INSTANCE_ACCESS.set(True)
+            try:
+                return await coroutine_factory()
+            finally:
+                reply_server._MANAGED_LIVE_INSTANCE_ACCESS.reset(access_token)
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-qr-reset-1"), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_by_id", return_value={"id": "acc-qr-reset-1"}), \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "log_with_user"), \
+             mock.patch.object(reply_server, "_run_live_instance_on_manager_loop", side_effect=execute_on_manager_loop) as run_mock:
+            response = await reply_server.reset_qr_cookie_refresh_cooldown(
+                "acc-qr-reset-1",
+                current_user={"user_id": 1},
+            )
+
+        self.assertTrue(response["success"])
+        self.assertEqual(response["account_id"], "acc-qr-reset-1")
+        self.assertEqual(response["previous_remaining_time"], 123)
+        live_instance.get_qr_cookie_refresh_remaining_time.assert_called_once_with()
+        live_instance.reset_qr_cookie_refresh_flag.assert_called_once_with()
+        run_mock.assert_awaited_once()
+
+    async def test_get_qr_cookie_refresh_cooldown_status_routes_runtime_call_via_manager_loop(self):
+        live_instance = SimpleNamespace(
+            get_qr_cookie_refresh_remaining_time=mock.Mock(return_value=95),
+            qr_cookie_refresh_cooldown=600,
+            last_qr_cookie_refresh_time=1234567890,
+        )
+        fake_manager = SimpleNamespace(
+            get_xianyu_instance=mock.Mock(return_value=live_instance),
+            loop=SimpleNamespace(
+                is_closed=mock.Mock(return_value=False),
+                is_running=mock.Mock(return_value=True),
+            ),
+        )
+
+        async def execute_on_manager_loop(_account_id, coroutine_factory, timeout=None):
+            access_token = reply_server._MANAGED_LIVE_INSTANCE_ACCESS.set(True)
+            try:
+                return await coroutine_factory()
+            finally:
+                reply_server._MANAGED_LIVE_INSTANCE_ACCESS.reset(access_token)
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-qr-status-1"), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_by_id", return_value={"id": "acc-qr-status-1"}), \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "_run_live_instance_on_manager_loop", side_effect=execute_on_manager_loop) as run_mock:
+            response = await reply_server.get_qr_cookie_refresh_cooldown_status(
+                "acc-qr-status-1",
+                current_user={"user_id": 1},
+            )
+
+        self.assertTrue(response["success"])
+        self.assertEqual(response["account_id"], "acc-qr-status-1")
+        self.assertEqual(response["remaining_time"], 95)
+        self.assertEqual(response["cooldown_duration"], 600)
+        self.assertEqual(response["last_refresh_time"], 1234567890)
+        self.assertTrue(response["is_in_cooldown"])
+        self.assertEqual(response["remaining_minutes"], 1)
+        self.assertEqual(response["remaining_seconds"], 35)
+        live_instance.get_qr_cookie_refresh_remaining_time.assert_called_once_with()
+        run_mock.assert_awaited_once()
+
+    async def test_check_valid_accounts_scopes_counts_to_current_user(self):
+        fake_manager = SimpleNamespace(
+            get_cookie_status=mock.Mock(side_effect=lambda account_id: account_id == "acc-owned-valid"),
+        )
+
+        with mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(
+                 reply_server.db_manager,
+                 "get_all_cookies",
+                 return_value={
+                     "acc-owned-valid": "x" * 51,
+                     "acc-owned-disabled": "y" * 51,
+                 },
+             ) as get_all_cookies:
+            response = await reply_server.check_valid_accounts(
+                current_user={"user_id": 321, "username": "owner"},
+            )
+
+        self.assertTrue(response["success"])
+        self.assertTrue(response["hasValidAccounts"])
+        self.assertEqual(response["validAccountCount"], 1)
+        self.assertEqual(response["enabledAccountCount"], 1)
+        self.assertEqual(response["totalAccountCount"], 2)
+        get_all_cookies.assert_called_once_with(321)
+        fake_manager.get_cookie_status.assert_has_calls(
+            [mock.call("acc-owned-valid"), mock.call("acc-owned-disabled")]
+        )
+
+    async def test_check_valid_accounts_without_current_user_returns_empty_counts(self):
+        fake_manager = SimpleNamespace(get_cookie_status=mock.Mock())
+
+        with mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(
+                 reply_server.db_manager,
+                 "get_all_cookies",
+                 side_effect=AssertionError("anonymous accounts check must not read global cookies"),
+             ):
+            response = await reply_server.check_valid_accounts(current_user=None)
+
+        self.assertTrue(response["success"])
+        self.assertFalse(response["hasValidAccounts"])
+        self.assertEqual(response["validAccountCount"], 0)
+        self.assertEqual(response["enabledAccountCount"], 0)
+        self.assertEqual(response["totalAccountCount"], 0)
+        fake_manager.get_cookie_status.assert_not_called()
+
+    async def test_optional_managed_live_instance_call_raises_when_manager_runtime_unavailable(self):
+        with mock.patch.object(reply_server, "_get_cookie_manager_runtime_issue", return_value="task_manager_loop_closed"):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                await reply_server._run_managed_live_instance_optional_call(
+                    "acc-runtime-issue-1",
+                    lambda _live_instance: True,
+                )
+
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertEqual(raised.exception.detail, "账号事件循环已关闭")
+
+    async def test_reset_qr_cookie_refresh_cooldown_re_raises_http_exception(self):
+        with mock.patch.object(
+            reply_server,
+            "_ensure_account_access",
+            side_effect=reply_server.HTTPException(status_code=403, detail="无权限访问该账号"),
+        ):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                await reply_server.reset_qr_cookie_refresh_cooldown(
+                    "acc-qr-reset-foreign",
+                    current_user={"user_id": 1},
+                )
+
+        self.assertEqual(raised.exception.status_code, 403)
+        self.assertEqual(raised.exception.detail, "无权限访问该账号")
+
+    async def test_get_qr_cookie_refresh_cooldown_status_re_raises_http_exception(self):
+        with mock.patch.object(
+            reply_server,
+            "_ensure_account_access",
+            side_effect=reply_server.HTTPException(status_code=403, detail="无权限访问该账号"),
+        ):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                await reply_server.get_qr_cookie_refresh_cooldown_status(
+                    "acc-qr-status-foreign",
+                    current_user={"user_id": 1},
+                )
+
+        self.assertEqual(raised.exception.status_code, 403)
+        self.assertEqual(raised.exception.detail, "无权限访问该账号")
+
+    async def test_manual_deliver_order_routes_live_calls_via_managed_helper(self):
+        fake_db = mock.Mock()
+        fake_db.get_item_info.return_value = {"item_title": "测试商品"}
+        fake_manager = SimpleNamespace(
+            get_xianyu_instance=mock.Mock(side_effect=AssertionError("direct live instance lookup should stay unused")),
+        )
+        managed_call = mock.AsyncMock(return_value={"success": True, "delivered": True, "message": "ok"})
+        order = {
+            "order_id": "order-deliver-2",
+            "account_id": "acc-deliver-2",
+            "item_id": "item-deliver-2",
+            "buyer_id": "buyer-deliver-2",
+            "quantity": 1,
+        }
+
+        with mock.patch.object(reply_server, "_get_scoped_order_for_current_user", return_value=("acc-deliver-2", order)), \
+             mock.patch("db_manager.db_manager", fake_db), \
+             mock.patch("cookie_manager.manager", fake_manager), \
+             mock.patch.object(reply_server, "_run_managed_live_instance_call", managed_call), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = await reply_server.manual_deliver_order(
+                "order-deliver-2",
+                account_id="acc-deliver-2",
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["delivered"])
+        fake_db.get_item_info.assert_called_once_with("acc-deliver-2", "item-deliver-2")
+        managed_call.assert_awaited_once()
+        self.assertEqual(managed_call.await_args.args[0], "acc-deliver-2")
+        self.assertTrue(callable(managed_call.await_args.args[1]))
+        self.assertEqual(
+            managed_call.await_args.kwargs["missing_detail"],
+            "账号 acc-deliver-2 未运行，请先启动账号",
+        )
+
+    async def test_refresh_order_status_routes_runtime_call_via_managed_helper(self):
+        fake_db = mock.Mock()
+        fake_db.get_order_by_id.side_effect = [
+            {
+                "order_id": "order-refresh-2",
+                "account_id": "acc-refresh-2",
+                "order_status": "pending_ship",
+                "item_id": "item-refresh-2",
+                "buyer_id": "buyer-refresh-2",
+                "sid": "sid-refresh-2",
+            },
+            {
+                "order_id": "order-refresh-2",
+                "account_id": "acc-refresh-2",
+                "order_status": "shipped",
+            },
+        ]
+        fake_manager = SimpleNamespace(
+            get_xianyu_instance=mock.Mock(side_effect=AssertionError("direct live instance lookup should stay unused")),
+        )
+        managed_call = mock.AsyncMock(return_value=True)
+
+        with mock.patch.object(reply_server, "_get_user_cookies_map", return_value={"acc-refresh-2": "cookie"}), \
+             mock.patch("db_manager.db_manager", fake_db), \
+             mock.patch("cookie_manager.manager", fake_manager), \
+             mock.patch.object(reply_server, "_run_managed_live_instance_call", managed_call), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = await reply_server.refresh_order_status(
+                "order-refresh-2",
+                account_id="acc-refresh-2",
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["updated"])
+        self.assertEqual(result["new_status"], "shipped")
+        managed_call.assert_awaited_once()
+        self.assertEqual(managed_call.await_args.args[0], "acc-refresh-2")
+        self.assertTrue(callable(managed_call.await_args.args[1]))
+        self.assertEqual(
+            managed_call.await_args.kwargs["missing_detail"],
+            "账号 acc-refresh-2 未运行，请先启动账号",
+        )
+
+    async def test_order_history_sync_prefers_managed_runtime_helper_for_detail_refresh(self):
+        job_id = "history-sync-job-managed"
+        fake_fetcher = SimpleNamespace(
+            fetch_recent_orders=mock.AsyncMock(return_value={
+                "orders": [{
+                    "order_id": "order-history-1",
+                    "item_id": "item-history-1",
+                    "buyer_id": "buyer-history-1",
+                    "buyer_nick": "buyer-history-nick-1",
+                    "sid": "sid-history-1",
+                }],
+                "scanned_count": 1,
+                "matched_count": 1,
+                "out_of_range_count": 0,
+            }),
+            fetch_order_detail=mock.AsyncMock(return_value=None),
+            close=mock.AsyncMock(),
+        )
+        managed_call = mock.AsyncMock(return_value={"order_id": "order-history-1", "order_status": "shipped"})
+        job = {
+            "request": {
+                "start_date": "2026-05-01",
+                "end_date": "2026-05-02",
+                "account_id": "acc-history-1",
+                "max_orders": 1,
+                "fetch_details": True,
+            },
+            "user_info": {"user_id": 1},
+            "status": "queued",
+        }
+        reply_server.order_history_sync_jobs[job_id] = job
+        try:
+            with mock.patch.object(reply_server.db_manager, "get_all_cookies", return_value={"acc-history-1": "cookie-value"}), \
+                 mock.patch("utils.order_history_sync.OrderHistoryPageFetcher", return_value=fake_fetcher) as fetcher_cls, \
+                 mock.patch.object(reply_server, "_run_managed_live_instance_call", managed_call), \
+                 mock.patch.object(reply_server, "_save_history_order_detail_result", return_value=True) as save_detail_mock, \
+                 mock.patch.object(reply_server, "_save_history_order_candidate", return_value=True) as save_candidate_mock, \
+                 mock.patch.object(reply_server, "_cleanup_order_history_sync_jobs"):
+                await reply_server._run_order_history_sync_job(job_id)
+        finally:
+            reply_server.order_history_sync_jobs.pop(job_id, None)
+            reply_server.order_history_sync_tasks.pop(job_id, None)
+
+        self.assertEqual(job["status"], "completed")
+        fetcher_cls.assert_called_once_with("cookie-value", account_id="acc-history-1", headless=True)
+        managed_call.assert_awaited_once()
+        self.assertEqual(managed_call.await_args.args[0], "acc-history-1")
+        self.assertTrue(callable(managed_call.await_args.args[1]))
+        fake_fetcher.fetch_order_detail.assert_not_awaited()
+        save_detail_mock.assert_called_once_with(
+            "acc-history-1",
+            {
+                "order_id": "order-history-1",
+                "item_id": "item-history-1",
+                "buyer_id": "buyer-history-1",
+                "buyer_nick": "buyer-history-nick-1",
+                "sid": "sid-history-1",
+            },
+            {"order_id": "order-history-1", "order_status": "shipped"},
+        )
+        save_candidate_mock.assert_not_called()
+
+    async def test_order_history_sync_falls_back_to_fetcher_when_managed_runtime_missing(self):
+        job_id = "history-sync-job-fallback"
+        fake_fetcher = SimpleNamespace(
+            fetch_recent_orders=mock.AsyncMock(return_value={
+                "orders": [{
+                    "order_id": "order-history-2",
+                    "item_id": "item-history-2",
+                    "buyer_id": "buyer-history-2",
+                    "buyer_nick": "buyer-history-nick-2",
+                    "sid": "sid-history-2",
+                }],
+                "scanned_count": 1,
+                "matched_count": 1,
+                "out_of_range_count": 0,
+            }),
+            fetch_order_detail=mock.AsyncMock(return_value={"order_id": "order-history-2", "order_status": "shipped"}),
+            close=mock.AsyncMock(),
+        )
+        managed_call = mock.AsyncMock(
+            side_effect=reply_server.HTTPException(status_code=400, detail="账号未启动，暂无法执行当前操作")
+        )
+        job = {
+            "request": {
+                "start_date": "2026-05-01",
+                "end_date": "2026-05-02",
+                "account_id": "acc-history-2",
+                "max_orders": 1,
+                "fetch_details": True,
+            },
+            "user_info": {"user_id": 1},
+            "status": "queued",
+        }
+        reply_server.order_history_sync_jobs[job_id] = job
+        try:
+            with mock.patch.object(reply_server.db_manager, "get_all_cookies", return_value={"acc-history-2": "cookie-value"}), \
+                 mock.patch("utils.order_history_sync.OrderHistoryPageFetcher", return_value=fake_fetcher), \
+                 mock.patch.object(reply_server, "_run_managed_live_instance_call", managed_call), \
+                 mock.patch.object(reply_server, "_save_history_order_detail_result", return_value=True) as save_detail_mock, \
+                 mock.patch.object(reply_server, "_save_history_order_candidate", return_value=True) as save_candidate_mock, \
+                 mock.patch.object(reply_server, "_cleanup_order_history_sync_jobs"):
+                await reply_server._run_order_history_sync_job(job_id)
+        finally:
+            reply_server.order_history_sync_jobs.pop(job_id, None)
+            reply_server.order_history_sync_tasks.pop(job_id, None)
+
+        self.assertEqual(job["status"], "completed")
+        managed_call.assert_awaited_once()
+        fake_fetcher.fetch_order_detail.assert_awaited_once_with("order-history-2", force_refresh=True)
+        save_detail_mock.assert_called_once_with(
+            "acc-history-2",
+            {
+                "order_id": "order-history-2",
+                "item_id": "item-history-2",
+                "buyer_id": "buyer-history-2",
+                "buyer_nick": "buyer-history-nick-2",
+                "sid": "sid-history-2",
+            },
+            {"order_id": "order-history-2", "order_status": "shipped"},
+        )
+        save_candidate_mock.assert_not_called()
+
+    async def test_order_history_sync_rejects_selected_account_outside_current_user_scope(self):
+        job_id = "history-sync-job-forbidden"
+        managed_call = mock.AsyncMock()
+        job = {
+            "request": {
+                "start_date": "2026-05-01",
+                "end_date": "2026-05-02",
+                "account_id": "acc-history-foreign",
+                "max_orders": 1,
+                "fetch_details": True,
+            },
+            "user_info": {"user_id": 1},
+            "status": "queued",
+        }
+        reply_server.order_history_sync_jobs[job_id] = job
+        try:
+            with mock.patch.object(reply_server.db_manager, "get_all_cookies", return_value={"acc-history-owned": "cookie-value"}), \
+                 mock.patch("utils.order_history_sync.OrderHistoryPageFetcher") as fetcher_cls, \
+                 mock.patch.object(reply_server, "_run_managed_live_instance_call", managed_call), \
+                 mock.patch.object(reply_server, "_save_history_order_detail_result", return_value=True) as save_detail_mock, \
+                 mock.patch.object(reply_server, "_save_history_order_candidate", return_value=True) as save_candidate_mock, \
+                 mock.patch.object(reply_server, "_cleanup_order_history_sync_jobs"):
+                await reply_server._run_order_history_sync_job(job_id)
+        finally:
+            reply_server.order_history_sync_jobs.pop(job_id, None)
+            reply_server.order_history_sync_tasks.pop(job_id, None)
+
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("指定账号不存在或无权限访问", job["error"])
+        fetcher_cls.assert_not_called()
+        managed_call.assert_not_awaited()
+        save_detail_mock.assert_not_called()
+        save_candidate_mock.assert_not_called()
+
+    async def test_order_history_sync_warns_and_falls_back_to_candidate_when_managed_detail_refresh_errors(self):
+        job_id = "history-sync-job-detail-warning"
+        candidate = {
+            "order_id": "order-history-3",
+            "item_id": "item-history-3",
+            "buyer_id": "buyer-history-3",
+            "buyer_nick": "buyer-history-nick-3",
+            "sid": "sid-history-3",
+        }
+        fake_fetcher = SimpleNamespace(
+            fetch_recent_orders=mock.AsyncMock(return_value={
+                "orders": [candidate],
+                "scanned_count": 1,
+                "matched_count": 1,
+                "out_of_range_count": 0,
+            }),
+            fetch_order_detail=mock.AsyncMock(return_value=None),
+            close=mock.AsyncMock(),
+        )
+        managed_call = mock.AsyncMock(side_effect=RuntimeError("detail boom"))
+        job = {
+            "request": {
+                "start_date": "2026-05-01",
+                "end_date": "2026-05-02",
+                "account_id": "acc-history-3",
+                "max_orders": 1,
+                "fetch_details": True,
+            },
+            "user_info": {"user_id": 1},
+            "status": "queued",
+        }
+        reply_server.order_history_sync_jobs[job_id] = job
+        try:
+            with mock.patch.object(reply_server.db_manager, "get_all_cookies", return_value={"acc-history-3": "cookie-value"}), \
+                 mock.patch("utils.order_history_sync.OrderHistoryPageFetcher", return_value=fake_fetcher), \
+                 mock.patch.object(reply_server, "_run_managed_live_instance_call", managed_call), \
+                 mock.patch.object(reply_server, "_save_history_order_detail_result", return_value=True) as save_detail_mock, \
+                 mock.patch.object(reply_server, "_save_history_order_candidate", return_value=True) as save_candidate_mock, \
+                 mock.patch.object(reply_server, "_cleanup_order_history_sync_jobs"):
+                await reply_server._run_order_history_sync_job(job_id)
+        finally:
+            reply_server.order_history_sync_jobs.pop(job_id, None)
+            reply_server.order_history_sync_tasks.pop(job_id, None)
+
+        self.assertEqual(job["status"], "completed")
+        managed_call.assert_awaited_once()
+        fake_fetcher.fetch_order_detail.assert_not_awaited()
+        save_detail_mock.assert_not_called()
+        save_candidate_mock.assert_called_once_with("acc-history-3", candidate)
+        self.assertEqual(job["orders_saved"], 1)
+        self.assertEqual(job["orders_failed"], 0)
+        self.assertTrue(
+            any("订单 order-history-3 详情刷新失败: detail boom" in warning for warning in job["warnings"])
+        )
+
+    def test_item_and_item_reply_dom_use_account_id_ids_and_datasets(self):
+        index_html = (REPO_ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        app_js = (REPO_ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="itemAccountFilter"', index_html)
+        self.assertIn('id="itemReplayAccountFilter"', index_html)
+        self.assertIn('id="editReplyAccountIdSelect"', index_html)
+        self.assertIn('id="editItemAccountId"', index_html)
+        self.assertIn('id="editItemAccountIdDisplay"', index_html)
+        self.assertIn("checkbox.dataset.accountId", app_js)
+        self.assertIn("data-account-id", app_js)
+        self.assertIn("document.getElementById('itemAccountFilter')", app_js)
+        self.assertIn("document.getElementById('itemReplayAccountFilter')", app_js)
+        self.assertIn("document.getElementById('editReplyAccountIdSelect')", app_js)
+
+    def test_order_history_sync_dom_uses_account_id_id(self):
+        index_html = (REPO_ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        app_js = (REPO_ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="orderHistorySyncAccountId"', index_html)
+        self.assertNotIn('id="orderHistorySyncCookieId"', index_html)
+        self.assertIn("orderHistorySyncAccountId", app_js)
+        self.assertIn("account_id: accountId || null", app_js)
+
+    def test_order_list_and_detail_dom_use_account_id(self):
+        index_html = (REPO_ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        app_js = (REPO_ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="orderAccountFilter"', index_html)
+        self.assertNotIn('id="orderCookieFilter"', index_html)
+        self.assertIn("loadOrdersByAccount()", app_js)
+        self.assertIn("document.getElementById('orderAccountFilter')", app_js)
+        self.assertNotIn("order.account_id || order.cookie_id", app_js)
+        self.assertIn("order.account_id", app_js)
+        self.assertIn("账号ID", app_js)
+        self.assertIn('data-account-id="${accountId}"', app_js)
+        self.assertIn("actionButton.dataset.accountId", app_js)
+        self.assertIn("showOrderDetail(orderId, accountId)", app_js)
+        self.assertIn("allOrdersData.find(o => o.order_id === orderId && String(o.account_id || '').trim() === normalizedAccountId)", app_js)
+        self.assertIn("params.set('account_id', normalizedAccountId)", app_js)
+        self.assertIn("accountId: cb.dataset.accountId", app_js)
+
+    def test_realtime_order_cache_matching_uses_account_id(self):
+        app_js = (REPO_ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("const normalizedAccountId = String(order.account_id || '').trim();", app_js)
+        self.assertIn("const existingIndex = allOrdersData.findIndex(item => item.order_id === order.order_id && String(item.account_id || '').trim() === normalizedAccountId);", app_js)
+        self.assertNotIn("const existingIndex = allOrdersData.findIndex(item => item.order_id === order.order_id);", app_js)
+
+    def test_risk_log_dom_and_fetch_use_account_id(self):
+        index_html = (REPO_ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        app_js = (REPO_ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="riskLogAccountFilter"', index_html)
+        self.assertNotIn('id="riskLogCookieFilter"', index_html)
+        self.assertIn("riskLogAccountFilter", app_js)
+        self.assertIn("params.set('account_id', accountId)", app_js)
+        self.assertNotIn("log.account_id || log.cookie_id", app_js)
+
+    def test_ai_reply_and_qr_requests_use_account_id_values(self):
+        app_js = (REPO_ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("fetch(`${apiBase}/ai-reply-settings/${accountId}`", app_js)
+        self.assertIn("fetch(`${apiBase}/ai-reply-test/${accountId}`", app_js)
+        self.assertIn("fetch(`${apiBase}/qr-login/cooldown-status/${accountId}`", app_js)
+        self.assertIn("fetch(`${apiBase}/qr-login/reset-cooldown/${accountId}`", app_js)
+        self.assertIn("account_id: selectedAccountId", app_js)
+        self.assertIn("document.getElementById('accountId')", app_js)
+
+    def test_account_management_uses_account_id_response_fields(self):
+        app_js = (REPO_ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("function getCookieDetailsAccountId(account)", app_js)
+        self.assertIn("return String(account?.account_id || '').trim();", app_js)
+        self.assertIn("String(cookie.account_id)", app_js)
+        self.assertIn("const accountId = String(cookie.account_id || '');", app_js)
+        self.assertIn("option.value = account.account_id;", app_js)
+        self.assertIn("option.textContent = `${account.account_id} ${hasCredentials}`;", app_js)
+        self.assertIn("async function deleteKeyword(accountId, index)", app_js)
+        self.assertIn("function editRemark(accountId, currentRemark)", app_js)
+        self.assertIn("function editPauseDuration(accountId, currentDuration)", app_js)
+        self.assertNotIn("fetchDashboardResource(`/keywords/${encodeURIComponent(account.id)}`", app_js)
+        self.assertNotIn("fetch(`${apiBase}/keywords/${account.id}`", app_js)
+        self.assertNotIn("const accountId = String(account.id || '');", app_js)
+        self.assertNotIn("const accountId = String(account?.id || '').trim();", app_js)
+        self.assertNotIn("option.value = account.id;", app_js)
+        self.assertNotIn("option.textContent = account.id;", app_js)
+        self.assertNotIn("aboutDiagnosticsAccounts.find(account => account.id === normalizedAccountId)", app_js)
+        self.assertNotIn("accounts.some(account => account.id === previousValue)", app_js)
+        self.assertNotIn("accounts.find(acc => acc.id === accountId)", app_js)
+        self.assertIn("const accountId = getCookieDetailsAccountId(accountData);", app_js)
+        self.assertIn("document.getElementById('accountEditId').value = accountId;", app_js)
+        self.assertIn("document.getElementById('accountEditIdDisplay').textContent = accountId;", app_js)
+        self.assertIn("fetch(`${apiBase}/accounts/details`", app_js)
+        self.assertIn("fetchJSON(`${apiBase}/accounts/details`)", app_js)
+        self.assertIn("fetchJSON(`${apiBase}/accounts/${encodeURIComponent(normalizedAccountId)}/runtime-status`)", app_js)
+        self.assertIn("fetchJSON(`${apiBase}/accounts/${encodeURIComponent(accountId)}/session-keepalive`", app_js)
+        self.assertIn("`${apiBase}/accounts/${encodeURIComponent(accountId)}/conversations/${encodeURIComponent(conversationId)}/history`", app_js)
+        self.assertIn("fetchJSON(`${apiBase}/accounts/${encodeURIComponent(id)}/details?include_secrets=true`)", app_js)
+        self.assertIn("fetchJSON(`${apiBase}/accounts/${encodeURIComponent(accountId)}/details?include_secrets=true`)", app_js)
+        self.assertIn("fetchJSON(apiBase + `/accounts/${accountId}/proxy?include_secret=true`)", app_js)
+        self.assertIn("fetchJSON(apiBase + `/accounts/${id}/account-info`", app_js)
+        self.assertIn("fetchJSON(apiBase + `/accounts/${id}/proxy`", app_js)
+        self.assertIn("fetchJSON(apiBase + `/accounts/${id}`", app_js)
+        self.assertIn("await fetchJSON(apiBase + `/accounts/${id}`, { method: 'DELETE' });", app_js)
+        self.assertIn("const response = await fetch(`${apiBase}/accounts/${accountId}/status`, {", app_js)
+        self.assertIn("const response = await fetch(`${apiBase}/accounts/${accountId}/auto-confirm`, {", app_js)
+        self.assertIn("const response = await fetch(`${apiBase}/accounts/${accountId}/auto-comment`, {", app_js)
+        self.assertIn("const response = await fetch(`${apiBase}/accounts/${accountId}/comment-templates`, {", app_js)
+        self.assertIn("const response = await fetch(`${apiBase}/accounts/${currentCommentTemplateAccountId}/comment-templates`, {", app_js)
+        self.assertIn("const response = await fetch(`${apiBase}/accounts/${currentCommentTemplateAccountId}/comment-templates/${templateId}`, {", app_js)
+        self.assertIn("const response = await fetch(`${apiBase}/accounts/${accountId}/comment-templates/${templateId}`, {", app_js)
+        self.assertIn("const response = await fetch(`${apiBase}/accounts/${accountId}/comment-templates/${templateId}/activate`, {", app_js)
+        self.assertIn("const accountsResponse = await fetch(`${apiBase}/accounts`, {", app_js)
+        self.assertIn("const response = await fetch(`${apiBase}/accounts/${accountId}/remark`, {", app_js)
+        self.assertIn("const response = await fetch(`${apiBase}/accounts/${accountId}/pause-duration`, {", app_js)
+        self.assertIn("const response = await fetch('/admin/accounts', {", app_js)
+        self.assertIn("const accountsCheckResponse = await fetch('/accounts/check', {", app_js)
+        self.assertIn("if (data.success && data.accounts) {", app_js)
+        self.assertIn("data.accounts.forEach(account => {", app_js)
+        self.assertIn("body: JSON.stringify({\n        account_id: id,\n        value: newValue", app_js)
+        self.assertIn("window.editingAccountData", app_js)
+        self.assertNotIn("fetch(`${apiBase}/cookies/details`", app_js)
+        self.assertNotIn("fetchJSON(`${apiBase}/cookies/details`)", app_js)
+        self.assertNotIn("fetchJSON(`${apiBase}/cookies/${encodeURIComponent(normalizedAccountId)}/runtime-status`)", app_js)
+        self.assertNotIn("fetchJSON(`${apiBase}/cookie/${encodeURIComponent(id)}/details?include_secrets=true`)", app_js)
+        self.assertNotIn("document.getElementById('accountEditId').value = accountData.id;", app_js)
+        self.assertNotIn("document.getElementById('accountEditIdDisplay').textContent = accountData.id;", app_js)
+        self.assertNotIn("option.value = cookie.id;", app_js)
+        self.assertNotIn("toggleAccountStatus('${cookie.id}', this.checked)", app_js)
+        self.assertNotIn("await fetchJSON(apiBase + `/cookies/${id}`, { method: 'DELETE' });", app_js)
+        self.assertNotIn("const response = await fetch(`${apiBase}/cookies/${accountId}/status`, {", app_js)
+        self.assertNotIn("const response = await fetch(`${apiBase}/cookies/${accountId}/auto-confirm`, {", app_js)
+        self.assertNotIn("const response = await fetch(`${apiBase}/cookies/${accountId}/auto-comment`, {", app_js)
+        self.assertNotIn("const response = await fetch(`${apiBase}/cookies/${accountId}/comment-templates`, {", app_js)
+        self.assertNotIn("const response = await fetch(`${apiBase}/cookies/${currentCommentTemplateAccountId}/comment-templates`, {", app_js)
+        self.assertNotIn("const response = await fetch(`${apiBase}/cookies/${currentCommentTemplateAccountId}/comment-templates/${templateId}`, {", app_js)
+        self.assertNotIn("const response = await fetch(`${apiBase}/cookies/${accountId}/comment-templates/${templateId}`, {", app_js)
+        self.assertNotIn("const response = await fetch(`${apiBase}/cookies/${accountId}/comment-templates/${templateId}/activate`, {", app_js)
+        self.assertNotIn("const accountsResponse = await fetch(`${apiBase}/cookies`, {", app_js)
+        self.assertNotIn("const response = await fetch(`${apiBase}/cookies/${accountId}/remark`, {", app_js)
+        self.assertNotIn("const response = await fetch(`${apiBase}/cookies/${accountId}/pause-duration`, {", app_js)
+        self.assertNotIn("const response = await fetch('/admin/cookies', {", app_js)
+        self.assertNotIn("const cookiesCheckResponse = await fetch('/cookies/check', {", app_js)
+        self.assertNotIn("if (data.success && data.cookies) {", app_js)
+        self.assertNotIn("data.cookies.forEach(cookie => {", app_js)
+        self.assertNotIn("body: JSON.stringify({\n        id: id,\n        value: newValue", app_js)
+        self.assertNotIn("window.editingCookieData", app_js)
+
+    def test_admin_dashboard_stats_uses_supported_stats_endpoint(self):
+        app_js = (REPO_ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+        source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+
+        self.assertIn("async function loadUserSystemStats()", app_js)
+        self.assertIn("fetch('/admin/stats', {", app_js)
+        self.assertIn("document.getElementById('totalUsers').textContent = statsData.users.total;", app_js)
+        self.assertIn("document.getElementById('totalUserCookies').textContent = statsData.cookies.total;", app_js)
+        self.assertIn("document.getElementById('totalUserCards').textContent = statsData.cards.total;", app_js)
+        self.assertNotIn("fetch(`${apiBase}/admin/data/cookies`, {", app_js)
+        self.assertNotIn("fetch(`${apiBase}/admin/data/cards`, {", app_js)
+        self.assertIn("@app.get('/admin/stats')", source)
+
+
+class ReplyServerOrderAccountScopeRuntimeTest(_ReplyServerModuleBindingMixin, unittest.TestCase):
+    def test_save_history_order_candidate_passes_account_id_to_order_upsert(self):
+        candidate = {
+            "order_id": "order-history-helper-1",
+            "item_id": "item-history-helper-1",
+            "buyer_id": "buyer-history-helper-1",
+            "buyer_nick": "buyer-history-helper-nick-1",
+            "sid": "sid-history-helper-1",
+            "amount": "19.80",
+            "order_status": "shipped",
+        }
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "insert_or_update_order",
+            return_value=True,
+        ) as insert_or_update_order:
+            saved = reply_server._save_history_order_candidate("acc-history-helper-1", candidate)
+
+        self.assertTrue(saved)
+        insert_or_update_order.assert_called_once()
+        call_kwargs = insert_or_update_order.call_args.kwargs
+        self.assertEqual(call_kwargs["account_id"], "acc-history-helper-1")
+        self.assertEqual(call_kwargs["order_id"], "order-history-helper-1")
+        self.assertEqual(call_kwargs["item_id"], "item-history-helper-1")
+        self.assertEqual(call_kwargs["order_status"], "shipped")
+
+    def test_save_history_order_detail_result_uses_candidate_fallback_fields_with_account_scope(self):
+        candidate = {
+            "order_id": "order-history-helper-2",
+            "item_id": "item-history-helper-2",
+            "buyer_id": "buyer-history-helper-2",
+            "buyer_nick": "buyer-history-helper-nick-2",
+            "sid": "sid-history-helper-2",
+            "amount": "28.50",
+            "platform_created_at": "2026-05-01 10:00:00",
+        }
+        detail_result = {
+            "order_id": "   ",
+            "item_id": "",
+            "order_status": "unknown",
+            "amount": "",
+        }
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "insert_or_update_order",
+            return_value=True,
+        ) as insert_or_update_order:
+            saved = reply_server._save_history_order_detail_result(
+                "acc-history-helper-2",
+                candidate,
+                detail_result,
+            )
+
+        self.assertTrue(saved)
+        insert_or_update_order.assert_called_once()
+        call_kwargs = insert_or_update_order.call_args.kwargs
+        self.assertEqual(call_kwargs["account_id"], "acc-history-helper-2")
+        self.assertEqual(call_kwargs["order_id"], "order-history-helper-2")
+        self.assertEqual(call_kwargs["item_id"], "item-history-helper-2")
+        self.assertEqual(call_kwargs["buyer_id"], "buyer-history-helper-2")
+        self.assertEqual(call_kwargs["sid"], "sid-history-helper-2")
+        self.assertIsNone(call_kwargs["order_status"])
+        self.assertEqual(call_kwargs["amount"], "28.50")
+        self.assertEqual(call_kwargs["platform_created_at"], "2026-05-01 10:00:00")
+
+    def test_delete_user_order_rejects_missing_account_id(self):
+        fake_db = mock.Mock()
+
+        with mock.patch.object(reply_server, "_get_user_cookies_map", return_value={"acc-order-1": "cookie"}), \
+             mock.patch("db_manager.db_manager", fake_db):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                reply_server.delete_user_order(
+                    "order-delete-1",
+                    current_user={"user_id": 1, "username": "admin"},
+                    account_id=None,
+                )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        fake_db.get_order_by_id.assert_not_called()
+
+    def test_delete_user_order_rejects_unowned_account_id_before_db_lookup(self):
+        fake_db = mock.Mock()
+
+        with mock.patch.object(reply_server, "_get_user_cookies_map", return_value={"acc-order-1": "cookie"}), \
+             mock.patch("db_manager.db_manager", fake_db):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                reply_server.delete_user_order(
+                    "order-delete-foreign",
+                    current_user={"user_id": 1, "username": "admin"},
+                    account_id="acc-order-foreign",
+                )
+
+        self.assertEqual(raised.exception.status_code, 403)
+        fake_db.get_order_by_id.assert_not_called()
+
+    def test_delete_user_order_scopes_lookup_by_account_id(self):
+        fake_db = mock.Mock()
+        fake_db.get_order_by_id.return_value = {
+            "order_id": "order-delete-1",
+            "account_id": "acc-order-1",
+        }
+        fake_db.delete_order.return_value = True
+
+        with mock.patch.object(reply_server, "_get_user_cookies_map", return_value={"acc-order-1": "cookie"}), \
+             mock.patch("db_manager.db_manager", fake_db), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = reply_server.delete_user_order(
+                "order-delete-1",
+                account_id="acc-order-1",
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        self.assertTrue(result["success"])
+        fake_db.get_order_by_id.assert_called_once_with(
+            "order-delete-1",
+            account_id="acc-order-1",
+            user_id=1,
+        )
+        fake_db.delete_order.assert_called_once_with("order-delete-1", account_id="acc-order-1")
+
+    def test_manual_deliver_order_scopes_lookup_by_account_id(self):
+        fake_db = mock.Mock()
+        fake_db.get_order_by_id.return_value = {
+            "order_id": "order-deliver-1",
+            "account_id": "acc-order-1",
+            "item_id": "item-deliver-1",
+            "buyer_id": "buyer-deliver-1",
+        }
+        managed_call = mock.AsyncMock(
+            side_effect=reply_server.HTTPException(
+                status_code=400,
+                detail="账号 acc-order-1 未运行，请先启动账号",
+            )
+        )
+
+        async def invoke():
+            return await reply_server.manual_deliver_order(
+                "order-deliver-1",
+                account_id="acc-order-1",
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        with mock.patch.object(reply_server, "_get_user_cookies_map", return_value={"acc-order-1": "cookie"}), \
+             mock.patch("db_manager.db_manager", fake_db), \
+             mock.patch.object(reply_server, "_run_managed_live_instance_call", managed_call), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertFalse(result["delivered"])
+        self.assertIn("未运行", result["message"])
+        fake_db.get_order_by_id.assert_called_once_with(
+            "order-deliver-1",
+            account_id="acc-order-1",
+            user_id=1,
+        )
+
+    def test_refresh_order_status_scopes_lookup_by_account_id(self):
+        fake_db = mock.Mock()
+        fake_db.get_order_by_id.return_value = {
+            "order_id": "order-refresh-1",
+            "account_id": "acc-order-1",
+            "order_status": "pending_ship",
+            "item_id": "item-refresh-1",
+            "buyer_id": "buyer-refresh-1",
+            "sid": "sid-refresh-1",
+        }
+        managed_call = mock.AsyncMock(
+            side_effect=reply_server.HTTPException(
+                status_code=400,
+                detail="账号 acc-order-1 未运行，请先启动账号",
+            )
+        )
+
+        async def invoke():
+            return await reply_server.refresh_order_status(
+                "order-refresh-1",
+                account_id="acc-order-1",
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        with mock.patch.object(reply_server, "_get_user_cookies_map", return_value={"acc-order-1": "cookie"}), \
+             mock.patch("db_manager.db_manager", fake_db), \
+             mock.patch.object(reply_server, "_run_managed_live_instance_call", managed_call), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertFalse(result["updated"])
+        self.assertIn("未运行", result["message"])
+        fake_db.get_order_by_id.assert_called_once_with(
+            "order-refresh-1",
+            account_id="acc-order-1",
+            user_id=1,
+        )
+
+
+class ReplyServerAccountBrowserRuntimeJanitorTest(_ReplyServerModuleBindingMixin, unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self):
+        task = getattr(reply_server.app.state, "account_browser_runtime_janitor_task", None)
+        if isinstance(task, asyncio.Task) and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        reply_server.app.state.account_browser_runtime_janitor_task = None
+
+    async def test_account_browser_runtime_janitor_runs_async_and_sync_cleanup_each_tick(self):
+        cleanup_async = mock.AsyncMock(return_value=1)
+        cleanup_sync = mock.Mock(return_value=1)
+
+        with mock.patch.object(
+            reply_server.account_browser_runtime_manager,
+            "cleanup_idle_runtimes",
+            cleanup_async,
+        ), mock.patch.object(
+            reply_server.account_browser_runtime_manager,
+            "cleanup_idle_runtimes_sync",
+            cleanup_sync,
+        ), mock.patch.object(
+            reply_server.asyncio,
+            "sleep",
+            new=mock.AsyncMock(side_effect=asyncio.CancelledError()),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await reply_server.account_browser_runtime_janitor(interval_seconds=1)
+
+        cleanup_async.assert_awaited_once_with()
+        cleanup_sync.assert_called_once_with()
+
+    async def test_start_account_browser_runtime_janitor_stores_created_task_on_app_state(self):
+        async def fake_janitor(interval_seconds=60):
+            await asyncio.sleep(3600)
+
+        with mock.patch.object(reply_server, "account_browser_runtime_janitor", new=fake_janitor):
+            await reply_server.start_account_browser_runtime_janitor()
+
+        task = getattr(reply_server.app.state, "account_browser_runtime_janitor_task", None)
+        self.assertIsInstance(task, asyncio.Task)
+        self.assertFalse(task.done())
+
+    async def test_stop_account_browser_runtime_janitor_cancels_and_clears_task(self):
+        task = asyncio.create_task(asyncio.sleep(3600))
+        reply_server.app.state.account_browser_runtime_janitor_task = task
+
+        await reply_server.stop_account_browser_runtime_janitor()
+
+        self.assertTrue(task.cancelled())
+        self.assertIsNone(getattr(reply_server.app.state, "account_browser_runtime_janitor_task", None))
+
+
+if __name__ == "__main__":
+    unittest.main()

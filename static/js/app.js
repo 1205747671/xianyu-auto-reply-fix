@@ -4,8 +4,8 @@
 // ================================
 const apiBase = location.origin;
 let keywordsData = {};
-let currentCookieId = '';
-let editCookieId = '';
+let currentAccountId = '';
+let editAccountId = '';
 let authToken = localStorage.getItem('auth_token');
 let dashboardData = {
     accounts: [],
@@ -331,15 +331,31 @@ async function fetchDashboardResource(path, fallbackValue) {
     }
 }
 
+function getCookieDetailsAccountId(account) {
+    return String(account?.account_id || '').trim();
+}
+
 async function enrichDashboardAccounts(accounts) {
     const scheduledTaskData = await fetchDashboardResource('/scheduled-tasks', { success: false, tasks: [] });
     const scheduledTasks = scheduledTaskData && scheduledTaskData.success ? (scheduledTaskData.tasks || []) : [];
 
     return Promise.all(accounts.map(async (account) => {
+        const accountId = getCookieDetailsAccountId(account);
+        if (!accountId) {
+            return {
+                ...account,
+                keywords: [],
+                keywordCount: 0,
+                defaultReply: { enabled: false, reply_content: '' },
+                aiReply: { ai_enabled: false, model_name: 'qwen-plus' },
+                polishSchedule: null,
+            };
+        }
+
         const [keywordsData, defaultReplyData, aiReplyData] = await Promise.all([
-            fetchDashboardResource(`/keywords/${encodeURIComponent(account.id)}`, []),
-            fetchDashboardResource(`/default-replies/${encodeURIComponent(account.id)}`, { enabled: false, reply_content: '' }),
-            fetchDashboardResource(`/ai-reply-settings/${encodeURIComponent(account.id)}`, { ai_enabled: false, model_name: 'qwen-plus' })
+            fetchDashboardResource(`/keywords/${encodeURIComponent(accountId)}`, []),
+            fetchDashboardResource(`/default-replies/${encodeURIComponent(accountId)}`, { enabled: false, reply_content: '' }),
+            fetchDashboardResource(`/ai-reply-settings/${encodeURIComponent(accountId)}`, { ai_enabled: false, model_name: 'qwen-plus' })
         ]);
 
         return {
@@ -348,7 +364,7 @@ async function enrichDashboardAccounts(accounts) {
             keywordCount: Array.isArray(keywordsData) ? keywordsData.length : 0,
             defaultReply: defaultReplyData || { enabled: false, reply_content: '' },
             aiReply: aiReplyData || { ai_enabled: false, model_name: 'qwen-plus' },
-            polishSchedule: getPolishScheduledTask(scheduledTasks, account.id)
+            polishSchedule: getPolishScheduledTask(scheduledTasks, accountId)
         };
     }));
 }
@@ -958,11 +974,11 @@ function renderDashboardAccountCard(account) {
     `).join('');
 
     return `
-        <div class="dashboard-account-card ${isEnabled ? '' : 'is-disabled'}" data-account-id="${escapeHtml(account.id)}" role="button" tabindex="0" onclick="openAccountManagement(this.dataset.accountId)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openAccountManagement(this.dataset.accountId);}">
+        <div class="dashboard-account-card ${isEnabled ? '' : 'is-disabled'}" data-account-id="${escapeHtml(getCookieDetailsAccountId(account))}" role="button" tabindex="0" onclick="openAccountManagement(this.dataset.accountId)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openAccountManagement(this.dataset.accountId);}">
             <div class="dashboard-account-card-head">
                 <div class="dashboard-account-card-main">
                     <div class="dashboard-account-card-title">
-                        <div class="dashboard-account-card-id">${escapeHtml(account.id)}</div>
+                        <div class="dashboard-account-card-id">${escapeHtml(getCookieDetailsAccountId(account))}</div>
                         ${remarkText ? `<span class="dashboard-account-card-remark-badge">${escapeHtml(remarkText)}</span>` : ''}
                     </div>
                     <div class="dashboard-account-secondary">${secondarySummary}</div>
@@ -1011,7 +1027,7 @@ function renderDashboardAccountOverview(accounts, totalItems = 0) {
         if (keywordDiff !== 0) {
             return keywordDiff;
         }
-        return String(a.id || '').localeCompare(String(b.id || ''), 'zh-Hans-CN');
+        return getCookieDetailsAccountId(a).localeCompare(getCookieDetailsAccountId(b), 'zh-Hans-CN');
     });
 
     enabledContainer.innerHTML = enabledAccounts.length
@@ -1030,7 +1046,7 @@ async function loadDashboard() {
     loadDashboardAnnouncement();
 
     // 获取账号列表
-    const cookiesResponse = await fetch(`${apiBase}/cookies/details`, {
+    const cookiesResponse = await fetch(`${apiBase}/accounts/details`, {
         headers: {
         'Authorization': `Bearer ${authToken}`
         }
@@ -1079,13 +1095,13 @@ async function refreshDashboardRuntimeSnapshots() {
     }
 
     try {
-        const cookieDetails = await fetchJSON(`${apiBase}/cookies/details`);
+        const cookieDetails = await fetchJSON(`${apiBase}/accounts/details`);
         const runtimeStatusMap = new Map(
-            (Array.isArray(cookieDetails) ? cookieDetails : []).map(cookie => [String(cookie.id), cookie.runtime_status || null])
+            (Array.isArray(cookieDetails) ? cookieDetails : []).map(cookie => [String(cookie.account_id), cookie.runtime_status || null])
         );
 
         dashboardData.accounts = dashboardData.accounts.map(account => {
-            const accountId = String(account.id || '');
+            const accountId = getCookieDetailsAccountId(account);
             if (!runtimeStatusMap.has(accountId)) {
                 return account;
             }
@@ -2136,7 +2152,7 @@ async function refreshAccountList() {
     toggleLoading(true);
 
     // 获取账号列表
-    const response = await fetch(`${apiBase}/cookies/details`, {
+    const response = await fetch(`${apiBase}/accounts/details`, {
         headers: {
         'Authorization': `Bearer ${authToken}`
         }
@@ -2151,7 +2167,7 @@ async function refreshAccountList() {
         const accountsWithKeywords = await Promise.all(
         accounts.map(async (account) => {
             try {
-            const keywordsResponse = await fetch(`${apiBase}/keywords/${account.id}`, {
+            const keywordsResponse = await fetch(`${apiBase}/keywords/${getCookieDetailsAccountId(account)}`, {
                 headers: {
                 'Authorization': `Bearer ${authToken}`
                 }
@@ -2171,7 +2187,7 @@ async function refreshAccountList() {
                 };
             }
             } catch (error) {
-            console.error(`获取账号 ${account.id} 关键词失败:`, error);
+            console.error(`获取账号 ${getCookieDetailsAccountId(account)} 关键词失败:`, error);
             return {
                 ...account,
                 keywordCount: 0
@@ -2189,7 +2205,7 @@ async function refreshAccountList() {
         // 分组显示：先显示启用的账号，再显示禁用的账号
         const enabledAccounts = accountsWithKeywords.filter(account => {
         const enabled = account.enabled === undefined ? true : account.enabled;
-        console.log(`账号 ${account.id} 过滤状态: enabled=${account.enabled}, 判断为启用=${enabled}`); // 调试信息
+        console.log(`账号 ${getCookieDetailsAccountId(account)} 过滤状态: enabled=${account.enabled}, 判断为启用=${enabled}`); // 调试信息
         return enabled;
         });
         const disabledAccounts = accountsWithKeywords.filter(account => {
@@ -2200,7 +2216,7 @@ async function refreshAccountList() {
         // 渲染启用的账号
         enabledAccounts.forEach(account => {
         const option = document.createElement('option');
-        option.value = account.id;
+        option.value = getCookieDetailsAccountId(account);
 
         // 根据关键词数量显示不同的图标和样式
         let icon = '📝';
@@ -2216,7 +2232,7 @@ async function refreshAccountList() {
             status = ` (${account.keywordCount} 个关键词)`;
         }
 
-        option.textContent = `${icon} ${account.id}${status}`;
+        option.textContent = `${icon} ${getCookieDetailsAccountId(account)}${status}`;
         select.appendChild(option);
         });
 
@@ -2231,7 +2247,7 @@ async function refreshAccountList() {
         // 渲染禁用的账号
         disabledAccounts.forEach(account => {
             const option = document.createElement('option');
-            option.value = account.id;
+            option.value = getCookieDetailsAccountId(account);
 
             // 禁用账号使用特殊图标和样式
             let icon = '🔴';
@@ -2242,7 +2258,7 @@ async function refreshAccountList() {
             status = ` (${account.keywordCount} 个关键词) [已禁用]`;
             }
 
-            option.textContent = `${icon} ${account.id}${status}`;
+            option.textContent = `${icon} ${getCookieDetailsAccountId(account)}${status}`;
             option.style.color = '#6b7280';
             option.style.fontStyle = 'italic';
             select.appendChild(option);
@@ -2263,13 +2279,13 @@ async function refreshAccountList() {
 
 // 只刷新关键词列表（不重新加载商品列表等其他数据）
 async function refreshKeywordsList() {
-    if (!currentCookieId) {
+    if (!currentAccountId) {
         console.warn('没有选中的账号，无法刷新关键词列表');
         return;
     }
 
     try {
-        const response = await fetch(`${apiBase}/keywords-with-item-id/${currentCookieId}`, {
+        const response = await fetch(`${apiBase}/keywords-with-item-id/${currentAccountId}`, {
             headers: {
                 'Authorization': `Bearer ${authToken}`
             }
@@ -2280,7 +2296,7 @@ async function refreshKeywordsList() {
             console.log('刷新关键词列表，从服务器获取的数据:', data);
 
             // 更新缓存数据
-            keywordsData[currentCookieId] = data;
+            keywordsData[currentAccountId] = data;
 
             // 只重新渲染关键词列表
             renderKeywordsList(data);
@@ -2309,10 +2325,10 @@ async function loadAccountKeywords() {
 
     try {
     toggleLoading(true);
-    currentCookieId = accountId;
+    currentAccountId = accountId;
 
     // 获取账号详情以检查状态
-    const accountResponse = await fetch(`${apiBase}/cookies/details`, {
+    const accountResponse = await fetch(`${apiBase}/accounts/details`, {
         headers: {
         'Authorization': `Bearer ${authToken}`
         }
@@ -2321,7 +2337,7 @@ async function loadAccountKeywords() {
     let accountStatus = true; // 默认启用
     if (accountResponse.ok) {
         const accounts = await accountResponse.json();
-        const currentAccount = accounts.find(acc => acc.id === accountId);
+        const currentAccount = accounts.find(acc => getCookieDetailsAccountId(acc) === accountId);
         accountStatus = currentAccount ? (currentAccount.enabled === undefined ? true : currentAccount.enabled) : true;
         console.log(`加载关键词时账号 ${accountId} 状态: enabled=${currentAccount?.enabled}, accountStatus=${accountStatus}`); // 调试信息
     }
@@ -2394,7 +2410,7 @@ function showAddKeywordForm() {
 // 加载商品列表
 async function loadItemsList(accountId) {
     try {
-    const response = await fetch(`${apiBase}/items/${accountId}`, {
+    const response = await fetch(`${apiBase}/items/account/${encodeURIComponent(accountId)}`, {
         headers: {
         'Authorization': `Bearer ${authToken}`
         }
@@ -2442,7 +2458,7 @@ async function addKeyword() {
     return;
     }
 
-    if (!currentCookieId) {
+    if (!currentAccountId) {
     showToast('请先选择账号', 'warning');
     return;
     }
@@ -2477,7 +2493,7 @@ async function addKeyword() {
     }
 
     // 获取当前关键词列表
-    let currentKeywords = [...(keywordsData[currentCookieId] || [])];
+    let currentKeywords = [...(keywordsData[currentAccountId] || [])];
 
     // 如果是编辑模式，先移除原关键词
     if (isEditMode) {
@@ -2490,7 +2506,7 @@ async function addKeyword() {
     // 如果是编辑模式，先移除原关键词
     if (isEditMode && typeof window.editingIndex !== 'undefined') {
         // 需要重新计算在文本关键字中的索引
-        const originalKeyword = keywordsData[currentCookieId][window.editingIndex];
+        const originalKeyword = keywordsData[currentAccountId][window.editingIndex];
         const textIndex = textKeywords.findIndex(item =>
             item.keyword === originalKeyword.keyword &&
             (item.item_id || '') === (originalKeyword.item_id || '')
@@ -2502,7 +2518,7 @@ async function addKeyword() {
 
     // 检查关键词是否已存在（考虑商品ID，检查所有类型的关键词）
     // 在编辑模式下，需要排除正在编辑的关键词本身
-    let allKeywords = keywordsData[currentCookieId] || [];
+    let allKeywords = keywordsData[currentAccountId] || [];
     if (isEditMode && typeof window.editingIndex !== 'undefined') {
         // 创建一个副本，排除正在编辑的关键词
         allKeywords = allKeywords.filter((item, index) => index !== window.editingIndex);
@@ -2542,7 +2558,7 @@ async function addKeyword() {
         }
     }
 
-    const response = await fetch(`${apiBase}/keywords-with-item-id/${currentCookieId}`, {
+    const response = await fetch(`${apiBase}/keywords-with-item-id/${currentAccountId}`, {
         method: 'POST',
         headers: {
         'Content-Type': 'application/json',
@@ -2839,7 +2855,7 @@ function focusKeywordInput() {
 
 // 编辑分组回复内容（就地编辑）
 function editGroupReply(groupIndex) {
-    const keywords = keywordsData[currentCookieId] || [];
+    const keywords = keywordsData[currentAccountId] || [];
     const groups = groupKeywordsByReply(keywords);
     const group = groups[groupIndex];
 
@@ -2877,13 +2893,13 @@ function editGroupReply(groupIndex) {
 
 // 取消编辑分组回复
 function cancelGroupReplyEdit(groupIndex) {
-    const keywords = keywordsData[currentCookieId] || [];
+    const keywords = keywordsData[currentAccountId] || [];
     renderKeywordsList(keywords);
 }
 
 // 保存分组回复内容
 async function saveGroupReply(groupIndex) {
-    const keywords = keywordsData[currentCookieId] || [];
+    const keywords = keywordsData[currentAccountId] || [];
     const groups = groupKeywordsByReply(keywords);
     const group = groups[groupIndex];
 
@@ -2911,7 +2927,7 @@ async function saveGroupReply(groupIndex) {
     try {
         toggleLoading(true);
 
-        const response = await fetch(`${apiBase}/keywords-with-item-id/${currentCookieId}`, {
+        const response = await fetch(`${apiBase}/keywords-with-item-id/${currentAccountId}`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -2940,7 +2956,7 @@ async function saveGroupReply(groupIndex) {
 
 // 编辑关键词 - 改进版本
 function editKeyword(index) {
-    const keywords = keywordsData[currentCookieId] || [];
+    const keywords = keywordsData[currentAccountId] || [];
     const keyword = keywords[index];
 
     if (!keyword) {
@@ -3031,7 +3047,7 @@ function cancelEdit() {
 }
 
 // 删除关键词
-async function deleteKeyword(cookieId, index) {
+async function deleteKeyword(accountId, index) {
     if (!confirm('确定要删除这个关键词吗？')) {
     return;
     }
@@ -3040,7 +3056,7 @@ async function deleteKeyword(cookieId, index) {
     toggleLoading(true);
 
     // 使用新的删除API
-    const response = await fetch(`${apiBase}/keywords/${cookieId}/${index}`, {
+    const response = await fetch(`${apiBase}/keywords/${accountId}/${index}`, {
         method: 'DELETE',
         headers: {
         'Authorization': `Bearer ${authToken}`
@@ -3066,7 +3082,7 @@ async function deleteKeyword(cookieId, index) {
 
 // 删除特定关键词（删除该关键词在所有商品中的配置）
 async function deleteSpecificKeyword(groupId, keywordIndex) {
-    const keywords = keywordsData[currentCookieId] || [];
+    const keywords = keywordsData[currentAccountId] || [];
     const groups = groupKeywordsByReply(keywords);
     const group = groups.find(g => g.id === groupId);
     
@@ -3098,7 +3114,7 @@ async function deleteSpecificKeyword(groupId, keywordIndex) {
         indicesToDelete.sort((a, b) => b - a);
         
         for (const index of indicesToDelete) {
-            const response = await fetch(`${apiBase}/keywords/${currentCookieId}/${index}`, {
+            const response = await fetch(`${apiBase}/keywords/${currentAccountId}/${index}`, {
                 method: 'DELETE',
                 headers: {
                     'Authorization': `Bearer ${authToken}`
@@ -3123,7 +3139,7 @@ async function deleteSpecificKeyword(groupId, keywordIndex) {
 
 // 删除特定商品的配置（删除该商品下所有关键词的配置）
 async function deleteSpecificItem(groupId, itemIndex) {
-    const keywords = keywordsData[currentCookieId] || [];
+    const keywords = keywordsData[currentAccountId] || [];
     const groups = groupKeywordsByReply(keywords);
     const group = groups.find(g => g.id === groupId);
     
@@ -3158,7 +3174,7 @@ async function deleteSpecificItem(groupId, itemIndex) {
         indicesToDelete.sort((a, b) => b - a);
         
         for (const index of indicesToDelete) {
-            const response = await fetch(`${apiBase}/keywords/${currentCookieId}/${index}`, {
+            const response = await fetch(`${apiBase}/keywords/${currentAccountId}/${index}`, {
                 method: 'DELETE',
                 headers: {
                     'Authorization': `Bearer ${authToken}`
@@ -3533,7 +3549,7 @@ function renderAboutAccountMeta(account) {
     const metaParts = [
         buildAboutMetaCard({
             label: '账号 ID',
-            value: account.id,
+            value: getCookieDetailsAccountId(account),
         }),
         buildAboutMetaCard({
             label: '登录名',
@@ -3836,7 +3852,7 @@ function populateAboutAccountOptions(accounts) {
         <option value="">请选择账号</option>
         ${accounts.map(account => {
             const runningSuffix = account.runtime_status?.running ? ' · 运行中' : '';
-            return `<option value="${escapeHtml(account.id)}">${escapeHtml(account.id + runningSuffix)}</option>`;
+            return `<option value="${escapeHtml(getCookieDetailsAccountId(account))}">${escapeHtml(getCookieDetailsAccountId(account) + runningSuffix)}</option>`;
         }).join('')}
     `;
 }
@@ -3849,14 +3865,14 @@ async function loadAboutRuntimeStatus(accountId = '') {
         return;
     }
 
-    const selectedAccount = aboutDiagnosticsAccounts.find(account => account.id === normalizedAccountId) || null;
+    const selectedAccount = aboutDiagnosticsAccounts.find(account => getCookieDetailsAccountId(account) === normalizedAccountId) || null;
     renderAboutAccountMeta(selectedAccount);
     renderAboutRuntimeStatus(selectedAccount?.runtime_status || null);
 
     try {
-        const result = await fetchJSON(`${apiBase}/cookies/${encodeURIComponent(normalizedAccountId)}/runtime-status`);
+        const result = await fetchJSON(`${apiBase}/accounts/${encodeURIComponent(normalizedAccountId)}/runtime-status`);
         const runtimeStatus = result?.runtime_status || null;
-        const targetAccount = aboutDiagnosticsAccounts.find(account => account.id === normalizedAccountId);
+        const targetAccount = aboutDiagnosticsAccounts.find(account => getCookieDetailsAccountId(account) === normalizedAccountId);
         if (targetAccount) {
             targetAccount.runtime_status = runtimeStatus;
             renderAboutAccountMeta(targetAccount);
@@ -3873,7 +3889,7 @@ async function loadAboutDiagnostics() {
 
     try {
         const previousAccountId = getAboutSelectedAccountId();
-        const accounts = await fetchJSON(`${apiBase}/cookies/details`);
+        const accounts = await fetchJSON(`${apiBase}/accounts/details`);
         aboutDiagnosticsAccounts = Array.isArray(accounts) ? accounts : [];
         populateAboutAccountOptions(aboutDiagnosticsAccounts);
 
@@ -3885,9 +3901,9 @@ async function loadAboutDiagnostics() {
             return;
         }
 
-        const nextAccountId = aboutDiagnosticsAccounts.some(account => account.id === previousAccountId)
+        const nextAccountId = aboutDiagnosticsAccounts.some(account => getCookieDetailsAccountId(account) === previousAccountId)
             ? previousAccountId
-            : (aboutDiagnosticsAccounts.find(account => account.runtime_status?.running)?.id || aboutDiagnosticsAccounts[0]?.id || '');
+            : (getCookieDetailsAccountId(aboutDiagnosticsAccounts.find(account => account.runtime_status?.running)) || getCookieDetailsAccountId(aboutDiagnosticsAccounts[0]) || '');
 
         accountSelect.value = nextAccountId;
         await loadAboutRuntimeStatus(nextAccountId);
@@ -3936,10 +3952,10 @@ async function triggerAboutSessionKeepalive() {
     }
 
     try {
-        const result = await fetchJSON(`${apiBase}/cookies/${encodeURIComponent(accountId)}/session-keepalive`, {
+        const result = await fetchJSON(`${apiBase}/accounts/${encodeURIComponent(accountId)}/session-keepalive`, {
             method: 'POST',
         });
-        const targetAccount = aboutDiagnosticsAccounts.find(account => account.id === accountId);
+        const targetAccount = aboutDiagnosticsAccounts.find(account => getCookieDetailsAccountId(account) === accountId);
         if (targetAccount) {
             targetAccount.runtime_status = result?.runtime_status || null;
             renderAboutAccountMeta(targetAccount);
@@ -3981,7 +3997,7 @@ async function loadAboutConversationHistory() {
 
     try {
         const result = await fetchJSON(
-            `${apiBase}/cookies/${encodeURIComponent(accountId)}/conversations/${encodeURIComponent(conversationId)}/history`
+            `${apiBase}/accounts/${encodeURIComponent(accountId)}/conversations/${encodeURIComponent(conversationId)}/history`
         );
         renderAboutConversationHistory(result?.messages || [], {
             conversationId: result?.conversation_id || conversationId,
@@ -4040,7 +4056,7 @@ async function loadCookies() {
     const tbody = document.querySelector('#cookieTable tbody');
     tbody.innerHTML = '';
 
-    const cookieDetails = await fetchJSON(apiBase + '/cookies/details');
+    const cookieDetails = await fetchJSON(apiBase + '/accounts/details');
 
     if (cookieDetails.length === 0) {
         tbody.innerHTML = `
@@ -4059,8 +4075,9 @@ async function loadCookies() {
     const accountsWithKeywords = await Promise.all(
         cookieDetails.map(async (cookie) => {
         try {
+            const accountId = String(cookie.account_id || '');
             // 获取关键词数量
-            const keywordsResponse = await fetch(`${apiBase}/keywords/${cookie.id}`, {
+            const keywordsResponse = await fetch(`${apiBase}/keywords/${accountId}`, {
             headers: { 'Authorization': `Bearer ${authToken}` }
             });
 
@@ -4071,7 +4088,7 @@ async function loadCookies() {
             }
 
             // 获取默认回复设置
-            const defaultReplyResponse = await fetch(`${apiBase}/default-replies/${cookie.id}`, {
+            const defaultReplyResponse = await fetch(`${apiBase}/default-replies/${accountId}`, {
             headers: { 'Authorization': `Bearer ${authToken}` }
             });
 
@@ -4081,7 +4098,7 @@ async function loadCookies() {
             }
 
             // 获取AI回复设置
-            const aiReplyResponse = await fetch(`${apiBase}/ai-reply-settings/${cookie.id}`, {
+            const aiReplyResponse = await fetch(`${apiBase}/ai-reply-settings/${accountId}`, {
             headers: { 'Authorization': `Bearer ${authToken}` }
             });
 
@@ -4108,14 +4125,15 @@ async function loadCookies() {
     );
 
     accountsWithKeywords.forEach(cookie => {
+        const accountId = String(cookie.account_id || '');
         // 使用数据库中的实际状态，默认为启用
         const isEnabled = cookie.enabled === undefined ? true : cookie.enabled;
 
-        console.log(`账号 ${cookie.id} 状态: enabled=${cookie.enabled}, isEnabled=${isEnabled}`); // 调试信息
+        console.log(`账号 ${accountId} 状态: enabled=${cookie.enabled}, isEnabled=${isEnabled}`); // 调试信息
 
         const tr = document.createElement('tr');
         tr.className = `account-row ${isEnabled ? 'enabled' : 'disabled'}`;
-        tr.dataset.accountId = cookie.id;
+        tr.dataset.accountId = accountId;
         // 默认回复状态标签
         const defaultReplyBadge = cookie.defaultReply.enabled ?
         '<span class="badge bg-success">启用</span>' :
@@ -4135,7 +4153,7 @@ async function loadCookies() {
         tr.innerHTML = `
         <td class="align-middle">
             <div class="cookie-id">
-            <strong class="text-primary">${cookie.id}</strong>
+            <strong class="text-primary">${accountId}</strong>
             </div>
         </td>
         <td class="align-middle">
@@ -4151,7 +4169,7 @@ async function loadCookies() {
         <td class="align-middle">
             <div class="d-flex align-items-center gap-2">
             <label class="status-toggle" title="${isEnabled ? '点击禁用' : '点击启用'}">
-                <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="toggleAccountStatus('${cookie.id}', this.checked)">
+                <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="toggleAccountStatus('${accountId}', this.checked)">
                 <span class="status-slider"></span>
             </label>
             <span class="status-badge ${isEnabled ? 'enabled' : 'disabled'}" title="${isEnabled ? '账号已启用' : '账号已禁用'}">
@@ -4168,7 +4186,7 @@ async function loadCookies() {
         <td class="align-middle">
             <div class="d-flex align-items-center gap-2">
             <label class="status-toggle" title="${autoConfirm ? '点击关闭自动确认发货' : '点击开启自动确认发货'}">
-                <input type="checkbox" ${autoConfirm ? 'checked' : ''} onchange="toggleAutoConfirm('${cookie.id}', this.checked)">
+                <input type="checkbox" ${autoConfirm ? 'checked' : ''} onchange="toggleAutoConfirm('${accountId}', this.checked)">
                 <span class="status-slider"></span>
             </label>
             <span class="status-badge ${autoConfirm ? 'enabled' : 'disabled'}" title="${autoConfirm ? '自动确认发货已开启' : '自动确认发货已关闭'}">
@@ -4179,53 +4197,53 @@ async function loadCookies() {
         <td class="align-middle">
             <div class="d-flex align-items-center gap-2">
             <label class="status-toggle" title="${autoComment ? '点击关闭自动好评' : '点击开启自动好评'}">
-                <input type="checkbox" ${autoComment ? 'checked' : ''} onchange="toggleAutoComment('${cookie.id}', this.checked)">
+                <input type="checkbox" ${autoComment ? 'checked' : ''} onchange="toggleAutoComment('${accountId}', this.checked)">
                 <span class="status-slider"></span>
             </label>
             <span class="status-badge ${autoComment ? 'enabled' : 'disabled'}" title="${autoComment ? '自动好评已开启' : '自动好评已关闭'}">
                 <i class="bi bi-${autoComment ? 'star-fill' : 'star'}"></i>
             </span>
-            <button class="btn btn-sm btn-outline-warning ms-1" onclick="showCommentTemplates('${cookie.id}')" title="管理好评模板">
+            <button class="btn btn-sm btn-outline-warning ms-1" onclick="showCommentTemplates('${accountId}')" title="管理好评模板">
                 <i class="bi bi-card-text"></i>
             </button>
             </div>
         </td>
         <td class="align-middle">
-            <div class="remark-cell" data-cookie-id="${cookie.id}">
-                <span class="remark-display" onclick="editRemark('${cookie.id}', '${(cookie.remark || '').replace(/'/g, '&#39;')}')" title="点击编辑备注" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;">
+            <div class="remark-cell" data-account-id="${accountId}">
+                <span class="remark-display" onclick="editRemark('${accountId}', '${(cookie.remark || '').replace(/'/g, '&#39;')}')" title="点击编辑备注" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;">
                     ${cookie.remark || '<i class="bi bi-plus-circle text-muted"></i> 添加备注'}
                 </span>
             </div>
         </td>
         <td class="align-middle">
-            <div class="pause-duration-cell" data-cookie-id="${cookie.id}">
-                <span class="pause-duration-display" onclick="editPauseDuration('${cookie.id}', ${cookie.pause_duration !== undefined ? cookie.pause_duration : 10})" title="点击编辑暂停时间" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;">
+            <div class="pause-duration-cell" data-account-id="${accountId}">
+                <span class="pause-duration-display" onclick="editPauseDuration('${accountId}', ${cookie.pause_duration !== undefined ? cookie.pause_duration : 10})" title="点击编辑暂停时间" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;">
                     <i class="bi bi-clock me-1"></i>${cookie.pause_duration === 0 ? '不暂停' : (cookie.pause_duration || 10) + '分钟'}
                 </span>
             </div>
         </td>
         <td class="align-middle">
             <div class="btn-group" role="group">
-            <button class="btn btn-sm btn-outline-secondary" onclick="showFaceVerification('${cookie.id}')" title="验证截图">
+            <button class="btn btn-sm btn-outline-secondary" onclick="showFaceVerification('${accountId}')" title="验证截图">
                 <i class="bi bi-shield-check"></i>
             </button>
-            <button class="btn btn-sm btn-outline-primary" onclick="editCookieInline('${cookie.id}', '${cookie.value}')" title="修改Cookie" ${!isEnabled ? 'disabled' : ''}>
+            <button class="btn btn-sm btn-outline-primary" onclick="editCookieInline('${accountId}', '${cookie.value}')" title="修改Cookie" ${!isEnabled ? 'disabled' : ''}>
                 <i class="bi bi-pencil"></i>
             </button>
-            <button class="btn btn-sm btn-outline-success" onclick="goToAutoReply('${cookie.id}')" title="${isEnabled ? '设置自动回复' : '配置关键词 (账号已禁用)'}">
+            <button class="btn btn-sm btn-outline-success" onclick="goToAutoReply('${accountId}')" title="${isEnabled ? '设置自动回复' : '配置关键词 (账号已禁用)'}">
                 <i class="bi bi-arrow-right-circle"></i>
             </button>
-            <button class="btn btn-sm btn-outline-warning" onclick="configAIReply('${cookie.id}')" title="配置AI回复" ${!isEnabled ? 'disabled' : ''}>
+            <button class="btn btn-sm btn-outline-warning" onclick="configAIReply('${accountId}')" title="配置AI回复" ${!isEnabled ? 'disabled' : ''}>
                 <i class="bi bi-robot"></i>
             </button>
-            <button class="btn btn-sm btn-outline-secondary" onclick="polishAccountItems('${cookie.id}')" title="一键擦亮" ${!isEnabled ? 'disabled' : ''}>
+            <button class="btn btn-sm btn-outline-secondary" onclick="polishAccountItems('${accountId}')" title="一键擦亮" ${!isEnabled ? 'disabled' : ''}>
                 <i class="bi bi-stars"></i>
             </button>
-            <button class="btn btn-sm btn-outline-info" onclick="openPolishScheduleModal('${cookie.id}')" title="定时擦亮" ${!isEnabled ? 'disabled' : ''}>
+            <button class="btn btn-sm btn-outline-info" onclick="openPolishScheduleModal('${accountId}')" title="定时擦亮" ${!isEnabled ? 'disabled' : ''}>
                 <i class="bi bi-clock"></i>
             </button>
 
-            <button class="btn btn-sm btn-outline-danger" onclick="delCookie('${cookie.id}')" title="删除账号">
+            <button class="btn btn-sm btn-outline-danger" onclick="delCookie('${accountId}')" title="删除账号">
                 <i class="bi bi-trash"></i>
             </button>
             </div>
@@ -4239,9 +4257,9 @@ async function loadCookies() {
         element.style.cursor = 'pointer';
         element.addEventListener('click', function() {
         const row = this.closest('tr');
-        const cookieId = row?.querySelector('.cookie-id strong')?.textContent;
-        if (cookieId) {
-            copyCookie(cookieId);
+        const accountId = row?.querySelector('.cookie-id strong')?.textContent;
+        if (accountId) {
+            copyCookie(accountId);
         }
         });
     });
@@ -4263,7 +4281,7 @@ async function loadCookies() {
 // 复制Cookie
 async function copyCookie(id) {
     try {
-    const details = await fetchJSON(`${apiBase}/cookie/${encodeURIComponent(id)}/details?include_secrets=true`);
+    const details = await fetchJSON(`${apiBase}/accounts/${encodeURIComponent(id)}/details?include_secrets=true`);
     const value = details?.value || '';
 
     if (!value || value === '未设置') {
@@ -4315,15 +4333,15 @@ async function polishAccountItems(accountId) {
 }
 
 // 刷新真实Cookie
-async function refreshRealCookie(cookieId) {
-    if (!cookieId) {
+async function refreshRealCookie(accountId) {
+    if (!accountId) {
         showToast('缺少账号ID', 'warning');
         return;
     }
 
     // 获取当前cookie值
     try {
-        const currentCookie = await fetchJSON(`${apiBase}/cookie/${encodeURIComponent(cookieId)}/details?include_secrets=true`);
+        const currentCookie = await fetchJSON(`${apiBase}/accounts/${encodeURIComponent(accountId)}/details?include_secrets=true`);
 
         if (!currentCookie || !currentCookie.value) {
             showToast('未找到有效的Cookie信息', 'warning');
@@ -4331,7 +4349,7 @@ async function refreshRealCookie(cookieId) {
         }
 
         // 确认操作
-        if (!confirm(`确定要刷新账号 "${cookieId}" 的真实Cookie吗？\n\n此操作将使用当前Cookie访问闲鱼IM界面获取最新的真实Cookie。`)) {
+        if (!confirm(`确定要刷新账号 "${accountId}" 的真实Cookie吗？\n\n此操作将使用当前Cookie访问闲鱼IM界面获取最新的真实Cookie。`)) {
             return;
         }
 
@@ -4350,14 +4368,14 @@ async function refreshRealCookie(cookieId) {
             },
             body: JSON.stringify({
                 qr_cookies: currentCookie.value,
-                cookie_id: cookieId
+                account_id: accountId
             })
         });
 
         const result = await response.json();
 
         if (result.success) {
-            showToast(`账号 "${cookieId}" 真实Cookie刷新成功`, 'success');
+            showToast(`账号 "${accountId}" 真实Cookie刷新成功`, 'success');
             // 刷新账号列表以显示更新后的cookie
             loadCookies();
         } else {
@@ -4378,14 +4396,14 @@ async function refreshRealCookie(cookieId) {
 }
 
 // 显示冷却状态
-async function showCooldownStatus(cookieId) {
-    if (!cookieId) {
+async function showCooldownStatus(accountId) {
+    if (!accountId) {
         showToast('缺少账号ID', 'warning');
         return;
     }
 
     try {
-        const response = await fetch(`${apiBase}/qr-login/cooldown-status/${cookieId}`, {
+        const response = await fetch(`${apiBase}/qr-login/cooldown-status/${accountId}`, {
             method: 'GET',
             headers: {
                 'Authorization': `Bearer ${authToken}`,
@@ -4398,7 +4416,7 @@ async function showCooldownStatus(cookieId) {
         if (result.success) {
             const { remaining_time, cooldown_duration, is_in_cooldown, remaining_minutes, remaining_seconds } = result;
 
-            let statusMessage = `账号: ${cookieId}\n`;
+            let statusMessage = `账号: ${accountId}\n`;
             statusMessage += `冷却时长: ${cooldown_duration / 60}分钟\n`;
 
             if (is_in_cooldown) {
@@ -4408,7 +4426,7 @@ async function showCooldownStatus(cookieId) {
                 statusMessage += `是否要重置冷却时间？`;
 
                 if (confirm(statusMessage)) {
-                    await resetCooldownTime(cookieId);
+                    await resetCooldownTime(accountId);
                 }
             } else {
                 statusMessage += `冷却状态: 无冷却\n`;
@@ -4426,14 +4444,14 @@ async function showCooldownStatus(cookieId) {
 }
 
 // 重置冷却时间
-async function resetCooldownTime(cookieId) {
-    if (!cookieId) {
+async function resetCooldownTime(accountId) {
+    if (!accountId) {
         showToast('缺少账号ID', 'warning');
         return;
     }
 
     try {
-        const response = await fetch(`${apiBase}/qr-login/reset-cooldown/${cookieId}`, {
+        const response = await fetch(`${apiBase}/qr-login/reset-cooldown/${accountId}`, {
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${authToken}`,
@@ -4448,7 +4466,7 @@ async function resetCooldownTime(cookieId) {
             const previousMinutes = Math.floor(previousTime / 60);
             const previousSeconds = previousTime % 60;
 
-            let message = `账号 "${cookieId}" 的扫码登录冷却时间已重置`;
+            let message = `账号 "${accountId}" 的扫码登录冷却时间已重置`;
             if (previousTime > 0) {
                 message += `\n原剩余时间: ${previousMinutes}分${previousSeconds}秒`;
             }
@@ -4469,7 +4487,7 @@ async function delCookie(id) {
     if (!confirm(`确定要删除账号 "${id}" 吗？此操作不可恢复。`)) return;
 
     try {
-    await fetchJSON(apiBase + `/cookies/${id}`, { method: 'DELETE' });
+    await fetchJSON(apiBase + `/accounts/${id}`, { method: 'DELETE' });
     showToast(`账号 "${id}" 已删除`, 'success');
     loadCookies();
     } catch (err) {
@@ -4483,7 +4501,7 @@ async function editCookieInline(id, currentValue) {
         toggleLoading(true);
         
         // 获取账号详细信息
-        const details = await fetchJSON(apiBase + `/cookie/${id}/details?include_secrets=true`);
+        const details = await fetchJSON(apiBase + `/accounts/${id}/details?include_secrets=true`);
         
         // 打开编辑模态框
         openAccountEditModal(details);
@@ -4497,19 +4515,20 @@ async function editCookieInline(id, currentValue) {
 
 // 打开账号编辑模态框
 async function openAccountEditModal(accountData) {
+    const accountId = getCookieDetailsAccountId(accountData);
     // 设置模态框数据
-    document.getElementById('accountEditId').value = accountData.id;
+    document.getElementById('accountEditId').value = accountId;
     document.getElementById('editAccountCookie').value = accountData.value || '';
     document.getElementById('editAccountUsername').value = accountData.username || '';
     document.getElementById('editAccountPassword').value = accountData.password || '';
     document.getElementById('editAccountShowBrowser').checked = accountData.show_browser || false;
     
     // 显示账号ID
-    document.getElementById('accountEditIdDisplay').textContent = accountData.id;
+    document.getElementById('accountEditIdDisplay').textContent = accountId;
     
     // 加载代理配置
     try {
-        const proxyData = await fetchJSON(apiBase + `/cookie/${accountData.id}/proxy?include_secret=true`);
+        const proxyData = await fetchJSON(apiBase + `/accounts/${accountId}/proxy?include_secret=true`);
         if (proxyData && proxyData.data) {
             document.getElementById('editProxyType').value = proxyData.data.proxy_type || 'none';
             document.getElementById('editProxyHost').value = proxyData.data.proxy_host || '';
@@ -4589,7 +4608,7 @@ async function saveAccountEdit() {
         toggleLoading(true);
         
         // 保存账号基本信息
-        await fetchJSON(apiBase + `/cookie/${id}/account-info`, {
+        await fetchJSON(apiBase + `/accounts/${id}/account-info`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -4601,7 +4620,7 @@ async function saveAccountEdit() {
         });
         
         // 保存代理配置
-        await fetchJSON(apiBase + `/cookie/${id}/proxy`, {
+        await fetchJSON(apiBase + `/accounts/${id}/proxy`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -4642,11 +4661,11 @@ async function saveCookieInline(id) {
     try {
     toggleLoading(true);
 
-    await fetchJSON(apiBase + `/cookies/${id}`, {
+    await fetchJSON(apiBase + `/accounts/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-        id: id,
+        account_id: id,
         value: newValue
         })
     });
@@ -4666,7 +4685,7 @@ async function saveCookieInline(id) {
 
 // 取消Cookie编辑
 function cancelCookieEdit(id) {
-    if (!window.editingCookieData || window.editingCookieData.id !== id) {
+    if (!window.editingAccountData || window.editingAccountData.id !== id) {
     console.error('编辑数据不存在');
     return;
     }
@@ -4675,14 +4694,14 @@ function cancelCookieEdit(id) {
     const cookieValueCell = row.querySelector('.cookie-value');
 
     // 恢复原内容
-    cookieValueCell.innerHTML = window.editingCookieData.originalContent;
+    cookieValueCell.innerHTML = window.editingAccountData.originalContent;
 
     // 恢复按钮状态
     const actionButtons = row.querySelectorAll('.btn-group button');
     actionButtons.forEach(btn => btn.disabled = false);
 
     // 清理全局数据
-    delete window.editingCookieData;
+    delete window.editingAccountData;
 }
 
 
@@ -4696,7 +4715,7 @@ async function toggleAccountStatus(accountId, enabled) {
     // 由于当前后端可能没有enabled字段，我们先在前端模拟
     // 实际项目中需要后端支持
 
-    const response = await fetch(`${apiBase}/cookies/${accountId}/status`, {
+    const response = await fetch(`${apiBase}/accounts/${accountId}/status`, {
         method: 'PUT',
         headers: {
         'Content-Type': 'application/json',
@@ -4795,7 +4814,7 @@ async function toggleAutoConfirm(accountId, enabled) {
     try {
     toggleLoading(true);
 
-    const response = await fetch(`${apiBase}/cookies/${accountId}/auto-confirm`, {
+    const response = await fetch(`${apiBase}/accounts/${accountId}/auto-confirm`, {
         method: 'PUT',
         headers: {
         'Content-Type': 'application/json',
@@ -4862,7 +4881,7 @@ async function toggleAutoComment(accountId, enabled) {
     try {
         toggleLoading(true);
 
-        const response = await fetch(`${apiBase}/cookies/${accountId}/auto-comment`, {
+        const response = await fetch(`${apiBase}/accounts/${accountId}/auto-comment`, {
             method: 'PUT',
             headers: {
                 'Content-Type': 'application/json',
@@ -4935,7 +4954,7 @@ async function showCommentTemplates(accountId) {
         toggleLoading(true);
         
         // 获取好评模板列表
-        const response = await fetch(`${apiBase}/cookies/${accountId}/comment-templates`, {
+        const response = await fetch(`${apiBase}/accounts/${accountId}/comment-templates`, {
             headers: {
                 'Authorization': `Bearer ${authToken}`
             }
@@ -5109,7 +5128,7 @@ async function addCommentTemplate() {
     try {
         toggleLoading(true);
         
-        const response = await fetch(`${apiBase}/cookies/${currentCommentTemplateAccountId}/comment-templates`, {
+        const response = await fetch(`${apiBase}/accounts/${currentCommentTemplateAccountId}/comment-templates`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -5171,7 +5190,7 @@ async function saveEditCommentTemplate() {
     try {
         toggleLoading(true);
         
-        const response = await fetch(`${apiBase}/cookies/${currentCommentTemplateAccountId}/comment-templates/${templateId}`, {
+        const response = await fetch(`${apiBase}/accounts/${currentCommentTemplateAccountId}/comment-templates/${templateId}`, {
             method: 'PUT',
             headers: {
                 'Content-Type': 'application/json',
@@ -5209,7 +5228,7 @@ async function deleteCommentTemplate(accountId, templateId) {
     try {
         toggleLoading(true);
         
-        const response = await fetch(`${apiBase}/cookies/${accountId}/comment-templates/${templateId}`, {
+        const response = await fetch(`${apiBase}/accounts/${accountId}/comment-templates/${templateId}`, {
             method: 'DELETE',
             headers: {
                 'Authorization': `Bearer ${authToken}`
@@ -5238,7 +5257,7 @@ async function activateCommentTemplate(accountId, templateId) {
     try {
         toggleLoading(true);
         
-        const response = await fetch(`${apiBase}/cookies/${accountId}/comment-templates/${templateId}/activate`, {
+        const response = await fetch(`${apiBase}/accounts/${accountId}/comment-templates/${templateId}/activate`, {
             method: 'PUT',
             headers: {
                 'Authorization': `Bearer ${authToken}`
@@ -5522,7 +5541,7 @@ async function openDefaultReplyManager() {
 async function loadDefaultReplies() {
     try {
     // 获取所有账号
-    const accountsResponse = await fetch(`${apiBase}/cookies`, {
+    const accountsResponse = await fetch(`${apiBase}/accounts`, {
         headers: {
         'Authorization': `Bearer ${authToken}`
         }
@@ -7208,7 +7227,7 @@ async function testNotificationTemplate(templateType) {
 async function loadMessageNotifications() {
     try {
     // 获取所有账号
-    const accountsResponse = await fetch(`${apiBase}/cookies`, {
+    const accountsResponse = await fetch(`${apiBase}/accounts`, {
         headers: {
         'Authorization': `Bearer ${authToken}`
         }
@@ -9717,7 +9736,7 @@ async function importBackup() {
         setTimeout(async () => {
         try {
             // 如果当前在关键字管理页面，重新加载数据
-            if (currentCookieId) {
+            if (currentAccountId) {
             await loadAccountKeywords();
             }
 
@@ -9767,7 +9786,7 @@ async function reloadSystemCache() {
         clearKeywordCache();
 
         // 如果当前在关键字管理页面，重新加载数据
-        if (currentCookieId) {
+        if (currentAccountId) {
         setTimeout(() => {
             loadAccountKeywords();
         }, 500);
@@ -9865,9 +9884,9 @@ async function doRestartSystem() {
 // ================================
 
 // 切换商品多规格状态
-async function toggleItemMultiSpec(cookieId, itemId, isMultiSpec) {
+async function toggleItemMultiSpec(accountId, itemId, isMultiSpec) {
     try {
-    const response = await fetch(`${apiBase}/items/${encodeURIComponent(cookieId)}/${encodeURIComponent(itemId)}/multi-spec`, {
+    const response = await fetch(`${apiBase}/items/${encodeURIComponent(accountId)}/${encodeURIComponent(itemId)}/multi-spec`, {
         method: 'PUT',
         headers: {
         'Content-Type': 'application/json',
@@ -9893,9 +9912,9 @@ async function toggleItemMultiSpec(cookieId, itemId, isMultiSpec) {
 }
 
 // 切换商品多数量发货状态
-async function toggleItemMultiQuantityDelivery(cookieId, itemId, multiQuantityDelivery) {
+async function toggleItemMultiQuantityDelivery(accountId, itemId, multiQuantityDelivery) {
     try {
-    const response = await fetch(`${apiBase}/items/${encodeURIComponent(cookieId)}/${encodeURIComponent(itemId)}/multi-quantity-delivery`, {
+    const response = await fetch(`${apiBase}/items/${encodeURIComponent(accountId)}/${encodeURIComponent(itemId)}/multi-quantity-delivery`, {
         method: 'PUT',
         headers: {
         'Content-Type': 'application/json',
@@ -9924,7 +9943,7 @@ async function toggleItemMultiQuantityDelivery(cookieId, itemId, multiQuantityDe
 async function loadItems() {
     try {
     // 先加载Cookie列表用于筛选
-    await loadCookieFilter('itemCookieFilter');
+    await loadCookieFilter('itemAccountFilter');
 
     // 加载商品列表
     await refreshItemsData();
@@ -9937,9 +9956,9 @@ async function loadItems() {
 // 只刷新商品数据，不重新加载筛选器
 async function refreshItemsData() {
     try {
-    const selectedCookie = document.getElementById('itemCookieFilter').value;
+    const selectedCookie = document.getElementById('itemAccountFilter').value;
     if (selectedCookie) {
-        await loadItemsByCookie();
+        await loadItemsByAccount();
     } else {
         await loadAllItems();
     }
@@ -9952,7 +9971,7 @@ async function refreshItemsData() {
 // 加载Cookie筛选选项
 async function loadCookieFilter(id) {
     try {
-    const response = await fetch(`${apiBase}/cookies/details`, {
+    const response = await fetch(`${apiBase}/accounts/details`, {
         headers: {
         'Authorization': `Bearer ${authToken}`
         }
@@ -9990,8 +10009,8 @@ async function loadCookieFilter(id) {
         // 添加启用的账号
         enabledAccounts.forEach(account => {
         const option = document.createElement('option');
-        option.value = account.id;
-        option.textContent = `🟢 ${account.id}`;
+        option.value = getCookieDetailsAccountId(account);
+        option.textContent = `🟢 ${getCookieDetailsAccountId(account)}`;
         select.appendChild(option);
         });
 
@@ -10008,8 +10027,8 @@ async function loadCookieFilter(id) {
 
         disabledAccounts.forEach(account => {
             const option = document.createElement('option');
-            option.value = account.id;
-            option.textContent = `🔴 ${account.id} (已禁用)`;
+            option.value = getCookieDetailsAccountId(account);
+            option.textContent = `🔴 ${getCookieDetailsAccountId(account)} (已禁用)`;
             select.appendChild(option);
         });
         }
@@ -10047,16 +10066,16 @@ async function loadAllItems() {
 }
 
 // 按Cookie加载商品
-async function loadItemsByCookie() {
-    const cookieId = document.getElementById('itemCookieFilter').value;
+async function loadItemsByAccount() {
+    const accountId = document.getElementById('itemAccountFilter').value;
 
-    if (!cookieId) {
+    if (!accountId) {
     await loadAllItems();
     return;
     }
 
     try {
-    const response = await fetch(`${apiBase}/items/cookie/${encodeURIComponent(cookieId)}`, {
+    const response = await fetch(`${apiBase}/items/account/${encodeURIComponent(accountId)}`, {
         headers: {
         'Authorization': `Bearer ${authToken}`
         }
@@ -10146,6 +10165,7 @@ function displayCurrentPageItems() {
     const currentPageItems = filteredItemsData.slice(startIndex, endIndex);
 
     const itemsHtml = currentPageItems.map(item => {
+        const itemAccountId = String(item.account_id || '').trim();
         // 处理商品标题显示
         let itemTitleDisplay = item.item_title || '未设置';
         if (itemTitleDisplay.length > 30) {
@@ -10175,11 +10195,11 @@ function displayCurrentPageItems() {
             <tr>
             <td>
                 <input type="checkbox" name="itemCheckbox"
-                        data-cookie-id="${escapeHtml(item.cookie_id)}"
+                        data-account-id="${escapeHtml(itemAccountId)}"
                         data-item-id="${escapeHtml(item.item_id)}"
                         onchange="updateSelectAllState()">
             </td>
-            <td>${escapeHtml(item.cookie_id)}</td>
+            <td>${escapeHtml(itemAccountId)}</td>
             <td>${escapeHtml(item.item_id)}</td>
             <td title="${escapeHtml(item.item_title || '未设置')}">${escapeHtml(itemTitleDisplay)}</td>
             <td title="${escapeHtml(getItemDetailText(item.item_detail || ''))}">${escapeHtml(itemDetailDisplay)}</td>
@@ -10189,16 +10209,16 @@ function displayCurrentPageItems() {
             <td>${formatDateTime(item.updated_at)}</td>
             <td>
                 <div class="btn-group" role="group">
-                <button class="btn btn-sm btn-outline-primary" onclick="editItem('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}')" title="编辑详情">
+                <button class="btn btn-sm btn-outline-primary" onclick="editItem('${escapeHtml(itemAccountId)}', '${escapeHtml(item.item_id)}')" title="编辑详情">
                     <i class="bi bi-pencil"></i>
                 </button>
-                <button class="btn btn-sm btn-outline-danger" onclick="deleteItem('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}', '${escapeHtml(item.item_title || item.item_id)}')" title="删除">
+                <button class="btn btn-sm btn-outline-danger" onclick="deleteItem('${escapeHtml(itemAccountId)}', '${escapeHtml(item.item_id)}', '${escapeHtml(item.item_title || item.item_id)}')" title="删除">
                     <i class="bi bi-trash"></i>
                 </button>
-                <button class="btn btn-sm ${isMultiSpec ? 'btn-warning' : 'btn-success'}" onclick="toggleItemMultiSpec('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}', ${!isMultiSpec})" title="${isMultiSpec ? '关闭多规格' : '开启多规格'}">
+                <button class="btn btn-sm ${isMultiSpec ? 'btn-warning' : 'btn-success'}" onclick="toggleItemMultiSpec('${escapeHtml(itemAccountId)}', '${escapeHtml(item.item_id)}', ${!isMultiSpec})" title="${isMultiSpec ? '关闭多规格' : '开启多规格'}">
                     <i class="bi ${isMultiSpec ? 'bi-toggle-on' : 'bi-toggle-off'}"></i>
                 </button>
-                <button class="btn btn-sm ${isMultiQuantityDelivery ? 'btn-warning' : 'btn-success'}" onclick="toggleItemMultiQuantityDelivery('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}', ${!isMultiQuantityDelivery})" title="${isMultiQuantityDelivery ? '关闭多数量发货' : '开启多数量发货'}">
+                <button class="btn btn-sm ${isMultiQuantityDelivery ? 'btn-warning' : 'btn-success'}" onclick="toggleItemMultiQuantityDelivery('${escapeHtml(itemAccountId)}', '${escapeHtml(item.item_id)}', ${!isMultiQuantityDelivery})" title="${isMultiQuantityDelivery ? '关闭多数量发货' : '开启多数量发货'}">
                     <i class="bi ${isMultiQuantityDelivery ? 'bi-box-arrow-down' : 'bi-box-arrow-up'}"></i>
                 </button>
                 </div>
@@ -10388,11 +10408,11 @@ async function refreshItems() {
 
 // 获取商品信息
 async function getAllItemsFromAccount() {
-    const cookieSelect = document.getElementById('itemCookieFilter');
-    const selectedCookieId = cookieSelect.value;
+    const cookieSelect = document.getElementById('itemAccountFilter');
+    const selectedAccountId = cookieSelect.value;
     const pageNumber = parseInt(document.getElementById('pageNumber').value) || 1;
 
-    if (!selectedCookieId) {
+    if (!selectedAccountId) {
     showToast('请先选择一个账号', 'warning');
     return;
     }
@@ -10416,7 +10436,7 @@ async function getAllItemsFromAccount() {
         'Authorization': `Bearer ${authToken}`
         },
         body: JSON.stringify({
-        cookie_id: selectedCookieId,
+        account_id: selectedAccountId,
         page_number: pageNumber,
         page_size: 20
         })
@@ -10446,10 +10466,10 @@ async function getAllItemsFromAccount() {
 
 // 获取所有页商品信息
 async function getAllItemsFromAccountAll() {
-    const cookieSelect = document.getElementById('itemCookieFilter');
-    const selectedCookieId = cookieSelect.value;
+    const cookieSelect = document.getElementById('itemAccountFilter');
+    const selectedAccountId = cookieSelect.value;
 
-    if (!selectedCookieId) {
+    if (!selectedAccountId) {
     showToast('请先选择一个账号', 'warning');
     return;
     }
@@ -10468,7 +10488,7 @@ async function getAllItemsFromAccountAll() {
         'Authorization': `Bearer ${authToken}`
         },
         body: JSON.stringify({
-        cookie_id: selectedCookieId
+        account_id: selectedAccountId
         })
     });
 
@@ -10500,9 +10520,9 @@ async function getAllItemsFromAccountAll() {
 
 
 // 编辑商品详情
-async function editItem(cookieId, itemId) {
+async function editItem(accountId, itemId) {
     try {
-    const response = await fetch(`${apiBase}/items/${encodeURIComponent(cookieId)}/${encodeURIComponent(itemId)}`, {
+    const response = await fetch(`${apiBase}/items/${encodeURIComponent(accountId)}/${encodeURIComponent(itemId)}`, {
         headers: {
         'Authorization': `Bearer ${authToken}`
         }
@@ -10513,9 +10533,9 @@ async function editItem(cookieId, itemId) {
         const item = data.item;
 
         // 填充表单
-        document.getElementById('editItemCookieId').value = item.cookie_id;
+        document.getElementById('editItemAccountId').value = item.account_id;
         document.getElementById('editItemId').value = item.item_id;
-        document.getElementById('editItemCookieIdDisplay').value = item.cookie_id;
+        document.getElementById('editItemAccountIdDisplay').value = item.account_id;
         document.getElementById('editItemIdDisplay').value = item.item_id;
         document.getElementById('editItemDetail').value = item.item_detail || '';
 
@@ -10533,7 +10553,7 @@ async function editItem(cookieId, itemId) {
 
 // 保存商品详情
 async function saveItemDetail() {
-    const cookieId = document.getElementById('editItemCookieId').value;
+    const accountId = document.getElementById('editItemAccountId').value;
     const itemId = document.getElementById('editItemId').value;
     const itemDetail = document.getElementById('editItemDetail').value.trim();
 
@@ -10543,7 +10563,7 @@ async function saveItemDetail() {
     }
 
     try {
-    const response = await fetch(`${apiBase}/items/${encodeURIComponent(cookieId)}/${encodeURIComponent(itemId)}`, {
+    const response = await fetch(`${apiBase}/items/${encodeURIComponent(accountId)}/${encodeURIComponent(itemId)}`, {
         method: 'PUT',
         headers: {
         'Content-Type': 'application/json',
@@ -10574,7 +10594,7 @@ async function saveItemDetail() {
 }
 
 // 删除商品信息
-async function deleteItem(cookieId, itemId, itemTitle) {
+async function deleteItem(accountId, itemId, itemTitle) {
     try {
     // 确认删除
     const confirmed = confirm(`确定要删除商品信息吗？\n\n商品ID: ${itemId}\n商品标题: ${itemTitle || '未设置'}\n\n此操作不可撤销！`);
@@ -10582,7 +10602,7 @@ async function deleteItem(cookieId, itemId, itemTitle) {
         return;
     }
 
-    const response = await fetch(`${apiBase}/items/${encodeURIComponent(cookieId)}/${encodeURIComponent(itemId)}`, {
+    const response = await fetch(`${apiBase}/items/${encodeURIComponent(accountId)}/${encodeURIComponent(itemId)}`, {
         method: 'DELETE',
         headers: {
         'Authorization': `Bearer ${authToken}`
@@ -10623,7 +10643,7 @@ async function batchDeleteItems() {
     const itemsToDelete = Array.from(checkboxes).map(checkbox => {
         const row = checkbox.closest('tr');
         return {
-        cookie_id: checkbox.dataset.cookieId,
+        account_id: checkbox.dataset.accountId,
         item_id: checkbox.dataset.itemId
         };
     });
@@ -10767,8 +10787,8 @@ function escapeHtml(text) {
 async function loadItemsReplay() {
     try {
     // 先加载Cookie列表用于筛选
-    await loadCookieFilter('itemReplayCookieFilter');
-    await loadCookieFilterPlus('editReplyCookieIdSelect');
+    await loadCookieFilter('itemReplayAccountFilter');
+    await loadCookieFilterPlus('editReplyAccountIdSelect');
     // 加载商品列表
     await refreshItemsReplayData();
     } catch (error) {
@@ -10780,9 +10800,9 @@ async function loadItemsReplay() {
 // 只刷新商品回复数据，不重新加载筛选器
 async function refreshItemsReplayData() {
     try {
-    const selectedCookie = document.getElementById('itemReplayCookieFilter').value;
+    const selectedCookie = document.getElementById('itemReplayAccountFilter').value;
     if (selectedCookie) {
-        await loadItemsReplayByCookie();
+        await loadItemsReplayByAccount();
     } else {
         await loadAllItemReplays();
     }
@@ -10795,7 +10815,7 @@ async function refreshItemsReplayData() {
 // 加载Cookie筛选选项添加弹框中使用
 async function loadCookieFilterPlus(id) {
     try {
-    const response = await fetch(`${apiBase}/cookies/details`, {
+    const response = await fetch(`${apiBase}/accounts/details`, {
         headers: {
         'Authorization': `Bearer ${authToken}`
         }
@@ -10833,8 +10853,8 @@ async function loadCookieFilterPlus(id) {
         // 添加启用的账号
         enabledAccounts.forEach(account => {
         const option = document.createElement('option');
-        option.value = account.id;
-        option.textContent = `🟢 ${account.id}`;
+        option.value = getCookieDetailsAccountId(account);
+        option.textContent = `🟢 ${getCookieDetailsAccountId(account)}`;
         select.appendChild(option);
         });
 
@@ -10851,8 +10871,8 @@ async function loadCookieFilterPlus(id) {
 
         disabledAccounts.forEach(account => {
             const option = document.createElement('option');
-            option.value = account.id;
-            option.textContent = `🔴 ${account.id} (已禁用)`;
+            option.value = getCookieDetailsAccountId(account);
+            option.textContent = `🔴 ${getCookieDetailsAccountId(account)} (已禁用)`;
             select.appendChild(option);
         });
         }
@@ -10896,15 +10916,15 @@ async function loadAllItemReplays() {
 }
 
 // 按Cookie加载商品回复
-async function loadItemsReplayByCookie() {
-    const cookieId = document.getElementById('itemReplayCookieFilter').value;
-    if (!cookieId) {
+async function loadItemsReplayByAccount() {
+    const accountId = document.getElementById('itemReplayAccountFilter').value;
+    if (!accountId) {
     await loadAllItemReplays();
     return;
     }
 
     try {
-    const response = await fetch(`${apiBase}/itemReplays/cookie/${encodeURIComponent(cookieId)}`, {
+    const response = await fetch(`${apiBase}/itemReplays/account/${encodeURIComponent(accountId)}`, {
         headers: {
         'Authorization': `Bearer ${authToken}`
         }
@@ -10939,6 +10959,7 @@ function displayItemReplays(items) {
     }
 
     const itemsHtml = items.map(item => {
+    const itemAccountId = String(item.account_id || '').trim();
     // 处理商品标题显示
     let itemTitleDisplay = item.item_title || '未设置';
     if (itemTitleDisplay.length > 30) {
@@ -10967,11 +10988,11 @@ function displayItemReplays(items) {
         <tr>
          <td>
             <input type="checkbox" name="itemReplyCheckbox"
-                    data-cookie-id="${escapeHtml(item.cookie_id)}"
+                    data-account-id="${escapeHtml(itemAccountId)}"
                     data-item-id="${escapeHtml(item.item_id)}"
                     onchange="updateItemReplySelectAllState()">
         </td>
-        <td>${escapeHtml(item.cookie_id)}</td>
+        <td>${escapeHtml(itemAccountId)}</td>
         <td>${escapeHtml(item.item_id)}</td>
         <td title="${escapeHtml(item.item_title || '未设置')}">${escapeHtml(itemTitleDisplay)}</td>
         <td title="${escapeHtml(item.item_detail || '未设置')}">${escapeHtml(itemDetailDisplay)}</td>
@@ -10979,10 +11000,10 @@ function displayItemReplays(items) {
         <td>${formatDateTime(item.updated_at)}</td>
         <td>
             <div class="btn-group" role="group">
-            <button class="btn btn-sm btn-outline-primary" onclick="editItemReply('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}')" title="编辑详情">
+            <button class="btn btn-sm btn-outline-primary" onclick="editItemReply('${escapeHtml(itemAccountId)}', '${escapeHtml(item.item_id)}')" title="编辑详情">
                 <i class="bi bi-pencil"></i>
             </button>
-            <button class="btn btn-sm btn-outline-danger" onclick="deleteItemReply('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}', '${escapeHtml(item.item_title || item.item_id)}')" title="删除">
+            <button class="btn btn-sm btn-outline-danger" onclick="deleteItemReply('${escapeHtml(itemAccountId)}', '${escapeHtml(item.item_id)}', '${escapeHtml(item.item_title || item.item_id)}')" title="删除">
                 <i class="bi bi-trash"></i>
             </button>
             </div>
@@ -11007,7 +11028,7 @@ function displayItemReplays(items) {
 async function showItemReplayEdit(){
     // 显示模态框
     const modal = new bootstrap.Modal(document.getElementById('editItemReplyModal'));
-    document.getElementById('editReplyCookieIdSelect').value = '';
+    document.getElementById('editReplyAccountIdSelect').value = '';
     document.getElementById('editReplyItemIdSelect').value = '';
     document.getElementById('editReplyItemIdSelect').disabled = true
     document.getElementById('editItemReplyContent').value = '';
@@ -11016,19 +11037,19 @@ async function showItemReplayEdit(){
 }
 
 // 当账号变化时加载对应商品
-async function onCookieChangeForReply() {
-  const cookieId = document.getElementById('editReplyCookieIdSelect').value;
+async function onAccountChangeForReply() {
+  const accountId = document.getElementById('editReplyAccountIdSelect').value;
   const itemSelect = document.getElementById('editReplyItemIdSelect');
 
   itemSelect.innerHTML = '<option value="">选择商品</option>';
-  if (!cookieId) {
+  if (!accountId) {
     itemSelect.disabled = true;  // 禁用选择框
     return;
   } else {
     itemSelect.disabled = false; // 启用选择框
   }
 
-  const response = await fetch(`${apiBase}/items/cookie/${encodeURIComponent(cookieId)}`, {
+  const response = await fetch(`${apiBase}/items/account/${encodeURIComponent(accountId)}`, {
         headers: {
         'Authorization': `Bearer ${authToken}`
         }
@@ -11052,9 +11073,9 @@ async function onCookieChangeForReply() {
 }
 
 // 编辑商品回复
-async function editItemReply(cookieId, itemId) {
+async function editItemReply(accountId, itemId) {
   try {
-    const response = await fetch(`${apiBase}/item-reply/${encodeURIComponent(cookieId)}/${encodeURIComponent(itemId)}`, {
+    const response = await fetch(`${apiBase}/item-reply/${encodeURIComponent(accountId)}/${encodeURIComponent(itemId)}`, {
       headers: {
         'Authorization': `Bearer ${authToken}`
       }
@@ -11063,14 +11084,14 @@ async function editItemReply(cookieId, itemId) {
       const data = await response.json();
       document.getElementById('itemReplayTitle').textContent = '编辑商品回复';
       // 填充表单
-      document.getElementById('editReplyCookieIdSelect').value = data.cookie_id;
-      let res = await onCookieChangeForReply()
+      document.getElementById('editReplyAccountIdSelect').value = data.account_id;
+      let res = await onAccountChangeForReply()
       document.getElementById('editReplyItemIdSelect').value = data.item_id;
       document.getElementById('editItemReplyContent').value = data.reply_content || '';
 
     } else if (response.status === 404) {
       // 如果没有记录，则填充空白内容（用于添加）
-//      document.getElementById('editReplyCookieIdSelect').value = data.cookie_id;
+//      document.getElementById('editReplyAccountIdSelect').value = data.account_id;
 //      document.getElementById('editReplyItemIdSelect').value = data.item_id;
 //      document.getElementById('editItemReplyContent').value = data.reply_content || '';
     } else {
@@ -11089,14 +11110,14 @@ async function editItemReply(cookieId, itemId) {
 
 // 保存商品回复
 async function saveItemReply() {
-  const cookieId = document.getElementById('editReplyCookieIdSelect').value;
+  const accountId = document.getElementById('editReplyAccountIdSelect').value;
   const itemId = document.getElementById('editReplyItemIdSelect').value;
   const replyContent = document.getElementById('editItemReplyContent').value.trim();
 
-  console.log(cookieId)
+  console.log(accountId)
   console.log(itemId)
   console.log(replyContent)
-  if (!cookieId) {
+  if (!accountId) {
     showToast('请选择账号', 'warning');
     return;
   }
@@ -11112,7 +11133,7 @@ async function saveItemReply() {
   }
 
   try {
-    const response = await fetch(`${apiBase}/item-reply/${encodeURIComponent(cookieId)}/${encodeURIComponent(itemId)}`, {
+    const response = await fetch(`${apiBase}/item-reply/${encodeURIComponent(accountId)}/${encodeURIComponent(itemId)}`, {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
@@ -11143,12 +11164,12 @@ async function saveItemReply() {
 }
 
 // 删除商品回复
-async function deleteItemReply(cookieId, itemId, itemTitle) {
+async function deleteItemReply(accountId, itemId, itemTitle) {
   try {
     const confirmed = confirm(`确定要删除该商品的自动回复吗？\n\n商品ID: ${itemId}\n商品标题: ${itemTitle || '未设置'}\n\n此操作不可撤销！`);
     if (!confirmed) return;
 
-    const response = await fetch(`${apiBase}/item-reply/${encodeURIComponent(cookieId)}/${encodeURIComponent(itemId)}`, {
+    const response = await fetch(`${apiBase}/item-reply/${encodeURIComponent(accountId)}/${encodeURIComponent(itemId)}`, {
       method: 'DELETE',
       headers: {
         'Authorization': `Bearer ${authToken}`
@@ -11157,7 +11178,7 @@ async function deleteItemReply(cookieId, itemId, itemTitle) {
 
     if (response.ok) {
       showToast('商品回复删除成功', 'success');
-      await loadItemsReplayByCookie?.(); // 如果你有刷新商品列表的函数
+      await loadItemsReplayByAccount?.(); // 如果你有刷新商品列表的函数
     } else {
       const error = await response.text();
       showToast(`删除失败: ${error}`, 'danger');
@@ -11181,7 +11202,7 @@ async function batchDeleteItemReplies() {
     if (!confirmed) return;
 
     const itemsToDelete = Array.from(checkboxes).map(checkbox => ({
-      cookie_id: checkbox.dataset.cookieId,
+      account_id: checkbox.dataset.accountId,
       item_id: checkbox.dataset.itemId
     }));
 
@@ -11197,7 +11218,7 @@ async function batchDeleteItemReplies() {
     if (response.ok) {
       const result = await response.json();
       showToast(`批量删除回复完成: 成功 ${result.success_count} 个，失败 ${result.failed_count} 个`, 'success');
-      await loadItemsReplayByCookie?.();
+      await loadItemsReplayByAccount?.();
     } else {
       const error = await response.text();
       showToast(`批量删除失败: ${error}`, 'danger');
@@ -11503,13 +11524,13 @@ async function showLogStats() {
 
 // 导出关键词
 async function exportKeywords() {
-    if (!currentCookieId) {
+    if (!currentAccountId) {
     showToast('请先选择账号', 'warning');
     return;
     }
 
     try {
-    const response = await fetch(`${apiBase}/keywords-export/${currentCookieId}`, {
+    const response = await fetch(`${apiBase}/keywords-export/${currentAccountId}`, {
         headers: {
         'Authorization': `Bearer ${authToken}`
         }
@@ -11523,14 +11544,14 @@ async function exportKeywords() {
         a.href = url;
 
         // 根据当前账号是否有数据来设置文件名和提示
-        const currentKeywords = keywordsData[currentCookieId] || [];
+        const currentKeywords = keywordsData[currentAccountId] || [];
         const hasData = currentKeywords.length > 0;
 
         if (hasData) {
-        a.download = `keywords_${currentCookieId}_${new Date().getTime()}.xlsx`;
+        a.download = `keywords_${currentAccountId}_${new Date().getTime()}.xlsx`;
         showToast('关键词导出成功！', 'success');
         } else {
-        a.download = `keywords_template_${currentCookieId}_${new Date().getTime()}.xlsx`;
+        a.download = `keywords_template_${currentAccountId}_${new Date().getTime()}.xlsx`;
         showToast('导入模板导出成功！模板中包含示例数据供参考', 'success');
         }
 
@@ -11550,7 +11571,7 @@ async function exportKeywords() {
 
 // 显示导入模态框
 function showImportModal() {
-    if (!currentCookieId) {
+    if (!currentAccountId) {
     showToast('请先选择账号', 'warning');
     return;
     }
@@ -11561,7 +11582,7 @@ function showImportModal() {
 
 // 导入关键词
 async function importKeywords() {
-    if (!currentCookieId) {
+    if (!currentAccountId) {
     showToast('请先选择账号', 'warning');
     return;
     }
@@ -11584,7 +11605,7 @@ async function importKeywords() {
     const formData = new FormData();
     formData.append('file', file);
 
-    const response = await fetch(`${apiBase}/keywords-import/${currentCookieId}`, {
+    const response = await fetch(`${apiBase}/keywords-import/${currentAccountId}`, {
         method: 'POST',
         headers: {
         'Authorization': `Bearer ${authToken}`
@@ -11610,7 +11631,7 @@ async function importKeywords() {
         fileInput.value = '';
 
         // 重新加载关键词列表
-        loadAccountKeywords(currentCookieId);
+        loadAccountKeywords(currentAccountId);
 
         showToast(`导入成功！新增: ${result.added}, 更新: ${result.updated}`, 'success');
         }, 500);
@@ -11664,7 +11685,8 @@ let manualCookieImportPollingState = {
 async function handleManualCookieImport(event) {
     event.preventDefault();
 
-    const accountId = document.getElementById('cookieId').value.trim();
+    const selectedAccountId = document.getElementById('accountId').value.trim();
+    const accountId = selectedAccountId;
     const cookieValue = document.getElementById('cookieValue').value.trim();
     const showBrowserCheckbox = document.getElementById('manualCookieShowBrowser');
     const showBrowser = showBrowserCheckbox ? showBrowserCheckbox.checked : false;
@@ -11687,7 +11709,7 @@ async function handleManualCookieImport(event) {
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-                account_id: accountId,
+                account_id: selectedAccountId,
                 cookie: cookieValue,
                 show_browser: showBrowser
             })
@@ -11908,7 +11930,7 @@ async function loadRefreshCookieAccountList() {
     select.innerHTML = '<option value="">请选择账号...</option>';
 
     try {
-        const response = await fetch(`${apiBase}/cookies/details`, {
+        const response = await fetch(`${apiBase}/accounts/details`, {
             headers: {
                 'Authorization': `Bearer ${authToken}`
             }
@@ -11916,14 +11938,14 @@ async function loadRefreshCookieAccountList() {
         const data = await response.json();
 
         if (data && data.length > 0) {
-            data.forEach(cookie => {
+            data.forEach(account => {
                 const option = document.createElement('option');
-                option.value = cookie.id;
+                option.value = account.account_id;
                 // 显示账号ID和是否配置了用户名密码
-                const hasCredentials = cookie.username && cookie.has_password ? '(已配置账密)' : '(未配置账密)';
-                option.textContent = `${cookie.id} ${hasCredentials}`;
-                option.dataset.hasCredentials = cookie.username && cookie.has_password ? 'true' : 'false';
-                option.dataset.username = cookie.username || '';
+                const hasCredentials = account.username && account.has_password ? '(已配置账密)' : '(未配置账密)';
+                option.textContent = `${account.account_id} ${hasCredentials}`;
+                option.dataset.hasCredentials = account.username && account.has_password ? 'true' : 'false';
+                option.dataset.username = account.username || '';
                 select.appendChild(option);
             });
         }
@@ -11968,11 +11990,11 @@ async function handleRefreshCookie(event) {
     event.preventDefault();
 
     const select = document.getElementById('refreshCookieAccountSelect');
-    const cookieId = select.value;
+    const accountId = select.value;
     const selectedOption = select.options[select.selectedIndex];
     const showBrowser = document.getElementById('refreshCookieShowBrowser').checked;
 
-    if (!cookieId) {
+    if (!accountId) {
         showToast('请选择要刷新的账号', 'warning');
         return;
     }
@@ -11995,7 +12017,7 @@ async function handleRefreshCookie(event) {
                 'Authorization': `Bearer ${authToken}`
             },
             body: JSON.stringify({
-                account_id: cookieId,
+                account_id: accountId,
                 refresh_mode: true,  // 标记为刷新模式
                 show_browser: showBrowser
             })
@@ -12006,7 +12028,7 @@ async function handleRefreshCookie(event) {
         if (data.session_id) {
             // 开始轮询检查登录状态
             showToast('正在验证账号并刷新Cookie，请稍候...', 'info');
-            startRefreshCookiePolling(data.session_id, cookieId);
+            startRefreshCookiePolling(data.session_id, accountId);
         } else {
             toggleLoading(false);
             showToast(data.message || '启动刷新失败', 'danger');
@@ -12030,7 +12052,7 @@ function updateRefreshCookieStatus(message) {
 let refreshCookieCheckInterval = null;
 let refreshCookiePollingState = {
     sessionId: null,
-    cookieId: null,
+    accountId: null,
     inFlight: false,
     completed: false
 };
@@ -12048,13 +12070,13 @@ function stopRefreshCookiePolling(sessionId = refreshCookiePollingState.sessionI
     refreshCookiePollingState.completed = true;
 }
 
-function startRefreshCookiePolling(sessionId, cookieId) {
+function startRefreshCookiePolling(sessionId, accountId) {
     // 清除之前的轮询
     stopRefreshCookiePolling();
 
     refreshCookiePollingState = {
         sessionId,
-        cookieId,
+        accountId,
         inFlight: false,
         completed: false
     };
@@ -12118,7 +12140,7 @@ function startRefreshCookiePolling(sessionId, cookieId) {
                     }
                     closePasswordLoginQRModal();
                     toggleLoading(false);
-                    showToast(`账号 ${cookieId} Cookie刷新成功！`, 'success');
+                    showToast(`账号 ${accountId} Cookie刷新成功！`, 'success');
                     // 隐藏表单
                     document.getElementById('refreshCookieForm').style.display = 'none';
                     // 刷新账号列表
@@ -12742,18 +12764,30 @@ async function refreshQRCode() {
     await generateQRCode();
 }
 
+function getQRCodeLoginAccountId() {
+    const input = document.getElementById('qrLoginAccountId');
+    return String(input?.value || '').trim();
+}
+
 // 生成二维码
 async function generateQRCode() {
     try {
     resetQRCodeVerificationState();
     showQRCodeLoading();
 
+    const accountId = getQRCodeLoginAccountId();
+    if (!accountId) {
+        showQRCodeError('请先输入账号ID后再生成二维码');
+        return;
+    }
+
     const response = await fetch(`${apiBase}/qr-login/generate`, {
         method: 'POST',
         headers: {
         'Authorization': `Bearer ${authToken}`,
         'Content-Type': 'application/json'
-        }
+        },
+        body: JSON.stringify({ account_id: accountId })
     });
 
     if (response.ok) {
@@ -13107,7 +13141,7 @@ function refreshQRCode() {
 
 // 显示添加图片关键词模态框
 function showAddImageKeywordModal() {
-    if (!currentCookieId) {
+    if (!currentAccountId) {
         showToast('请先选择账号', 'warning');
         return;
     }
@@ -13133,7 +13167,7 @@ function showAddImageKeywordModal() {
 // 为图片关键词模态框加载商品列表
 async function loadItemsListForImageKeyword() {
     try {
-        const response = await fetch(`${apiBase}/items/${currentCookieId}`, {
+        const response = await fetch(`${apiBase}/items/${currentAccountId}`, {
             headers: {
                 'Authorization': `Bearer ${authToken}`
             }
@@ -13312,7 +13346,7 @@ async function addImageKeyword() {
         itemIds = [''];
     }
 
-    if (!currentCookieId) {
+    if (!currentAccountId) {
         showToast('请先选择账号', 'warning');
         return;
     }
@@ -13321,7 +13355,7 @@ async function addImageKeyword() {
         toggleLoading(true);
 
         // 检查重复关键词
-        const allKeywords = keywordsData[currentCookieId] || [];
+        const allKeywords = keywordsData[currentAccountId] || [];
         const duplicates = [];
         for (const keyword of keywords) {
             for (const itemId of itemIds) {
@@ -13373,7 +13407,7 @@ async function addImageKeyword() {
         }
 
         // 第二步：使用批量API添加所有关键词
-        const batchResponse = await fetch(`${apiBase}/keywords/${currentCookieId}/image-batch`, {
+        const batchResponse = await fetch(`${apiBase}/keywords/${currentAccountId}/image-batch`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -13467,7 +13501,7 @@ function editImageKeyword(index) {
 
 // 修改导出关键词函数，使用后端导出API
 async function exportKeywords() {
-    if (!currentCookieId) {
+    if (!currentAccountId) {
         showToast('请先选择账号', 'warning');
         return;
     }
@@ -13476,7 +13510,7 @@ async function exportKeywords() {
         toggleLoading(true);
 
         // 使用后端导出API
-        const response = await fetch(`${apiBase}/keywords-export/${currentCookieId}`, {
+        const response = await fetch(`${apiBase}/keywords-export/${currentAccountId}`, {
             headers: {
                 'Authorization': `Bearer ${authToken}`
             }
@@ -13488,7 +13522,7 @@ async function exportKeywords() {
 
             // 从响应头获取文件名
             const contentDisposition = response.headers.get('Content-Disposition');
-            let fileName = `关键词数据_${currentCookieId}_${new Date().toISOString().slice(0, 10)}.xlsx`;
+            let fileName = `关键词数据_${currentAccountId}_${new Date().toISOString().slice(0, 10)}.xlsx`;
 
             if (contentDisposition) {
                 const fileNameMatch = contentDisposition.match(/filename\*=UTF-8''(.+)/);
@@ -13527,9 +13561,9 @@ async function exportKeywords() {
 // ==================== 备注管理功能 ====================
 
 // 编辑备注
-function editRemark(cookieId, currentRemark) {
-    console.log('editRemark called:', cookieId, currentRemark); // 调试信息
-    const remarkCell = document.querySelector(`[data-cookie-id="${cookieId}"] .remark-display`);
+function editRemark(accountId, currentRemark) {
+    console.log('editRemark called:', accountId, currentRemark); // 调试信息
+    const remarkCell = document.querySelector(`[data-account-id="${accountId}"] .remark-display`);
     if (!remarkCell) {
         console.log('remarkCell not found'); // 调试信息
         return;
@@ -13579,7 +13613,7 @@ function editRemark(cookieId, currentRemark) {
         isProcessing = true;
 
         try {
-            const response = await fetch(`${apiBase}/cookies/${cookieId}/remark`, {
+            const response = await fetch(`${apiBase}/accounts/${accountId}/remark`, {
                 method: 'PUT',
                 headers: {
                     'Content-Type': 'application/json',
@@ -13591,7 +13625,7 @@ function editRemark(cookieId, currentRemark) {
             if (response.ok) {
                 // 更新显示
                 remarkCell.innerHTML = `
-                    <span class="remark-display" onclick="editRemark('${cookieId}', '${newRemark.replace(/'/g, '&#39;')}')" title="点击编辑备注" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;">
+                    <span class="remark-display" onclick="editRemark('${accountId}', '${newRemark.replace(/'/g, '&#39;')}')" title="点击编辑备注" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;">
                         ${newRemark || '<i class="bi bi-plus-circle text-muted"></i> 添加备注'}
                     </span>
                 `;
@@ -13640,9 +13674,9 @@ function editRemark(cookieId, currentRemark) {
 }
 
 // 编辑暂停时间
-function editPauseDuration(cookieId, currentDuration) {
-    console.log('editPauseDuration called:', cookieId, currentDuration); // 调试信息
-    const pauseCell = document.querySelector(`[data-cookie-id="${cookieId}"] .pause-duration-display`);
+function editPauseDuration(accountId, currentDuration) {
+    console.log('editPauseDuration called:', accountId, currentDuration); // 调试信息
+    const pauseCell = document.querySelector(`[data-account-id="${accountId}"] .pause-duration-display`);
     if (!pauseCell) {
         console.log('pauseCell not found'); // 调试信息
         return;
@@ -13702,7 +13736,7 @@ function editPauseDuration(cookieId, currentDuration) {
         isProcessing = true;
 
         try {
-            const response = await fetch(`${apiBase}/cookies/${cookieId}/pause-duration`, {
+            const response = await fetch(`${apiBase}/accounts/${accountId}/pause-duration`, {
                 method: 'PUT',
                 headers: {
                     'Content-Type': 'application/json',
@@ -13714,7 +13748,7 @@ function editPauseDuration(cookieId, currentDuration) {
             if (response.ok) {
                 // 更新显示
                 pauseCell.innerHTML = `
-                    <span class="pause-duration-display" onclick="editPauseDuration('${cookieId}', ${newDuration})" title="点击编辑暂停时间" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;">
+                    <span class="pause-duration-display" onclick="editPauseDuration('${accountId}', ${newDuration})" title="点击编辑暂停时间" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;">
                         <i class="bi bi-clock me-1"></i>${newDuration === 0 ? '不暂停' : newDuration + '分钟'}
                     </span>
                 `;
@@ -14347,7 +14381,8 @@ function handleOrdersStreamEvent(eventName, payloadText) {
 function applyRealtimeOrderUpdate(order) {
     if (!order || !order.order_id) return;
 
-    const existingIndex = allOrdersData.findIndex(item => item.order_id === order.order_id);
+    const normalizedAccountId = String(order.account_id || '').trim();
+    const existingIndex = allOrdersData.findIndex(item => item.order_id === order.order_id && String(item.account_id || '').trim() === normalizedAccountId);
     if (existingIndex === -1) {
         refreshOrdersData();
         return;
@@ -14478,14 +14513,14 @@ async function refreshOrdersData() {
 // 加载Cookie筛选选项
 async function loadOrderCookieFilter() {
     try {
-        const select = document.getElementById('orderCookieFilter');
+        const select = document.getElementById('orderAccountFilter');
         const previousValue = select ? select.value : '';
 
         const accounts = await fetchOrderSyncAccounts(true);
         if (select) {
             renderOrderAccountOptions(select, accounts, { includeAllOption: true });
 
-            if (previousValue && accounts.some(account => account.id === previousValue)) {
+            if (previousValue && accounts.some(account => getCookieDetailsAccountId(account) === previousValue)) {
                 select.value = previousValue;
             }
         }
@@ -14526,15 +14561,19 @@ async function loadAllOrders() {
 }
 
 // 根据Cookie加载订单
-async function loadOrdersByCookie() {
+async function loadOrdersByAccount() {
     filterOrders(false);
+}
+
+async function loadOrdersByCookie() {
+    await loadOrdersByAccount();
 }
 
 // 筛选订单
 function filterOrders(resetPage = true) {
     const searchKeyword = document.getElementById('orderSearchInput')?.value.toLowerCase() || '';
     const statusFilter = document.getElementById('orderStatusFilter')?.value || '';
-    const cookieFilter = document.getElementById('orderCookieFilter')?.value || '';
+    const accountFilter = document.getElementById('orderAccountFilter')?.value || '';
     const normalizedStatusFilter = statusFilter ? normalizeOrderStatus(statusFilter) : '';
 
     filteredOrdersData = allOrdersData.filter(order => {
@@ -14545,10 +14584,10 @@ function filterOrders(resetPage = true) {
             (order.buyer_id && order.buyer_id.toLowerCase().includes(searchKeyword)) ||
             (order.buyer_nick && order.buyer_nick.toLowerCase().includes(searchKeyword));
 
-        const matchesCookie = !cookieFilter || order.cookie_id === cookieFilter;
+        const matchesAccount = !accountFilter || order.account_id === accountFilter;
         const matchesStatus = !normalizedStatusFilter || normalizeOrderStatus(order.order_status) === normalizedStatusFilter;
 
-        return matchesSearch && matchesCookie && matchesStatus;
+        return matchesSearch && matchesAccount && matchesStatus;
     });
 
     currentOrderSearchKeyword = searchKeyword;
@@ -14609,7 +14648,7 @@ function createOrderRow(order) {
     const itemId = escapeHtml(order.item_id || '-');
     const buyerId = escapeHtml(order.buyer_id || '-');
     const buyerNick = escapeHtml(order.buyer_nick || '-');
-    const cookieId = escapeHtml(order.cookie_id || '-');
+    const accountId = escapeHtml(order.account_id || '-');
     const specName = escapeHtml(order.spec_name || '');
     const specValue = escapeHtml(order.spec_value || '');
     const specName2 = escapeHtml(order.spec_name_2 || '');
@@ -14631,7 +14670,7 @@ function createOrderRow(order) {
     return `
         <tr>
             <td>
-                <input type="checkbox" class="order-checkbox" value="${orderId}">
+                <input type="checkbox" class="order-checkbox" value="${orderId}" data-account-id="${accountId}">
             </td>
             <td>
                 <span class="text-truncate d-inline-block" style="max-width: 120px;" title="${orderId}">
@@ -14664,22 +14703,22 @@ function createOrderRow(order) {
                 <span class="badge ${statusClass}">${escapeHtml(statusText)}</span>
             </td>
             <td>
-                <span class="text-truncate d-inline-block" style="max-width: 80px;" title="${cookieId === '-' ? '' : cookieId}">
-                    ${cookieId}
+                <span class="text-truncate d-inline-block" style="max-width: 80px;" title="${accountId === '-' ? '' : accountId}">
+                    ${accountId}
                 </span>
             </td>
             <td>
                 <div class="btn-group btn-group-sm" role="group">
-                    <button class="btn btn-outline-success btn-sm order-action-btn" data-order-action="deliver" data-order-id="${orderId}" title="手动发货" ${canDeliver ? '' : 'disabled'}>
+                    <button class="btn btn-outline-success btn-sm order-action-btn" data-order-action="deliver" data-order-id="${orderId}" data-account-id="${accountId}" title="手动发货" ${canDeliver ? '' : 'disabled'}>
                         <i class="bi bi-truck"></i>
                     </button>
-                    <button class="btn btn-outline-info btn-sm order-action-btn" data-order-action="refresh" data-order-id="${orderId}" title="刷新状态">
+                    <button class="btn btn-outline-info btn-sm order-action-btn" data-order-action="refresh" data-order-id="${orderId}" data-account-id="${accountId}" title="刷新状态">
                         <i class="bi bi-arrow-repeat"></i>
                     </button>
-                    <button class="btn btn-outline-primary btn-sm order-action-btn" data-order-action="detail" data-order-id="${orderId}" title="查看详情">
+                    <button class="btn btn-outline-primary btn-sm order-action-btn" data-order-action="detail" data-order-id="${orderId}" data-account-id="${accountId}" title="查看详情">
                         <i class="bi bi-eye"></i>
                     </button>
-                    <button class="btn btn-outline-danger btn-sm order-action-btn" data-order-action="delete" data-order-id="${orderId}" title="删除">
+                    <button class="btn btn-outline-danger btn-sm order-action-btn" data-order-action="delete" data-order-id="${orderId}" data-account-id="${accountId}" title="删除">
                         <i class="bi bi-trash"></i>
                     </button>
                 </div>
@@ -14863,7 +14902,7 @@ async function fetchOrderSyncAccounts(forceRefresh = false) {
         return orderHistorySyncAccounts;
     }
 
-    const response = await fetch(`${apiBase}/cookies/details`, {
+    const response = await fetch(`${apiBase}/accounts/details`, {
         headers: {
             'Authorization': `Bearer ${authToken}`
         }
@@ -14879,7 +14918,7 @@ async function fetchOrderSyncAccounts(forceRefresh = false) {
 }
 
 function formatOrderAccountLabel(account) {
-    const accountId = String(account?.id || '').trim();
+    const accountId = getCookieDetailsAccountId(account);
     const remark = String(account?.remark || '').trim();
     if (remark) {
         return `${remark} (${accountId})`;
@@ -14899,7 +14938,7 @@ function renderOrderAccountOptions(select, accounts, options = {}) {
     select.innerHTML = includeAllOption ? `<option value="">${allOptionLabel}</option>` : '';
 
     (accounts || []).forEach(account => {
-        const accountId = String(account?.id || '').trim();
+        const accountId = getCookieDetailsAccountId(account);
         if (!accountId) return;
 
         const option = document.createElement('option');
@@ -14932,7 +14971,7 @@ function resetOrderHistorySyncProgress() {
 
 function setOrderHistorySyncFormDisabled(disabled) {
     [
-        'orderHistorySyncCookieId',
+        'orderHistorySyncAccountId',
         'orderHistorySyncStartDate',
         'orderHistorySyncEndDate',
         'orderHistorySyncMaxOrders',
@@ -15012,14 +15051,14 @@ function renderOrderHistorySyncJob(job) {
     const currentText = document.getElementById('orderHistorySyncCurrentText');
     const warningsWrap = document.getElementById('orderHistorySyncWarningsWrap');
     const warningsContainer = document.getElementById('orderHistorySyncWarnings');
-    const cookieSelect = document.getElementById('orderHistorySyncCookieId');
+    const cookieSelect = document.getElementById('orderHistorySyncAccountId');
     const startDateInput = document.getElementById('orderHistorySyncStartDate');
     const endDateInput = document.getElementById('orderHistorySyncEndDate');
     const maxOrdersInput = document.getElementById('orderHistorySyncMaxOrders');
     const fetchDetailsInput = document.getElementById('orderHistorySyncFetchDetails');
 
-    if (cookieSelect && Object.prototype.hasOwnProperty.call(request, 'cookie_id')) {
-        cookieSelect.value = request.cookie_id || '';
+    if (cookieSelect && Object.prototype.hasOwnProperty.call(request, 'account_id')) {
+        cookieSelect.value = request.account_id || '';
     }
     if (startDateInput && request.start_date) {
         startDateInput.value = request.start_date;
@@ -15076,7 +15115,7 @@ function renderOrderHistorySyncJob(job) {
     }
 
     const requestParts = [
-        request.cookie_id ? `账号 ${request.cookie_id}` : '全部账号',
+        request.account_id ? `账号 ${request.account_id}` : '全部账号',
         request.max_orders ? `最多同步 ${request.max_orders} 单` : '',
         request.fetch_details === false ? '仅基础信息' : '含订单详情',
         request.start_date && request.end_date ? `时间范围 ${request.start_date} 至 ${request.end_date}` : '',
@@ -15132,10 +15171,10 @@ async function openOrderHistorySyncModal() {
         orderHistorySyncModalInstance = bootstrap.Modal.getOrCreateInstance(modalElement);
 
         const accounts = await fetchOrderSyncAccounts(true);
-        const select = document.getElementById('orderHistorySyncCookieId');
+        const select = document.getElementById('orderHistorySyncAccountId');
         renderOrderAccountOptions(select, accounts, { includeAllOption: true });
 
-        const pageFilterValue = document.getElementById('orderCookieFilter')?.value || '';
+        const pageFilterValue = document.getElementById('orderAccountFilter')?.value || '';
         const startDateInput = document.getElementById('orderHistorySyncStartDate');
         const endDateInput = document.getElementById('orderHistorySyncEndDate');
         const maxOrdersInput = document.getElementById('orderHistorySyncMaxOrders');
@@ -15181,7 +15220,7 @@ async function openOrderHistorySyncModal() {
 
 async function startOrderHistorySync() {
     try {
-        const cookieId = document.getElementById('orderHistorySyncCookieId')?.value || '';
+        const accountId = document.getElementById('orderHistorySyncAccountId')?.value || '';
         const startDate = document.getElementById('orderHistorySyncStartDate')?.value || '';
         const endDate = document.getElementById('orderHistorySyncEndDate')?.value || '';
         const maxOrders = parseInt(document.getElementById('orderHistorySyncMaxOrders')?.value || '120', 10);
@@ -15213,7 +15252,7 @@ async function startOrderHistorySync() {
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-                cookie_id: cookieId || null,
+                account_id: accountId || null,
                 start_date: startDate,
                 end_date: endDate,
                 max_orders: maxOrders,
@@ -15332,20 +15371,22 @@ async function cancelOrderHistorySync() {
 function clearOrderFilters() {
     const searchInput = document.getElementById('orderSearchInput');
     const statusFilter = document.getElementById('orderStatusFilter');
-    const cookieFilter = document.getElementById('orderCookieFilter');
+    const accountFilter = document.getElementById('orderAccountFilter');
 
     if (searchInput) searchInput.value = '';
     if (statusFilter) statusFilter.value = '';
-    if (cookieFilter) cookieFilter.value = '';
+    if (accountFilter) accountFilter.value = '';
 
     filterOrders();
     showToast('筛选条件已清空', 'info');
 }
 
 // 显示订单详情
-async function showOrderDetail(orderId) {
+async function showOrderDetail(orderId, accountId = '') {
     try {
-        const order = allOrdersData.find(o => o.order_id === orderId);
+        const normalizedAccountId = String(accountId || '').trim();
+        const order = allOrdersData.find(o => o.order_id === orderId && String(o.account_id || '').trim() === normalizedAccountId)
+            || (!normalizedAccountId ? allOrdersData.find(o => o.order_id === orderId) : null);
         if (!order) {
             showToast('订单不存在', 'warning');
             return;
@@ -15356,7 +15397,7 @@ async function showOrderDetail(orderId) {
         const safeItemId = escapeHtml(order.item_id || '未知');
         const safeBuyerId = escapeHtml(order.buyer_id || '未知');
         const safeBuyerNick = escapeHtml(order.buyer_nick || '未知');
-        const safeCookieId = escapeHtml(order.cookie_id || '未知');
+        const safeAccountId = escapeHtml(order.account_id || '未知');
         const safeSpecName = escapeHtml(order.spec_name || '无');
         const safeSpecValue = escapeHtml(order.spec_value || '无');
         const safeSpecName2 = escapeHtml(order.spec_name_2 || '无');
@@ -15390,7 +15431,7 @@ async function showOrderDetail(orderId) {
                                         <tr><td>商品ID</td><td>${safeItemId}</td></tr>
                                         <tr><td>买家ID</td><td>${safeBuyerId}</td></tr>
                                         <tr><td>买家昵称</td><td>${safeBuyerNick}</td></tr>
-                                        <tr><td>Cookie账号</td><td>${safeCookieId}</td></tr>
+                                        <tr><td>账号ID</td><td>${safeAccountId}</td></tr>
                                         <tr><td>订单状态</td><td><span class="badge ${getOrderStatusClass(order.order_status)}">${safeStatusText}</span></td></tr>
                                     </table>
                                 </div>
@@ -15455,7 +15496,7 @@ async function showOrderDetail(orderId) {
 
         // 异步加载商品详情
         if (order.item_id) {
-            loadItemDetailForOrder(order.item_id, order.cookie_id);
+            loadItemDetailForOrder(order.item_id, normalizedAccountId || String(order.account_id || '').trim());
         }
 
     } catch (error) {
@@ -15465,12 +15506,15 @@ async function showOrderDetail(orderId) {
 }
 
 // 为订单加载商品详情
-async function loadItemDetailForOrder(itemId, cookieId) {
+async function loadItemDetailForOrder(itemId, accountId) {
     try {
         const token = localStorage.getItem('auth_token');
+        const normalizedAccountId = String(accountId || '').trim();
+        const params = new URLSearchParams();
+        params.set('account_id', normalizedAccountId);
 
         // 尝试从数据库获取商品信息
-        let response = await fetch(`${apiBase}/items/${cookieId}/${itemId}`, {
+        let response = await fetch(`${apiBase}/items/${normalizedAccountId}/${itemId}?${params.toString()}`, {
             headers: {
                 'Authorization': `Bearer ${token}`
             }
@@ -15571,7 +15615,11 @@ async function batchDeleteOrders() {
         return;
     }
 
-    const orderIds = Array.from(checkboxes).map(cb => cb.value);
+    const selectedOrders = Array.from(checkboxes).map(cb => ({
+        orderId: cb.value,
+        accountId: cb.dataset.accountId
+    }));
+    const orderIds = selectedOrders.map(({ orderId }) => orderId);
     const confirmed = confirm(`确定要删除选中的 ${orderIds.length} 个订单吗？\n\n此操作不可撤销！`);
 
     if (!confirmed) return;
@@ -15786,6 +15834,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
             const orderId = actionButton.dataset.orderId;
             const action = actionButton.dataset.orderAction;
+            const accountId = actionButton.dataset.accountId;
             if (!orderId || !action) return;
 
             if (action === 'deliver') {
@@ -15793,7 +15842,7 @@ document.addEventListener('DOMContentLoaded', function() {
             } else if (action === 'refresh') {
                 refreshOrderStatus(orderId);
             } else if (action === 'detail') {
-                showOrderDetail(orderId);
+                showOrderDetail(orderId, accountId);
             } else if (action === 'delete') {
                 deleteOrder(orderId);
             }
@@ -15843,49 +15892,26 @@ async function loadUserManagement() {
 async function loadUserSystemStats() {
     try {
         const token = localStorage.getItem('auth_token');
-
-        // 获取用户统计
-        const usersResponse = await fetch('/admin/users', {
+        const statsResponse = await fetch('/admin/stats', {
             headers: {
                 'Authorization': `Bearer ${token}`
             }
         });
 
-        if (usersResponse.ok) {
-            const usersData = await usersResponse.json();
-            document.getElementById('totalUsers').textContent = usersData.users.length;
+        if (!statsResponse.ok) {
+            throw new Error(`load admin stats failed: ${statsResponse.status}`);
         }
 
-        // 获取Cookie统计
-        const cookiesResponse = await fetch(`${apiBase}/admin/data/cookies`, {
-            headers: {
-                'Authorization': `Bearer ${token}`
-            }
-        });
-
-        if (cookiesResponse.ok) {
-            const cookiesData = await cookiesResponse.json();
-            document.getElementById('totalUserCookies').textContent = cookiesData.data ? cookiesData.data.length : 0;
-        }
-
-        // 获取卡券统计
-        const cardsResponse = await fetch(`${apiBase}/admin/data/cards`, {
-            headers: {
-                'Authorization': `Bearer ${token}`
-            }
-        });
-
-        if (cardsResponse.ok) {
-            const cardsData = await cardsResponse.json();
-            document.getElementById('totalUserCards').textContent = cardsData.data ? cardsData.data.length : 0;
-        }
+        const statsData = await statsResponse.json();
+        document.getElementById('totalUsers').textContent = statsData.users.total;
+        document.getElementById('totalUserCookies').textContent = statsData.cookies.total;
+        document.getElementById('totalUserCards').textContent = statsData.cards.total;
 
     } catch (error) {
-        console.error('加载系统统计失败:', error);
+        console.error('????????:', error);
     }
 }
 
-// 加载用户列表
 async function loadUsers() {
     const loadingDiv = document.getElementById('loadingUsers');
     const usersListDiv = document.getElementById('usersList');
@@ -16422,7 +16448,7 @@ function deleteRecord(record, index) {
     initDeleteRecordModal();
 
     // 尝试多种方式获取记录ID
-    currentDeleteId = record.id || record.user_id || record.cookie_id || record.keyword_id ||
+    currentDeleteId = record.account_id || record.id || record.user_id || record.keyword_id ||
                      record.card_id || record.item_id || record.order_id || index;
 
     console.log('设置currentDeleteId为:', currentDeleteId);
@@ -16866,8 +16892,8 @@ function onRiskSliderRangeChange(rangeValue = 'all') {
     document.querySelectorAll('#riskSliderRangeFilter .risk-slider-range-btn').forEach((button) => {
         button.classList.toggle('is-active', button.dataset.range === rangeValue);
     });
-    const cookieId = document.getElementById('riskLogCookieFilter')?.value || '';
-    loadRiskControlSliderStats(cookieId);
+    const accountId = document.getElementById('riskLogAccountFilter')?.value || '';
+    loadRiskControlSliderStats(accountId);
 }
 
 function setRiskControlSliderStatsLoading(scopeLabel = '全部账号') {
@@ -16929,9 +16955,9 @@ function renderRiskControlSliderStats(stats = {}) {
     if (recentFailureElement) recentFailureElement.textContent = recentFailureText;
 }
 
-async function loadRiskControlSliderStats(cookieId = '') {
+async function loadRiskControlSliderStats(accountId = '') {
     const token = localStorage.getItem('auth_token');
-    const scopeLabel = cookieId || '全部账号';
+    const scopeLabel = accountId || '全部账号';
     const rangeValue = getRiskSliderStatsRange();
     const rangeLabel = getRiskSliderStatsRangeLabel(rangeValue);
     const requestId = ++currentRiskSliderStatsRequestId;
@@ -16940,8 +16966,8 @@ async function loadRiskControlSliderStats(cookieId = '') {
 
     try {
         const params = new URLSearchParams();
-        if (cookieId) {
-            params.set('cookie_id', cookieId);
+        if (accountId) {
+            params.set('account_id', accountId);
         }
         params.set('range_key', rangeValue);
         const url = `/admin/slider-verification-stats?${params.toString()}`;
@@ -17002,7 +17028,7 @@ async function loadRiskControlSliderStats(cookieId = '') {
 
 function getRiskLogFilters() {
     return {
-        cookieId: document.getElementById('riskLogCookieFilter')?.value || '',
+        accountId: document.getElementById('riskLogAccountFilter')?.value || '',
         eventType: document.getElementById('riskLogEventTypeFilter')?.value || '',
         triggerScene: document.getElementById('riskLogTriggerSceneFilter')?.value || '',
         dateFrom: document.getElementById('riskLogDateFrom')?.value || '',
@@ -17015,7 +17041,7 @@ function getRiskLogFilters() {
 
 function hasActiveRiskLogFilters(filters = {}) {
     return Boolean(
-        filters.cookieId ||
+        filters.accountId ||
         filters.processingStatus ||
         filters.eventType ||
         filters.triggerScene ||
@@ -17026,7 +17052,7 @@ function hasActiveRiskLogFilters(filters = {}) {
 }
 
 async function fetchRiskControlLogsPage(token, {
-    cookieId = '',
+    accountId = '',
     processingStatus = '',
     eventType = '',
     triggerScene = '',
@@ -17042,7 +17068,7 @@ async function fetchRiskControlLogsPage(token, {
         offset: String(offset),
     });
 
-    if (cookieId) params.set('cookie_id', cookieId);
+    if (accountId) params.set('account_id', accountId);
     if (processingStatus) params.set('processing_status', processingStatus);
     if (eventType) params.set('event_type', eventType);
     if (triggerScene) params.set('trigger_scene', triggerScene);
@@ -17069,7 +17095,7 @@ function needsClientSideRiskLogFilter(logs, processingStatus) {
 }
 
 async function fetchRiskControlLogsWithClientFilter(token, {
-    cookieId = '',
+    accountId = '',
     processingStatus = '',
     eventType = '',
     triggerScene = '',
@@ -17087,7 +17113,7 @@ async function fetchRiskControlLogsWithClientFilter(token, {
 
     while (true) {
         const pageData = await fetchRiskControlLogsPage(token, {
-            cookieId,
+            accountId,
             eventType,
             triggerScene,
             dateFrom,
@@ -17123,11 +17149,11 @@ async function fetchRiskControlLogsWithClientFilter(token, {
 async function loadRiskControlLogs(offset = 0) {
     const token = localStorage.getItem('auth_token');
     const filters = getRiskLogFilters();
-    const cookieId = filters.cookieId;
+    const accountId = filters.accountId;
     const limit = filters.limit;
     currentRiskLogOffset = offset;
 
-    loadRiskControlSliderStats(cookieId);
+    loadRiskControlSliderStats(accountId);
 
     const loadingDiv = document.getElementById('loadingRiskLogs');
     const logContainer = document.getElementById('riskLogContainer');
@@ -17335,7 +17361,7 @@ function displayRiskControlLogs(logs) {
 
         row.innerHTML = `
             <td class="text-nowrap">${createdAt}</td>
-            <td class="text-nowrap">${escapeHtml(log.cookie_id || '-')}</td>
+            <td class="text-nowrap">${escapeHtml(log.account_id || '-')}</td>
             <td class="text-nowrap">${eventCategoryBadge}</td>
             <td class="text-nowrap">${triggerSceneBadge}</td>
             <td>${statusBadge}</td>
@@ -17437,7 +17463,7 @@ function filterRiskLogsByStatus(status) {
 async function loadCookieFilterOptions() {
     try {
         const token = localStorage.getItem('auth_token');
-        const response = await fetch('/admin/cookies', {
+        const response = await fetch('/admin/accounts', {
             headers: {
                 'Authorization': `Bearer ${token}`
             }
@@ -17445,18 +17471,18 @@ async function loadCookieFilterOptions() {
 
         if (response.ok) {
             const data = await response.json();
-            const select = document.getElementById('riskLogCookieFilter');
+            const select = document.getElementById('riskLogAccountFilter');
 
             // 清空现有选项，保留"全部账号"
             select.innerHTML = '<option value="">全部账号</option>';
 
-            if (data.success && data.cookies) {
-                data.cookies.forEach(cookie => {
+            if (data.success && data.accounts) {
+                data.accounts.forEach(account => {
                     const option = document.createElement('option');
-                    option.value = cookie.cookie_id;
+                    option.value = account.account_id;
                     // 优先显示备注，其次显示用户名，都没有则不显示括号
-                    const displayName = cookie.nickname || cookie.username || '';
-                    option.textContent = displayName ? `${cookie.cookie_id} (${displayName})` : cookie.cookie_id;
+                    const displayName = account.nickname || account.username || '';
+                    option.textContent = displayName ? `${account.account_id} (${displayName})` : account.account_id;
                     select.appendChild(option);
                 });
             }
@@ -17542,6 +17568,17 @@ function initItemSearch() {
     }
 }
 
+function getItemSearchAccountId() {
+    const accountId = document.getElementById('itemAccountFilter')?.value
+        || document.getElementById('itemReplayAccountFilter')?.value
+        || '';
+    if (!accountId) {
+        showToast('请先选择账号', 'warning');
+        return '';
+    }
+    return accountId;
+}
+
 // 处理商品搜索
 async function handleItemSearch(event) {
     event.preventDefault();
@@ -17549,6 +17586,7 @@ async function handleItemSearch(event) {
     const keyword = document.getElementById('searchKeyword').value.trim();
     const totalPages = parseInt(document.getElementById('searchTotalPages').value) || 1;
     const pageSize = parseInt(document.getElementById('searchPageSize').value) || 20;
+    const accountId = getItemSearchAccountId();
 
     if (!keyword) {
         showToast('请输入搜索关键词', 'warning');
@@ -17561,15 +17599,15 @@ async function handleItemSearch(event) {
 
     try {
         // 检查是否有有效的cookies账户
-        const cookiesCheckResponse = await fetch('/cookies/check', {
+        const accountsCheckResponse = await fetch('/accounts/check', {
             headers: {
                 'Authorization': `Bearer ${localStorage.getItem('auth_token')}`
             }
         });
 
-        if (cookiesCheckResponse.ok) {
-            const cookiesData = await cookiesCheckResponse.json();
-            if (!cookiesData.hasValidCookies) {
+        if (accountsCheckResponse.ok) {
+            const cookiesData = await accountsCheckResponse.json();
+            if (!cookiesData.hasValidAccounts) {
                 showToast('搜索失败：系统中不存在有效的账户信息。请先在Cookie管理中添加有效的闲鱼账户。', 'warning');
                 showSearchStatus(false);
                 return;
@@ -17654,6 +17692,7 @@ async function handleItemSearch(event) {
                 'Authorization': `Bearer ${token}`
             },
             body: JSON.stringify({
+                account_id: accountId,
                 keyword: keyword,
                 total_pages: totalPages
             })
@@ -17701,6 +17740,7 @@ async function handleItemSearch(event) {
                             'Authorization': `Bearer ${token}`
                         },
                         body: JSON.stringify({
+                            account_id: accountId,
                             keyword: keyword,
                             total_pages: totalPages
                         })
@@ -18108,9 +18148,19 @@ function clearIgnoredUpdateVersion(showFeedback = true) {
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v1.9.2',
+    version: 'v1.9.3',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+{
+            version: 'v1.9.3',
+            date: '2026-05-12',
+            updates: [
+                '【修复】账号管理接口与前端调用统一切换到 /accounts、/accounts/check、/admin/accounts，收口旧 /cookies 外部契约',
+                '【修复】账号管理请求模型统一使用 account_id，更新、删除、启停、自动确认、自动好评、备注、暂停时长全部按 account_id 语义收口',
+                '【优化】管理员账号筛选与有效账号检查统一改为 accounts 响应字段，减少 account / cookie 混用带来的状态错判',
+                '【优化】同步更新本地版本元数据与临时文件忽略规则，降低发布前 review 与热更新清单噪音'
+            ]
+        },
         {
             version: 'v1.9.2',
             date: '2026-04-10',
@@ -19903,7 +19953,7 @@ async function loadImAccountList() {
         if (usernameEl) usernameEl.textContent = '-';
         if (passwordEl) passwordEl.textContent = '-';
 
-        const response = await fetch(`${apiBase}/cookies/details`, {
+        const response = await fetch(`${apiBase}/accounts/details`, {
             headers: {
                 'Authorization': `Bearer ${authToken}`
             }
@@ -19919,8 +19969,8 @@ async function loadImAccountList() {
 
                 imAccountsData.forEach(account => {
                     const option = document.createElement('option');
-                    option.value = account.id;
-                    option.textContent = account.id;
+                    option.value = getCookieDetailsAccountId(account);
+                    option.textContent = getCookieDetailsAccountId(account);
                     // 仅缓存非敏感账号信息，敏感字段按需拉取
                     option.dataset.username = account.username || '';
                     select.appendChild(option);
@@ -19938,7 +19988,7 @@ async function loadImAccountList() {
  * 账号选择变化时的处理
  */
 async function fetchImAccountDetails(accountId) {
-    const response = await fetch(`${apiBase}/cookie/${encodeURIComponent(accountId)}/details?include_secrets=true`, {
+    const response = await fetch(`${apiBase}/accounts/${encodeURIComponent(accountId)}/details?include_secrets=true`, {
         headers: {
             'Authorization': `Bearer ${authToken}`
         }

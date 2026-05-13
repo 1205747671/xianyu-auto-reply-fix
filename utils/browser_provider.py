@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence
+from urllib.parse import quote, urlparse, urlunparse
 
 from cloakbrowser import (
+    build_args,
+    ensure_binary,
     launch as cloak_launch,
     launch_async as cloak_launch_async,
     launch_context as cloak_launch_context,
     launch_context_async as cloak_launch_context_async,
     launch_persistent_context as cloak_launch_persistent_context,
     launch_persistent_context_async as cloak_launch_persistent_context_async,
+    maybe_resolve_geoip,
 )
 
 BrowserLike = Any
@@ -89,6 +94,108 @@ async def launch_browser_persistent_context_async(**kwargs):
     return await cloak_launch_persistent_context_async(**kwargs)
 
 
+def _ensure_proxy_scheme(proxy_url: str) -> str:
+    proxy_url = str(proxy_url or "").strip()
+    if not proxy_url:
+        return ""
+    if "://" in proxy_url:
+        return proxy_url
+    return f"http://{proxy_url}"
+
+
+def _build_proxy_server_url(proxy: Any) -> tuple[Optional[str], Optional[str]]:
+    if proxy is None:
+        return None, None
+
+    if isinstance(proxy, dict):
+        server = _ensure_proxy_scheme(proxy.get("server"))
+        if not server:
+            return None, None
+        bypass = str(proxy.get("bypass") or "").strip() or None
+        username = str(proxy.get("username") or "")
+        password = str(proxy.get("password") or "")
+        if username or password:
+            parsed = urlparse(server)
+            hostname = parsed.hostname or ""
+            port = f":{parsed.port}" if parsed.port else ""
+            userinfo = quote(username, safe="")
+            if password or username:
+                userinfo = f"{userinfo}:{quote(password, safe='')}"
+            netloc = f"{userinfo}@{hostname}{port}" if userinfo else f"{hostname}{port}"
+            server = urlunparse(
+                (parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)
+            )
+        return server, bypass
+
+    server = _ensure_proxy_scheme(proxy)
+    if not server:
+        return None, None
+    return server, None
+
+
+def _build_managed_browser_launch_args(
+    *,
+    args: Optional[Sequence[str]],
+    headless: bool,
+    proxy: Any = None,
+    stealth_args: bool = True,
+    timezone: Optional[str] = None,
+    locale: Optional[str] = None,
+    geoip: bool = False,
+) -> list[str]:
+    resolved_timezone, resolved_locale, exit_ip = maybe_resolve_geoip(
+        geoip,
+        proxy,
+        timezone,
+        locale,
+    )
+    resolved_args = list(args or [])
+    proxy_server, proxy_bypass = _build_proxy_server_url(proxy)
+    if proxy_server and not any(arg.startswith("--proxy-server=") for arg in resolved_args):
+        resolved_args.append(f"--proxy-server={proxy_server}")
+    if proxy_bypass and not any(arg.startswith("--proxy-bypass-list=") for arg in resolved_args):
+        resolved_args.append(f"--proxy-bypass-list={proxy_bypass}")
+    if exit_ip and not any(arg.startswith("--fingerprint-webrtc-ip=") for arg in resolved_args):
+        resolved_args.append(f"--fingerprint-webrtc-ip={exit_ip}")
+    return build_args(
+        stealth_args,
+        resolved_args,
+        timezone=resolved_timezone,
+        locale=resolved_locale,
+        headless=headless,
+    )
+
+
+def _patch_browser_humanize_sync(
+    browser: Any,
+    *,
+    humanize: bool,
+    human_preset: str,
+    human_config: Optional[Dict[str, Any]],
+) -> None:
+    if not humanize or browser is None:
+        return
+    from cloakbrowser.human import patch_browser
+    from cloakbrowser.human.config import resolve_config
+
+    patch_browser(browser, resolve_config(human_preset, human_config))
+
+
+async def _patch_browser_humanize_async(
+    browser: Any,
+    *,
+    humanize: bool,
+    human_preset: str,
+    human_config: Optional[Dict[str, Any]],
+) -> None:
+    if not humanize or browser is None:
+        return
+    from cloakbrowser.human import patch_browser_async
+    from cloakbrowser.human.config import resolve_config
+
+    await patch_browser_async(browser, resolve_config(human_preset, human_config))
+
+
 def _ensure_managed_launch_args(
     args: Optional[Sequence[str]],
     user_data_dir: str,
@@ -157,11 +264,35 @@ async def _connect_over_cdp_async(endpoint: str) -> tuple[Any, BrowserLike]:
     return playwright, browser
 
 
+async def _wait_for_process_exit_async(process: Any, close_timeout: float) -> None:
+    wait = getattr(process, "wait", None)
+    if not callable(wait):
+        return
+
+    if inspect.iscoroutinefunction(wait):
+        await asyncio.wait_for(wait(), timeout=close_timeout)
+        return
+
+    try:
+        await asyncio.to_thread(wait, timeout=close_timeout)
+    except TypeError:
+        await asyncio.to_thread(wait)
+
+
 def launch_managed_browser_runtime(
-    executable_path: str,
     user_data_dir: str,
     *,
+    executable_path: Optional[str] = None,
     args: Optional[Sequence[str]] = None,
+    headless: bool = True,
+    proxy: Any = None,
+    stealth_args: bool = True,
+    timezone: Optional[str] = None,
+    locale: Optional[str] = None,
+    geoip: bool = False,
+    humanize: bool = False,
+    human_preset: str = "default",
+    human_config: Optional[Dict[str, Any]] = None,
     env: Optional[Dict[str, str]] = None,
     cwd: Optional[str] = None,
     startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
@@ -171,7 +302,20 @@ def launch_managed_browser_runtime(
     _port_reader: Optional[Callable[[str, float, Any, Callable[[float], None]], int]] = None,
     _sleep: Callable[[float], None] = time.sleep,
 ) -> ManagedBrowserRuntime:
-    command = [executable_path, *_ensure_managed_launch_args(args, user_data_dir, cdp_host)]
+    resolved_executable_path = executable_path or ensure_binary()
+    chrome_args = _build_managed_browser_launch_args(
+        args=args,
+        headless=headless,
+        proxy=proxy,
+        stealth_args=stealth_args,
+        timezone=timezone,
+        locale=locale,
+        geoip=geoip,
+    )
+    command = [
+        resolved_executable_path,
+        *_ensure_managed_launch_args(chrome_args, user_data_dir, cdp_host),
+    ]
     process = _process_factory(
         command,
         cwd=cwd,
@@ -192,6 +336,12 @@ def launch_managed_browser_runtime(
             runtime.playwright, runtime.browser = connected
         else:
             runtime.browser = connected
+        _patch_browser_humanize_sync(
+            runtime.browser,
+            humanize=humanize,
+            human_preset=human_preset,
+            human_config=human_config,
+        )
         return runtime
     except Exception:
         close_managed_browser_runtime(runtime, reason="attach_failed")
@@ -199,10 +349,19 @@ def launch_managed_browser_runtime(
 
 
 async def launch_managed_browser_runtime_async(
-    executable_path: str,
     user_data_dir: str,
     *,
+    executable_path: Optional[str] = None,
     args: Optional[Sequence[str]] = None,
+    headless: bool = True,
+    proxy: Any = None,
+    stealth_args: bool = True,
+    timezone: Optional[str] = None,
+    locale: Optional[str] = None,
+    geoip: bool = False,
+    humanize: bool = False,
+    human_preset: str = "default",
+    human_config: Optional[Dict[str, Any]] = None,
     env: Optional[Dict[str, str]] = None,
     cwd: Optional[str] = None,
     startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
@@ -211,7 +370,20 @@ async def launch_managed_browser_runtime_async(
     _connect_over_cdp: Optional[Callable[[str], Any]] = None,
     _port_reader: Optional[Callable[[str, float, Any], Any]] = None,
 ) -> AsyncManagedBrowserRuntime:
-    command = [executable_path, *_ensure_managed_launch_args(args, user_data_dir, cdp_host)]
+    resolved_executable_path = executable_path or ensure_binary()
+    chrome_args = _build_managed_browser_launch_args(
+        args=args,
+        headless=headless,
+        proxy=proxy,
+        stealth_args=stealth_args,
+        timezone=timezone,
+        locale=locale,
+        geoip=geoip,
+    )
+    command = [
+        resolved_executable_path,
+        *_ensure_managed_launch_args(chrome_args, user_data_dir, cdp_host),
+    ]
     process = _process_factory(
         command,
         cwd=cwd,
@@ -232,6 +404,12 @@ async def launch_managed_browser_runtime_async(
             runtime.playwright, runtime.browser = connected
         else:
             runtime.browser = connected
+        await _patch_browser_humanize_async(
+            runtime.browser,
+            humanize=humanize,
+            human_preset=human_preset,
+            human_config=human_config,
+        )
         return runtime
     except Exception:
         await close_managed_browser_runtime_async(runtime, reason="attach_failed")
@@ -303,12 +481,44 @@ async def close_managed_browser_runtime_async(
     if process is not None and process.poll() is None:
         process.terminate()
         try:
-            await asyncio.wait_for(process.wait(), timeout=close_timeout)
+            await _wait_for_process_exit_async(process, close_timeout)
         except Exception:
             process.kill()
             try:
-                await asyncio.wait_for(process.wait(), timeout=close_timeout)
+                await _wait_for_process_exit_async(process, close_timeout)
             except Exception:
                 pass
 
     return runtime
+
+
+def close_managed_runtime_handle(
+    runtime: ManagedBrowserRuntime,
+    *,
+    reason: str = "closed",
+    close_timeout: float = DEFAULT_CLOSE_TIMEOUT,
+) -> ManagedBrowserRuntime:
+    return close_managed_browser_runtime(
+        runtime,
+        reason=reason,
+        close_timeout=close_timeout,
+    )
+
+
+async def close_managed_runtime_handle_async(
+    runtime: ManagedBrowserRuntime | AsyncManagedBrowserRuntime,
+    *,
+    reason: str = "closed",
+    close_timeout: float = DEFAULT_CLOSE_TIMEOUT,
+) -> ManagedBrowserRuntime | AsyncManagedBrowserRuntime:
+    if isinstance(runtime, AsyncManagedBrowserRuntime):
+        return await close_managed_browser_runtime_async(
+            runtime,
+            reason=reason,
+            close_timeout=close_timeout,
+        )
+    return close_managed_browser_runtime(
+        runtime,
+        reason=reason,
+        close_timeout=close_timeout,
+    )

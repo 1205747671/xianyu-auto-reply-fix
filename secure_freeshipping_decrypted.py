@@ -6,10 +6,10 @@ from utils.xianyu_utils import trans_cookies, generate_sign
 
 
 class SecureFreeshipping:
-    def __init__(self, session, cookies_str, cookie_id):
+    def __init__(self, session, cookies_str, account_id):
         self.session = session
         self.cookies_str = cookies_str
-        self.cookie_id = cookie_id
+        self.account_id = account_id
         self.cookies = trans_cookies(cookies_str) if cookies_str else {}
         
         # 这些属性将由主类传递
@@ -88,11 +88,11 @@ class SecureFreeshipping:
             from db_manager import db_manager
             
             # 更新数据库中的Cookie
-            db_manager.update_cookie_account_info(self.cookie_id, cookie_value=self.cookies_str)
-            logger.debug(f"【{self.cookie_id}】Cookie已更新到数据库")
+            db_manager.update_cookie_account_info(self.account_id, cookie_value=self.cookies_str)
+            logger.debug(f"【{self.account_id}】Cookie已更新到数据库")
             
         except Exception as e:
-            logger.error(f"【{self.cookie_id}】更新Cookie到数据库失败: {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】更新Cookie到数据库失败: {self._safe_str(e)}")
 
     async def auto_freeshipping(self, order_id, item_id, buyer_id, retry_count=0):
         """自动免拼发货 - 加密版本"""
@@ -124,8 +124,8 @@ class SecureFreeshipping:
         }
         
         # 打印参数信息
-        logger.info(f"【{self.cookie_id}】免拼发货请求参数: data_val = {data_val}")
-        logger.info(f"【{self.cookie_id}】参数详情 - order_id: {order_id}, item_id: {item_id}, buyer_id: {buyer_id}")
+        logger.info(f"【{self.account_id}】免拼发货请求参数: data_val = {data_val}")
+        logger.info(f"【{self.account_id}】参数详情 - order_id: {order_id}, item_id: {item_id}, buyer_id: {buyer_id}")
 
         # 始终从最新的cookies中获取_m_h5_tk token（刷新后cookies会被更新）
         token = trans_cookies(self.cookies_str).get('_m_h5_tk', '').split('_')[0] if trans_cookies(self.cookies_str).get('_m_h5_tk') else ''
@@ -139,7 +139,7 @@ class SecureFreeshipping:
         params['sign'] = sign
 
         try:
-            logger.info(f"【{self.cookie_id}】开始自动免拼发货，订单ID: {order_id}")
+            logger.info(f"【{self.account_id}】开始自动免拼发货，订单ID: {order_id}")
 
             # 设置请求超时
             request_timeout = aiohttp.ClientTimeout(total=30)
@@ -155,26 +155,26 @@ class SecureFreeshipping:
                 if await self._apply_response_cookie_updates(response.headers):
                     logger.debug("已更新Cookie到数据库")
 
-                logger.info(f"【{self.cookie_id}】自动免拼发货响应: {res_json}")
+                logger.info(f"【{self.account_id}】自动免拼发货响应: {res_json}")
                 
                 # 检查响应结果
                 if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
-                    logger.info(f"【{self.cookie_id}】✅ 自动免拼发货成功，订单ID: {order_id}")
+                    logger.info(f"【{self.account_id}】✅ 自动免拼发货成功，订单ID: {order_id}")
                     return {"success": True, "order_id": order_id}
                 else:
                     error_msg = res_json.get('ret', ['未知错误'])[0] if res_json.get('ret') else '未知错误'
-                    logger.warning(f"【{self.cookie_id}】❌ 自动免拼发货失败: {error_msg}")
+                    logger.warning(f"【{self.account_id}】❌ 自动免拼发货失败: {error_msg}")
                     
                     return await self.auto_freeshipping(order_id, item_id, buyer_id, retry_count + 1)
                     
 
         except Exception as e:
-            logger.error(f"【{self.cookie_id}】自动免拼发货API请求异常: {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】自动免拼发货API请求异常: {self._safe_str(e)}")
             await asyncio.sleep(0.5)
             
             # 网络异常也进行重试
             if retry_count < 2:
-                logger.info(f"【{self.cookie_id}】网络异常，准备重试...")
+                logger.info(f"【{self.account_id}】网络异常，准备重试...")
                 return await self.auto_freeshipping(order_id, item_id, buyer_id, retry_count + 1)
             
             return {"error": f"网络异常: {self._safe_str(e)}", "order_id": order_id}

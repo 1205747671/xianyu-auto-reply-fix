@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import sys
@@ -23,6 +24,13 @@ if "cloakbrowser" not in sys.modules:
     cloakbrowser_stub.launch_context_async = _not_used
     cloakbrowser_stub.launch_persistent_context = _not_used
     cloakbrowser_stub.launch_persistent_context_async = _not_used
+    cloakbrowser_stub.ensure_binary = lambda: "C:/cloakbrowser/chrome.exe"
+    cloakbrowser_stub.build_args = (
+        lambda stealth_args, extra_args, timezone=None, locale=None, headless=True: list(extra_args or [])
+    )
+    cloakbrowser_stub.maybe_resolve_geoip = (
+        lambda geoip, proxy, timezone, locale: (timezone, locale, None)
+    )
     sys.modules["cloakbrowser"] = cloakbrowser_stub
 
 from utils.xianyu_slider_stealth import XianyuSliderStealth
@@ -82,6 +90,12 @@ class _FakePage:
 
     def content(self):
         return ""
+
+    def goto(self, *_args, **_kwargs):
+        return None
+
+    def wait_for_load_state(self, *_args, **_kwargs):
+        return None
 
 
 class _RecoverablePunishPage(_FakePage):
@@ -311,6 +325,102 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         slider = self._make_slider(page)
 
         self.assertTrue(slider.check_page_changed())
+
+    def test_run_uses_attached_managed_runtime_without_reinitializing_or_closing_external_browser(self):
+        page = _FakePage(
+            title="验证码",
+            url="https://passport.goofish.com/iv/test",
+        )
+        page.mouse.move = mock.Mock()
+        page.content = mock.Mock(return_value="captcha")
+        slider = self._make_slider(page)
+        slider.context = object()
+        slider.browser = object()
+        slider.playwright = object()
+        slider.headless = True
+        slider.disable_headless_warmup = True
+        slider.slider_max_retries = 1
+        slider._managed_runtime_binding = {
+            "context": slider.context,
+            "page": page,
+            "browser": slider.browser,
+            "playwright": slider.playwright,
+        }
+        slider._check_date_validity = lambda: True
+        slider._warmup_slider_context = mock.Mock()
+        slider._is_hard_block_page = lambda _page: False
+        slider._simulate_human_page_behavior = mock.Mock()
+        slider.solve_slider = mock.Mock(return_value=True)
+        slider._detect_qr_code_verification = lambda _page: (False, None)
+        slider._select_monitor_page = lambda _context, fallback_page=None: fallback_page or page
+        slider._get_cookies_after_success = mock.Mock(return_value={"unb": "u", "cookie2": "c"})
+        slider._detach_managed_runtime = mock.Mock(
+            side_effect=lambda: (
+                setattr(slider, "browser", None),
+                setattr(slider, "context", None),
+                setattr(slider, "page", None),
+                setattr(slider, "playwright", None),
+                setattr(slider, "_managed_runtime_binding", None),
+            )
+        )
+        slider.init_browser = mock.Mock(side_effect=AssertionError("should not init browser"))
+        slider.close_browser = mock.Mock(side_effect=AssertionError("should not close external runtime"))
+
+        success, cookies = slider.run("https://passport.goofish.com/iv/test")
+
+        self.assertTrue(success)
+        self.assertEqual(cookies, {"unb": "u", "cookie2": "c"})
+        slider.init_browser.assert_not_called()
+        slider.close_browser.assert_not_called()
+        slider._detach_managed_runtime.assert_called_once()
+
+    def test_run_rejects_missing_managed_runtime_when_explicitly_required(self):
+        page = _FakePage(
+            title="验证码",
+            url="https://passport.goofish.com/iv/test",
+        )
+        slider = self._make_slider(page)
+        slider.headless = True
+        slider.disable_headless_warmup = True
+        slider.slider_max_retries = 1
+        slider._check_date_validity = lambda: True
+        slider.init_browser = mock.Mock(side_effect=AssertionError("should not init browser"))
+        slider.close_browser = mock.Mock()
+
+        success, cookies = slider.run(
+            "https://passport.goofish.com/iv/test",
+            require_managed_runtime=True,
+        )
+
+        self.assertFalse(success)
+        self.assertIsNone(cookies)
+        self.assertIn("managed runtime", slider.last_login_error)
+        slider.init_browser.assert_not_called()
+
+    def test_async_run_rejects_missing_managed_runtime_when_explicitly_required(self):
+        page = _FakePage(
+            title="验证码",
+            url="https://passport.goofish.com/iv/test",
+        )
+        slider = self._make_slider(page)
+        slider.headless = True
+        slider.disable_headless_warmup = True
+        slider.slider_max_retries = 1
+        slider._check_date_validity = lambda: True
+        slider.init_browser = mock.Mock(side_effect=AssertionError("should not init browser"))
+        slider.close_browser = mock.Mock()
+
+        success, cookies = asyncio.run(
+            slider.async_run(
+                "https://passport.goofish.com/iv/test",
+                require_managed_runtime=True,
+            )
+        )
+
+        self.assertFalse(success)
+        self.assertIsNone(cookies)
+        self.assertIn("managed runtime", slider.last_login_error)
+        slider.init_browser.assert_not_called()
 
     @mock.patch("utils.xianyu_slider_stealth.time.sleep", return_value=None)
     def test_check_verification_success_fast_rejects_punish_after_container_missing(self, _mock_sleep):

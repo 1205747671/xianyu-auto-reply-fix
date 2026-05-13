@@ -60,18 +60,27 @@ def build_order_update_event(order: Dict[str, Any], source: str = "unknown") -> 
     }
 
 
-def publish_order_update_event(order_id: str, source: str = "unknown") -> Optional[Dict[str, Any]]:
+def publish_order_update_event(
+    order_id: str,
+    account_id: str = None,
+    source: str = "unknown",
+) -> Optional[Dict[str, Any]]:
     from db_manager import db_manager
 
-    order = db_manager.get_order_by_id(order_id)
+    normalized_account_id = str(account_id or "").strip() or None
+    if normalized_account_id is None:
+        logger.warning(f"拒绝未带 account_id 的订单事件发布查询: {order_id}")
+        return None
+
+    order = db_manager.get_order_by_id(order_id, account_id=normalized_account_id)
     if not order:
         return None
 
-    cookie_id = order.get('cookie_id')
-    if not cookie_id:
+    account_id = order.get('account_id')
+    if not account_id:
         return None
 
-    cookie_info = db_manager.get_cookie_details(cookie_id)
+    cookie_info = db_manager.get_cookie_details(account_id)
     user_id = cookie_info.get('user_id') if cookie_info else None
     if user_id is None:
         return None

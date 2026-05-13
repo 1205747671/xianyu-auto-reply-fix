@@ -19,10 +19,7 @@ from loguru import logger
 import hashlib
 from urllib.parse import urlparse
 
-from utils.browser_provider import (
-    launch_browser_async,
-    launch_browser_persistent_context_async,
-)
+from utils.account_browser_runtime import account_browser_runtime_manager
 from utils.image_utils import image_manager
 
 
@@ -87,9 +84,10 @@ class NotLoginError(Exception):
 class QRLoginSession:
     """二维码登录会话"""
 
-    def __init__(self, session_id: str, user_id: Optional[int] = None):
+    def __init__(self, session_id: str, user_id: Optional[int] = None, account_id: Optional[str] = None):
         self.session_id = session_id
         self.user_id = user_id
+        self.account_id = str(account_id or '').strip()
         self.status = 'waiting'  # waiting, scanned, confirmed, success, failed, expired, cancelled, verification_required
         self.phase = 'waiting_for_scan'
         self.verification_type = None
@@ -110,6 +108,7 @@ class QRLoginSession:
         self.screenshot_path = None  # 风控验证截图
         self.verification_task = None  # 风控验证页面保持任务
         self.success_source = None  # 登录成功来源: api/browser
+        self.managed_runtime_lease = None
         self.managed_runtime = None
         self.managed_context = None
         self.managed_page = None
@@ -126,6 +125,8 @@ class QRLoginSession:
         """转换为字典"""
         return {
             'session_id': self.session_id,
+            'user_id': self.user_id,
+            'account_id': self.account_id,
             'status': self.status,
             'phase': self.phase,
             'verification_type': self.verification_type,
@@ -246,6 +247,22 @@ class QRLoginManager:
         if session.proxy_config:
             return dict(session.proxy_config)
 
+        if session.user_id and session.account_id:
+            try:
+                from db_manager import db_manager
+
+                proxy_config = dict(db_manager.get_cookie_proxy_config(session.account_id) or {})
+                session.proxy_config = proxy_config
+                session.proxy_account_id = session.account_id
+                if not self._build_proxy_url(proxy_config):
+                    logger.info(f"扫码登录验证链路未匹配到可用代理，沿用直连: {session.account_id}")
+                else:
+                    logger.info(f"扫码登录验证链路复用账号代理: {session.account_id}")
+                return proxy_config
+            except Exception as e:
+                logger.warning(f"扫码登录验证链路读取账号代理失败，沿用直连: {session.account_id}, 错误: {e}")
+                return {}
+
         if not session.user_id or not session.unb:
             return {}
 
@@ -336,16 +353,10 @@ class QRLoginManager:
         return context_options
 
     def _resolve_verification_profile_dir(self, session: QRLoginSession) -> str:
-        # 已匹配到现有账号时，优先复用账号级画像目录，避免扫码验证和后续恢复跑到两套画像上。
-        profile_key = (
-            str(getattr(session, 'proxy_account_id', '') or '').strip()
-            or str(session.unb or "").strip()
-            or f"qr_{session.session_id}"
-        )
-        safe_key = re.sub(r"[^0-9A-Za-z_.-]+", "_", profile_key)
-        profile_dir = os.path.join(os.getcwd(), 'browser_data', f'user_{safe_key}')
-        os.makedirs(profile_dir, exist_ok=True)
-        return profile_dir
+        account_id = str(getattr(session, 'account_id', '') or '').strip()
+        if not account_id:
+            raise ValueError("扫码登录验证会话缺少account_id，拒绝按unb/session_id派生profile")
+        return account_browser_runtime_manager.resolve_profile_dir(account_id)
 
     async def _launch_verification_browser_context(self, session: QRLoginSession):
         show_browser = self._should_show_verification_browser()
@@ -360,27 +371,62 @@ class QRLoginManager:
             launch_options['proxy'] = proxy_settings
         context_options = self._build_verification_context_options(show_browser)
         profile_dir = self._resolve_verification_profile_dir(session)
+        runtime_request = {
+            'account_id': session.account_id,
+            'purpose': 'qr_login_verification',
+            'profile_dir': profile_dir,
+            'use_persistent_context': True,
+            'launch_options': launch_options,
+            'persistent_context_options': context_options,
+        }
 
         try:
-            context = await launch_browser_persistent_context_async(
-                user_data_dir=profile_dir,
-                **launch_options,
-                **context_options,
+            lease = await account_browser_runtime_manager.acquire_runtime(
+                session.account_id,
+                'qr_login_verification',
+                exclusive=True,
+                runtime_request=runtime_request,
             )
-            browser = getattr(context, 'browser', None)
+            runtime = getattr(lease, 'runtime', None)
+            context = getattr(runtime, 'context', None)
+            browser = getattr(context, 'browser', None) or getattr(runtime, 'browser', None)
+            if context is None:
+                await account_browser_runtime_manager.release_runtime(
+                    lease,
+                    reason='verification_context_missing',
+                )
+                raise RuntimeError(f"扫码登录验证页 runtime 缺少 context: {session.session_id}")
             logger.info(
                 f"扫码登录验证页复用 CloakBrowser 持久化画像: {session.session_id}, "
                 f"profile_dir: {profile_dir}, headless: {not show_browser}"
             )
-            return browser, context, show_browser
+            return lease, browser, context, show_browser
         except Exception as persistent_error:
-            logger.warning(
-                f"扫码登录持久化画像启动失败，降级到临时上下文: {session.session_id}, "
+            logger.error(
+                f"扫码登录持久化画像启动失败，拒绝降级到匿名上下文: {session.session_id}, "
                 f"错误: {persistent_error}"
             )
-            browser = await launch_browser_async(**launch_options)
-            context = await browser.new_context(**context_options)
-            return browser, context, show_browser
+            raise
+
+    @staticmethod
+    def _track_runtime_lease_page(lease: Any, page: Any) -> None:
+        if lease is None or page is None:
+            return
+        lease_pages = getattr(lease, 'pages', None)
+        if not isinstance(lease_pages, list):
+            return
+        if page not in lease_pages:
+            lease_pages.append(page)
+
+    @staticmethod
+    def _untrack_runtime_lease_page(lease: Any, page: Any) -> None:
+        if lease is None or page is None:
+            return
+        lease_pages = getattr(lease, 'pages', None)
+        if not isinstance(lease_pages, list):
+            return
+        while page in lease_pages:
+            lease_pages.remove(page)
 
     async def _get_or_create_context_page(self, context):
         context_pages = getattr(context, 'pages', None)
@@ -477,6 +523,7 @@ class QRLoginManager:
         *,
         error: Optional[str] = None,
         account_info: Optional[Dict[str, Any]] = None,
+        terminal: bool = True,
     ) -> Optional[QRLoginSession]:
         session = self.sessions.get(session_id)
         if not session:
@@ -491,12 +538,12 @@ class QRLoginManager:
         }
         self._update_session_state(
             session,
-            status=('failed' if normalized_status == 'failed' else session.status),
+            status=('failed' if normalized_status == 'failed' and terminal else session.status),
             handoff_status=normalized_status,
             handoff_error=(error if normalized_status == 'failed' else None),
             phase=phase_map.get(normalized_status, session.phase),
-            error_message=(error if normalized_status == 'failed' else session.error_message),
-            clear_error=normalized_status != 'failed',
+            error_message=(error if normalized_status == 'failed' and terminal else session.error_message),
+            clear_error=(normalized_status != 'failed'),
             clear_handoff_error=normalized_status != 'failed',
         )
         if account_info is not None:
@@ -592,6 +639,7 @@ class QRLoginManager:
         cookies: Any,
         source: str,
         require_complete_cookies: bool = False,
+        managed_runtime_lease=None,
         managed_runtime=None,
         managed_context=None,
         managed_page=None,
@@ -612,12 +660,16 @@ class QRLoginManager:
         was_success = session.status == 'success'
         session.status = 'success'
         session.success_source = session.success_source or source
+        if managed_runtime_lease is not None:
+            session.managed_runtime_lease = managed_runtime_lease
         if managed_runtime is not None:
             session.managed_runtime = managed_runtime
         if managed_context is not None:
             session.managed_context = managed_context
         if managed_page is not None:
             session.managed_page = managed_page
+        if managed_runtime_lease is not None and managed_page is not None:
+            self._track_runtime_lease_page(managed_runtime_lease, managed_page)
         self._update_session_state(
             session,
             phase='login_complete',
@@ -639,7 +691,14 @@ class QRLoginManager:
         cookies = await context.cookies()
         return self._normalize_cookie_dict(cookies)
 
-    async def _probe_browser_login_success(self, session: QRLoginSession, page, context, managed_runtime=None) -> bool:
+    async def _probe_browser_login_success(
+        self,
+        session: QRLoginSession,
+        page,
+        context,
+        managed_runtime=None,
+        managed_runtime_lease=None,
+    ) -> bool:
         """在浏览器侧兜底判断验证是否已经完成"""
         runtime = managed_runtime if managed_runtime is not None else getattr(context, 'browser', None)
         current_url = page.url
@@ -656,6 +715,7 @@ class QRLoginManager:
                 cookie_dict,
                 'browser',
                 require_complete_cookies=True,
+                managed_runtime_lease=managed_runtime_lease,
                 managed_runtime=runtime,
                 managed_context=context,
                 managed_page=page,
@@ -689,28 +749,37 @@ class QRLoginManager:
                     probe_cookie_dict,
                     'browser',
                     require_complete_cookies=True,
+                    managed_runtime_lease=managed_runtime_lease,
                     managed_runtime=runtime,
                     managed_context=context,
                     managed_page=existing_page,
                 )
 
         probe_page = None
+        probe_context = context
+        keep_probe_page = False
         try:
             now = time.time()
             if session.last_active_probe_time and now - session.last_active_probe_time < 10:
                 return False
             session.last_active_probe_time = now
 
-            probe_page = await context.new_page()
+            if managed_runtime_lease is not None:
+                probe_page, probe_context = await account_browser_runtime_manager.get_fresh_page(
+                    managed_runtime_lease
+                )
+            else:
+                probe_page = await context.new_page()
             await probe_page.goto('https://www.goofish.com/im', wait_until='domcontentloaded', timeout=30000)
             await probe_page.wait_for_timeout(1500)
 
             probe_url = probe_page.url
-            probe_cookie_dict = await self._context_cookie_dict(context)
+            probe_cookie_dict = await self._context_cookie_dict(probe_context)
             im_root = await probe_page.query_selector('.rc-virtual-list-holder-inner')
             has_im_root = im_root is not None
 
             if self._is_logged_in_url(probe_url):
+                keep_probe_page = True
                 logger.info(
                     f"扫码登录浏览器侧探测成功: {session.session_id}, "
                     f"probe_url: {probe_url}, has_im_root: {has_im_root}"
@@ -720,18 +789,21 @@ class QRLoginManager:
                     probe_cookie_dict,
                     'browser',
                     require_complete_cookies=True,
+                    managed_runtime_lease=managed_runtime_lease,
                     managed_runtime=runtime,
-                    managed_context=context,
-                    managed_page=page,
+                    managed_context=probe_context,
+                    managed_page=probe_page,
                 )
         except Exception as e:
             logger.debug(f"扫码登录浏览器侧探测未确认成功: {session.session_id}, 错误: {e}")
         finally:
-            if probe_page:
+            if probe_page and not keep_probe_page:
                 try:
                     await probe_page.close()
                 except Exception:
                     pass
+                finally:
+                    self._untrack_runtime_lease_page(managed_runtime_lease, probe_page)
 
         return False
 
@@ -783,12 +855,13 @@ class QRLoginManager:
         browser = None
         context = None
         page = None
+        runtime_lease = None
         launch_error_message = None
 
         try:
 
             logger.info(f"开始打开扫码登录验证页面: {session_id}")
-            browser, context, show_browser = await self._launch_verification_browser_context(session)
+            runtime_lease, browser, context, show_browser = await self._launch_verification_browser_context(session)
             self._update_session_state(
                 session,
                 phase='verification_browser_ready',
@@ -802,6 +875,7 @@ class QRLoginManager:
                 logger.info(f"扫码登录验证页已注入 {len(browser_cookies)} 个跨域 Cookie: {session_id}")
 
             page = await self._get_or_create_context_page(context)
+            self._track_runtime_lease_page(runtime_lease, page)
             try:
                 logger.info(f"扫码登录验证页预热闲鱼首页: {session_id}")
                 await page.goto('https://www.goofish.com/', wait_until='domcontentloaded', timeout=15000)
@@ -843,6 +917,7 @@ class QRLoginManager:
                     current_session,
                     page,
                     context,
+                    managed_runtime_lease=runtime_lease,
                     managed_runtime=browser,
                 ):
                     break
@@ -871,18 +946,31 @@ class QRLoginManager:
                 context,
             )
             keep_current_page = self._should_keep_session_page(latest_session, page)
+            released_runtime_lease = False
+            if runtime_lease is not None and not keep_session_handles:
+                try:
+                    await account_browser_runtime_manager.release_runtime(
+                        runtime_lease,
+                        reason='qr_login_verification_page_closed',
+                    )
+                    released_runtime_lease = True
+                except Exception as release_error:
+                    logger.debug(f"释放扫码登录 verification runtime lease 失败，降级为关闭句柄: {release_error}")
             try:
-                if page and not keep_current_page:
+                if page and not keep_current_page and not released_runtime_lease:
                     await page.close()
             except Exception:
                 pass
+            finally:
+                if page and not keep_current_page and not released_runtime_lease:
+                    self._untrack_runtime_lease_page(runtime_lease, page)
             try:
-                if context and not keep_session_handles:
+                if context and not keep_session_handles and not released_runtime_lease:
                     await context.close()
             except Exception:
                 pass
             try:
-                if browser and not keep_session_handles:
+                if browser and not keep_session_handles and not released_runtime_lease:
                     await browser.close()
             except Exception:
                 pass
@@ -914,7 +1002,7 @@ class QRLoginManager:
             return
         session.verification_task = asyncio.create_task(self._launch_verification_page(session.session_id))
 
-    def _cleanup_session_assets(self, session: QRLoginSession):
+    def _cleanup_session_assets(self, session: QRLoginSession, *, reason: str = 'qr_login_session_cleanup'):
         """清理会话关联的截图和后台任务"""
         task = session.verification_task
         if task and not task.done():
@@ -925,27 +1013,47 @@ class QRLoginManager:
             image_manager.delete_image(session.screenshot_path)
             session.screenshot_path = None
 
+        managed_runtime_lease = session.managed_runtime_lease
         managed_runtime = session.managed_runtime
         managed_context = session.managed_context
         managed_page = session.managed_page
+        session.managed_runtime_lease = None
         session.managed_runtime = None
         session.managed_context = None
         session.managed_page = None
 
-        if not any((managed_runtime, managed_context, managed_page)):
+        if not any((managed_runtime_lease, managed_runtime, managed_context, managed_page)):
             return
 
-        close_coro = self._close_managed_browser_handles(
-            managed_runtime,
-            managed_context,
-            managed_page,
-        )
+        async def _release_or_close_handles():
+            if managed_runtime_lease is not None:
+                try:
+                    await account_browser_runtime_manager.release_runtime(
+                        managed_runtime_lease,
+                        reason=reason,
+                    )
+                    return
+                except Exception as release_error:
+                    logger.debug(f"释放扫码登录 runtime lease 失败，降级为关闭句柄: {release_error}")
+            await self._close_managed_browser_handles(
+                managed_runtime,
+                managed_context,
+                managed_page,
+            )
+
+        close_coro = _release_or_close_handles()
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             asyncio.run(close_coro)
         else:
             loop.create_task(close_coro)
+
+    def release_session_assets(self, session_id: str, *, reason: str = 'qr_login_session_cleanup') -> None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+        self._cleanup_session_assets(session, reason=reason)
 
     async def _get_mh5tk(self, session: QRLoginSession) -> dict:
         """获取m_h5_tk和m_h5_tk_enc"""
@@ -1054,12 +1162,16 @@ class QRLoginManager:
                 logger.error("获取登录参数时连接错误")
                 raise
     
-    async def generate_qr_code(self, user_id: Optional[int] = None) -> Dict[str, Any]:
+    async def generate_qr_code(self, user_id: Optional[int] = None, account_id: Optional[str] = None) -> Dict[str, Any]:
         """生成二维码"""
         try:
+            account_id = str(account_id or '').strip()
+            if not account_id:
+                return {'success': False, 'message': '缺少account_id'}
+
             # 创建新的会话
             session_id = str(uuid.uuid4())
-            session = QRLoginSession(session_id, user_id=user_id)
+            session = QRLoginSession(session_id, user_id=user_id, account_id=account_id)
 
             # 1. 获取m_h5_tk
             await self._get_mh5tk(session)
@@ -1132,6 +1244,7 @@ class QRLoginManager:
                     logger.info(f"二维码生成成功: {session_id}")
                     return {
                         'success': True,
+                        'account_id': account_id,
                         'session_id': session_id,
                         'qr_code_url': qr_data_url
                     }
@@ -1306,6 +1419,8 @@ class QRLoginManager:
         result = {
             'status': session.status,
             'session_id': session_id,
+            'user_id': session.user_id,
+            'account_id': session.account_id,
             'phase': session.phase,
             'verification_type': verification_type,
             'verification_type_label': verification_type_label,
@@ -1358,8 +1473,10 @@ class QRLoginManager:
         session = self.sessions.get(session_id)
         if session and session.status == 'success':
             return {
+                'account_id': session.account_id,
                 'cookies': self._cookie_marshal(session.cookies),
                 'unb': session.unb,
+                'managed_runtime_lease': session.managed_runtime_lease,
                 'managed_runtime': session.managed_runtime,
                 'managed_context': session.managed_context,
                 'managed_page': session.managed_page,

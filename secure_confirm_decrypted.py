@@ -14,19 +14,19 @@ from utils.xianyu_utils import generate_sign, trans_cookies
 class SecureConfirm:
     """自动确认发货类"""
 
-    def __init__(self, session, cookies_str, cookie_id, main_instance=None):
+    def __init__(self, session, cookies_str, account_id, main_instance=None):
         """
         初始化确认发货实例
 
         Args:
             session: aiohttp会话对象
             cookies_str: Cookie字符串
-            cookie_id: Cookie ID
+            account_id: 账号 ID
             main_instance: 主实例对象（XianyuLive）
         """
         self.session = session
         self.cookies_str = cookies_str
-        self.cookie_id = cookie_id
+        self.account_id = account_id
         self.main_instance = main_instance
 
         # 解析cookies
@@ -103,12 +103,12 @@ class SecureConfirm:
             from db_manager import db_manager
             
             # 获取该账号的商品列表
-            items = db_manager.get_items_by_cookie(self.cookie_id)
+            items = db_manager.get_items_by_account(self.account_id)
             if items:
                 # 返回第一个商品的ID
                 item_id = items[0].get('item_id')
                 if item_id:
-                    logger.debug(f"【{self.cookie_id}】获取到真实商品ID: {item_id}")
+                    logger.debug(f"【{self.account_id}】获取到真实商品ID: {item_id}")
                     return item_id
             
             # 如果该账号没有商品，尝试获取任意一个商品ID
@@ -116,14 +116,14 @@ class SecureConfirm:
             if all_items:
                 item_id = all_items[0].get('item_id')
                 if item_id:
-                    logger.debug(f"【{self.cookie_id}】使用其他账号的商品ID: {item_id}")
+                    logger.debug(f"【{self.account_id}】使用其他账号的商品ID: {item_id}")
                     return item_id
             
-            logger.warning(f"【{self.cookie_id}】数据库中没有找到任何商品ID")
+            logger.warning(f"【{self.account_id}】数据库中没有找到任何商品ID")
             return None
             
         except Exception as e:
-            logger.error(f"【{self.cookie_id}】获取真实商品ID失败: {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】获取真实商品ID失败: {self._safe_str(e)}")
             return None
 
     async def _update_config_cookies(self):
@@ -131,10 +131,10 @@ class SecureConfirm:
         try:
             from db_manager import db_manager
             # 更新数据库中的cookies
-            db_manager.update_cookie_account_info(self.cookie_id, cookie_value=self.cookies_str)
-            logger.debug(f"【{self.cookie_id}】已更新数据库中的Cookie")
+            db_manager.update_cookie_account_info(self.account_id, cookie_value=self.cookies_str)
+            logger.debug(f"【{self.account_id}】已更新数据库中的Cookie")
         except Exception as e:
-            logger.error(f"【{self.cookie_id}】更新数据库Cookie失败: {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】更新数据库Cookie失败: {self._safe_str(e)}")
 
 
     async def auto_confirm(self, order_id, item_id=None, retry_count=0):
@@ -146,7 +146,7 @@ class SecureConfirm:
         # 保存item_id供Token刷新使用
         if item_id:
             self._current_item_id = item_id
-            logger.debug(f"【{self.cookie_id}】设置当前商品ID: {item_id}")
+            logger.debug(f"【{self.account_id}】设置当前商品ID: {item_id}")
 
         params = {
             'jsv': '2.7.2',
@@ -179,7 +179,7 @@ class SecureConfirm:
         params['sign'] = sign
 
         try:
-            logger.info(f"【{self.cookie_id}】开始自动确认发货，订单ID: {order_id}")
+            logger.info(f"【{self.account_id}】开始自动确认发货，订单ID: {order_id}")
 
             # 设置请求超时
             request_timeout = aiohttp.ClientTimeout(total=30)
@@ -212,26 +212,26 @@ class SecureConfirm:
                     if await self._apply_response_cookie_updates(response.headers):
                         logger.debug("已更新Cookie到数据库")
 
-                    logger.info(f"【{self.cookie_id}】自动确认发货响应: {res_json}")
+                    logger.info(f"【{self.account_id}】自动确认发货响应: {res_json}")
 
                     # 检查响应结果
                     if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
-                        logger.info(f"【{self.cookie_id}】✅ 自动确认发货成功，订单ID: {order_id}")
+                        logger.info(f"【{self.account_id}】✅ 自动确认发货成功，订单ID: {order_id}")
                         return {"success": True, "order_id": order_id}
                     else:
                         error_msg = res_json.get('ret', ['未知错误'])[0] if res_json.get('ret') else '未知错误'
-                        logger.warning(f"【{self.cookie_id}】❌ 自动确认发货失败: {error_msg}")
+                        logger.warning(f"【{self.account_id}】❌ 自动确认发货失败: {error_msg}")
 
                         return await self.auto_confirm(order_id, item_id, retry_count + 1)
 
 
         except Exception as e:
-            logger.error(f"【{self.cookie_id}】自动确认发货API请求异常: {self._safe_str(e)}")
+            logger.error(f"【{self.account_id}】自动确认发货API请求异常: {self._safe_str(e)}")
             await asyncio.sleep(0.5)
 
             # 网络异常也进行重试
             if retry_count < 2:
-                logger.info(f"【{self.cookie_id}】网络异常，准备重试...")
+                logger.info(f"【{self.account_id}】网络异常，准备重试...")
                 return await self.auto_confirm(order_id, item_id, retry_count + 1)
 
             return {"error": f"网络异常: {self._safe_str(e)}", "order_id": order_id}

@@ -13,7 +13,8 @@ import re
 import json
 from threading import Lock
 from collections import defaultdict
-from utils.browser_provider import BrowserContextLike, BrowserLike, PageLike, launch_browser_async
+from utils.account_browser_runtime import account_browser_runtime_manager
+from utils.browser_provider import BrowserContextLike, BrowserLike, PageLike
 from utils.time_utils import parse_local_datetime_text_to_db_utc
 
 # 修复Docker环境中的asyncio事件循环策略问题
@@ -81,118 +82,86 @@ class OrderDetailFetcher:
     # 类级别的锁字典，为每个order_id维护一个锁
     _order_locks = defaultdict(lambda: asyncio.Lock())
 
-    def __init__(self, cookie_string: str = None, headless: bool = True, cookie_id_for_log: str = "unknown"):
+    def __init__(self, cookie_string: str = None, headless: bool = True, account_id: str = None):
         self.browser: Optional[BrowserLike] = None
         self.context: Optional[BrowserContextLike] = None
         self.page: Optional[PageLike] = None
         self.headless = headless  # 保存headless设置
-        self.cookie_id_for_log = cookie_id_for_log or "unknown"
+        self.account_id = str(account_id or "").strip()
         self._last_order_status_source = 'unknown'
         self._active_order_id = ''
         self._captured_amount_candidates: List[Dict[str, Any]] = []
         self._captured_sku_candidates: List[Dict[str, Any]] = []
         self._pending_response_tasks = set()
         self._response_handler = None
+        self._runtime_lease = None
 
         # Cookie配置 - 支持动态传入
         self.cookie = cookie_string
 
+    def _resolve_account_id(self) -> str:
+        return str(self.account_id or "").strip()
+
+    async def _release_runtime_lease(self, reason: str) -> None:
+        lease = self._runtime_lease
+        self._runtime_lease = None
+        self.browser = None
+        self.context = None
+        self.page = None
+        self._active_order_id = ''
+
+        if lease is None:
+            return
+
+        try:
+            await account_browser_runtime_manager.release_runtime(lease, reason=reason)
+        except Exception as e:
+            logger.warning(f"释放订单详情 runtime 失败: {e}")
+
     async def init_browser(self, headless: bool = None):
         """初始化浏览器"""
+        lease = None
         try:
             # 如果没有传入headless参数，使用实例的设置
             if headless is None:
                 headless = self.headless
 
+            account_id = self._resolve_account_id()
+            if not account_id:
+                logger.error("订单详情抓取缺少 account_id，无法申请账号级 runtime")
+                return False
+
+            await self._release_runtime_lease(reason="refresh_order_detail_page")
             logger.info(f"开始初始化浏览器，headless模式: {headless}")
-
-
-            # 启动浏览器（Docker环境优化）
-            browser_args = [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-gpu',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
-                '--disable-features=TranslateUI',
-                '--disable-ipc-flooding-protection',
-                '--disable-extensions',
-                '--disable-default-apps',
-                '--disable-sync',
-                '--disable-translate',
-                '--hide-scrollbars',
-                '--mute-audio',
-                '--no-default-browser-check',
-                '--no-pings'
-            ]
-
-            # 移除--single-process参数，使用多进程模式提高稳定性
-            # if os.getenv('DOCKER_ENV'):
-            #     browser_args.append('--single-process')  # 注释掉，避免崩溃
-
-            # 在Docker环境中添加额外参数
-            if os.getenv('DOCKER_ENV'):
-                browser_args.extend([
-                    '--disable-background-networking',
-                    '--disable-background-timer-throttling',
-                    '--disable-client-side-phishing-detection',
-                    '--disable-default-apps',
-                    '--disable-hang-monitor',
-                    '--disable-popup-blocking',
-                    '--disable-prompt-on-repost',
-                    '--disable-sync',
-                    '--disable-web-resources',
-                    '--metrics-recording-only',
-                    '--no-first-run',
-                    '--safebrowsing-disable-auto-update',
-                    '--password-store=basic',
-                    '--use-mock-keychain',
-                    # 添加内存优化和稳定性参数
-                    '--memory-pressure-off',
-                    '--max_old_space_size=512',
-                    '--disable-ipc-flooding-protection',
-                    '--disable-component-extensions-with-background-pages',
-                    '--disable-features=TranslateUI,BlinkGenPropertyTrees',
-                    '--disable-logging',
-                    '--disable-permissions-api',
-                    '--disable-notifications',
-                    '--no-pings',
-                    '--no-zygote'
-                ])
-
-            logger.info(f"启动浏览器，参数: {browser_args}")
-            self.browser = await launch_browser_async(
-                headless=headless,
-                args=browser_args
+            lease = await account_browser_runtime_manager.acquire_runtime(
+                account_id,
+                "order_detail_fetch",
+                exclusive=False,
+                runtime_request={
+                    "headless": headless,
+                    "cookie_string": self.cookie,
+                    "account_id": account_id,
+                },
             )
-
-            logger.info("浏览器启动成功，创建上下文...")
-
-            # 让 CloakBrowser 接管浏览器身份，不再额外覆盖上下文层 UA/headers。
-            self.context = await self.browser.new_context()
-
-            logger.info("创建页面...")
-
-            # 创建页面
-            self.page = await self.context.new_page()
+            self.page, self.context = await account_browser_runtime_manager.get_fresh_page(lease)
+            self._runtime_lease = lease
+            lease_runtime = getattr(lease, "runtime", None)
+            self.browser = getattr(lease_runtime, "browser", None)
 
             logger.info("页面创建成功，设置Cookie...")
 
             # 设置Cookie
             await self._set_cookies()
 
-            # 等待一段时间确保浏览器完全初始化
-            await asyncio.sleep(1)
-
             logger.info("浏览器初始化成功")
             return True
             
         except Exception as e:
+            if lease is not None and self._runtime_lease is None:
+                try:
+                    await account_browser_runtime_manager.release_runtime(lease, reason="order_detail_init_failed")
+                except Exception:
+                    pass
             logger.error(f"浏览器初始化失败: {e}")
             return False
 
@@ -240,17 +209,24 @@ class OrderDetailFetcher:
                 # 如果不是强制刷新，先查询数据库缓存
                 if not force_refresh:
                     from db_manager import db_manager
-                    existing_order = db_manager.get_order_by_id(order_id)
+                    existing_order = db_manager.get_order_by_id(
+                        order_id,
+                        account_id=self._resolve_account_id(),
+                    )
 
                     if existing_order:
                         amount = existing_order.get('amount', '')
                         item_config = None
-                        if existing_order.get('item_id') and existing_order.get('cookie_id'):
-                            item_config = db_manager.get_item_info(existing_order.get('cookie_id'), existing_order.get('item_id'))
+                        cached_account_id = (
+                            existing_order.get('account_id')
+                            or self._resolve_account_id()
+                        )
+                        if existing_order.get('item_id') and cached_account_id:
+                            item_config = db_manager.get_item_info(cached_account_id, existing_order.get('item_id'))
 
                         if _should_use_cached_order(existing_order, item_config=item_config):
                             logger.info(f"📋 订单 {order_id} 已存在于数据库中且金额有效({amount})，直接返回缓存数据")
-                            print(f"✅ 订单 {order_id} 使用缓存数据，跳过浏览器获取")
+                            logger.info(f"订单 {order_id} 使用缓存数据，跳过浏览器获取")
 
                             # 构建返回格式，与浏览器获取的格式保持一致
                             result = {
@@ -282,13 +258,13 @@ class OrderDetailFetcher:
                             return result
                         else:
                             logger.info(f"📋 订单 {order_id} 缓存字段不完整或状态无效，重新获取详情: amount={amount}, status={existing_order.get('order_status')}")
-                            print(f"⚠️ 订单 {order_id} 缓存不满足复用条件，重新获取详情...")
+                            logger.warning(f"订单 {order_id} 缓存不满足复用条件，重新获取详情")
                 else:
                     logger.info(f"🔄 订单 {order_id} 强制刷新模式，跳过缓存检查")
 
                 # 只有在数据库中没有有效数据时才初始化浏览器
                 logger.info(f"🌐 订单 {order_id} 需要浏览器获取，开始初始化浏览器...")
-                print(f"🔍 订单 {order_id} 开始浏览器获取详情...")
+                logger.info(f"订单 {order_id} 开始浏览器获取详情")
 
                 # 确保浏览器准备就绪
                 if not await self._ensure_browser_ready():
@@ -2089,7 +2065,7 @@ class OrderDetailFetcher:
             field_flags = self._build_parse_field_flags(sku_info, order_status)
             payload = {
                 'event': event_name,
-                'cookie_id': self.cookie_id_for_log,
+                'account_id': self._resolve_account_id() or 'unknown',
                 'order_id': order_id,
                 'attempt': attempt,
                 'url': url,
@@ -2490,18 +2466,29 @@ class OrderDetailFetcher:
     async def _check_browser_status(self) -> bool:
         """检查浏览器状态是否正常"""
         try:
-            if not self.browser or not self.context or not self.page:
+            if not self.context or not self.page:
                 logger.warning("浏览器组件不完整")
                 return False
 
-            # 检查浏览器是否已连接
-            if self.browser.is_connected():
-                # 尝试获取页面标题来验证页面是否可用
-                await self.page.title()
-                return True
-            else:
-                logger.warning("浏览器连接已断开")
+            is_closed = getattr(self.page, "is_closed", None)
+            if callable(is_closed) and is_closed():
+                logger.warning("订单详情页面已关闭")
                 return False
+
+            context_is_closed = getattr(self.context, "is_closed", None)
+            if callable(context_is_closed) and context_is_closed():
+                logger.warning("订单详情上下文已关闭")
+                return False
+
+            if self.browser is not None:
+                is_connected = getattr(self.browser, "is_connected", None)
+                if callable(is_connected) and not is_connected():
+                    logger.warning("浏览器连接已断开")
+                    return False
+
+            # 尝试获取页面标题来验证页面是否可用
+            await self.page.title()
+            return True
         except Exception as e:
             logger.warning(f"浏览器状态检查失败: {e}")
             return False
@@ -2518,7 +2505,9 @@ class OrderDetailFetcher:
             await self._force_close_browser()
 
             # 重新初始化浏览器
-            await self.init_browser()
+            if not await self.init_browser():
+                logger.error("浏览器重新初始化失败")
+                return False
 
             # 等待更长时间确保浏览器完全就绪
             await asyncio.sleep(2)
@@ -2538,7 +2527,12 @@ class OrderDetailFetcher:
     async def _force_close_browser(self):
         """强制关闭浏览器，忽略所有错误"""
         try:
+            await self._wait_for_response_capture_tasks(timeout=0.2)
             self._clear_response_capture_handler()
+            if self._runtime_lease is not None:
+                await self._release_runtime_lease(reason="force_close_order_detail_page")
+                return
+
             if self.page:
                 try:
                     await self.page.close()
@@ -2570,6 +2564,10 @@ class OrderDetailFetcher:
         try:
             await self._wait_for_response_capture_tasks(timeout=0.2)
             self._clear_response_capture_handler()
+            if self._runtime_lease is not None:
+                await self._release_runtime_lease(reason="close_order_detail_page")
+                logger.info("浏览器已关闭")
+                return
             if self.page:
                 await self.page.close()
             if self.context:
@@ -2599,7 +2597,7 @@ async def fetch_order_detail_simple(
     cookie_string: str = None,
     headless: bool = True,
     force_refresh: bool = False,
-    cookie_id_for_log: str = "unknown"
+    account_id: str = None,
 ) -> Optional[Dict[str, Any]]:
     """
     简单的订单详情获取函数（优化版：先检查数据库，再初始化浏览器）
@@ -2609,7 +2607,7 @@ async def fetch_order_detail_simple(
         cookie_string: Cookie字符串，如果不提供则使用默认值
         headless: 是否无头模式
         force_refresh: 是否强制刷新（跳过缓存直接从闲鱼获取）
-        cookie_id_for_log: 日志上下文中的账号ID，用于定位异常账号
+        account_id: 账号ID，作为浏览器 runtime 主身份
 
     Returns:
         订单详情字典，包含以下字段：
@@ -2625,21 +2623,33 @@ async def fetch_order_detail_simple(
         - timestamp: 获取时间戳
         失败时返回None
     """
+    normalized_account_id = str(account_id or '').strip()
+    if not normalized_account_id:
+        logger.error(f"订单 {order_id} 缺少 account_id，拒绝执行账号级详情抓取")
+        return None
+
     # 如果不是强制刷新，先检查数据库中是否有有效数据
     if not force_refresh:
         try:
             from db_manager import db_manager
-            existing_order = db_manager.get_order_by_id(order_id)
+            existing_order = db_manager.get_order_by_id(
+                order_id,
+                account_id=normalized_account_id,
+            )
 
             if existing_order:
                 amount = existing_order.get('amount', '')
                 item_config = None
-                if existing_order.get('item_id') and existing_order.get('cookie_id'):
-                    item_config = db_manager.get_item_info(existing_order.get('cookie_id'), existing_order.get('item_id'))
+                cached_account_id = (
+                    existing_order.get('account_id')
+                    or normalized_account_id
+                )
+                if existing_order.get('item_id') and cached_account_id:
+                    item_config = db_manager.get_item_info(cached_account_id, existing_order.get('item_id'))
 
                 if _should_use_cached_order(existing_order, item_config=item_config):
                     logger.info(f"📋 订单 {order_id} 已存在于数据库中且金额有效({amount})，直接返回缓存数据")
-                    print(f"✅ 订单 {order_id} 使用缓存数据，跳过浏览器获取")
+                    logger.info(f"订单 {order_id} 使用缓存数据，跳过浏览器获取")
 
                     # 构建返回格式
                     result = {
@@ -2670,18 +2680,22 @@ async def fetch_order_detail_simple(
                     return result
                 else:
                     logger.info(f"📋 订单 {order_id} 缓存字段不完整或状态无效，重新获取详情: amount={amount}, status={existing_order.get('order_status')}")
-                    print(f"⚠️ 订单 {order_id} 缓存不满足复用条件，重新获取详情...")
+                    logger.warning(f"订单 {order_id} 缓存不满足复用条件，重新获取详情")
         except Exception as e:
             logger.warning(f"检查数据库缓存失败: {e}")
     else:
         logger.info(f"🔄 订单 {order_id} 强制刷新，跳过缓存检查")
-        print(f"🔄 订单 {order_id} 强制刷新模式...")
+        logger.info(f"订单 {order_id} 强制刷新模式")
 
     # 数据库中没有有效数据，使用浏览器获取
     logger.info(f"🌐 订单 {order_id} 需要浏览器获取，开始初始化浏览器...")
-    print(f"🔍 订单 {order_id} 开始浏览器获取详情...")
+    logger.info(f"订单 {order_id} 开始浏览器获取详情")
 
-    fetcher = OrderDetailFetcher(cookie_string, headless, cookie_id_for_log=cookie_id_for_log)
+    fetcher = OrderDetailFetcher(
+        cookie_string,
+        headless,
+        account_id=normalized_account_id,
+    )
     try:
         if await fetcher.init_browser(headless=headless):
             return await fetcher.fetch_order_detail(order_id, force_refresh=force_refresh)
@@ -2698,7 +2712,7 @@ if __name__ == "__main__":
         
         print(f"🔍 开始获取订单详情: {test_order_id}")
         
-        result = await fetch_order_detail_simple(test_order_id, headless=False)
+        result = await fetch_order_detail_simple(test_order_id, account_id="demo-account", headless=False)
         
         if result:
             print("✅ 订单详情获取成功:")

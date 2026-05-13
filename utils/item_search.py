@@ -32,26 +32,28 @@ if os.getenv('DOCKER_ENV'):
         logger.warning(f"设置SelectorEventLoop失败: {e}")
 
 try:
-    from utils.browser_provider import launch_browser_persistent_context_async as _launch_browser_persistent_context_async
+    from utils.account_browser_runtime import account_browser_runtime_manager
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
     logger.warning("Playwright 未安装，将使用模拟数据")
-async def launch_browser_persistent_context_async(*args, **kwargs):
-    if args:
-        kwargs.setdefault("user_data_dir", args[0])
-    return await _launch_browser_persistent_context_async(**kwargs)
 
 
 class XianyuSearcher:
     """闲鱼商品搜索器 - 基于 Playwright"""
 
-    def __init__(self):
+    def __init__(self, account_id: str, cookie_value: str):
+        account_id = str(account_id or "").strip()
+        if not account_id:
+            raise ValueError("商品搜索必须显式指定account_id")
         self.browser = None
         self.context = None
         self.page = None
+        self._runtime_lease = None
         self.api_responses = []
-        self.user_id = "default"  # 默认用户ID
+        self.account_id = account_id
+        self.cookie_value = str(cookie_value or "").strip()
+        self.user_id = account_id
         self.enable_manual_scratch_captcha_debug = False
         self.use_remote_control = False
 
@@ -651,29 +653,6 @@ class XianyuSearcher:
                 return default
         return data
 
-    async def get_first_valid_cookie(self):
-        """获取第一个有效的cookie"""
-        try:
-            from db_manager import db_manager
-
-            # 获取所有cookies，返回格式是 {id: value}
-            cookies = db_manager.get_all_cookies()
-
-            # 找到第一个有效的cookie（长度大于50的认为是有效的）
-            for cookie_id, cookie_value in cookies.items():
-                if len(cookie_value) > 50:
-                    logger.info(f"找到有效cookie: {cookie_id}")
-                    return {
-                        'id': cookie_id,
-                        'value': cookie_value
-                    }
-
-            return None
-
-        except Exception as e:
-            logger.error(f"获取cookie失败: {str(e)}")
-            return None
-
     async def set_browser_cookies(self, cookie_value: str):
         """设置浏览器cookies"""
         try:
@@ -703,19 +682,18 @@ class XianyuSearcher:
             return False
 
     async def init_browser(self):
-        """初始化浏览器（使用持久化上下文，保留缓存和cookies）"""
+        """初始化浏览器（通过账号级 runtime manager 申请独立页面）"""
         if not PLAYWRIGHT_AVAILABLE:
             raise Exception("Playwright 未安装，无法使用真实搜索功能")
 
-        if not self.browser:
-            
-            # 设置持久化数据目录（保存缓存、cookies等）
-            import tempfile
-            user_data_dir = os.path.join(tempfile.gettempdir(), 'xianyu_browser_cache')
-            os.makedirs(user_data_dir, exist_ok=True)
-            logger.info(f"使用持久化数据目录（保留缓存）: {user_data_dir}")
-            
-            # 简化的浏览器启动参数，避免冲突
+        lease = None
+        try:
+            if self._runtime_lease is not None:
+                await self._release_runtime_lease(reason="refresh_item_search_page")
+
+            user_data_dir = account_browser_runtime_manager.resolve_profile_dir(self.account_id)
+            logger.info(f"使用账号级持久化数据目录: {user_data_dir}")
+
             browser_args = [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -726,55 +704,73 @@ class XianyuSearcher:
                 '--no-default-browser-check',
             ]
 
-            # 只在确实是Docker环境时添加额外参数
             if os.getenv('DOCKER_ENV') == 'true':
-                browser_args.extend([
-                    '--disable-gpu',
-                    # 移除--single-process参数，使用多进程模式提高稳定性
-                    # '--single-process'  # 注释掉，避免崩溃
-                ])
+                browser_args.append('--disable-gpu')
 
-            logger.info("正在启动浏览器（中文模式，持久化缓存）...")
-            
-            # 使用 launch_persistent_context 实现跨会话的缓存持久化
-            # 这样通过一次滑块验证后，下次搜索可以复用缓存，避免再次出现滑块
-            self.context = await launch_browser_persistent_context_async(
-                user_data_dir,  # 第一个参数是用户数据目录，用于持久化
-                headless=True,  # 无头模式，后台运行
-                args=browser_args,
-                # 持久化上下文会自动保存和加载：
-                # - Cookies
-                # - 缓存
-                # - LocalStorage
-                # - SessionStorage
-                # - 其他浏览器状态
+            logger.info("正在通过账号级 runtime manager 申请搜索页面...")
+            lease = await account_browser_runtime_manager.acquire_runtime(
+                self.account_id,
+                "item_search",
+                exclusive=False,
+                runtime_request={
+                    "headless": True,
+                    "use_persistent_context": True,
+                    "profile_dir": user_data_dir,
+                    "launch_options": {
+                        "headless": True,
+                        "args": browser_args,
+                    },
+                },
             )
-            
-            # launch_persistent_context 返回的是 context，不是 browser
-            # 需要通过 context.browser 获取 browser 对象
-            self.browser = self.context.browser
+            self.page, self.context = await account_browser_runtime_manager.get_fresh_page(lease)
+            self._runtime_lease = lease
+            lease_runtime = getattr(lease, "runtime", None)
+            self.browser = getattr(lease_runtime, "browser", None)
 
-            logger.info("浏览器启动成功（持久化上下文已创建）...")
+            logger.info("浏览器初始化完成（账号级 runtime 已就绪）")
+        except Exception:
+            if lease is not None and self._runtime_lease is None:
+                try:
+                    await account_browser_runtime_manager.release_runtime(
+                        lease,
+                        reason="item_search_init_failed",
+                    )
+                except Exception:
+                    pass
+            raise
 
-            logger.info("创建页面...")
-            self.page = await self.context.new_page()
+    async def _release_runtime_lease(self, reason: str) -> None:
+        lease = self._runtime_lease
+        self._runtime_lease = None
+        self.browser = None
+        self.context = None
+        self.page = None
 
-            logger.info("浏览器初始化完成（缓存将持久化保存）")
+        if lease is None:
+            return
+
+        try:
+            await account_browser_runtime_manager.release_runtime(lease, reason=reason)
+        except Exception as e:
+            logger.warning(f"释放商品搜索 runtime 失败: {e}")
 
     async def close_browser(self):
-        """关闭浏览器（持久化上下文会自动保存缓存和cookies）"""
+        """关闭浏览器"""
         try:
+            if self._runtime_lease is not None:
+                await self._release_runtime_lease(reason="close_item_search_page")
+                logger.debug("商品搜索器浏览器已关闭（runtime lease 已释放）")
+                return
             if self.page:
                 await self.page.close()
                 self.page = None
-            # 注意：使用 persistent_context 时，关闭 context 会自动保存所有数据
             if self.context:
                 await self.context.close()
                 self.context = None
-            # persistent_context 的 browser 会在 context 关闭时自动关闭
-            # 不需要单独关闭 browser
+            if self.browser:
+                await self.browser.close()
             self.browser = None
-            logger.debug("商品搜索器浏览器已关闭（缓存已保存）")
+            logger.debug("商品搜索器浏览器已关闭")
         except Exception as e:
             logger.warning(f"关闭商品搜索器浏览器时出错: {e}")
     
@@ -843,20 +839,17 @@ class XianyuSearcher:
                         logger.warning(f"响应处理异常: {str(e)}")
 
             try:
-                # 获取并设置cookies进行登录
-                logger.info("正在获取有效的cookies账户...")
-                cookie_data = await self.get_first_valid_cookie()
-                if not cookie_data:
-                    raise Exception("未找到有效的cookies账户，请先在Cookie管理中添加有效的闲鱼账户")
+                if not self.cookie_value:
+                    raise Exception(f"账号 {self.account_id} 没有可用Cookie，无法执行搜索")
 
-                logger.info(f"使用账户: {cookie_data.get('id', 'unknown')}")
+                logger.info(f"使用账户: {self.account_id}")
 
                 logger.info("正在访问闲鱼首页...")
                 await self.page.goto("https://www.goofish.com", timeout=30000)
 
                 # 设置cookies进行登录
                 logger.info("正在设置cookies进行登录...")
-                cookie_success = await self.set_browser_cookies(cookie_data.get('value', ''))
+                cookie_success = await self.set_browser_cookies(self.cookie_value)
                 if not cookie_success:
                     logger.warning("设置cookies失败，将以未登录状态继续")
                 else:
@@ -1251,20 +1244,17 @@ class XianyuSearcher:
                 if not self.page or self.page.is_closed():
                     raise Exception("页面已关闭或不可用")
 
-                # 获取并设置cookies进行登录
-                logger.info("正在获取有效的cookies账户...")
-                cookie_data = await self.get_first_valid_cookie()
-                if not cookie_data:
-                    raise Exception("未找到有效的cookies账户，请先在Cookie管理中添加有效的闲鱼账户")
+                if not self.cookie_value:
+                    raise Exception(f"账号 {self.account_id} 没有可用Cookie，无法执行搜索")
 
-                logger.info(f"使用账户: {cookie_data.get('id', 'unknown')}")
+                logger.info(f"使用账户: {self.account_id}")
 
                 logger.info("正在访问闲鱼首页...")
                 await self.page.goto("https://www.goofish.com", timeout=30000)
 
                 # 设置cookies进行登录
                 logger.info("正在设置cookies进行登录...")
-                cookie_success = await self.set_browser_cookies(cookie_data.get('value', ''))
+                cookie_success = await self.set_browser_cookies(self.cookie_value)
                 if not cookie_success:
                     logger.warning("设置cookies失败，将以未登录状态继续")
                 else:
@@ -1524,11 +1514,20 @@ class XianyuSearcher:
 
 # 搜索器工具函数
 
-async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+async def search_xianyu_items(
+    *,
+    account_id: str,
+    cookie_value: str,
+    keyword: str,
+    page: int = 1,
+    page_size: int = 20,
+) -> Dict[str, Any]:
     """
     搜索闲鱼商品的便捷函数，带重试机制
 
     Args:
+        account_id: 账号ID
+        cookie_value: 当前账号Cookie
         keyword: 搜索关键词
         page: 页码
         page_size: 每页数量
@@ -1543,7 +1542,7 @@ async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) 
         searcher = None
         try:
             # 每次搜索都创建新的搜索器实例，避免浏览器状态混乱
-            searcher = XianyuSearcher()
+            searcher = XianyuSearcher(account_id=account_id, cookie_value=cookie_value)
 
             logger.info(f"开始单页搜索，尝试次数: {attempt + 1}/{max_retries + 1}")
             result = await searcher.search_items(keyword, page, page_size)
@@ -1585,11 +1584,19 @@ async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) 
     }
 
 
-async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1) -> Dict[str, Any]:
+async def search_multiple_pages_xianyu(
+    *,
+    account_id: str,
+    cookie_value: str,
+    keyword: str,
+    total_pages: int = 1,
+) -> Dict[str, Any]:
     """
     搜索多页闲鱼商品的便捷函数，带重试机制
 
     Args:
+        account_id: 账号ID
+        cookie_value: 当前账号Cookie
         keyword: 搜索关键词
         total_pages: 总页数
 
@@ -1603,7 +1610,7 @@ async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1) -> Di
         searcher = None
         try:
             # 每次搜索都创建新的搜索器实例，避免浏览器状态混乱
-            searcher = XianyuSearcher()
+            searcher = XianyuSearcher(account_id=account_id, cookie_value=cookie_value)
 
             logger.info(f"开始多页搜索，尝试次数: {attempt + 1}/{max_retries + 1}")
             result = await searcher.search_multiple_pages(keyword, total_pages)

@@ -531,9 +531,16 @@ stats_*.log
 # 临时Python脚本（不要提交临时脚本）
 temp_*.py
 tmp_*.py
+tmp_*
 quick_*.py
 fix_*.py
 test_*.py
+!tests/test_account_id_migration_batch.py
+!tests/test_cookie_manager_account_runtime.py
+!tests/test_db_manager_account_id_relations.py
+!tests/test_order_detail_fetcher_runtime.py
+!tests/test_order_status_handler_account_id.py
+!tests/test_reply_server_account_scope.py
 check_*.py
 debug_*.py
 

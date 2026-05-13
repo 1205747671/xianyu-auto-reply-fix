@@ -378,9 +378,17 @@ class AIReplyEngine:
         result = response.json()
         return result['choices'][0]['message']['content'].strip()
 
-    def is_ai_enabled(self, cookie_id: str) -> bool:
+    def _require_account_id(self, account_id: str) -> str:
+        """规范并校验账号ID。"""
+        normalized_account_id = str(account_id or "").strip()
+        if not normalized_account_id:
+            raise ValueError("account_id 不能为空")
+        return normalized_account_id
+
+    def is_ai_enabled(self, account_id: str) -> bool:
         """检查指定账号是否启用AI回复"""
-        settings = db_manager.get_ai_reply_settings(cookie_id)
+        normalized_account_id = self._require_account_id(account_id)
+        settings = db_manager.get_ai_reply_settings(normalized_account_id)
         return settings['ai_enabled']
     
     def _get_chat_lock(self, chat_id: str) -> threading.Lock:
@@ -391,27 +399,29 @@ class AIReplyEngine:
             return self._chat_locks[chat_id]
     
     def generate_reply(self, message: str, item_info: dict, chat_id: str,
-                      cookie_id: str, user_id: str, item_id: str,
+                      account_id: str, user_id: str, item_id: str,
                       skip_wait: bool = False) -> Optional[str]:
         """
         生成AI回复 - 统一意图识别与回复生成
         AI会自动判断用户意图并生成合适的回复，避免关键词误判
         """
-        if not self.is_ai_enabled(cookie_id):
+        normalized_account_id = self._require_account_id(account_id)
+
+        if not self.is_ai_enabled(normalized_account_id):
             return None
         
         try:
             # 先保存用户消息到数据库（意图暂时设为None，后续可根据需要更新）
             message_created_at = self.save_conversation(
-                chat_id, cookie_id, user_id, item_id, "user", message, intent=None
+                chat_id, normalized_account_id, user_id, item_id, "user", message, intent=None
             )
             
             # 消息去抖处理
             if not skip_wait:
-                logger.info(f"【{cookie_id}】消息已保存，等待10秒收集后续消息: {message[:20]}...")
+                logger.info(f"【{normalized_account_id}】消息已保存，等待10秒收集后续消息: {message[:20]}...")
                 time.sleep(10)
             else:
-                logger.info(f"【{cookie_id}】消息已保存（外部防抖已启用）: {message[:20]}...")
+                logger.info(f"【{normalized_account_id}】消息已保存（外部防抖已启用）: {message[:20]}...")
             
             # 获取该chat_id的锁，确保同一对话的消息串行处理
             chat_lock = self._get_chat_lock(chat_id)
@@ -419,23 +429,27 @@ class AIReplyEngine:
             with chat_lock:
                 # 检查是否有更新的消息
                 query_seconds = 6 if skip_wait else 25
-                recent_messages = self._get_recent_user_messages(chat_id, cookie_id, seconds=query_seconds)
+                recent_messages = self._get_recent_user_messages(
+                    chat_id,
+                    normalized_account_id,
+                    seconds=query_seconds,
+                )
                 
                 if recent_messages and len(recent_messages) > 0:
                     latest_message = recent_messages[-1]
                     if message_created_at != latest_message['created_at']:
-                        logger.info(f"【{cookie_id}】检测到更新消息，跳过当前消息")
+                        logger.info(f"【{normalized_account_id}】检测到更新消息，跳过当前消息")
                         return None
                 
                 # 1. 获取AI设置
-                settings = db_manager.get_ai_reply_settings(cookie_id)
+                settings = db_manager.get_ai_reply_settings(normalized_account_id)
                 custom_prompts = json.loads(settings['custom_prompts']) if settings['custom_prompts'] else {}
 
                 # 2. 获取对话历史
-                context = self.get_conversation_context(chat_id, cookie_id)
+                context = self.get_conversation_context(chat_id, normalized_account_id)
 
                 # 3. 获取对话轮数和议价设置（供AI参考）
-                conversation_rounds = self.get_conversation_rounds(chat_id, cookie_id)
+                conversation_rounds = self.get_conversation_rounds(chat_id, normalized_account_id)
                 max_bargain_rounds = settings.get('max_bargain_rounds', 3)
                 max_discount_percent = settings.get('max_discount_percent', 10)
                 max_discount_amount = settings.get('max_discount_amount', 100)
@@ -506,13 +520,21 @@ class AIReplyEngine:
                     reply = self._call_openai_chat_api(settings, messages, max_tokens=150, temperature=0.7)
 
                 # 10. 保存AI回复到对话记录
-                self.save_conversation(chat_id, cookie_id, user_id, item_id, "assistant", reply, intent=None)
+                self.save_conversation(
+                    chat_id,
+                    normalized_account_id,
+                    user_id,
+                    item_id,
+                    "assistant",
+                    reply,
+                    intent=None,
+                )
                 
-                logger.info(f"AI回复生成成功 (账号: {cookie_id}): {reply}")
+                logger.info(f"AI回复生成成功 (账号: {normalized_account_id}): {reply}")
                 return reply
                 
         except Exception as e:
-            logger.error(f"AI回复生成失败 {cookie_id}: {e}")
+            logger.error(f"AI回复生成失败 {normalized_account_id}: {e}")
             if hasattr(e, 'response') and hasattr(e.response, 'url'):
                 logger.error(f"请求URL: {e.response.url}")
             if hasattr(e, 'request') and hasattr(e.request, 'url'):
@@ -520,7 +542,7 @@ class AIReplyEngine:
             return None
 
     async def generate_reply_async(self, message: str, item_info: dict, chat_id: str,
-                                   cookie_id: str, user_id: str, item_id: str,
+                                   account_id: str, user_id: str, item_id: str,
                                    skip_wait: bool = False) -> Optional[str]:
         """
         异步包装器：在独立线程池中执行同步的 `generate_reply`，并返回结果。
@@ -528,21 +550,31 @@ class AIReplyEngine:
         """
         try:
             import asyncio as _asyncio
-            return await _asyncio.to_thread(self.generate_reply, message, item_info, chat_id, cookie_id, user_id, item_id, skip_wait)
+            return await _asyncio.to_thread(
+                self.generate_reply,
+                message,
+                item_info,
+                chat_id,
+                account_id,
+                user_id,
+                item_id,
+                skip_wait,
+            )
         except Exception as e:
             logger.error(f"异步生成回复失败: {e}")
             return None
     
-    def get_conversation_context(self, chat_id: str, cookie_id: str, limit: int = 20) -> List[Dict]:
+    def get_conversation_context(self, chat_id: str, account_id: str, limit: int = 20) -> List[Dict]:
         """获取对话上下文"""
+        normalized_account_id = self._require_account_id(account_id)
         try:
             with db_manager.lock:
                 cursor = db_manager.conn.cursor()
                 cursor.execute('''
                 SELECT role, content FROM ai_conversations 
-                WHERE chat_id = ? AND cookie_id = ? 
+                WHERE chat_id = ? AND account_id = ? 
                 ORDER BY created_at DESC LIMIT ?
-                ''', (chat_id, cookie_id, limit))
+                ''', (chat_id, normalized_account_id, limit))
                 
                 results = cursor.fetchall()
                 context = [{"role": row[0], "content": row[1]} for row in reversed(results)]
@@ -551,17 +583,18 @@ class AIReplyEngine:
             logger.error(f"获取对话上下文失败: {e}")
             return []
     
-    def save_conversation(self, chat_id: str, cookie_id: str, user_id: str, 
+    def save_conversation(self, chat_id: str, account_id: str, user_id: str, 
                          item_id: str, role: str, content: str, intent: str = None) -> Optional[str]:
         """保存对话记录，返回创建时间"""
+        normalized_account_id = self._require_account_id(account_id)
         try:
             with db_manager.lock:
                 cursor = db_manager.conn.cursor()
                 cursor.execute('''
                 INSERT INTO ai_conversations 
-                (cookie_id, chat_id, user_id, item_id, role, content, intent)
+                (account_id, chat_id, user_id, item_id, role, content, intent)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (cookie_id, chat_id, user_id, item_id, role, content, intent))
+                ''', (normalized_account_id, chat_id, user_id, item_id, role, content, intent))
                 db_manager.conn.commit()
                 
                 # 获取刚插入记录的created_at
@@ -574,15 +607,17 @@ class AIReplyEngine:
         except Exception as e:
             logger.error(f"保存对话记录失败: {e}")
             return None
-    def get_conversation_rounds(self, chat_id: str, cookie_id: str) -> int:
+
+    def get_conversation_rounds(self, chat_id: str, account_id: str) -> int:
         """获取对话轮数（用户消息数量）"""
+        normalized_account_id = self._require_account_id(account_id)
         try:
             with db_manager.lock:
                 cursor = db_manager.conn.cursor()
                 cursor.execute('''
                 SELECT COUNT(*) FROM ai_conversations 
-                WHERE chat_id = ? AND cookie_id = ? AND role = 'user'
-                ''', (chat_id, cookie_id))
+                WHERE chat_id = ? AND account_id = ? AND role = 'user'
+                ''', (chat_id, normalized_account_id))
                 
                 result = cursor.fetchone()
                 return result[0] if result else 0
@@ -590,8 +625,9 @@ class AIReplyEngine:
             logger.error(f"获取对话轮数失败: {e}")
             return 0
     
-    def _get_recent_user_messages(self, chat_id: str, cookie_id: str, seconds: int = 2) -> List[Dict]:
+    def _get_recent_user_messages(self, chat_id: str, account_id: str, seconds: int = 2) -> List[Dict]:
         """获取最近seconds秒内的所有用户消息（包含内容和时间戳）"""
+        normalized_account_id = self._require_account_id(account_id)
         try:
             with db_manager.lock:
                 cursor = db_manager.conn.cursor()
@@ -601,9 +637,9 @@ class AIReplyEngine:
                        julianday('now') - julianday(created_at) as time_diff_days,
                        (julianday('now') - julianday(created_at)) * 86400.0 as time_diff_seconds
                 FROM ai_conversations 
-                WHERE chat_id = ? AND cookie_id = ? AND role = 'user' 
+                WHERE chat_id = ? AND account_id = ? AND role = 'user' 
                 ORDER BY created_at DESC LIMIT 10
-                ''', (chat_id, cookie_id))
+                ''', (chat_id, normalized_account_id))
                 
                 all_messages = cursor.fetchall()
                 logger.info(f"【调试】chat_id={chat_id} 最近10条user消息: {[(msg[0][:10], msg[1], f'{msg[3]:.2f}秒前') for msg in all_messages]}")
@@ -611,10 +647,10 @@ class AIReplyEngine:
                 # 正式查询
                 cursor.execute('''
                 SELECT content, created_at FROM ai_conversations 
-                WHERE chat_id = ? AND cookie_id = ? AND role = 'user' 
+                WHERE chat_id = ? AND account_id = ? AND role = 'user' 
                 AND julianday('now') - julianday(created_at) < (? / 86400.0)
                 ORDER BY created_at ASC
-                ''', (chat_id, cookie_id, seconds))
+                ''', (chat_id, normalized_account_id, seconds))
                 
                 results = cursor.fetchall()
                 return [{"content": row[0], "created_at": row[1]} for row in results]

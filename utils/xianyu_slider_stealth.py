@@ -1067,6 +1067,7 @@ class XianyuSliderStealth:
                     self.browser_channel = detected_channel
         self.playwright = None
         self._concurrency_slot_registered = False
+        self._managed_runtime_binding = None
         
         # 提取纯用户ID（移除时间戳部分）
         self.pure_user_id = concurrency_manager._extract_pure_user_id(user_id)
@@ -1206,7 +1207,7 @@ class XianyuSliderStealth:
                 },
             )
             log_id = db_manager.add_risk_control_log(
-                cookie_id=self.pure_user_id,
+                account_id=self.pure_user_id,
                 event_type='slider_captcha',
                 session_id=getattr(self, 'risk_session_id', None),
                 trigger_scene=trigger_scene,
@@ -2700,6 +2701,82 @@ class XianyuSliderStealth:
                 self.playwright = None
         except Exception as e:
             logger.warning(f"【{self.pure_user_id}】清理Playwright时出错: {e}")
+
+    def build_managed_runtime_request(self, **kwargs) -> Dict[str, Any]:
+        browser_features = self._build_browser_features()
+        self.browser_features = browser_features
+        self.profile_id = browser_features.get("profile_id", "unknown")
+
+        launch_options: Dict[str, Any] = {
+            "headless": self.headless,
+            "proxy": self._build_browser_proxy_settings(),
+            "args": self._build_browser_launch_args(),
+        }
+        if getattr(self, "browser_channel", None):
+            launch_options["channel"] = self.browser_channel
+        if getattr(self, "executable_path", None):
+            launch_options["executable_path"] = self.executable_path
+        launch_options = self._sanitize_provider_launch_options(launch_options)
+        launch_options = self._apply_provider_launch_defaults(launch_options)
+
+        context_options = self._build_browser_context_options(browser_features)
+        persistent_context_options = self._build_persistent_context_options(
+            browser_features,
+            context_options=context_options,
+        )
+        runtime_request = {
+            "browser_features": browser_features,
+            "profile_id": self.profile_id,
+            "launch_options": launch_options,
+            "context_options": context_options,
+            "persistent_context_options": persistent_context_options,
+            "initial_cookie_payload": self._build_initial_cookie_payload(),
+            "use_persistent_context": self._should_use_account_persistent_profile(),
+            "profile_dir": self._resolve_account_persistent_profile_dir(),
+        }
+        runtime_request.update(kwargs)
+        return runtime_request
+
+    def attach_managed_runtime(
+        self,
+        *,
+        lease: Any = None,
+        runtime: Any = None,
+        browser: Any = None,
+        context: Any = None,
+        page: Any = None,
+        playwright: Any = None,
+        browser_features: Optional[Dict[str, Any]] = None,
+        profile_id: Optional[str] = None,
+    ):
+        self._managed_runtime_binding = {
+            "lease": lease,
+            "runtime": runtime,
+            "browser": browser,
+            "context": context,
+            "page": page,
+            "playwright": playwright,
+        }
+        self.browser = browser
+        self.context = context
+        self.page = page
+        self.playwright = playwright
+        if browser_features:
+            self.browser_features = dict(browser_features)
+        if profile_id:
+            self.profile_id = profile_id
+        if page and browser_features:
+            try:
+                self._install_stealth_init_script(page, browser_features)
+            except Exception as attach_err:
+                logger.debug(f"【{self.pure_user_id}】附加受管运行时时注入脚本失败: {attach_err}")
+
+    def _detach_managed_runtime(self):
+        self._managed_runtime_binding = None
+        self.browser = None
+        self.context = None
+        self.page = None
+        self.playwright = None
     
     def _load_success_history(self) -> List[Dict[str, Any]]:
         """加载历史成功数据（带自动清理）"""
@@ -9532,13 +9609,17 @@ class XianyuSliderStealth:
     def close_browser(self):
         """安全关闭浏览器并清理资源"""
         logger.info(f"【{self.pure_user_id}】开始清理资源...")
+        managed_runtime_binding = getattr(self, "_managed_runtime_binding", None) or {}
+        using_managed_runtime = bool(managed_runtime_binding)
 
         # 先释放槽位，避免后续任一清理步骤卡死把同账号任务永久堵住。
         self._release_concurrency_slot("close_browser开始")
         
         # 清理页面
         try:
-            if hasattr(self, 'page') and self.page:
+            if using_managed_runtime:
+                self.page = None
+            elif hasattr(self, 'page') and self.page:
                 self.page.close()
                 logger.debug(f"【{self.pure_user_id}】页面已关闭")
                 self.page = None
@@ -9547,7 +9628,9 @@ class XianyuSliderStealth:
         
         # 清理上下文
         try:
-            if hasattr(self, 'context') and self.context:
+            if using_managed_runtime:
+                self.context = None
+            elif hasattr(self, 'context') and self.context:
                 self.context.close()
                 logger.debug(f"【{self.pure_user_id}】上下文已关闭")
                 self.context = None
@@ -9556,7 +9639,9 @@ class XianyuSliderStealth:
         
         # 【修复】同步关闭浏览器，确保资源真正释放
         try:
-            if hasattr(self, 'browser') and self.browser:
+            if using_managed_runtime:
+                self.browser = None
+            elif hasattr(self, 'browser') and self.browser:
                 self.browser.close()  # 直接同步关闭，不使用异步任务
                 logger.info(f"【{self.pure_user_id}】浏览器已关闭")
                 self.browser = None
@@ -9565,7 +9650,9 @@ class XianyuSliderStealth:
         
         # 【修复】同步停止Playwright，确保资源真正释放
         try:
-            if hasattr(self, 'playwright') and self.playwright:
+            if using_managed_runtime:
+                self.playwright = None
+            elif hasattr(self, 'playwright') and self.playwright:
                 stopped = self._stop_playwright_with_timeout()
                 if stopped:
                     logger.info(f"【{self.pure_user_id}】Playwright已停止")
@@ -9586,6 +9673,8 @@ class XianyuSliderStealth:
         
         # 再兜底释放一次，兼容前面提前释放失败的极端情况。
         self._release_concurrency_slot("close_browser收尾")
+        if using_managed_runtime:
+            self._detach_managed_runtime()
         
         logger.info(f"【{self.pure_user_id}】资源清理完成")
     
@@ -9959,7 +10048,7 @@ class XianyuSliderStealth:
                                     db_event_type = event_type_map.get(verification_type, 'unknown')
                                     event_name = event_type_names.get(verification_type, '身份验证')
                                     db_manager.add_risk_control_log(
-                                        cookie_id=self.pure_user_id,
+                                        account_id=self.pure_user_id,
                                         event_type=db_event_type,
                                         session_id=getattr(self, 'risk_session_id', None),
                                         trigger_scene=getattr(self, 'risk_trigger_scene', None) or 'password_login',
@@ -10495,7 +10584,8 @@ class XianyuSliderStealth:
     
     def _login_with_browser_flow(self, account: str, password: str, show_browser: bool = False,
                                  notification_callback: Optional[Callable] = None,
-                                 force_clean_context: bool = False) -> dict:
+                                 force_clean_context: bool = False,
+                                 require_managed_runtime: bool = False) -> dict:
         """使用浏览器 provider 进行密码登录
         
         Args:
@@ -10594,60 +10684,72 @@ class XianyuSliderStealth:
             if self._should_prefer_project_browser_for_playwright():
                 self._ensure_project_playwright_browser()
 
-            playwright = None
-            browser = None
+            managed_runtime_binding = getattr(self, "_managed_runtime_binding", None) or {}
+            using_managed_runtime = bool(managed_runtime_binding)
+            if require_managed_runtime and not using_managed_runtime:
+                logger.error(
+                    f"【{self.pure_user_id}】当前密码登录流程要求使用 managed runtime，"
+                    "拒绝降级到匿名浏览器上下文"
+                )
+                return self._fail_login("missing managed runtime binding for account-scoped password login")
+            playwright = managed_runtime_binding.get("playwright") if using_managed_runtime else None
+            browser = managed_runtime_binding.get("browser") if using_managed_runtime else None
+            context = managed_runtime_binding.get("context") if using_managed_runtime else None
+            page = managed_runtime_binding.get("page") if using_managed_runtime else None
             used_profile_lock_fallback = False
-            launch_options: Dict[str, Any] = {
-                'headless': not show_browser,
-                'args': browser_args,
-            }
-            proxy_settings = self._build_browser_proxy_settings()
-            if proxy_settings:
-                launch_options['proxy'] = proxy_settings
-                logger.info(f"【{self.pure_user_id}】密码登录浏览器启用代理: {proxy_settings['server']}")
-            if self.browser_channel:
-                launch_options['channel'] = self.browser_channel
-            if self.executable_path:
-                launch_options['executable_path'] = self.executable_path
-            launch_options = self._sanitize_provider_launch_options(launch_options)
-            launch_options = self._apply_provider_launch_defaults(launch_options)
-            context_options = self._build_browser_context_options(browser_features)
-            persistent_context_options = self._build_persistent_context_options(
-                browser_features,
-                context_options=context_options,
-            )
-            if force_clean_context:
-                browser, context = self._launch_clean_cookie_seeded_context(
-                    launch_options,
+            if not using_managed_runtime:
+                launch_options: Dict[str, Any] = {
+                    'headless': not show_browser,
+                    'args': browser_args,
+                }
+                proxy_settings = self._build_browser_proxy_settings()
+                if proxy_settings:
+                    launch_options['proxy'] = proxy_settings
+                    logger.info(f"【{self.pure_user_id}】密码登录浏览器启用代理: {proxy_settings['server']}")
+                if self.browser_channel:
+                    launch_options['channel'] = self.browser_channel
+                if self.executable_path:
+                    launch_options['executable_path'] = self.executable_path
+                launch_options = self._sanitize_provider_launch_options(launch_options)
+                launch_options = self._apply_provider_launch_defaults(launch_options)
+                context_options = self._build_browser_context_options(browser_features)
+                persistent_context_options = self._build_persistent_context_options(
                     browser_features,
                     context_options=context_options,
                 )
-            else:
-                try:
-                    context = launch_browser_persistent_context(
-                        user_data_dir=user_data_dir,
-                        **launch_options,
-                        **persistent_context_options,
-                    )
-                except Exception as persistent_launch_error:
-                    if not self._is_profile_in_use_launch_error(persistent_launch_error):
-                        raise
-                    used_profile_lock_fallback = True
-                    logger.warning(
-                        f"【{self.pure_user_id}】持久化浏览器目录被其他 Chromium 进程占用，"
-                        f"自动切换到干净上下文兜底登录: {persistent_launch_error}"
-                    )
+                if force_clean_context:
                     browser, context = self._launch_clean_cookie_seeded_context(
                         launch_options,
                         browser_features,
                         context_options=context_options,
                     )
+                else:
+                    try:
+                        context = launch_browser_persistent_context(
+                            user_data_dir=user_data_dir,
+                            **launch_options,
+                            **persistent_context_options,
+                        )
+                    except Exception as persistent_launch_error:
+                        if not self._is_profile_in_use_launch_error(persistent_launch_error):
+                            raise
+                        used_profile_lock_fallback = True
+                        logger.warning(
+                            f"【{self.pure_user_id}】持久化浏览器目录被其他 Chromium 进程占用，"
+                            f"自动切换到干净上下文兜底登录: {persistent_launch_error}"
+                        )
+                        browser, context = self._launch_clean_cookie_seeded_context(
+                            launch_options,
+                            browser_features,
+                            context_options=context_options,
+                        )
             effective_clean_context = force_clean_context or used_profile_lock_fallback
             logger.info(f"【{self.pure_user_id}】已设置浏览器语言为中文（zh-CN）")
 
             if not browser:
                 browser = context.browser
-            page = context.new_page()
+            if not page:
+                page = context.new_page()
             self._apply_headless_network_fingerprint(page, browser_features)
             observed_set_cookie_updates: Dict[str, str] = {}
 
@@ -11511,33 +11613,36 @@ class XianyuSliderStealth:
             finally:
                 # 关闭浏览器。这里不能无限阻塞，否则上层会话会一直卡在 processing。
                 try:
-                    close_errors = []
-                    # sync Playwright 的 page/context/browser 需要在创建它们的同一线程关闭，
-                    # 否则 greenlet 会报 "Cannot switch to a different thread"。
-                    try:
-                        if context:
-                            context.close()
-                    except Exception as close_context_err:
-                        close_errors.append(f"context.close: {close_context_err}")
-
-                    if effective_clean_context and browser:
-                        try:
-                            browser.close()
-                        except Exception as close_browser_err:
-                            close_errors.append(f"browser.close: {close_browser_err}")
-
-                    try:
-                        if playwright:
-                            playwright.stop()
-                    except Exception as stop_playwright_err:
-                        close_errors.append(f"playwright.stop: {stop_playwright_err}")
-
-                    if close_errors:
-                        logger.warning(f"【{self.pure_user_id}】关闭浏览器时出现异常: {close_errors}")
-                    elif effective_clean_context:
-                        logger.info(f"【{self.pure_user_id}】浏览器已关闭，干净上下文已销毁")
+                    if using_managed_runtime:
+                        self._detach_managed_runtime()
                     else:
-                        logger.info(f"【{self.pure_user_id}】浏览器已关闭，缓存已保存")
+                        close_errors = []
+                        # sync Playwright 的 page/context/browser 需要在创建它们的同一线程关闭，
+                        # 否则 greenlet 会报 "Cannot switch to a different thread"。
+                        try:
+                            if context:
+                                context.close()
+                        except Exception as close_context_err:
+                            close_errors.append(f"context.close: {close_context_err}")
+
+                        if effective_clean_context and browser:
+                            try:
+                                browser.close()
+                            except Exception as close_browser_err:
+                                close_errors.append(f"browser.close: {close_browser_err}")
+
+                        try:
+                            if playwright:
+                                playwright.stop()
+                        except Exception as stop_playwright_err:
+                            close_errors.append(f"playwright.stop: {stop_playwright_err}")
+
+                        if close_errors:
+                            logger.warning(f"【{self.pure_user_id}】关闭浏览器时出现异常: {close_errors}")
+                        elif effective_clean_context:
+                            logger.info(f"【{self.pure_user_id}】浏览器已关闭，干净上下文已销毁")
+                        else:
+                            logger.info(f"【{self.pure_user_id}】浏览器已关闭，缓存已保存")
                 except Exception as e:
                     logger.warning(f"【{self.pure_user_id}】关闭浏览器时出错: {e}")
 
@@ -11582,17 +11687,27 @@ class XianyuSliderStealth:
         url: str,
         notification_callback: Optional[Callable] = None,
         notification_scene: str = '手动导入 Cookie',
+        require_managed_runtime: bool = False,
     ):
         """运行主流程，返回(成功状态, cookie数据)"""
         cookies = None
+        using_managed_runtime = bool(getattr(self, "_managed_runtime_binding", None))
         try:
+            if require_managed_runtime and not using_managed_runtime:
+                self.last_login_error = "missing managed runtime binding for account-scoped verification flow"
+                logger.error(
+                    f"【{self.pure_user_id}】当前验证流程要求使用 managed runtime，"
+                    "拒绝降级到匿名浏览器上下文"
+                )
+                return False, None
             # 检查日期有效性
             if not self._check_date_validity():
                 logger.error(f"【{self.pure_user_id}】日期验证失败，无法执行")
                 return False, None
             
             # 初始化浏览器
-            self.init_browser()
+            if not using_managed_runtime:
+                self.init_browser()
 
             # 无头模式默认跳过额外预热，避免先访问其它页面把风控状态搞得更脏；
             # 如需回滚，可设置 XY_SLIDER_HEADLESS_WARMUP=1。
@@ -11744,9 +11859,12 @@ class XianyuSliderStealth:
             return False, None
         finally:
             # 关闭浏览器
-            self.close_browser()
+            if using_managed_runtime:
+                self._detach_managed_runtime()
+            else:
+                self.close_browser()
 
-    async def async_run(self, url: str):
+    async def async_run(self, url: str, **kwargs):
         """异步运行主流程，返回(成功状态, cookie数据)
 
         在独立线程中运行同步的 Playwright，避免事件循环冲突
@@ -11769,7 +11887,7 @@ class XianyuSliderStealth:
             return self.run(url)
 
         # 使用 asyncio.to_thread 在独立线程中运行
-        return await self._run_sync_method_on_fresh_thread(self.run, url)
+        return await self._run_sync_method_on_fresh_thread(self.run, url, **kwargs)
 
     async def _run_sync_method_on_fresh_thread(self, func, *args, **kwargs):
         import asyncio

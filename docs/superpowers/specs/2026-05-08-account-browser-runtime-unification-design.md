@@ -48,6 +48,33 @@
    - fallback 只能重建同账号 runtime，不允许更换身份
    - 明确并发锁、回滚、失效判定、空闲回收、日志观测规则
 
+## 实施状态注记（2026-05-09）
+
+以下内容已经落地或部分落地：
+
+1. `utils/account_browser_runtime.py` 已存在，并负责账号级 runtime / profile_dir / generation / idle cleanup
+2. `db_manager.py` 已补 `bound_unb` / `bind_status`
+3. 扫码登录链路已显式带 `account_id`，并把 `phase / verification_type / handoff_status` 暴露给前端
+4. `utils/order_detail_fetcher.py` 类内部已接 runtime manager，不再是纯直启浏览器
+
+以下内容仍未完全符合本设计：
+
+1. `utils/item_search.py` 还没完全切成统一 runtime lease/page 模式
+2. `XianyuAutoAsync.py` / `cookie_manager.py` 仍没把浏览器恢复和账号启停彻底纳入同一 runtime 生命周期
+3. API、前端状态名、数据层关系字段仍大量残留 `cookie_id` 语义
+
+因此，这份设计的核心方向已经验证可行，但实现还处在“中段施工”状态，不能当成已经全量验收通过。
+
+### 2026-05-09 补注（覆盖更晚事实）
+
+- `utils/item_search.py` 主搜索路径已接账号级 runtime manager；“仍拿第一个有效 cookie / 共享缓存目录”的说法只适合作为 2026-05-08 写作时背景，不再代表当前主路径
+- `utils/order_detail_fetcher.py` 主路径已接 runtime manager，且缺 `account_id` 会直接拒绝；当前遗留问题更多是 `cookie_string` 仍作凭证参数、深层语义收尾和遗留导入，而不是继续把“直启浏览器”当主路径
+- `reply_server.py` 的账号管理/诊断 helper 在 Batch 7 继续收口：
+  - `_ensure_cookie_access()` 已移除
+  - 单账号详情 / proxy / runtime-status / conversation history / session-keepalive 已统一改走 `_ensure_account_access(...)`
+  - 一批 `/cookie(s)` 管理路由占位符已统一到 `{account_id}`
+- `cookie_manager.py` 变量层的 `cookie_id -> account_id` 已继续收口，但 `XianyuAutoAsync.py` / `XianyuLive(cookie_id=...)` 深层内部契约仍未完全迁完
+
 ## 非目标
 
 本设计不包含以下内容：
@@ -525,3 +552,131 @@ runtime 生命周期建议如下：
 - 并发、回滚、失效、回收都能基于同一套模型处理
 
 后续实施应以“先统一入口、再替换旧链路、最后清理 fallback”为基本顺序推进。
+
+### 2026-05-09 Batch 8 补注（覆盖更晚事实）
+
+- `order_status_handler.py` 这批真迁移已经落地：
+  - 当前文件内已无 `cookie_id`
+  - 待处理队列 / 延迟处理 / 订单状态回填都只走 `account_id`
+- `utils/order_history_sync.py` / `utils/order_detail_fetcher.py` 当前状态应按下面理解：
+  - **身份键**：`account_id`
+  - **凭证参数**：`cookie_string`
+  - 不再使用 `account_id_for_log` / `cookie_id_for_log` 这类过渡命名
+- `cookie_manager.py` / `Start.py` 本轮补了最小生命周期安全修正：
+  - 任务结束后自动清理 `manager.tasks[account_id]` 的 stale 引用
+  - `_start_cookie_task()` 遇到已完成旧任务时会先清理再重启
+  - 启动期 `manager.add_cookie(...)` 会在 API 线程启动前等待账号注册协程收口
+- 术语边界再强调一遍：
+  - `/send-message`、`/xianyu/reply`、`/cookie...`、`/cookies...` 都是本项目自有 API /
+    内部编排边界
+  - 这轮并没有去改闲鱼官方接口，也没有去改第三方上游协议
+
+### 仍未达到设计目标的块（按当前代码事实）
+
+1. `db_manager.py` 仍保留兼容层与旧 schema：
+   - `_resolve_account_id()`
+   - `_normalize_account_scoped_record()`
+   - `_backfill_account_id_column()`
+2. `XianyuAutoAsync.py` 仍大量以 `self.cookie_id` 作为内部主身份语义；
+   浏览器恢复链路也还没完全切成统一 runtime lease/page 模式
+3. `reply_server.py` 仍有多处 API 线程直接读取 `live_instance` 状态，
+   说明“账号运行时只通过统一调度边界访问”的目标态还没完全达成
+4. `/cookie/...`、`/cookies/...` 路由前缀 noun 还是旧门牌号，
+   当前只是占位符和参数名完成了 `account_id` 化
+
+### 当前验证口径（不要再把旧绿灯当现状）
+
+- 通过：
+  - `.\.venv\Scripts\python.exe -m unittest tests.test_cookie_manager_account_runtime tests.test_reply_server_account_scope tests.test_order_status_handler_account_id tests.test_account_id_migration_batch tests.test_order_detail_fetcher_runtime -v`
+  - 结果：`Ran 41 tests` / `OK`
+- 单独通过：
+  - `.\.venv\Scripts\python.exe -m unittest tests.test_qr_login_status_flow -v`
+- 当前已恢复为验收依据：
+  - `.\.venv\Scripts\python.exe -m unittest tests.test_xianyu_async_browser_runtime -v`
+  - 结果：`Ran 25 tests` / `OK`
+  - 上述历史“`_PlaceholderXianyuLive` 缺方法/模块污染导致不能验收”的结论已过期，
+    当前这组测试已重新纳入联合回归口径。
+
+### 2026-05-09 Batch 9 补注（按当前代码事实校准）
+
+- 设计里“账号级主键必须穿透到商品同步和 `item_info` 读写边界”这一条，
+  当前已补上最关键的运行时缺口：
+  - `XianyuAutoAsync.py` 商品批量同步写库 payload 已改传 `account_id`
+  - `db_manager.py` 对 `item_info` 的关键词关联、用户级备份、用户级导入，
+    已统一按 `account_id` 作用域处理
+- 这说明设计上的账号级 runtime / account-scoped data boundary
+  已经进一步落地到**真实写库链**，不再只是 helper / route / 参数名层面的收口
+
+### 仍未达到设计目标的块（Batch 9 之后）
+
+1. `db_manager.py` 仍保留兼容层：
+   - `_resolve_account_id()`
+   - `_normalize_account_scoped_record()`
+   - `_backfill_account_id_column()`
+2. `XianyuAutoAsync.py` 仍未完成内部主身份语义改造：
+   - `self.cookie_id`
+   - `XianyuLive(cookie_id=...)`
+3. `reply_server.py` 仍未完全收口到统一 runtime 调度边界：
+   - 仍有 API 线程直接读取 `live_instance` 状态
+4. `/cookie/...`、`/cookies/...` 的 URL noun 仍是旧门牌号
+
+### Batch 9 review / verification
+
+- review 结论：
+  - 当前最危险的 account 边界错位，已从“商品同步 payload + item_info mixed schema”
+    这条链上清掉
+  - 设计文档里此前标记为待修的这部分，现在应视为**已落地**
+- 验证命令：
+  - `.\.venv\Scripts\python.exe -m unittest tests.test_db_manager_account_id_relations tests.test_cookie_manager_account_runtime tests.test_reply_server_account_scope tests.test_order_status_handler_account_id tests.test_account_id_migration_batch tests.test_order_detail_fetcher_runtime -v`
+  - 结果：`Ran 55 tests` / `OK`
+  - `.\.venv\Scripts\python.exe -m unittest tests.test_xianyu_async_browser_runtime -v`
+  - 结果：`Ran 25 tests` / `OK`
+  - `.\.venv\Scripts\python.exe -m unittest tests.test_browser_sidecars -v`
+  - 结果：`Ran 14 tests` / `OK`
+    - 本轮同时已修掉旧测试仍传 `account_id_for_log=...` 的口径漂移
+  - `.\.venv\Scripts\python.exe release_precheck.py`
+  - 结果：通过；当前 warning 为 `utils/account_browser_runtime.py` 未跟踪
+
+### 2026-05-09 最新设计校准（覆盖前文相关旧快照）
+
+- `utils/order_history_sync.py` / `utils/order_detail_fetcher.py` 已不再使用
+  `account_id_for_log` / `cookie_id_for_log` 这类过渡命名。
+- `tests.test_xianyu_async_browser_runtime` 已恢复并纳入当前联合回归，不再单独排除。
+- `reply_server.py` 的 runtime 调度边界已继续补强：
+  `send_message_api` / `get_conversation_history` / `trigger_session_keepalive` /
+  `_build_live_runtime_status` 都已通过 manager loop 访问受管账号实例；
+  `_get_managed_live_instance(...)` 现在也会拒绝脱离受管调度上下文的直接调用。
+- 当前最需要继续落地的设计偏差，已收敛到：
+  1. `XianyuAutoAsync.py` 深层 `self.cookie_id` 主身份语义
+  2. `orders` 读写 helper 的 account-scoped 边界
+  3. 统一 runtime lease/page 生命周期
+- 当前推荐验收口径：
+  - `.\.venv\Scripts\python.exe -m unittest tests.test_db_manager_account_id_relations tests.test_cookie_manager_account_runtime tests.test_reply_server_account_scope tests.test_order_status_handler_account_id tests.test_account_id_migration_batch tests.test_order_detail_fetcher_runtime tests.test_browser_sidecars tests.test_xianyu_async_browser_runtime -v`
+  - 结果：`Ran 95 tests` / `OK`
+
+### 2026-05-12 设计校准（覆盖本文件旧快照）
+
+#### 已按设计落地的部分
+- 账号主键语义已继续收口：当前非测试 / 非文档源码里 `cookie_id` 只剩 4 处旧关键字拒绝 guard。
+- 公开账号管理契约已统一到 `/accounts/...`，前端 `static/js/app.js` 当前消费也已对齐 `/accounts/...`。
+- `db_manager.py` 已不再保留 `_resolve_account_id()` / `_normalize_account_scoped_record()` /
+  `_backfill_account_id_column()` 这类兼容 helper。
+- `XianyuAutoAsync.py` 已不再保留 `self.cookie_id` 作为内部主身份字段。
+- `utils/qr_login.py`、`utils/item_search.py`、`utils/order_detail_fetcher.py`、
+  `XianyuAutoAsync.py`、`reply_server.py`、`cookie_manager.py`
+  均已显式接入 `account_browser_runtime_manager`。
+
+#### 对旧“未完成项”的修正
+- 本文件前文凡是把 `db_manager.py` 兼容层仍在、`XianyuAutoAsync.py` 仍大量 `self.cookie_id`、
+  或公开账号管理仍残留 `/cookie...` / `/cookies...` 当成当前事实的表述，均以本节为准：**这些结论已过期**。
+- 当前保留的 4 处 `cookie_id` 不是设计偏差，而是对旧调用的拒绝型 guard。
+
+#### 仍值得继续清理但不是当前 blocker 的项
+- `static/js/app.js` 里 `window.editingAccountData`、`cancelCookieEdit()` 等旧命名残留，
+  更像 UI 层历史死代码，不影响当前 account_id 级 runtime 隔离设计落地。
+
+#### 2026-05-12 新鲜验证
+- `.\.venv\Scripts\python.exe -m unittest tests.test_reply_server_account_scope tests.test_db_manager_account_id_relations tests.test_cookie_manager_account_runtime tests.test_xianyu_async_browser_runtime tests.test_order_detail_fetcher_runtime tests.test_browser_sidecars tests.test_account_id_migration_batch tests.test_order_status_handler_account_id tests.test_qr_login_status_flow`
+- 结果：`Ran 482 tests in 40.836s` / `OK`
+- `.\.venv\Scripts\python.exe release_precheck.py`
+- 结果：`可以直接发版`

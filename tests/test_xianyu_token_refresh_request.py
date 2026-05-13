@@ -47,7 +47,7 @@ class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
         fake_session = _FakeSession(fake_response)
 
         live = XianyuLive.__new__(XianyuLive)
-        live.cookie_id = "token_refresh_proxy_test"
+        live.account_id = "token_refresh_proxy_test"
         live.session = fake_session
         live._http_proxy_url = "http://127.0.0.1:8888"
         live.device_id = "device-id"
@@ -113,7 +113,7 @@ class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
                 return False, None
 
         live = XianyuLive.__new__(XianyuLive)
-        live.cookie_id = "token_refresh_captcha_scene_test"
+        live.account_id = "token_refresh_captcha_scene_test"
         live.cookies_str = "_m_h5_tk=test_token_12345; cookie2=dummy_cookie2"
         live.proxy_config = {}
         live.connection_state = ConnectionState.DISCONNECTED
@@ -151,7 +151,7 @@ class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
                 return False, None
 
         live = XianyuLive.__new__(XianyuLive)
-        live.cookie_id = "token_refresh_persistent_profile_test"
+        live.account_id = "token_refresh_persistent_profile_test"
         live.cookies_str = "_m_h5_tk=test_token_12345; cookie2=dummy_cookie2"
         live.proxy_config = {}
         live.connection_state = ConnectionState.DISCONNECTED

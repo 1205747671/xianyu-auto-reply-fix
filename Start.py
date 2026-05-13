@@ -293,47 +293,55 @@ async def main():
 
     # 1) 从数据库加载的 Cookie 已经在 CookieManager 初始化时完成
     # 为每个启用的 Cookie 启动任务
-    for cid, val in manager.cookies.items():
+    for account_id, cookie_value in manager.cookies.items():
         # 检查账号是否启用
-        if not manager.get_cookie_status(cid):
-            logger.info(f"跳过禁用的 Cookie: {cid}")
+        if not manager.get_cookie_status(account_id):
+            logger.info(f"跳过禁用的账号: {account_id}")
             continue
 
         try:
-            # 直接启动任务，不重新保存到数据库
+            # 直接启动运行时任务，不重新保存到数据库
             from db_manager import db_manager
-            logger.info(f"正在获取Cookie详细信息: {cid}")
-            cookie_info = db_manager.get_cookie_details(cid)
+            logger.info(f"正在获取账号详细信息: {account_id}")
+            cookie_info = db_manager.get_cookie_details(account_id)
             user_id = cookie_info.get('user_id') if cookie_info else None
-            logger.info(f"Cookie详细信息获取成功: {cid}, user_id: {user_id}")
+            logger.info(f"账号详细信息获取成功: {account_id}, user_id: {user_id}")
 
-            logger.info(f"正在创建异步任务: {cid}")
-            task = loop.create_task(manager._run_xianyu(cid, val, user_id))
-            manager.tasks[cid] = task
-            logger.info(f"启动数据库中的 Cookie 任务: {cid} (用户ID: {user_id})")
+            logger.info(f"正在创建账号运行时任务: {account_id}")
+            manager.start_runtime_task(account_id, cookie_value, user_id)
+            logger.info(f"启动数据库中的账号任务: {account_id} (用户ID: {user_id})")
             logger.info(f"任务已添加到管理器，当前任务数: {len(manager.tasks)}")
         except Exception as e:
-            logger.error(f"启动 Cookie 任务失败: {cid}, {e}")
+            logger.error(f"启动账号任务失败: {account_id}, {e}")
             import traceback
             logger.error(f"详细错误信息: {traceback.format_exc()}")
     
     # 2) 如果配置文件中有新的 Cookie，也加载它们
+    pending_account_registrations = []
     for entry in COOKIES_LIST:
-        cid = entry.get('id')
-        val = entry.get('value')
-        if not cid or not val or cid in manager.cookies:
+        account_id = entry.get('id')
+        cookie_value = entry.get('value')
+        if not account_id or not cookie_value or account_id in manager.cookies:
             continue
         
         kw_file = entry.get('keywords_file')
         kw_list = load_keywords_file(kw_file) if kw_file else None
-        manager.add_cookie(cid, val, kw_list)
-        logger.info(f"从配置文件加载 Cookie: {cid}")
+        registration = manager.add_cookie(account_id, cookie_value, kw_list)
+        if isinstance(registration, asyncio.Future):
+            pending_account_registrations.append(registration)
+        logger.info(f"从配置文件加载账号凭证: {account_id}")
 
     # 3) 若老环境变量仍提供单账号 Cookie，则作为 default 账号
     env_cookie = os.getenv('COOKIES_STR')
     if env_cookie and 'default' not in manager.list_cookies():
-        manager.add_cookie('default', env_cookie)
+        registration = manager.add_cookie('default', env_cookie)
+        if isinstance(registration, asyncio.Future):
+            pending_account_registrations.append(registration)
         logger.info("从环境变量加载 default Cookie")
+
+    if pending_account_registrations:
+        logger.info(f"等待 {len(pending_account_registrations)} 个启动期账号注册完成")
+        await asyncio.gather(*pending_account_registrations)
 
     # 启动 API 服务线程
     print("启动 API 服务线程...")

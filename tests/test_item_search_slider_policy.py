@@ -8,6 +8,8 @@ if "loguru" not in sys.modules:
     loguru_stub = types.ModuleType("loguru")
     loguru_stub.logger = mock.Mock()
     sys.modules["loguru"] = loguru_stub
+elif not hasattr(sys.modules["loguru"].logger, "success"):
+    sys.modules["loguru"].logger.success = mock.Mock()
 
 if "cloakbrowser" not in sys.modules:
     cloakbrowser_stub = types.ModuleType("cloakbrowser")
@@ -21,12 +23,22 @@ if "cloakbrowser" not in sys.modules:
     cloakbrowser_stub.launch_context_async = _not_used
     cloakbrowser_stub.launch_persistent_context = _not_used
     cloakbrowser_stub.launch_persistent_context_async = _not_used
+    cloakbrowser_stub.ensure_binary = lambda: "C:/cloakbrowser/chrome.exe"
+    cloakbrowser_stub.build_args = (
+        lambda stealth_args, extra_args, timezone=None, locale=None, headless=True: list(extra_args or [])
+    )
+    cloakbrowser_stub.maybe_resolve_geoip = (
+        lambda geoip, proxy, timezone, locale: (timezone, locale, None)
+    )
     sys.modules["cloakbrowser"] = cloakbrowser_stub
 
 import utils.item_search as item_search
 
 
 class ItemSearchSliderPolicyTest(unittest.IsolatedAsyncioTestCase):
+    def _make_searcher(self):
+        return item_search.XianyuSearcher(account_id="test-account", cookie_value="test-cookie")
+
     def _make_scratch_page(self):
         slider_element = mock.Mock()
         slider_element.is_visible = mock.AsyncMock(return_value=True)
@@ -51,7 +63,7 @@ class ItemSearchSliderPolicyTest(unittest.IsolatedAsyncioTestCase):
         return page
 
     async def test_scratch_captcha_prefers_automatic_solver_before_any_manual_remote_control(self):
-        searcher = item_search.XianyuSearcher()
+        searcher = self._make_searcher()
         searcher._handle_scratch_captcha_async = mock.AsyncMock(return_value=True)
         searcher._handle_scratch_captcha_manual = mock.AsyncMock(return_value=True)
 
@@ -72,7 +84,7 @@ class ItemSearchSliderPolicyTest(unittest.IsolatedAsyncioTestCase):
         slider_cls.assert_not_called()
 
     async def test_scratch_captcha_falls_back_to_general_slider_solver_when_automatic_scratch_solver_fails(self):
-        searcher = item_search.XianyuSearcher()
+        searcher = self._make_searcher()
         searcher._handle_scratch_captcha_async = mock.AsyncMock(return_value=False)
         searcher._handle_scratch_captcha_manual = mock.AsyncMock(return_value=True)
 
@@ -101,7 +113,7 @@ class ItemSearchSliderPolicyTest(unittest.IsolatedAsyncioTestCase):
         fake_slider_handler.solve_slider.assert_called_once_with(max_retries=2)
 
     async def test_manual_remote_control_is_only_used_when_explicitly_enabled_for_debug(self):
-        searcher = item_search.XianyuSearcher()
+        searcher = self._make_searcher()
         searcher.enable_manual_scratch_captcha_debug = True
         searcher.use_remote_control = True
         searcher._handle_scratch_captcha_async = mock.AsyncMock(return_value=False)

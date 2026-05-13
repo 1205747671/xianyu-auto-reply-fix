@@ -513,8 +513,8 @@
               </div>
               <form id="addForm" class="row g-3">
                 <div class="col-md-3">
-                  <label for="cookieId" class="form-label">账号ID</label>
-                  <input type="text" class="form-control" id="cookieId" placeholder="唯一标识" required>
+                  <label for="accountId" class="form-label">账号ID</label>
+                  <input type="text" class="form-control" id="accountId" placeholder="唯一标识" required>
                 </div>
                 <div class="col-md-9">
                   <label for="cookieValue" class="form-label">Cookie值</label>
@@ -735,8 +735,8 @@
           <div class="card-body">
             <div class="row align-items-end mb-3">
               <div class="col-md-6">
-                <label for="itemCookieFilter" class="form-label">筛选账号</label>
-                <select class="form-select" id="itemCookieFilter" onchange="loadItemsByCookie()">
+                <label for="itemAccountFilter" class="form-label">筛选账号</label>
+                <select class="form-select" id="itemAccountFilter" onchange="loadItemsByAccount()">
                   <option value="">所有账号</option>
                 </select>
               </div>
@@ -874,8 +874,8 @@
           <div class="card-body">
             <div class="row align-items-end">
               <div class="col-md-6">
-                <label for="itemReplayCookieFilter" class="form-label">筛选账号</label>
-                <select class="form-select" id="itemReplayCookieFilter" onchange="loadItemsReplayByCookie()">
+                <label for="itemReplayAccountFilter" class="form-label">筛选账号</label>
+                <select class="form-select" id="itemReplayAccountFilter" onchange="loadItemsReplayByAccount()">
                   <option value="">所有账号</option>
                 </select>
               </div>
@@ -945,13 +945,13 @@
         </div>
         <div class="modal-body">
           <form id="editItemReplyForm">
-            <input type="hidden" id="editReplyCookieId">
+            <input type="hidden" id="editReplyAccountId">
             <input type="hidden" id="editReplyItemId">
 
             <div class="row mb-3">
               <div class="col-md-6">
                 <label class="form-label">账号ID<span class="text-danger">*</span></label>
-                <select id="editReplyCookieIdSelect" class="form-select" onchange="onCookieChangeForReply()">
+                <select id="editReplyAccountIdSelect" class="form-select" onchange="onAccountChangeForReply()">
                   <option value="">请选择账号</option>
                   <!-- JS 动态填充账号选项 -->
                 </select>
@@ -997,11 +997,11 @@
         <p class="text-muted mb-0">查看和管理所有订单信息</p>
       </div>
       <div class="content-body">
-        <!-- Cookie筛选器 -->
+        <!-- 账号筛选器 -->
         <div class="row mb-3">
           <div class="col-md-4">
             <label class="form-label">筛选账号</label>
-            <select class="form-select" id="orderCookieFilter" onchange="loadOrdersByCookie()">
+            <select class="form-select" id="orderAccountFilter" onchange="loadOrdersByAccount()">
               <option value="">所有账号</option>
             </select>
           </div>
@@ -1149,7 +1149,7 @@
             <div class="row g-3">
               <div class="col-md-6">
                 <label class="form-label">同步账号</label>
-                <select class="form-select" id="orderHistorySyncCookieId">
+                <select class="form-select" id="orderHistorySyncAccountId">
                   <option value="">所有账号</option>
                 </select>
               </div>
@@ -2355,7 +2355,7 @@
                   <div class="risk-filter-grid">
                     <div class="risk-filter-field risk-filter-field-account">
                       <label class="form-label">账号筛选</label>
-                      <select class="form-select" id="riskLogCookieFilter" onchange="loadRiskControlLogs()">
+                      <select class="form-select" id="riskLogAccountFilter" onchange="loadRiskControlLogs()">
                         <option value="">全部账号</option>
                       </select>
                     </div>
@@ -2939,7 +2939,7 @@
                     <p class="mb-2"><strong>请求参数：</strong></p>
                     <pre class="mb-2"><code>{
   "api_key": "您的秘钥",
-  "cookie_id": "账号ID",
+  "account_id": "账号ID",
   "chat_id": "聊天ID",
   "to_user_id": "目标用户ID",
   "message": "消息内容"
@@ -3131,7 +3131,7 @@
                 <select class="form-select" id="tableSelect" onchange="loadTableData()">
                   <option value="">请选择数据表...</option>
                   <option value="users">users - 用户表</option>
-                  <option value="cookies">cookies - Cookie账号表</option>
+                  <option value="cookies">cookies - 账号凭证表</option>
                   <option value="cookie_status">cookie_status - Cookie状态表</option>
                   <option value="keywords">keywords - 关键字表</option>
                   <option value="default_replies">default_replies - 默认回复表</option>
@@ -3274,6 +3274,12 @@
                 </div>
               </div>
             </div>
+          </div>
+
+          <div class="mb-3 text-start">
+            <label for="qrLoginAccountId" class="form-label">账号ID <span class="text-danger">*</span></label>
+            <input type="text" class="form-control" id="qrLoginAccountId" placeholder="输入要绑定的账号ID，例如 account_001">
+            <div class="form-text">扫码前先确定账号ID；已有账号会复用当前账号画像，新账号会先创建 pending_bind 占位。</div>
           </div>
 
           <!-- 二维码区域 -->
@@ -3572,8 +3578,8 @@
                             <span class="text-muted ms-2">规格值</span>
                           </div>
                           <div class="param-item mb-2">
-                            <code class="param-name">cookie_id</code>
-                            <span class="text-muted ms-2">cookies账号id</span>
+                            <code class="param-name">account_id</code>
+                            <span class="text-muted ms-2">账号ID</span>
                           </div>
                           <div class="param-item mb-2">
                             <code class="param-name">buyer_id</code>
@@ -3898,8 +3904,8 @@
                             <span class="text-muted ms-2">规格值</span>
                           </div>
                           <div class="param-item mb-2">
-                            <code class="param-name">cookie_id</code>
-                            <span class="text-muted ms-2">cookies账号id</span>
+                            <code class="param-name">account_id</code>
+                            <span class="text-muted ms-2">账号ID</span>
                           </div>
                           <div class="param-item mb-2">
                             <code class="param-name">buyer_id</code>
@@ -4367,13 +4373,13 @@
         </div>
         <div class="modal-body">
           <form id="editItemForm">
-            <input type="hidden" id="editItemCookieId">
+            <input type="hidden" id="editItemAccountId">
             <input type="hidden" id="editItemId">
 
             <div class="row mb-3">
               <div class="col-md-6">
                 <label class="form-label">账号ID</label>
-                <input type="text" class="form-control" id="editItemCookieIdDisplay" readonly>
+                <input type="text" class="form-control" id="editItemAccountIdDisplay" readonly>
               </div>
               <div class="col-md-6">
                 <label class="form-label">商品ID</label>

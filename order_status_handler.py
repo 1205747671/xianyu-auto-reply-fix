@@ -64,14 +64,14 @@ class OrderStatusHandler:
             'cancelled': '已关闭',      # 交易关闭
         }
         
-        # 待处理的订单状态更新队列 {order_id: [update_info, ...]}
+        # 待处理的订单状态更新队列 {(account_id, order_id): [update_info, ...]}
         self.pending_updates = {}
-        # 待处理的系统消息队列（用于延迟处理）{cookie_id: [message_info, ...]}
+        # 待处理的系统消息队列（用于延迟处理）{account_id: [message_info, ...]}
         self._pending_system_messages = {}
-        # 待处理的红色提醒消息队列（用于延迟处理）{cookie_id: [message_info, ...]}
+        # 待处理的红色提醒消息队列（用于延迟处理）{account_id: [message_info, ...]}
         self._pending_red_reminder_messages = {}
         
-        # 订单状态历史记录 {order_id: [status_history, ...]}
+        # 订单状态历史记录 {(account_id, order_id): [status_history, ...]}
         # 用于退款撤销时回退到上一次状态
         self._order_status_history = {}
         
@@ -83,6 +83,47 @@ class OrderStatusHandler:
         # 设置日志级别
         log_level = self.config.get('log_level', 'info')
         logger.info(f"订单状态处理器初始化完成，配置: {self.config}")
+
+    @staticmethod
+    def _resolve_record_account_id(record: Optional[Dict[str, Any]], fallback: Optional[str] = None) -> Optional[str]:
+        record = record or {}
+        record_account_id = OrderStatusHandler._normalize_account_scope(record.get('account_id'))
+        if record_account_id:
+            return record_account_id
+        return OrderStatusHandler._normalize_account_scope(fallback)
+
+    @staticmethod
+    def _normalize_account_scope(account_id: Optional[str]) -> Optional[str]:
+        normalized_account_id = str(account_id or '').strip()
+        return normalized_account_id or None
+
+    def _build_scoped_order_key(self, order_id: Optional[str], account_id: Optional[str] = None):
+        normalized_order_id = str(order_id or '').strip()
+        if not normalized_order_id:
+            return None
+        return (self._normalize_account_scope(account_id), normalized_order_id)
+
+    @staticmethod
+    def _split_scoped_order_key(scoped_key):
+        if isinstance(scoped_key, tuple) and len(scoped_key) == 2:
+            return scoped_key[0], scoped_key[1]
+        return None, str(scoped_key or '').strip()
+
+    @staticmethod
+    def _scoped_key_matches_order_id(scoped_key, order_id: Optional[str]) -> bool:
+        normalized_order_id = str(order_id or '').strip()
+        if not normalized_order_id:
+            return False
+        _, scoped_order_id = OrderStatusHandler._split_scoped_order_key(scoped_key)
+        return scoped_order_id == normalized_order_id
+
+    def _resolve_pending_update_key(self, order_id: Optional[str], account_id: Optional[str] = None):
+        normalized_account_id = self._normalize_account_scope(account_id)
+        if not normalized_account_id:
+            return None
+
+        scoped_key = self._build_scoped_order_key(order_id, normalized_account_id)
+        return scoped_key if scoped_key in self.pending_updates else None
     
     def extract_order_id(self, message: dict) -> Optional[str]:
         """从消息中提取订单ID"""
@@ -616,7 +657,7 @@ class OrderStatusHandler:
             'refunding',
         ]
 
-    def _find_recent_orders_for_match_context(self, cookie_id: str, match_context: Dict[str, Any],
+    def _find_recent_orders_for_match_context(self, account_id: str, match_context: Dict[str, Any],
                                               statuses: list, exclude_order_id: str = None) -> list:
         if not match_context.get('has_strong_match_key'):
             return []
@@ -627,7 +668,7 @@ class OrderStatusHandler:
                 sid=match_context.get('sid'),
                 buyer_id=match_context.get('buyer_id'),
                 item_id=match_context.get('item_id'),
-                cookie_id=cookie_id,
+                account_id=account_id,
                 statuses=statuses,
                 exclude_order_id=exclude_order_id,
                 minutes=self.config.get('terminal_resolution_search_minutes', 30),
@@ -636,17 +677,17 @@ class OrderStatusHandler:
         except Exception as e:
             logger.warning(
                 "按匹配键查询最近订单失败: "
-                f"cookie_id={cookie_id}, {self._format_pending_match_context(match_context)}, error={e}"
+                f"account_id={account_id}, {self._format_pending_match_context(match_context)}, error={e}"
             )
             return []
 
-    def _try_resolve_cancelled_message_without_order_id(self, cookie_id: str, msg_time: str, new_status: str,
+    def _try_resolve_cancelled_message_without_order_id(self, account_id: str, msg_time: str, new_status: str,
                                                         context_label: str, match_context: Dict[str, Any]) -> bool:
         if new_status != 'cancelled' or not match_context.get('has_strong_match_key'):
             return False
 
         candidates = self._find_recent_orders_for_match_context(
-            cookie_id=cookie_id,
+            account_id=account_id,
             match_context=match_context,
             statuses=self._get_terminal_resolution_candidate_statuses()
         )
@@ -656,7 +697,7 @@ class OrderStatusHandler:
 
         if len(candidates) > 1:
             logger.warning(
-                f"[{msg_time}] 【{cookie_id}】{context_label} 无法直接回填旧订单，命中过多候选: "
+                f"[{msg_time}] 【{account_id}】{context_label} 无法直接回填旧订单，命中过多候选: "
                 f"count={len(candidates)}, {self._format_pending_match_context(match_context)}"
             )
             return False
@@ -664,24 +705,24 @@ class OrderStatusHandler:
         resolved_order = candidates[0]
         resolved_order_id = resolved_order.get('order_id')
         logger.info(
-            f"[{msg_time}] 【{cookie_id}】{context_label} 命中唯一旧订单，直接回填关闭状态: "
+            f"[{msg_time}] 【{account_id}】{context_label} 命中唯一旧订单，直接回填关闭状态: "
             f"order_id={resolved_order_id}, current_status={resolved_order.get('order_status')}"
         )
 
         success = self.update_order_status(
             order_id=resolved_order_id,
             new_status=new_status,
-            cookie_id=cookie_id,
+            account_id=account_id,
             context=f"{context_label} - {msg_time} - 按匹配键即时回填"
         )
         if success:
             logger.info(
-                f"[{msg_time}] 【{cookie_id}】{context_label} 已直接回填到旧订单: "
+                f"[{msg_time}] 【{account_id}】{context_label} 已直接回填到旧订单: "
                 f"order_id={resolved_order_id}"
             )
         else:
             logger.warning(
-                f"[{msg_time}] 【{cookie_id}】{context_label} 命中旧订单但回填失败，保留待处理逻辑: "
+                f"[{msg_time}] 【{account_id}】{context_label} 命中旧订单但回填失败，保留待处理逻辑: "
                 f"order_id={resolved_order_id}"
             )
         return success
@@ -719,7 +760,7 @@ class OrderStatusHandler:
             return ['completed', 'refunding', 'cancelled']
         return []
 
-    def _pending_terminal_message_already_resolved(self, order_id: str, cookie_id: str,
+    def _pending_terminal_message_already_resolved(self, order_id: str, account_id: str,
                                                    pending_msg: Dict[str, Any],
                                                    match_context: Dict[str, Any]) -> bool:
         pending_status = pending_msg.get('new_status')
@@ -731,7 +772,7 @@ class OrderStatusHandler:
             return False
 
         resolved_orders = self._find_recent_orders_for_match_context(
-            cookie_id=cookie_id,
+            account_id=account_id,
             match_context=match_context,
             statuses=resolution_statuses,
             exclude_order_id=order_id
@@ -747,27 +788,43 @@ class OrderStatusHandler:
         )
         return True
 
-    def _clear_temp_pending_update(self, temp_order_id: Optional[str], log_prefix: str = ""):
+    def _clear_temp_pending_update(self, temp_order_id: Optional[str], account_id: Optional[str] = None,
+                                   log_prefix: str = ""):
         if not temp_order_id:
             return
 
-        if temp_order_id in self.pending_updates:
-            del self.pending_updates[temp_order_id]
+        pending_key = self._build_scoped_order_key(temp_order_id, account_id)
+        if pending_key is None:
+            return
+
+        with self._lock:
+            removed = pending_key in self.pending_updates
+            if removed:
+                del self.pending_updates[pending_key]
+
+        if removed:
             logger.info(f"{log_prefix}清理临时订单ID {temp_order_id} 的待处理更新")
 
-    def update_order_status(self, order_id: str, new_status: str, cookie_id: str, context: str = "") -> bool:
+    def update_order_status(self, order_id: str, new_status: str, account_id: Optional[str] = None,
+                            context: str = "") -> bool:
         """更新订单状态到数据库
         
         Args:
             order_id: 订单ID
             new_status: 新状态 (processing/pending_ship/partial_success/partial_pending_finalize/shipped/completed/cancelled)
-            cookie_id: Cookie ID
+            account_id: 账号ID
             context: 上下文信息，用于日志记录
             
         Returns:
             bool: 更新是否成功
         """
-        logger.info(f"🔄 订单状态处理器.update_order_status开始: order_id={order_id}, new_status={new_status}, cookie_id={cookie_id}, context={context}")
+        account_id = self._normalize_account_scope(account_id)
+        if not account_id:
+            logger.warning(
+                f"订单 {order_id} 缺少有效 account_id，拒绝更新订单状态: new_status={new_status}, context={context}"
+            )
+            return False
+        logger.info(f"🔄 订单状态处理器.update_order_status开始: order_id={order_id}, new_status={new_status}, account_id={account_id}, context={context}")
         with self._lock:
             try:
                 from db_manager import db_manager
@@ -785,7 +842,7 @@ class OrderStatusHandler:
                 for attempt in range(max_retries):
                     try:
                         logger.info(f"🔍 尝试获取订单信息 (尝试 {attempt + 1}/{max_retries}): {order_id}")
-                        current_order = db_manager.get_order_by_id(order_id)
+                        current_order = db_manager.get_order_by_id(order_id, account_id=account_id)
                         logger.info(f"✅ 订单信息获取成功: {order_id}")
                         break
                     except Exception as db_e:
@@ -801,7 +858,7 @@ class OrderStatusHandler:
                     logger.info(f"⚠️ 订单 {order_id} 不存在于数据库中")
                     if self.config.get('use_pending_queue', True):
                         logger.info(f"📝 订单 {order_id} 不存在于数据库中，添加到待处理队列等待主程序拉取订单详情")
-                        self._add_to_pending_updates(order_id, new_status, cookie_id, context)
+                        self._add_to_pending_updates(order_id, new_status, account_id=account_id, context=context)
                     else:
                         logger.error(f"❌ 订单 {order_id} 不存在于数据库中且未启用待处理队列，跳过状态更新")
                     return False
@@ -826,9 +883,13 @@ class OrderStatusHandler:
                 # 处理退款撤销的特殊逻辑
                 if new_status == 'refund_cancelled':
                     # 从历史记录中获取上一次状态
-                    previous_status = self._get_previous_status(order_id, current_status=current_status)
+                    previous_status = self._get_previous_status(
+                        order_id,
+                        account_id=account_id,
+                        current_status=current_status
+                    )
                     if not previous_status:
-                        previous_status = db_manager.get_order_pre_refund_status(order_id)
+                        previous_status = db_manager.get_order_pre_refund_status(order_id, account_id=account_id)
                     if previous_status:
                         logger.info(f"🔄 退款撤销，回退到上一次状态: {previous_status}")
                         new_status = previous_status
@@ -852,7 +913,7 @@ class OrderStatusHandler:
                         success = db_manager.insert_or_update_order(
                             order_id=order_id,
                             order_status=new_status,
-                            cookie_id=cookie_id,
+                            account_id=account_id,
                             pre_refund_status=pre_refund_status_to_save,
                             clear_pre_refund_status=clear_pre_refund_status
                         )
@@ -868,11 +929,17 @@ class OrderStatusHandler:
                 
                 if success:
                     # 记录状态历史（用于退款撤销时回退）
-                    self._record_status_history(order_id, current_status, new_status, context)
+                    self._record_status_history(
+                        order_id,
+                        account_id=account_id,
+                        from_status=current_status,
+                        to_status=new_status,
+                        context=context
+                    )
 
                     try:
                         from order_event_hub import publish_order_update_event
-                        publish_order_update_event(order_id, source='order_status_handler')
+                        publish_order_update_event(order_id, account_id=account_id, source='order_status_handler')
                     except Exception as publish_e:
                         logger.warning(f"发布订单状态事件失败: order_id={order_id}, error={publish_e}")
                     
@@ -1000,18 +1067,29 @@ class OrderStatusHandler:
             logger.debug(f"检查退款消息失败: {e}")
             return None
     
-    def _record_status_history(self, order_id: str, from_status: str, to_status: str, context: str):
+    def _record_status_history(
+        self,
+        order_id: str,
+        account_id: Optional[str],
+        from_status: str,
+        to_status: str,
+        context: str
+    ):
         """记录订单状态历史
         
         Args:
             order_id: 订单ID
+            account_id: 账号ID
             from_status: 原状态
             to_status: 新状态
             context: 上下文信息
         """
         with self._lock:
-            if order_id not in self._order_status_history:
-                self._order_status_history[order_id] = []
+            history_key = self._build_scoped_order_key(order_id, account_id)
+            if history_key is None:
+                return
+            if history_key not in self._order_status_history:
+                self._order_status_history[history_key] = []
             
             # 只记录非临时状态的历史（排除 refund_cancelled）
             if to_status != 'refund_cancelled':
@@ -1021,28 +1099,38 @@ class OrderStatusHandler:
                     'context': context,
                     'timestamp': time.time()
                 }
-                self._order_status_history[order_id].append(history_entry)
+                self._order_status_history[history_key].append(history_entry)
                 
                 # 限制历史记录数量，只保留最近10条
-                if len(self._order_status_history[order_id]) > 10:
-                    self._order_status_history[order_id] = self._order_status_history[order_id][-10:]
+                if len(self._order_status_history[history_key]) > 10:
+                    self._order_status_history[history_key] = self._order_status_history[history_key][-10:]
                 
-                logger.debug(f"📝 记录订单状态历史: {order_id} {from_status} -> {to_status}")
+                logger.debug(
+                    f"📝 记录订单状态历史: account_id={self._normalize_account_scope(account_id)} "
+                    f"order_id={order_id} {from_status} -> {to_status}"
+                )
     
-    def _get_previous_status(self, order_id: str, current_status: str = None) -> Optional[str]:
+    def _get_previous_status(
+        self,
+        order_id: str,
+        account_id: Optional[str] = None,
+        current_status: str = None
+    ) -> Optional[str]:
         """获取订单的上一次状态（用于退款撤销时回退）
         
         Args:
             order_id: 订单ID
+            account_id: 账号ID
             
         Returns:
             str: 上一次状态，如果没有历史记录则返回None
         """
         with self._lock:
-            if order_id not in self._order_status_history or not self._order_status_history[order_id]:
+            history_key = self._build_scoped_order_key(order_id, account_id)
+            if history_key not in self._order_status_history or not self._order_status_history[history_key]:
                 return None
             
-            history = self._order_status_history[order_id]
+            history = self._order_status_history[history_key]
 
             if current_status:
                 for entry in reversed(history):
@@ -1057,43 +1145,60 @@ class OrderStatusHandler:
                 return None
             return fallback_status
     
-    def _add_to_pending_updates(self, order_id: str, new_status: str, cookie_id: str, context: str):
+    def _add_to_pending_updates(self, order_id: str, new_status: str, account_id: Optional[str] = None,
+                                context: str = ""):
         """添加到待处理更新队列
         
         Args:
             order_id: 订单ID
             new_status: 新状态
-            cookie_id: Cookie ID
+            account_id: 账号ID
             context: 上下文信息
         """
+        account_id = self._normalize_account_scope(account_id)
+        if not account_id:
+            logger.warning(
+                f"订单 {order_id} 缺少有效 account_id，拒绝加入待处理队列: new_status={new_status}, context={context}"
+            )
+            return
         with self._lock:
-            if order_id not in self.pending_updates:
-                self.pending_updates[order_id] = []
+            pending_key = self._build_scoped_order_key(order_id, account_id)
+            if pending_key is None:
+                return
+            if pending_key not in self.pending_updates:
+                self.pending_updates[pending_key] = []
             
             update_info = {
                 'new_status': new_status,
-                'cookie_id': cookie_id,
+                'account_id': account_id,
                 'context': context,
                 'timestamp': time.time()
             }
             
-            self.pending_updates[order_id].append(update_info)
+            self.pending_updates[pending_key].append(update_info)
             logger.info(f"订单 {order_id} 状态更新已添加到待处理队列: {new_status} ({context})")
     
-    def process_pending_updates(self, order_id: str) -> bool:
+    def process_pending_updates(self, order_id: str, account_id: Optional[str] = None) -> bool:
         """处理指定订单的待处理更新
         
         Args:
             order_id: 订单ID
+            account_id: 账号ID
             
         Returns:
             bool: 是否有更新被处理
         """
+        account_id = self._normalize_account_scope(account_id)
+        if not account_id:
+            logger.warning(f"订单 {order_id} 缺少有效 account_id，拒绝处理 account-scoped 待处理队列")
+            return False
+
         with self._lock:
-            if order_id not in self.pending_updates:
+            pending_key = self._resolve_pending_update_key(order_id, account_id)
+            if pending_key is None:
                 return False
             
-            updates = self.pending_updates.pop(order_id)
+            updates = self.pending_updates.pop(pending_key)
             processed_count = 0
         
         for update_info in updates:
@@ -1101,7 +1206,7 @@ class OrderStatusHandler:
                 success = self.update_order_status(
                     order_id=order_id,
                     new_status=update_info['new_status'],
-                    cookie_id=update_info['cookie_id'],
+                    account_id=update_info.get('account_id'),
                     context=f"待处理队列: {update_info['context']}"
                 )
                 
@@ -1129,11 +1234,12 @@ class OrderStatusHandler:
             if not self.pending_updates:
                 return 0
             
-            order_ids = list(self.pending_updates.keys())
+            pending_keys = list(self.pending_updates.keys())
             processed_orders = 0
         
-        for order_id in order_ids:
-            if self.process_pending_updates(order_id):
+        for pending_key in pending_keys:
+            pending_account_id, order_id = self._split_scoped_order_key(pending_key)
+            if self.process_pending_updates(order_id, account_id=pending_account_id):
                 processed_orders += 1
         
         return processed_orders
@@ -1188,56 +1294,60 @@ class OrderStatusHandler:
                 logger.info(f"共清理了 {len(expired_orders)} 个过期的待处理订单更新")
             
             # 清理 _pending_system_messages
-            expired_cookies_system = []
-            for cookie_id, messages in self._pending_system_messages.items():
+            expired_accounts_system = []
+            for account_id, messages in self._pending_system_messages.items():
                 valid_messages = [
                     msg for msg in messages 
                     if current_time - msg.get('timestamp', 0) < max_age_seconds
                 ]
                 
                 if not valid_messages:
-                    expired_cookies_system.append(cookie_id)
+                    expired_accounts_system.append(account_id)
                 else:
-                    self._pending_system_messages[cookie_id] = valid_messages
+                    self._pending_system_messages[account_id] = valid_messages
             
-            for cookie_id in expired_cookies_system:
-                del self._pending_system_messages[cookie_id]
-                logger.info(f"清理过期的待处理系统消息: 账号 {cookie_id}")
+            for account_id in expired_accounts_system:
+                del self._pending_system_messages[account_id]
+                logger.info(f"清理过期的待处理系统消息: 账号 {account_id}")
             
             # 清理 _pending_red_reminder_messages
-            expired_cookies_red = []
-            for cookie_id, messages in self._pending_red_reminder_messages.items():
+            expired_accounts_red = []
+            for account_id, messages in self._pending_red_reminder_messages.items():
                 valid_messages = [
                     msg for msg in messages 
                     if current_time - msg.get('timestamp', 0) < max_age_seconds
                 ]
                 
                 if not valid_messages:
-                    expired_cookies_red.append(cookie_id)
+                    expired_accounts_red.append(account_id)
                 else:
-                    self._pending_red_reminder_messages[cookie_id] = valid_messages
+                    self._pending_red_reminder_messages[account_id] = valid_messages
             
-            for cookie_id in expired_cookies_red:
-                del self._pending_red_reminder_messages[cookie_id]
-                logger.info(f"清理过期的待处理红色提醒消息: 账号 {cookie_id}")
+            for account_id in expired_accounts_red:
+                del self._pending_red_reminder_messages[account_id]
+                logger.info(f"清理过期的待处理红色提醒消息: 账号 {account_id}")
             
-            total_cleared = len(expired_orders) + len(expired_cookies_system) + len(expired_cookies_red)
+            total_cleared = len(expired_orders) + len(expired_accounts_system) + len(expired_accounts_red)
             if total_cleared > 0:
                 logger.info(f"内存清理完成，共清理了 {total_cleared} 个过期项目")
     
-    def handle_system_message(self, message: dict, send_message: str, cookie_id: str, msg_time: str,
-                              match_context: Dict[str, Any] = None) -> bool:
+    def handle_system_message(self, message: dict, send_message: str, account_id: Optional[str] = None,
+                              msg_time: str = "", match_context: Dict[str, Any] = None) -> bool:
         """处理系统消息并更新订单状态
         
         Args:
             message: 原始消息数据
             send_message: 消息内容
-            cookie_id: Cookie ID
+            account_id: 账号ID
             msg_time: 消息时间
             
         Returns:
             bool: 是否处理了订单状态更新
         """
+        account_id = self._normalize_account_scope(account_id)
+        if not account_id:
+            logger.warning(f'[{msg_time}] 系统消息缺少有效 account_id，拒绝处理: {send_message}')
+            return False
         try:
             new_status, message_meta, status_candidates = self._resolve_system_message_status(message, send_message)
             if not new_status:
@@ -1253,7 +1363,7 @@ class OrderStatusHandler:
                 for candidate in status_candidates[:6]
             )
             logger.info(
-                f'[{msg_time}] 【{cookie_id}】系统消息状态候选: {candidate_summary or "none"}，'
+                f'[{msg_time}] 【{account_id}】系统消息状态候选: {candidate_summary or "none"}，'
                 f'最终采用 {new_status}'
             )
             
@@ -1262,12 +1372,12 @@ class OrderStatusHandler:
             if not order_id:
                 # 如果无法提取订单ID，根据配置决定是否添加到待处理队列
                 if not self.config.get('use_pending_queue', True):
-                    logger.error(f'[{msg_time}] 【{cookie_id}】{send_message}，无法提取订单ID且未启用待处理队列，跳过处理')
+                    logger.error(f'[{msg_time}] 【{account_id}】{send_message}，无法提取订单ID且未启用待处理队列，跳过处理')
                     return False
 
                 pending_match_context = self._normalize_pending_match_context(message=message, match_context=match_context)
                 if self._try_resolve_cancelled_message_without_order_id(
-                    cookie_id=cookie_id,
+                    account_id=account_id,
                     msg_time=msg_time,
                     new_status=new_status,
                     context_label=send_message,
@@ -1275,7 +1385,7 @@ class OrderStatusHandler:
                 ):
                     return True
 
-                logger.info(f'[{msg_time}] 【{cookie_id}】{send_message}，暂时无法提取订单ID，添加到待处理队列')
+                logger.info(f'[{msg_time}] 【{account_id}】{send_message}，暂时无法提取订单ID，添加到待处理队列')
                 
                 # 创建一个临时的订单ID占位符，用于标识这个待处理的状态更新
                 temp_order_id = f"temp_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
@@ -1284,18 +1394,18 @@ class OrderStatusHandler:
                 self._add_to_pending_updates(
                     order_id=temp_order_id,
                     new_status=new_status,
-                    cookie_id=cookie_id,
+                    account_id=account_id,
                     context=f"{send_message} - {msg_time} - 等待订单ID提取"
                 )
                 
                 # 添加到待处理的系统消息队列
-                if cookie_id not in self._pending_system_messages:
-                    self._pending_system_messages[cookie_id] = []
+                if account_id not in self._pending_system_messages:
+                    self._pending_system_messages[account_id] = []
 
-                self._pending_system_messages[cookie_id].append({
+                self._pending_system_messages[account_id].append({
                     'message': message,
                     'send_message': send_message,
-                    'cookie_id': cookie_id,
+                    'account_id': account_id,
                     'msg_time': msg_time,
                     'new_status': new_status,
                     'temp_order_id': temp_order_id,
@@ -1307,7 +1417,7 @@ class OrderStatusHandler:
                     'timestamp': time.time()  # 添加时间戳用于清理
                 })
                 logger.info(
-                    f"[{msg_time}] 【{cookie_id}】{send_message} 已进入严格待处理队列: "
+                    f"[{msg_time}] 【{account_id}】{send_message} 已进入严格待处理队列: "
                     f"{self._format_pending_match_context(pending_match_context)}"
                 )
                 
@@ -1317,7 +1427,7 @@ class OrderStatusHandler:
             
             # 检查当前订单状态，避免不合理的状态回退
             from db_manager import db_manager
-            current_order = db_manager.get_order_by_id(order_id)
+            current_order = db_manager.get_order_by_id(order_id, account_id=account_id)
             
             # 如果订单存在，检查是否需要忽略这次状态更新
             if current_order and current_order.get('order_status'):
@@ -1327,30 +1437,31 @@ class OrderStatusHandler:
                 
                 # 如果新状态的优先级低于当前状态，且不是特殊状态（退款、取消），则忽略
                 if new_priority < current_priority and new_status not in ['refunding', 'cancelled', 'refund_cancelled']:
-                    logger.warning(f'[{msg_time}] 【{cookie_id}】{send_message}，订单 {order_id} 当前状态为 {current_status}，忽略回退到 {new_status}')
+                    logger.warning(f'[{msg_time}] 【{account_id}】{send_message}，订单 {order_id} 当前状态为 {current_status}，忽略回退到 {new_status}')
                     return True  # 返回True表示已处理，但实际上是忽略
             
             # 更新订单状态
             success = self.update_order_status(
                 order_id=order_id,
                 new_status=new_status,
-                cookie_id=cookie_id,
+                account_id=account_id,
                 context=f"{send_message} - {msg_time}"
             )
             
             if success:
                 status_text = self.status_mapping.get(new_status, new_status)
-                logger.info(f'[{msg_time}] 【{cookie_id}】{send_message}，订单 {order_id} 状态已更新为{status_text}')
+                logger.info(f'[{msg_time}] 【{account_id}】{send_message}，订单 {order_id} 状态已更新为{status_text}')
             else:
-                logger.error(f'[{msg_time}] 【{cookie_id}】{send_message}，但订单 {order_id} 状态更新失败')
+                logger.error(f'[{msg_time}] 【{account_id}】{send_message}，但订单 {order_id} 状态更新失败')
             
             return True
             
         except Exception as e:
-            logger.error(f'[{msg_time}] 【{cookie_id}】处理系统消息订单状态更新时出错: {str(e)}')
+            logger.error(f'[{msg_time}] 【{account_id}】处理系统消息订单状态更新时出错: {str(e)}')
             return False
     
-    def handle_red_reminder_message(self, message: dict, red_reminder: str, user_id: str, cookie_id: str, msg_time: str,
+    def handle_red_reminder_message(self, message: dict, red_reminder: str, user_id: str,
+                                    account_id: Optional[str] = None, msg_time: str = "",
                                     match_context: Dict[str, Any] = None) -> bool:
         """处理红色提醒消息并更新订单状态
         
@@ -1358,12 +1469,16 @@ class OrderStatusHandler:
             message: 原始消息数据
             red_reminder: 红色提醒内容
             user_id: 用户ID
-            cookie_id: Cookie ID
+            account_id: 账号ID
             msg_time: 消息时间
             
         Returns:
             bool: 是否处理了订单状态更新
         """
+        account_id = self._normalize_account_scope(account_id)
+        if not account_id:
+            logger.warning(f'[{msg_time}] 红色提醒缺少有效 account_id，拒绝处理: {red_reminder}')
+            return False
         try:
             # 只处理交易关闭的情况
             if red_reminder != '交易关闭':
@@ -1374,12 +1489,12 @@ class OrderStatusHandler:
             if not order_id:
                 # 如果无法提取订单ID，根据配置决定是否添加到待处理队列
                 if not self.config.get('use_pending_queue', True):
-                    logger.error(f'[{msg_time}] 【{cookie_id}】交易关闭，无法提取订单ID且未启用待处理队列，跳过处理')
+                    logger.error(f'[{msg_time}] 【{account_id}】交易关闭，无法提取订单ID且未启用待处理队列，跳过处理')
                     return False
 
                 pending_match_context = self._normalize_pending_match_context(message=message, match_context=match_context)
                 if self._try_resolve_cancelled_message_without_order_id(
-                    cookie_id=cookie_id,
+                    account_id=account_id,
                     msg_time=msg_time,
                     new_status='cancelled',
                     context_label='交易关闭',
@@ -1387,7 +1502,7 @@ class OrderStatusHandler:
                 ):
                     return True
 
-                logger.info(f'[{msg_time}] 【{cookie_id}】交易关闭，暂时无法提取订单ID，添加到待处理队列')
+                logger.info(f'[{msg_time}] 【{account_id}】交易关闭，暂时无法提取订单ID，添加到待处理队列')
                 
                 # 创建一个临时的订单ID占位符，用于标识这个待处理的状态更新
                 temp_order_id = f"temp_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
@@ -1396,19 +1511,19 @@ class OrderStatusHandler:
                 self._add_to_pending_updates(
                     order_id=temp_order_id,
                     new_status='cancelled',
-                    cookie_id=cookie_id,
+                    account_id=account_id,
                     context=f"交易关闭 - 用户{user_id} - {msg_time} - 等待订单ID提取"
                 )
                 
                 # 添加到待处理的红色提醒消息队列
-                if cookie_id not in self._pending_red_reminder_messages:
-                    self._pending_red_reminder_messages[cookie_id] = []
+                if account_id not in self._pending_red_reminder_messages:
+                    self._pending_red_reminder_messages[account_id] = []
 
-                self._pending_red_reminder_messages[cookie_id].append({
+                self._pending_red_reminder_messages[account_id].append({
                     'message': message,
                     'red_reminder': red_reminder,
                     'user_id': user_id,
-                    'cookie_id': cookie_id,
+                    'account_id': account_id,
                     'msg_time': msg_time,
                     'new_status': 'cancelled',
                     'temp_order_id': temp_order_id,
@@ -1420,7 +1535,7 @@ class OrderStatusHandler:
                     'timestamp': time.time()  # 添加时间戳用于清理
                 })
                 logger.info(
-                    f"[{msg_time}] 【{cookie_id}】交易关闭已进入严格待处理队列: "
+                    f"[{msg_time}] 【{account_id}】交易关闭已进入严格待处理队列: "
                     f"{self._format_pending_match_context(pending_match_context)}"
                 )
                 
@@ -1430,39 +1545,41 @@ class OrderStatusHandler:
             success = self.update_order_status(
                 order_id=order_id,
                 new_status='cancelled',
-                cookie_id=cookie_id,
+                account_id=account_id,
                 context=f"交易关闭 - 用户{user_id} - {msg_time}"
             )
             
             if success:
-                logger.info(f'[{msg_time}] 【{cookie_id}】交易关闭，订单 {order_id} 状态已更新为已关闭')
+                logger.info(f'[{msg_time}] 【{account_id}】交易关闭，订单 {order_id} 状态已更新为已关闭')
             else:
-                logger.error(f'[{msg_time}] 【{cookie_id}】交易关闭，但订单 {order_id} 状态更新失败')
+                logger.error(f'[{msg_time}] 【{account_id}】交易关闭，但订单 {order_id} 状态更新失败')
             
             return True
             
         except Exception as e:
-            logger.error(f'[{msg_time}] 【{cookie_id}】处理交易关闭订单状态更新时出错: {str(e)}')
+            logger.error(f'[{msg_time}] 【{account_id}】处理交易关闭订单状态更新时出错: {str(e)}')
             return False
 
-    def handle_red_reminder_order_status(self, red_reminder: str, message: dict, user_id: str, cookie_id: str, msg_time: str,
+    def handle_red_reminder_order_status(self, red_reminder: str, message: dict, user_id: str,
+                                         account_id: Optional[str] = None, msg_time: str = "",
                                          match_context: Dict[str, Any] = None) -> bool:
         """兼容旧调用入口，统一委托到红色提醒状态处理逻辑。"""
         return self.handle_red_reminder_message(
             message=message,
             red_reminder=red_reminder,
             user_id=user_id,
-            cookie_id=cookie_id,
+            account_id=account_id,
             msg_time=msg_time,
-            match_context=match_context
+            match_context=match_context,
         )
     
-    def handle_auto_delivery_order_status(self, order_id: str, cookie_id: str, context: str = "自动发货") -> bool:
+    def handle_auto_delivery_order_status(self, order_id: str, account_id: Optional[str] = None,
+                                          context: str = "自动发货") -> bool:
         """处理自动发货时的订单状态更新
         
         Args:
             order_id: 订单ID
-            cookie_id: Cookie ID
+            account_id: 账号ID
             context: 上下文信息
             
         Returns:
@@ -1471,16 +1588,17 @@ class OrderStatusHandler:
         return self.update_order_status(
             order_id=order_id,
             new_status='shipped',  # 已发货
-            cookie_id=cookie_id,
+            account_id=account_id,
             context=context
         )
     
-    def handle_order_basic_info_status(self, order_id: str, cookie_id: str, context: str = "基本信息保存") -> bool:
+    def handle_order_basic_info_status(self, order_id: str, account_id: Optional[str] = None,
+                                       context: str = "基本信息保存") -> bool:
         """处理订单基本信息保存时的状态设置
         
         Args:
             order_id: 订单ID
-            cookie_id: Cookie ID
+            account_id: 账号ID
             context: 上下文信息
             
         Returns:
@@ -1489,34 +1607,43 @@ class OrderStatusHandler:
         return self.update_order_status(
             order_id=order_id,
             new_status='processing',  # 处理中
-            cookie_id=cookie_id,
+            account_id=account_id,
             context=context
         )
     
-    def handle_order_detail_fetched_status(self, order_id: str, cookie_id: str, context: str = "详情已获取") -> bool:
+    def handle_order_detail_fetched_status(self, order_id: str, account_id: Optional[str] = None,
+                                           context: str = "详情已获取") -> bool:
         """处理订单详情拉取后的状态设置
         
         Args:
             order_id: 订单ID
-            cookie_id: Cookie ID
+            account_id: 账号ID
             context: 上下文信息
             
         Returns:
             bool: 更新是否成功
         """
-        logger.info(f"🔄 订单状态处理器.handle_order_detail_fetched_status开始: order_id={order_id}, cookie_id={cookie_id}, context={context}")
+        logger.info(f"🔄 订单状态处理器.handle_order_detail_fetched_status开始: order_id={order_id}, account_id={account_id}, context={context}")
         
         # 订单详情获取成功后，不需要改变状态，只是处理待处理队列
         logger.info(f"✅ 订单详情已获取，处理待处理队列: order_id={order_id}")
         return True
     
-    def on_order_details_fetched(self, order_id: str):
+    def on_order_details_fetched(self, order_id: str, account_id: Optional[str] = None):
         """当主程序拉取到订单详情后调用此方法处理待处理的更新
         
         Args:
             order_id: 订单ID
+            account_id: 账号ID
         """
-        logger.info(f"🔄 订单状态处理器.on_order_details_fetched开始: order_id={order_id}")
+        account_id = self._normalize_account_scope(account_id)
+        logger.info(
+            f"🔄 订单状态处理器.on_order_details_fetched开始: "
+            f"order_id={order_id}, account_id={account_id}"
+        )
+        if not account_id:
+            logger.warning(f"订单 {order_id} 详情已拉取，但缺少有效 account_id，拒绝处理待处理队列")
+            return
         
         # 检查是否启用待处理队列
         if not self.config.get('use_pending_queue', True):
@@ -1526,10 +1653,11 @@ class OrderStatusHandler:
         logger.info(f"✅ 待处理队列已启用，检查订单 {order_id} 的待处理更新")
         
         with self._lock:
-            if order_id in self.pending_updates:
+            pending_key = self._resolve_pending_update_key(order_id, account_id)
+            if pending_key is not None:
                 logger.info(f"📝 检测到订单 {order_id} 详情已拉取，开始处理待处理的状态更新")
                 # 注意：process_pending_updates 内部也有锁，这里需要先释放锁避免死锁
-                updates = self.pending_updates.pop(order_id)
+                updates = self.pending_updates.pop(pending_key)
                 logger.info(f"📊 订单 {order_id} 有 {len(updates)} 个待处理更新")
             else:
                 logger.info(f"ℹ️ 订单 {order_id} 没有待处理的更新")
@@ -1555,7 +1683,7 @@ class OrderStatusHandler:
                 success = self.update_order_status(
                     order_id=order_id,
                     new_status=update_info['new_status'],
-                    cookie_id=update_info['cookie_id'],
+                    account_id=update_info.get('account_id'),
                     context=f"待处理队列: {update_info['context']}"
                 )
                 
@@ -1571,17 +1699,21 @@ class OrderStatusHandler:
         if processed_count > 0:
             logger.info(f"订单 {order_id} 共处理了 {processed_count} 个待处理状态更新")
     
-    def on_order_id_extracted(self, order_id: str, cookie_id: str, message: dict = None,
+    def on_order_id_extracted(self, order_id: str, account_id: Optional[str] = None, message: dict = None,
                               match_context: Dict[str, Any] = None):
         """当主程序成功提取到订单ID后调用此方法处理待处理的系统消息
         
         Args:
             order_id: 订单ID
-            cookie_id: Cookie ID
+            account_id: 账号ID
             message: 原始消息（可选，用于匹配）
             match_context: 结构化匹配键（message_hash/sid/buyer_id/item_id）
         """
-        logger.info(f"🔄 订单状态处理器.on_order_id_extracted开始: order_id={order_id}, cookie_id={cookie_id}")
+        account_id = self._normalize_account_scope(account_id)
+        logger.info(f"🔄 订单状态处理器.on_order_id_extracted开始: order_id={order_id}, account_id={account_id}")
+        if not account_id:
+            logger.warning(f"订单 {order_id} 已提取，但缺少有效 account_id，拒绝绑定待处理消息")
+            return
         
         with self._lock:
             # 检查是否启用待处理队列
@@ -1594,33 +1726,33 @@ class OrderStatusHandler:
                 f"🔗 订单 {order_id} 严格关联键: {self._format_pending_match_context(normalized_match_context)}"
             )
             
-            logger.info(f"✅ 待处理队列已启用，检查账号 {cookie_id} 的待处理系统消息")
+            logger.info(f"✅ 待处理队列已启用，检查账号 {account_id} 的待处理系统消息")
             
             # 处理待处理的系统消息队列
-            if cookie_id in self._pending_system_messages and self._pending_system_messages[cookie_id]:
-                logger.info(f"📝 账号 {cookie_id} 有 {len(self._pending_system_messages[cookie_id])} 个待处理的系统消息")
+            if account_id in self._pending_system_messages and self._pending_system_messages[account_id]:
+                logger.info(f"📝 账号 {account_id} 有 {len(self._pending_system_messages[account_id])} 个待处理的系统消息")
                 pending_msg = None
                 discarded_msg = None
                 matched_index, match_mode = self._select_pending_message_index(
-                    self._pending_system_messages[cookie_id],
+                    self._pending_system_messages[account_id],
                     normalized_match_context,
                     '系统消息'
                 )
                 if matched_index is not None:
-                    candidate_msg = self._pending_system_messages[cookie_id][matched_index]
+                    candidate_msg = self._pending_system_messages[account_id][matched_index]
                     if self._should_bind_pending_terminal_message(candidate_msg, message):
-                        pending_msg = self._pending_system_messages[cookie_id].pop(matched_index)
+                        pending_msg = self._pending_system_messages[account_id].pop(matched_index)
                         logger.info(
                             f"✅ 严格匹配到待处理的系统消息: {pending_msg['send_message']} "
                             f"(mode={match_mode}, {self._format_pending_match_context(normalized_match_context)})"
                         )
                     elif self._pending_terminal_message_already_resolved(
                         order_id=order_id,
-                        cookie_id=cookie_id,
+                        account_id=account_id,
                         pending_msg=candidate_msg,
                         match_context=normalized_match_context
                     ):
-                        discarded_msg = self._pending_system_messages[cookie_id].pop(matched_index)
+                        discarded_msg = self._pending_system_messages[account_id].pop(matched_index)
                         logger.info(
                             f"🗑️ 丢弃已被旧订单消化的待处理系统消息: {discarded_msg['send_message']} "
                             f"(mode={match_mode}, {self._format_pending_match_context(normalized_match_context)})"
@@ -1633,66 +1765,68 @@ class OrderStatusHandler:
                     success = self.update_order_status(
                         order_id=order_id,
                         new_status=pending_msg['new_status'],
-                        cookie_id=cookie_id,
+                        account_id=self._resolve_record_account_id(pending_msg, account_id),
                         context=f"{pending_msg['send_message']} - {pending_msg['msg_time']} - 延迟处理"
                     )
                     
                     if success:
                         status_text = self.status_mapping.get(pending_msg['new_status'], pending_msg['new_status'])
-                        logger.info(f'✅ [{pending_msg["msg_time"]}] 【{cookie_id}】{pending_msg["send_message"]}，订单 {order_id} 状态已更新为{status_text} (延迟处理)')
+                        logger.info(f'✅ [{pending_msg["msg_time"]}] 【{account_id}】{pending_msg["send_message"]}，订单 {order_id} 状态已更新为{status_text} (延迟处理)')
                     else:
-                        logger.error(f'❌ [{pending_msg["msg_time"]}] 【{cookie_id}】{pending_msg["send_message"]}，但订单 {order_id} 状态更新失败 (延迟处理)')
+                        logger.error(f'❌ [{pending_msg["msg_time"]}] 【{account_id}】{pending_msg["send_message"]}，但订单 {order_id} 状态更新失败 (延迟处理)')
                     
                     # 清理临时订单ID的待处理更新
                     self._clear_temp_pending_update(
                         pending_msg.get('temp_order_id'),
+                        account_id=self._resolve_record_account_id(pending_msg, account_id),
                         log_prefix="🗑️ "
                     )
                     
                     # 如果队列为空，删除该账号的队列
-                    if not self._pending_system_messages[cookie_id]:
-                        del self._pending_system_messages[cookie_id]
-                        logger.info(f"🗑️ 账号 {cookie_id} 的待处理系统消息队列已清空")
+                    if not self._pending_system_messages[account_id]:
+                        del self._pending_system_messages[account_id]
+                        logger.info(f"🗑️ 账号 {account_id} 的待处理系统消息队列已清空")
                 elif discarded_msg:
                     self._clear_temp_pending_update(
                         discarded_msg.get('temp_order_id'),
+                        account_id=self._resolve_record_account_id(discarded_msg, account_id),
                         log_prefix="🗑️ "
                     )
-                    if cookie_id in self._pending_system_messages and not self._pending_system_messages[cookie_id]:
-                        del self._pending_system_messages[cookie_id]
-                        logger.info(f"🗑️ 账号 {cookie_id} 的待处理系统消息队列已清空")
+                    if account_id in self._pending_system_messages and not self._pending_system_messages[account_id]:
+                        del self._pending_system_messages[account_id]
+                        logger.info(f"🗑️ 账号 {account_id} 的待处理系统消息队列已清空")
                 else:
                     logger.info(
                         f"ℹ️ 订单 {order_id} ID已提取，但严格关联未命中待处理系统消息，保留队列等待后续命中: "
                         f"mode={match_mode}, {self._format_pending_match_context(normalized_match_context)}"
                     )
             else:
-                logger.info(f"ℹ️ 账号 {cookie_id} 没有待处理的系统消息")
+                logger.info(f"ℹ️ 账号 {account_id} 没有待处理的系统消息")
             
             # 处理待处理的红色提醒消息队列
-            if cookie_id in self._pending_red_reminder_messages and self._pending_red_reminder_messages[cookie_id]:
+            if account_id in self._pending_red_reminder_messages and self._pending_red_reminder_messages[account_id]:
                 pending_msg = None
                 discarded_msg = None
                 matched_index, match_mode = self._select_pending_message_index(
-                    self._pending_red_reminder_messages[cookie_id],
+                    self._pending_red_reminder_messages[account_id],
                     normalized_match_context,
                     '红色提醒'
                 )
                 if matched_index is not None:
-                    candidate_msg = self._pending_red_reminder_messages[cookie_id][matched_index]
+                    candidate_msg = self._pending_red_reminder_messages[account_id][matched_index]
                     if self._should_bind_pending_terminal_message(candidate_msg, message):
-                        pending_msg = self._pending_red_reminder_messages[cookie_id].pop(matched_index)
+                        pending_msg = self._pending_red_reminder_messages[account_id].pop(matched_index)
                         logger.info(
                             f"✅ 严格匹配到待处理的红色提醒消息: {pending_msg['red_reminder']} "
                             f"(mode={match_mode}, {self._format_pending_match_context(normalized_match_context)})"
                         )
                     elif self._pending_terminal_message_already_resolved(
                         order_id=order_id,
-                        cookie_id=cookie_id,
+                        account_id=account_id,
                         pending_msg=candidate_msg,
                         match_context=normalized_match_context
                     ):
-                        discarded_msg = self._pending_red_reminder_messages[cookie_id].pop(matched_index)
+                        discarded_msg = self._pending_red_reminder_messages[account_id].pop(matched_index)
                         logger.info(
                             f"🗑️ 丢弃已被旧订单消化的待处理红色提醒消息: {discarded_msg['red_reminder']} "
                             f"(mode={match_mode}, {self._format_pending_match_context(normalized_match_context)})"
@@ -1705,26 +1839,32 @@ class OrderStatusHandler:
                     success = self.update_order_status(
                         order_id=order_id,
                         new_status=pending_msg['new_status'],
-                        cookie_id=cookie_id,
+                        account_id=self._resolve_record_account_id(pending_msg, account_id),
                         context=f"{pending_msg['red_reminder']} - 用户{pending_msg['user_id']} - {pending_msg['msg_time']} - 延迟处理"
                     )
                     
                     if success:
                         status_text = self.status_mapping.get(pending_msg['new_status'], pending_msg['new_status'])
-                        logger.info(f'[{pending_msg["msg_time"]}] 【{cookie_id}】{pending_msg["red_reminder"]}，订单 {order_id} 状态已更新为{status_text} (延迟处理)')
+                        logger.info(f'[{pending_msg["msg_time"]}] 【{account_id}】{pending_msg["red_reminder"]}，订单 {order_id} 状态已更新为{status_text} (延迟处理)')
                     else:
-                        logger.error(f'[{pending_msg["msg_time"]}] 【{cookie_id}】{pending_msg["red_reminder"]}，但订单 {order_id} 状态更新失败 (延迟处理)')
+                        logger.error(f'[{pending_msg["msg_time"]}] 【{account_id}】{pending_msg["red_reminder"]}，但订单 {order_id} 状态更新失败 (延迟处理)')
                     
                     # 清理临时订单ID的待处理更新
-                    self._clear_temp_pending_update(pending_msg.get('temp_order_id'))
+                    self._clear_temp_pending_update(
+                        pending_msg.get('temp_order_id'),
+                        account_id=self._resolve_record_account_id(pending_msg, account_id)
+                    )
                     
                     # 如果队列为空，删除该账号的队列
-                    if not self._pending_red_reminder_messages[cookie_id]:
-                        del self._pending_red_reminder_messages[cookie_id]
+                    if not self._pending_red_reminder_messages[account_id]:
+                        del self._pending_red_reminder_messages[account_id]
                 elif discarded_msg:
-                    self._clear_temp_pending_update(discarded_msg.get('temp_order_id'))
-                    if cookie_id in self._pending_red_reminder_messages and not self._pending_red_reminder_messages[cookie_id]:
-                        del self._pending_red_reminder_messages[cookie_id]
+                    self._clear_temp_pending_update(
+                        discarded_msg.get('temp_order_id'),
+                        account_id=self._resolve_record_account_id(discarded_msg, account_id)
+                    )
+                    if account_id in self._pending_red_reminder_messages and not self._pending_red_reminder_messages[account_id]:
+                        del self._pending_red_reminder_messages[account_id]
                 else:
                     logger.info(
                         f"ℹ️ 订单 {order_id} ID已提取，但严格关联未命中待处理红色提醒消息，保留队列等待后续命中: "
