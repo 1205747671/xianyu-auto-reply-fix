@@ -3894,10 +3894,117 @@ def _stabilize_password_login_cookies_after_login(
     account_id: str,
     user_id: int,
     current_user: Dict[str, Any],
+    slider_instance: Any = None,
+    proxy_config: Optional[Dict[str, Any]] = None,
     request_loop: asyncio.AbstractEventLoop,
     preflight_timeout: float,
     browser_refresh_timeout: float = 90.0,
 ) -> Tuple[str, Dict[str, Any]]:
+    # 优先走纯 HTTP Token 探测 + 复用当前 managed runtime 的 Cookie 稳定化，
+    # 避免“密码登录成功 -> Token 预检失败 -> 再次申请 runtime”导致的二次拉起浏览器。
+    from utils.xianyu_slider_stealth import probe_cookie_verification_from_cookie
+
+    def _to_cookie_str(cookie_dict: Dict[str, Any]) -> str:
+        normalized: Dict[str, str] = {}
+        for key, value in (cookie_dict or {}).items():
+            if value is None:
+                continue
+            normalized[str(key)] = str(value)
+        return '; '.join([f"{k}={v}" for k, v in normalized.items()])
+
+    def _probe_cookie(cookie_text: str) -> Dict[str, Any]:
+        return probe_cookie_verification_from_cookie(cookie_text, proxy=proxy_config)
+
+    log_with_user(
+        'info',
+        f"密码登录成功后开始执行Token预检(HTTP)，优先确认新Cookie可直接交接: {account_id}",
+        current_user,
+    )
+    probe_result: Dict[str, Any] = {}
+    try:
+        probe_result = _probe_cookie(cookies_str)
+    except Exception as probe_err:
+        probe_result = {
+            'status': 'unknown',
+            'verification_url': None,
+            'payload': {'error': str(probe_err)},
+            'session_cookies': trans_cookies(cookies_str),
+        }
+
+    if probe_result.get('status') == 'cookie_valid':
+        merged = trans_cookies(cookies_str)
+        merged.update(probe_result.get('session_cookies') or {})
+        cookies_str = _to_cookie_str(merged)
+        log_with_user(
+            'info',
+            f"密码登录后的Token预检(HTTP)通过，将使用预热后的Cookie继续交接: {account_id}",
+            current_user,
+        )
+        return cookies_str, {
+            'token_prewarmed': True,
+            'real_cookie_refreshed': False,
+            'fallback_reason': None,
+        }
+
+    fallback_reason_http = (
+        f"status={probe_result.get('status')}, "
+        f"verification_url={probe_result.get('verification_url') or ''}, "
+        f"payload={str(probe_result.get('payload') or '')[:200]}"
+    )
+    log_with_user(
+        'warning',
+        (
+            "密码登录后的Token预检(HTTP)未通过，尝试复用当前 managed runtime 做Cookie稳定化，"
+            f"避免二次拉起浏览器: {account_id}, 原因: {fallback_reason_http}"
+        ),
+        current_user,
+    )
+
+    stabilized_cookie_dict = None
+    try:
+        context = getattr(slider_instance, 'context', None) if slider_instance is not None else None
+        page = getattr(slider_instance, 'page', None) if slider_instance is not None else None
+        stabilizer = getattr(slider_instance, '_stabilize_logged_in_context_cookies', None) if slider_instance is not None else None
+        if callable(stabilizer) and context is not None:
+            stabilized_cookie_dict = stabilizer(
+                context,
+                page,
+                scene="密码登录后(交接前)",
+            )
+    except Exception as stabilize_err:
+        log_with_user(
+            'warning',
+            f"复用当前 runtime 稳定化Cookie失败，将继续走旧的 async 兜底: {account_id}, 错误: {str(stabilize_err)}",
+            current_user,
+        )
+
+    if stabilized_cookie_dict:
+        cookies_str = _to_cookie_str(stabilized_cookie_dict)
+        try:
+            probe_result = _probe_cookie(cookies_str)
+        except Exception as probe_err:
+            probe_result = {
+                'status': 'unknown',
+                'verification_url': None,
+                'payload': {'error': str(probe_err)},
+                'session_cookies': trans_cookies(cookies_str),
+            }
+
+        if probe_result.get('status') == 'cookie_valid':
+            merged = trans_cookies(cookies_str)
+            merged.update(probe_result.get('session_cookies') or {})
+            cookies_str = _to_cookie_str(merged)
+            log_with_user(
+                'info',
+                f"复用当前 runtime 稳定化后Token预检(HTTP)通过，将使用稳定化Cookie继续交接: {account_id}",
+                current_user,
+            )
+            return cookies_str, {
+                'token_prewarmed': True,
+                'real_cookie_refreshed': True,
+                'fallback_reason': fallback_reason_http,
+            }
+
     from XianyuAutoAsync import XianyuLive
 
     log_with_user('info', f"密码登录成功后开始执行Token预检，优先确认新Cookie可直接交接: {account_id}", current_user)
@@ -4463,17 +4570,27 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 
                 log_with_user('info', f"账号密码登录成功，获取到 {len(cookies_dict)} 个Cookie字段: {account_id}", current_user)
 
-                # 这里先释放 password_login 占用的受管 runtime（持久化 profile 会被独占锁住）。
-                # 后续的 Token 预检若失败，会降级到浏览器 Cookie 稳定化流程；该流程会重新获取 runtime。
-                # 如果不提前释放，会导致 profile_dir 被占用，从而稳定化直接失败（见 owner=manager=... 的报错）。
-                try:
-                    _release_slider_managed_runtime_sync(
-                        runtime_lease,
-                        reason='password_login_captured_cookies',
+                if is_refresh_mode:
+                    # 刷新模式：后续会在 asyncio loop 里做 Token 预检/恢复，必须先释放 sync runtime（否则 profile_dir 会被占用）。
+                    try:
+                        _release_slider_managed_runtime_sync(
+                            runtime_lease,
+                            reason='password_login_captured_cookies',
+                        )
+                    except Exception as runtime_release_err:
+                        log_with_user(
+                            'warning',
+                            f"提前释放账号运行时失败（将继续尝试后续流程）: {account_id}, 错误: {str(runtime_release_err)}",
+                            current_user,
+                        )
+                    runtime_lease = None
+                else:
+                    # 普通密码登录：优先复用同一次 runtime 做 Token 预检/稳定化，减少二次拉起浏览器。
+                    log_with_user(
+                        'debug',
+                        f"普通密码登录将复用同一次 runtime 做Token预检/稳定化，避免二次拉起浏览器: {account_id}",
+                        current_user,
                     )
-                except Exception as runtime_release_err:
-                    log_with_user('warning', f"提前释放账号运行时失败（将继续尝试后续流程）: {account_id}, 错误: {str(runtime_release_err)}", current_user)
-                runtime_lease = None
                 
                 # 检查是否已存在相同账号ID的Cookie
                 existing_cookies = db_manager.get_all_cookies(user_id)
@@ -4575,20 +4692,70 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                             account_id=account_id,
                             user_id=user_id,
                             current_user=current_user,
+                            slider_instance=slider_instance,
+                            proxy_config=proxy_config,
                             request_loop=request_loop,
                             preflight_timeout=manual_refresh_preflight_timeout,
                         )
                         merged_cookies_dict = trans_cookies(cookies_str)
                     except Exception as stabilization_err:
-                        error_message = f"密码登录后Cookie稳定化失败，任务未切换: {str(stabilization_err)}"
-                        log_with_user('error', f"{error_message}: {account_id}", current_user)
-                        _finalize_password_login_session_failure(
-                            session_id,
-                            error_message,
-                            result_code='password_login_post_stabilization_failed',
-                            event_meta={'account_id': account_id},
-                        )
-                        return
+                        # 仍保留 async 兜底：首次尝试默认复用当前 runtime；若失败则释放/失效当前 runtime 后重试一次。
+                        retry_succeeded = False
+                        if runtime_lease is not None:
+                            log_with_user(
+                                'warning',
+                                (
+                                    f"密码登录后Cookie稳定化首次失败，准备释放当前 runtime 并重试 async 兜底: {account_id}, "
+                                    f"错误: {str(stabilization_err)}"
+                                ),
+                                current_user,
+                            )
+                            try:
+                                _release_slider_managed_runtime_sync(
+                                    runtime_lease,
+                                    reason='password_login_stabilization_retry_release',
+                                )
+                            except Exception as runtime_release_err:
+                                log_with_user(
+                                    'warning',
+                                    f"释放账号runtime失败（将继续尝试重试稳定化）: {account_id}, 错误: {str(runtime_release_err)}",
+                                    current_user,
+                                )
+                            runtime_lease = None
+                            try:
+                                account_browser_runtime_manager.invalidate_runtime_sync(
+                                    account_id,
+                                    reason='password_login_stabilization_retry_invalidate',
+                                )
+                            except Exception:
+                                pass
+
+                            try:
+                                cookies_str, stabilization_meta = _stabilize_password_login_cookies_after_login(
+                                    cookies_str=cookies_str,
+                                    account_id=account_id,
+                                    user_id=user_id,
+                                    current_user=current_user,
+                                    slider_instance=None,
+                                    proxy_config=proxy_config,
+                                    request_loop=request_loop,
+                                    preflight_timeout=manual_refresh_preflight_timeout,
+                                )
+                                merged_cookies_dict = trans_cookies(cookies_str)
+                                retry_succeeded = True
+                            except Exception as retry_err:
+                                stabilization_err = retry_err
+
+                        if not retry_succeeded:
+                            error_message = f"密码登录后Cookie稳定化失败，任务未切换: {str(stabilization_err)}"
+                            log_with_user('error', f"{error_message}: {account_id}", current_user)
+                            _finalize_password_login_session_failure(
+                                session_id,
+                                error_message,
+                                result_code='password_login_post_stabilization_failed',
+                                event_meta={'account_id': account_id},
+                            )
+                            return
                 
                 is_new_account = _persist_password_login_success(
                     account_id=account_id,

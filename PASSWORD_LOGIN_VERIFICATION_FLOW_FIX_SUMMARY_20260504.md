@@ -111,6 +111,16 @@
   - `use_account_persistent_profile=True`
   - 从而保证所有登录/导入/验证链路都按 `browser_data/user_<account_id>` 这套账号画像复用。
 
+### K. 减少“密码登录后二次拉起浏览器”的概率（优先复用同一次 runtime）
+
+- **背景**：旧流程为了让 token 预检/稳定化链路重新申请 runtime，会在拿到 cookies 后立刻释放 password_login 的 sync runtime，表现为“看起来又启动了一次浏览器/又开了一个窗口”。  
+- **调整**：
+  - `reply_server.py::_stabilize_password_login_cookies_after_login()` 新增“HTTP Token 预检 + 原 runtime 内稳定化”优先级：
+    - 先用 `probe_cookie_verification_from_cookie()` 做 token 探测（纯 HTTP，无浏览器）。
+    - 若未通过，尝试直接调用当前 `slider_instance._stabilize_logged_in_context_cookies()` 在同一 managed runtime 内访问 `https://www.goofish.com/im` 等动作，补齐延迟下发 Cookie 后再探测。
+  - `reply_server.py` 的 password-login 正常模式不再提前释放 runtime，而是尽量复用到稳定化完成（刷新模式仍保持提前释放以支持 async 预检/恢复）。
+  - 兜底策略仍保留：若复用失败，则释放/失效当前 runtime 后再走旧的 async 稳定化（仍可能再次申请 runtime）。
+
 --- 
 
 ## 这轮迁移收口了什么
