@@ -91,6 +91,17 @@
 - `static/uploads/images/`
 - `browser_data/user_1`（账号 1 的 profile 目录，删除后会自动重建）
 
+### H. 风控日志 risk_control_logs 遗留结构自动修复（cookie_id -> account_id）
+
+- **背景**：历史版本里 `risk_control_logs` 曾用 `cookie_id` 之类字段去关联账号；新版本统一按 `account_id` 作用域查询/写入。
+- **风险**：如果用户数据库里还残留旧结构，会导致风控日志查询、会话排查口径混乱（看起来像“没记录/记录丢了”）。
+- **修复**：`db_manager.py` 在数据库迁移时检测到遗留字段会自动重建表结构为 `account_id`，并迁移可识别记录。
+- **验证**：新增单测覆盖该迁移逻辑（`tests/test_db_manager_account_id_relations.py`）。
+
+### I. Windows 调试：人脸/扫码截图快速打开
+
+- `debug_manual_password_login.py` 在拿到验证截图路径后（Windows）会尝试 `os.startfile()` 自动打开图片，便于人工处理验证。
+
 --- 
 
 ## 这轮迁移收口了什么
