@@ -75,6 +75,8 @@ def main() -> int:
         browser_channel=args.browser_channel,
         executable_path=args.browser_path,
         slider_max_retries=args.max_retries,
+        # 按 account_id 复用账号持久化画像目录，便于复现“已登录直接复用”行为。
+        use_account_persistent_profile=True,
     )
     print(f"local_browser_info={slider.local_browser_info}")
 
