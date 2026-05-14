@@ -4294,6 +4294,9 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
             initial_cookies=existing_cookie_info.get('value', ''),
             proxy=proxy_config,
             slider_max_retries=4,
+            # 账号级别：无论密码登录/刷新，都按 account_id 复用持久化画像目录（browser_data/user_{account_id}）。
+            # 这能保证已登录会话可直接复用，避免同 account_id 每次都被迫重新登录。
+            use_account_persistent_profile=True,
         )
         slider_instance.risk_session_id = password_login_sessions.get(session_id, {}).get('risk_session_id') or session_id
         slider_instance.risk_trigger_scene = 'manual_password_refresh' if is_refresh_mode else 'password_login'
@@ -4742,6 +4745,8 @@ async def _execute_manual_cookie_import(
             initial_cookies=cookie_value,
             proxy=proxy_config,
             slider_max_retries=4,
+            # 手动 Cookie 导入验证也按 account_id 复用持久化画像目录，保证验证/后续流程与账号一致。
+            use_account_persistent_profile=True,
         )
         manual_cookie_import_sessions[session_id]['slider_instance'] = slider_instance
 

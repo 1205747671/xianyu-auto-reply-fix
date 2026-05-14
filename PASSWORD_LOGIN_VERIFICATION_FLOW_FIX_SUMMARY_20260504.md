@@ -102,6 +102,15 @@
 
 - `debug_manual_password_login.py` 在拿到验证截图路径后（Windows）会尝试 `os.startfile()` 自动打开图片，便于人工处理验证。
 
+### J. 登录/导入入口统一按 account_id 复用账号画像（避免“同账号已登录仍要重登”）
+
+- **背景**：`/password-login`、`/manual-cookie-import` 入口在 API 层创建 `XianyuSliderStealth` 时，若未显式开启账号持久化画像，会导致 managed runtime 走 `new_context()`（非持久化上下文），表现为：
+  - 同 `account_id` 明明已登录，后续仍可能被要求重新登录；
+  - 有头调试时更容易出现“看起来像两个窗口/两次启动”的观感（一个是持久化 profile 的宿主窗口，一个是新建的匿名 context）。
+- **调整**：`reply_server.py` 在这两个入口创建 `XianyuSliderStealth` 时统一强制：
+  - `use_account_persistent_profile=True`
+  - 从而保证所有登录/导入/验证链路都按 `browser_data/user_<account_id>` 这套账号画像复用。
+
 --- 
 
 ## 这轮迁移收口了什么
