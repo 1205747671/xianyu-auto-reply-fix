@@ -150,6 +150,13 @@ def _build_managed_browser_launch_args(
         locale,
     )
     resolved_args = list(args or [])
+    # NOTE:
+    # Our "managed runtime" launches Chromium via subprocess (not Playwright),
+    # so `headless=True` must be expressed as Chromium CLI args, otherwise it
+    # will still open a visible window on Windows.
+    if headless and not any(arg == "--headless" or arg.startswith("--headless=") for arg in resolved_args):
+        # Prefer the "new" headless implementation when supported.
+        resolved_args.append("--headless=new")
     proxy_server, proxy_bypass = _build_proxy_server_url(proxy)
     if proxy_server and not any(arg.startswith("--proxy-server=") for arg in resolved_args):
         resolved_args.append(f"--proxy-server={proxy_server}")
@@ -302,6 +309,17 @@ def launch_managed_browser_runtime(
     _port_reader: Optional[Callable[[str, float, Any, Callable[[float], None]], int]] = None,
     _sleep: Callable[[float], None] = time.sleep,
 ) -> ManagedBrowserRuntime:
+    # Chrome will write DevToolsActivePort into the profile dir. If the previous
+    # run was killed abruptly, the file may remain and point to a stale port,
+    # causing connect_over_cdp() to ECONNREFUSED. Always remove it before launch.
+    try:
+        (Path(user_data_dir) / DEVTOOLS_ACTIVE_PORT).unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        # Best-effort cleanup; the launcher will retry or fail with a clearer error.
+        pass
+
     resolved_executable_path = executable_path or ensure_binary()
     chrome_args = _build_managed_browser_launch_args(
         args=args,
@@ -370,6 +388,14 @@ async def launch_managed_browser_runtime_async(
     _connect_over_cdp: Optional[Callable[[str], Any]] = None,
     _port_reader: Optional[Callable[[str, float, Any], Any]] = None,
 ) -> AsyncManagedBrowserRuntime:
+    # See sync variant above: clear stale DevToolsActivePort before launching.
+    try:
+        (Path(user_data_dir) / DEVTOOLS_ACTIVE_PORT).unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
     resolved_executable_path = executable_path or ensure_binary()
     chrome_args = _build_managed_browser_launch_args(
         args=args,

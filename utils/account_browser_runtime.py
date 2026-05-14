@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import os
 import re
 import threading
 import time
@@ -38,6 +40,28 @@ SyncRuntimeFactory = Callable[[str, str, int, str, bool], Any]
 SyncRuntimeCloser = Callable[[Any], Any]
 
 ACCOUNT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _stable_cloakbrowser_fingerprint_seed(account_id: str) -> str:
+    """为 CloakBrowser 的 --fingerprint 生成稳定 seed。
+
+    CloakBrowser 默认每次 launch 会随机生成 fingerprint seed；若不固定 seed，复用 user_data_dir 也可能
+    因“设备画像”变化导致会话不稳定（频繁要求重新登录）。
+    """
+    override = os.environ.get("XY_CLOAKBROWSER_FINGERPRINT", "").strip()
+    if override:
+        return override
+    digest = hashlib.sha256(f"{account_id}:cloak_fingerprint".encode("utf-8")).hexdigest()
+    value = int(digest[:12], 16)
+    return str(10000 + (value % 90000))
+
+
+def _ensure_cloakbrowser_fingerprint_arg(account_id: str, launch_options: Dict[str, Any]) -> None:
+    args = list(launch_options.get("args") or [])
+    if any(str(arg).startswith("--fingerprint=") for arg in args):
+        return
+    args.append(f"--fingerprint={_stable_cloakbrowser_fingerprint_seed(account_id)}")
+    launch_options["args"] = args
 
 
 @dataclass
@@ -315,6 +339,7 @@ async def _default_async_runtime_factory(
         persistent_context_options=persistent_context_options,
         use_persistent_context=use_persistent_context,
     )
+    _ensure_cloakbrowser_fingerprint_arg(account_id, managed_launch_options)
     runtime = await _maybe_await(
         launch_managed_browser_runtime_async(
             user_data_dir=profile_dir,
@@ -415,6 +440,7 @@ def _default_sync_runtime_factory(
         persistent_context_options=persistent_context_options,
         use_persistent_context=use_persistent_context,
     )
+    _ensure_cloakbrowser_fingerprint_arg(account_id, managed_launch_options)
     runtime = launch_managed_browser_runtime(
         user_data_dir=profile_dir,
         **managed_launch_options,

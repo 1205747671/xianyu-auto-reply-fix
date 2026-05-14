@@ -1,8 +1,8 @@
-# 闲鱼账号验证 / Cookie / 保活链路修复总结（更新至 2026-05-06）
+# 闲鱼账号验证 / Cookie / 保活链路修复总结（更新至 2026-05-14）
 
 ## 当前结论
 
-截至 **2026-05-06**，这条链路现在要分两层看：
+截至 **2026-05-14**，这条链路现在要分两层看：
 
 1. **浏览器运行时已经统一**
    - 仓库里的活跃浏览器链路已经统一走 `CloakBrowser` provider。
@@ -26,6 +26,72 @@
 > 现在主要问题不是“老浏览器被识别导致链路根本跑不起来”，而是“账号在滑块后还要不要继续做人工验证，以及保活恢复能不能正确承接这个状态”。
 
 ---
+
+## 2026-05-14 这轮修复/调整（重点注意）
+
+这一轮主要是在“**无头 + 指纹稳定 + 登录后 Cookie 承接/复用**”这几个点把坑补齐，核心目标：
+
+1) `account_id=1` 这类“已登录账号”在后续流程里不应该动不动就要求重新登录  
+2) 全链路必须可在 **Docker 无头**稳定跑起来（不能依赖有头窗口）  
+3) 人脸/滑块的交互不要出现“抽搐”（双重拟人化叠加）  
+4) 密码登录完成后，Cookie 能落库并被后续 WS/保活/刷新链路正确接管
+
+### A. 指纹浏览器会话不稳定（根因：fingerprint seed 每次随机）
+
+- **现象**：即使复用 `browser_data/user_<account_id>`，同一账号后续流程仍然可能被要求重新登录。
+- **根因**：`CloakBrowser` 默认每次 launch 会随机生成 `--fingerprint=<seed>`，导致“设备画像”在变。
+- **修复**：
+  - `utils/xianyu_slider_stealth.py`：当 provider 接管浏览器身份时，为账号生成稳定 `--fingerprint=`，并支持环境变量覆盖：
+    - `XY_CLOAKBROWSER_FINGERPRINT=<seed>`
+  - `utils/account_browser_runtime.py`：managed runtime 启动时同样补齐稳定 `--fingerprint=`（覆盖所有 runtime 入口，避免漏网）。
+
+### B. “扫完人脸后滑块抽搐”（根因：provider humanize + 自研轨迹叠加）
+
+- **现象**：滑块表现为往右拉又往左、一顿一顿的“抽搐”。
+- **根因**：CloakBrowser humanize 会替换 `page.mouse.*` 为拟人化实现；而我们自研轨迹本身也包含超调/回退/微调。两套叠加就会抖。
+- **修复**：
+  - 默认路径：在 `simulate_slide()` 内检测到 `page._original` 时，改用 `page._original.mouse` 执行轨迹，避免双重拟人化。
+  - 可选开关：若你想“完全交给指纹浏览器自带的滑块处理”，可以设置：
+    - `XY_SLIDER_USE_PROVIDER_HUMANIZE_DRAG=1`
+    - 开启后走 provider 的简单拖拽，不再生成自研物理轨迹（避免叠加）。
+
+### C. 新账号首次密码登录成功后落库失败（KeyError / “账号不存在”）
+
+- **现象**：第一次密码登录拿到 Cookie 后，保存流程报错（典型是 `账号不存在: 1` / KeyError）。
+- **根因**：新账号还没插入 cookies 记录时，就先做 unb 绑定校验，导致绑定逻辑内部拿不到账号 cookie 行。
+- **修复**：`reply_server.py` 调整顺序：
+  - **老账号**：仍然先做 unb 冲突校验，再更新 cookie（避免覆盖到别的账号）
+  - **新账号**：先 `update_cookie_account_info(INSERT)` 落库，再做 unb 绑定
+
+### D. 密码登录 runtime 未释放导致“profile 被占用”，后续稳定化流程失败
+
+- **现象**：密码登录完成后进入 token 预检/稳定化降级流程时，报 `profile_dir 已被其他 runtime 持有`。
+- **根因**：密码登录的 managed runtime 独占锁未释放，稳定化又要复用同一 profile。
+- **修复**：`reply_server.py` 在拿到 `cookies_dict` 后立即释放 `runtime_lease`，再进入预检/稳定化流程。
+
+### E. DevToolsActivePort 残留导致 connect_over_cdp() 连到旧端口（ECONNREFUSED）
+
+- **现象**：偶发 `ECONNREFUSED`，看起来像 CDP 连接不上。
+- **根因**：上一次异常退出后，`browser_data/.../DevToolsActivePort` 残留，里面端口已无效。
+- **修复**：`utils/browser_provider.py` 在启动 managed runtime 前 best-effort 删除 `DevToolsActivePort`。
+
+### F. 无头模式下仍弹“有头窗口”（根因：managed runtime 没有传 headless CLI）
+
+- **现象**：你肉眼看到像“起了两个有头浏览器”，扫完了窗口还会闪/弹。
+- **根因**：managed runtime 是 subprocess 直接起 Chromium 二进制；`headless=True` 如果不转成 Chromium CLI 参数，并不会真的无头。
+- **修复**：`utils/browser_provider.py` 在 `headless=True` 时强制追加：
+  - `--headless=new`
+
+### G. 旧日志/轨迹等历史数据的清理口径
+
+本轮测试前清理了以下运行期数据目录（用于排除历史干扰，不建议在生产频繁乱删 profile）：
+- `logs/`
+- `trajectory_history/`
+- `__pycache__/`
+- `static/uploads/images/`
+- `browser_data/user_1`（账号 1 的 profile 目录，删除后会自动重建）
+
+--- 
 
 ## 这轮迁移收口了什么
 

@@ -358,13 +358,14 @@ async def main():
                 logger.warning(
                     f"检测到 COOKIES_STR，但 ACCOUNT_ID 非法，跳过环境变量账号加载: {account_id_error}"
                 )
-            elif env_account_id in manager.list_cookies():
-                logger.info(f"环境变量账号已存在，跳过重复加载: {env_account_id}")
             else:
-                registration = manager.add_cookie(env_account_id, env_cookie)
-                if isinstance(registration, asyncio.Future):
-                    pending_account_registrations.append(registration)
-                logger.info(f"从环境变量加载账号 Cookie: {env_account_id}")
+                if env_account_id in manager.list_cookies():
+                    logger.info(f"环境变量账号已存在，跳过重复加载: {env_account_id}")
+                else:
+                    registration = manager.add_cookie(env_account_id, env_cookie)
+                    if isinstance(registration, asyncio.Future):
+                        pending_account_registrations.append(registration)
+                    logger.info(f"从环境变量加载账号 Cookie: {env_account_id}")
 
     if pending_account_registrations:
         logger.info(f"等待 {len(pending_account_registrations)} 个启动期账号注册完成")

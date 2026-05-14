@@ -91,6 +91,12 @@ def main() -> int:
         print(f"verification_type={verification_type or ''}")
         print(f"verification_screenshot={actual_screenshot_path}")
         print(f"verification_url={verification_url or ''}")
+        # Windows 下自动打开截图，方便人工人脸/扫码操作
+        try:
+            if actual_screenshot_path and os.name == "nt" and os.path.exists(actual_screenshot_path):
+                os.startfile(actual_screenshot_path)
+        except Exception:
+            pass
 
     result = slider.login_with_password_browser(
         account=args.account,

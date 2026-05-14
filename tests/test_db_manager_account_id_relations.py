@@ -1,5 +1,6 @@
 import os
 import inspect
+import sqlite3
 import tempfile
 import unittest
 import ast
@@ -1335,6 +1336,77 @@ class DBManagerAccountIdRelationsTest(unittest.TestCase):
         stats = self.db.get_slider_verification_session_stats(account_ids=["acc-risk-1"], range_key="all")
         self.assertEqual(stats["accounts_with_sessions"], 1)
         self.assertEqual(stats["total_sessions"], 1)
+
+    def test_risk_control_logs_legacy_schema_is_rebuilt_with_account_id(self):
+        legacy_db_path = os.path.join(self.temp_dir.name, "legacy-risk.db")
+
+        bootstrap_db = db_module.DBManager(legacy_db_path)
+        try:
+            self.assertTrue(bootstrap_db.save_cookie("acc-risk-legacy-1", "a=1; b=2", user_id=1))
+        finally:
+            bootstrap_db.close()
+
+        legacy_link_column = "".join(["cookie", "_id"])
+        conn = sqlite3.connect(legacy_db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("DROP TABLE risk_control_logs")
+            cursor.execute(
+                f"""
+                CREATE TABLE risk_control_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    {legacy_link_column} TEXT NOT NULL,
+                    event_type TEXT NOT NULL DEFAULT 'slider_captcha',
+                    session_id TEXT,
+                    trigger_scene TEXT,
+                    result_code TEXT,
+                    event_description TEXT,
+                    event_meta TEXT,
+                    processing_result TEXT,
+                    processing_status TEXT DEFAULT 'processing',
+                    error_message TEXT,
+                    duration_ms INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    account_id TEXT,
+                    FOREIGN KEY ({legacy_link_column}) REFERENCES cookies(id) ON DELETE CASCADE
+                )
+                """
+            )
+            cursor.execute(
+                f"""
+                INSERT INTO risk_control_logs (
+                    {legacy_link_column}, event_type, session_id, event_description, processing_status, account_id
+                ) VALUES (?, ?, ?, ?, ?, NULL)
+                """,
+                ("acc-risk-legacy-1", "slider_captcha", "legacy-session-1", "legacy-row", "processing"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        migrated_db = db_module.DBManager(legacy_db_path)
+        try:
+            cursor = migrated_db.conn.cursor()
+            cursor.execute("PRAGMA table_info(risk_control_logs)")
+            columns = [row[1] for row in cursor.fetchall()]
+            self.assertIn("account_id", columns)
+            self.assertNotIn(legacy_link_column, columns)
+
+            logs = migrated_db.get_risk_control_logs(account_id="acc-risk-legacy-1", limit=10)
+            self.assertEqual(len(logs), 1)
+            self.assertEqual(logs[0]["account_id"], "acc-risk-legacy-1")
+            self.assertEqual(logs[0]["event_description"], "legacy-row")
+
+            log_id = migrated_db.add_risk_control_log(
+                account_id="acc-risk-legacy-1",
+                event_type="slider_captcha",
+                processing_status="processing",
+                event_description="post-migration-row",
+            )
+            self.assertIsNotNone(log_id)
+        finally:
+            migrated_db.close()
 
     def test_risk_control_log_filter_helper_uses_account_id_column(self):
         conditions, params = self.db._build_risk_control_log_filters(

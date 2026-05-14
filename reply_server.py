@@ -4203,9 +4203,11 @@ def _persist_password_login_success(
     is_refresh_mode: bool,
     current_user: Dict[str, Any],
 ) -> bool:
-    _bind_cookie_account_unb_or_raise(account_id, merged_cookies_dict.get('unb'), user_id)
     existing_cookies = db_manager.get_all_cookies(user_id)
     is_new_account = account_id not in existing_cookies
+    if not is_new_account:
+        # 已存在的账号：先做 unb 冲突校验，避免 cookie 被错误覆盖到别的账号上。
+        _bind_cookie_account_unb_or_raise(account_id, merged_cookies_dict.get('unb'), user_id)
     update_success = db_manager.update_cookie_account_info(
         account_id,
         cookie_value=cookies_str,
@@ -4216,6 +4218,9 @@ def _persist_password_login_success(
     )
     if not update_success:
         raise RuntimeError(f"保存账号信息失败: {account_id}")
+    if is_new_account:
+        # 新账号：先落库再绑定 unb（bind_cookie_account_unb 内部会校验 belongs_to_user）。
+        _bind_cookie_account_unb_or_raise(account_id, merged_cookies_dict.get('unb'), user_id)
 
     if cookie_manager.manager:
         if is_new_account:
@@ -4454,6 +4459,18 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     return
                 
                 log_with_user('info', f"账号密码登录成功，获取到 {len(cookies_dict)} 个Cookie字段: {account_id}", current_user)
+
+                # 这里先释放 password_login 占用的受管 runtime（持久化 profile 会被独占锁住）。
+                # 后续的 Token 预检若失败，会降级到浏览器 Cookie 稳定化流程；该流程会重新获取 runtime。
+                # 如果不提前释放，会导致 profile_dir 被占用，从而稳定化直接失败（见 owner=manager=... 的报错）。
+                try:
+                    _release_slider_managed_runtime_sync(
+                        runtime_lease,
+                        reason='password_login_captured_cookies',
+                    )
+                except Exception as runtime_release_err:
+                    log_with_user('warning', f"提前释放账号运行时失败（将继续尝试后续流程）: {account_id}, 错误: {str(runtime_release_err)}", current_user)
+                runtime_lease = None
                 
                 # 检查是否已存在相同账号ID的Cookie
                 existing_cookies = db_manager.get_all_cookies(user_id)

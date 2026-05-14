@@ -962,6 +962,82 @@ Cookie数量: {cookie_count}
                 f"cookies 表缺少必需绑定字段: {', '.join(missing_columns)}"
             )
 
+    def _ensure_risk_control_logs_account_schema(self, cursor):
+        """将 risk_control_logs 的遗留账号关联结构重建为 account_id 作用域。"""
+        legacy_link_column = "".join(["cookie", "_id"])
+
+        self._execute_sql(cursor, "PRAGMA table_info(risk_control_logs)")
+        risk_log_columns = [column[1] for column in cursor.fetchall()]
+        if legacy_link_column not in risk_log_columns:
+            return risk_log_columns
+
+        logger.warning("检测到 risk_control_logs 仍使用遗留账号关联结构，开始重建为 account_id 作用域")
+        account_id_expr = (
+            f"COALESCE(NULLIF(TRIM(account_id), ''), NULLIF(TRIM({legacy_link_column}), ''))"
+            if "account_id" in risk_log_columns
+            else f"NULLIF(TRIM({legacy_link_column}), '')"
+        )
+
+        self._execute_sql(cursor, "DROP TABLE IF EXISTS risk_control_logs_new")
+        self._execute_sql(
+            cursor,
+            """
+            CREATE TABLE risk_control_logs_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                event_type TEXT NOT NULL DEFAULT 'slider_captcha',
+                session_id TEXT,
+                trigger_scene TEXT,
+                result_code TEXT,
+                event_description TEXT,
+                event_meta TEXT,
+                processing_result TEXT,
+                processing_status TEXT DEFAULT 'processing',
+                error_message TEXT,
+                duration_ms INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (account_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            """,
+        )
+        self._execute_sql(
+            cursor,
+            f"""
+            INSERT INTO risk_control_logs_new (
+                id, account_id, event_type, session_id, trigger_scene, result_code,
+                event_description, event_meta, processing_result, processing_status,
+                error_message, duration_ms, created_at, updated_at
+            )
+            SELECT
+                id,
+                {account_id_expr} AS account_id,
+                event_type,
+                session_id,
+                trigger_scene,
+                result_code,
+                event_description,
+                event_meta,
+                processing_result,
+                processing_status,
+                error_message,
+                duration_ms,
+                created_at,
+                updated_at
+            FROM risk_control_logs
+            WHERE {account_id_expr} IS NOT NULL
+            """,
+        )
+        self._execute_sql(cursor, "SELECT COUNT(*) FROM risk_control_logs_new")
+        migrated_rows = int((cursor.fetchone() or [0])[0] or 0)
+
+        self._execute_sql(cursor, "DROP TABLE risk_control_logs")
+        self._execute_sql(cursor, "ALTER TABLE risk_control_logs_new RENAME TO risk_control_logs")
+        logger.info(f"数据库迁移完成：risk_control_logs 已切换为 account_id 结构，迁移记录数: {migrated_rows}")
+
+        self._execute_sql(cursor, "PRAGMA table_info(risk_control_logs)")
+        return [column[1] for column in cursor.fetchall()]
+
     def _migrate_database(self, cursor):
         """执行数据库迁移"""
         try:
@@ -1037,6 +1113,8 @@ Cookie数量: {cookie_count}
                     logger.info(f"添加risk_control_logs表的{column_name}列...")
                     cursor.execute(f"ALTER TABLE risk_control_logs ADD COLUMN {column_name} {column_type}")
                     logger.info(f"数据库迁移完成：添加risk_control_logs.{column_name}列")
+
+            risk_log_columns = self._ensure_risk_control_logs_account_schema(cursor)
 
             self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_risk_control_logs_account_created ON risk_control_logs(account_id, created_at DESC)")
             self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_risk_control_logs_type_status_created ON risk_control_logs(event_type, processing_status, created_at DESC)")

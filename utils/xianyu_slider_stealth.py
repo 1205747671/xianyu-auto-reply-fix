@@ -2371,7 +2371,21 @@ class XianyuSliderStealth:
             "--password-store=basic",
             "--use-mock-keychain",
         ]
+        if os.name == "nt" and self.headless:
+            # Windows 下部分 Chromium 版本在 headless 模式也可能闪现/残留一个空白窗口，
+            # 将窗口挪到屏幕外，避免影响本机使用；Docker 场景无显示设备也不会受影响。
+            args.append("--window-position=-2400,-2400")
         if self._provider_owns_browser_identity():
+            # CloakBrowser 默认每次 launch 都会随机生成 fingerprint seed。
+            # 若不固定 seed，即使复用 user_data_dir，也会因为“设备画像”变化导致站点会话不稳定（频繁要求重新登录）。
+            # 这里按账号维度生成稳定 seed，并允许通过环境变量覆盖。
+            if not any(str(arg).startswith("--fingerprint=") for arg in args):
+                override = os.environ.get("XY_CLOAKBROWSER_FINGERPRINT", "").strip()
+                if override:
+                    fingerprint_seed = override
+                else:
+                    fingerprint_seed = str(10000 + (self._stable_number("cloak_fingerprint") % 90000))
+                args.append(f"--fingerprint={fingerprint_seed}")
             return args
 
         args.extend([
@@ -7243,6 +7257,14 @@ class XianyuSliderStealth:
     def simulate_slide(self, slider_button: ElementHandle, trajectory):
         """模拟滑动 - 优化版本（增强随机性+智能学习）"""
         try:
+            # 若启用 provider 内置 humanize，则优先走“简单拖拽”，避免我们自研轨迹与 humanize 叠加。
+            # 开关：XY_SLIDER_USE_PROVIDER_HUMANIZE_DRAG=1
+            if (
+                self._provider_owns_browser_identity()
+                and os.environ.get("XY_SLIDER_USE_PROVIDER_HUMANIZE_DRAG", "").strip().lower() in {"1", "true", "yes", "on"}
+            ):
+                return self._simulate_slide_with_provider_humanize(slider_button, trajectory)
+
             # 🧠 获取学习到的行为参数
             reference_distance = ((getattr(self, 'current_trajectory_data', {}) or {}).get("distance"))
             optimized_params = self._optimize_trajectory_params(reference_distance=reference_distance)
@@ -7258,6 +7280,12 @@ class XianyuSliderStealth:
                 ((getattr(self, "current_trajectory_data", {}) or {}).get("random_params", {}) or {}).get("profile", "")
             )
             stable_headless_profile = current_profile == "cold_start_headless_stable"
+
+            # CloakBrowser humanize 会把 page.mouse.* 替换为拟人化实现（带缓动/微超调等）。
+            # 本方法本身也生成了物理轨迹（含超调/回退/微调），若再叠加 humanize，容易出现“往右又往左、一顿一顿”的观感。
+            # 因此在存在 page._original 时，优先用原生 Playwright 的 mouse 来执行轨迹。
+            raw_page = getattr(self.page, "_original", None) or self.page
+            mouse = raw_page.mouse
 
             # 🎭 用户速度人格因子：模拟同一个人各阶段行为的一致性
             # 快用户 (0.75~0.95) 各阶段等待都偏短，慢用户 (1.05~1.25) 各阶段等待都偏长
@@ -7323,7 +7351,7 @@ class XianyuSliderStealth:
                 
                 slide_behavior['approach_steps'] = approach_steps
                 
-                self.page.mouse.move(
+                mouse.move(
                     start_x + offset_x,
                     start_y + offset_y,
                     steps=approach_steps
@@ -7352,7 +7380,7 @@ class XianyuSliderStealth:
                 
                 slide_behavior['precision_steps'] = precision_steps
                 
-                self.page.mouse.move(
+                mouse.move(
                     start_x,
                     start_y,
                     steps=precision_steps
@@ -7404,7 +7432,7 @@ class XianyuSliderStealth:
             
             # 第三阶段：按下鼠标
             try:
-                self.page.mouse.move(start_x, start_y)
+                mouse.move(start_x, start_y)
                 
                 # 🎲 随机9：按下前停顿随机化（应用学习结果）
                 # 🔧 优化：成功案例的按下前停顿集中在 0.08-0.17秒
@@ -7418,7 +7446,7 @@ class XianyuSliderStealth:
                 slide_behavior['pre_down_pause'] = pre_down_pause
                 time.sleep(pre_down_pause * _tempo(4))
                 
-                self.page.mouse.down()
+                mouse.down()
                 
                 # 🎲 随机10：按下后停顿随机化（应用学习结果）
                 # 🔧 优化：成功案例的按下后停顿集中在 0.04-0.09秒
@@ -7473,12 +7501,12 @@ class XianyuSliderStealth:
                             progress = (j + 1) / sub_steps
                             sub_x = start_x + last_x + dx * progress
                             sub_y = start_y + last_y + dy * progress
-                            self.page.mouse.move(sub_x, sub_y)
+                            mouse.move(sub_x, sub_y)
                             # 小步之间只有极短延迟
                             time.sleep(random.uniform(0.001, 0.003))
                     else:
                         # 小位移直接移动
-                        self.page.mouse.move(current_x, current_y)
+                        mouse.move(current_x, current_y)
                     
                     last_x, last_y = x, y
                     
@@ -7525,7 +7553,7 @@ class XianyuSliderStealth:
                 time.sleep(pre_up_pause * _tempo(6))
                 
                 # 释放鼠标
-                self.page.mouse.up()
+                mouse.up()
 
                 # 释放后短暂停顿（模拟手指离开）
                 post_up_pause = random.uniform(0.02, 0.06)
@@ -7574,7 +7602,7 @@ class XianyuSliderStealth:
                 logger.error(traceback.format_exc())
                 # 确保释放鼠标
                 try:
-                    self.page.mouse.up()
+                    mouse.up()
                 except:
                     pass
                 return False
@@ -7585,6 +7613,58 @@ class XianyuSliderStealth:
             logger.error(traceback.format_exc())
             return False
     
+    def _simulate_slide_with_provider_humanize(self, slider_button: ElementHandle, trajectory) -> bool:
+        """使用 CloakBrowser humanize 的 page.mouse.* 来执行拖拽，不走自研物理轨迹。"""
+        try:
+            if not self.page:
+                return False
+
+            # humanize 只有在 page.mouse.* 上生效；page._original 是未打补丁版本，别用它。
+            page = self.page
+            mouse = page.mouse
+
+            button_box = slider_button.bounding_box()
+            if not button_box:
+                logger.error(f"【{self.pure_user_id}】无法获取滑块按钮位置(provider_humanize)")
+                return False
+
+            start_x = button_box["x"] + button_box["width"] / 2
+            start_y = button_box["y"] + button_box["height"] / 2
+
+            # trajectory 里 x 是相对位移，最后一个点接近目标距离；取最后一个 x 作为目标位移
+            target_dx = 0.0
+            try:
+                if trajectory:
+                    target_dx = float(trajectory[-1][0])
+            except Exception:
+                target_dx = 0.0
+            if not target_dx:
+                logger.warning(f"【{self.pure_user_id}】轨迹为空或目标位移为0(provider_humanize)，放弃拖拽")
+                return False
+
+            # 轻微靠近 + hover（用 selector API 更好，但这里已有 ElementHandle）
+            try:
+                slider_button.hover(timeout=2000)
+            except Exception:
+                pass
+
+            mouse.move(start_x, start_y)
+            time.sleep(random.uniform(0.05, 0.15))
+            mouse.down()
+            time.sleep(random.uniform(0.02, 0.08))
+
+            # 一次性拖到目标位置，让 humanize 自己做曲线/超调/停顿
+            # steps 给个范围，避免“瞬移”
+            steps = random.randint(18, 35)
+            mouse.move(start_x + target_dx, start_y, steps=steps)
+
+            time.sleep(random.uniform(0.05, 0.18))
+            mouse.up()
+            return True
+        except Exception as e:
+            logger.warning(f"【{self.pure_user_id}】provider_humanize 拖拽失败: {e}")
+            return False
+
     def _simulate_human_page_behavior(self):
         """在验证码页先停留一会儿，再做轻微交互，别一上来就莽。"""
         if not self.page:
@@ -9389,7 +9469,14 @@ class XianyuSliderStealth:
                     continue
                 
                 # 3. 生成人类化轨迹（传递尝试次数以增加随机扰动）
-                trajectory = self.generate_human_trajectory(slide_distance, attempt=attempt)
+                if (
+                    self._provider_owns_browser_identity()
+                    and os.environ.get("XY_SLIDER_USE_PROVIDER_HUMANIZE_DRAG", "").strip().lower() in {"1", "true", "yes", "on"}
+                ):
+                    # 使用 CloakBrowser humanize 时，不再生成自研物理轨迹，避免叠加导致抽搐。
+                    trajectory = [(float(slide_distance), 0.0, 0.0)]
+                else:
+                    trajectory = self.generate_human_trajectory(slide_distance, attempt=attempt)
                 if not trajectory:
                     logger.error(f"【{self.pure_user_id}】轨迹生成失败")
                     continue
