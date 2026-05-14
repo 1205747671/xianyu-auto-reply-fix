@@ -1,8 +1,8 @@
-# 闲鱼账号验证 / Cookie / 保活链路修复总结（更新至 2026-05-14）
+# 闲鱼账号验证 / Cookie / 保活链路修复总结（更新至 2026-05-15）
 
 ## 当前结论
 
-截至 **2026-05-14**，这条链路现在要分两层看：
+截至 **2026-05-15**，这条链路现在要分两层看：
 
 1. **浏览器运行时已经统一**
    - 仓库里的活跃浏览器链路已经统一走 `CloakBrowser` provider。
@@ -122,6 +122,39 @@
   - 兜底策略仍保留：若复用失败，则释放/失效当前 runtime 后再走旧的 async 稳定化（仍可能再次申请 runtime）。
 
 --- 
+
+## 2026-05-15 这轮修复/调整（二维码扫码登录“扫了没反应”/服务卡死）
+
+### A. 现象
+
+- 扫码后前端一直停在 `waiting` / `confirmed`，看起来“扫了没反应”。  
+- 极端情况下，`/qr-login/check/{session_id}` 甚至 `/health` 会超时无响应，但进程仍在 listen（典型就是 API 线程被卡住了）。
+
+### B. 根因（组合拳）
+
+1) **managed runtime 关闭阶段可能卡死**  
+`await runtime.browser.close()` / `await playwright.stop()` 在 CDP attach 场景下有概率卡住，导致 runtime invalidation/切换流程拖住后续链路。
+
+2) **跨线程调用 CookieManager 更新，可能阻塞 API event loop**  
+扫码 cookie 交接时，如果在 API server 的 event loop 线程里直接调用 `cookie_manager.manager.update_cookie()`，内部跨线程 `future.result()` 在遇到 runtime 关闭卡住时会被放大成“接口不返回”。
+
+### C. 修复点（本次落地）
+
+- `utils/browser_provider.py`
+  - `close_managed_browser_runtime_async()`：对 `browser.close()` / `playwright.stop()` 增加 `asyncio.wait_for(..., timeout=close_timeout)`，避免无限挂死。
+  - `launch_managed_browser_runtime*()`：启动前 best-effort 清理陈旧锁文件：`DevToolsActivePort`、`lockfile`、`SingletonLock/Cookie/Socket`，降低“残留导致启动失败/端口陈旧”的概率。
+- `reply_server.py`
+  - `process_qr_login_cookies()`：把 CookieManager 的 add/update 强制投递到 `cookie_manager.manager.loop` 内执行，避免 API 线程被跨线程阻塞拖死。
+  - 任务切换采用**软超时**：`_run_live_instance_on_manager_loop(..., timeout=15, cancel_on_timeout=False)`，超时只是不再等待（避免“扫了没反应”），但不会取消 manager.loop 内部的切换协程，后台会继续跑完。
+  - 扫码链路不再因为 `task_restarted=False` 就把会话标记为失败；真实 Cookie 已落库时，不回滚/不删除，最多给前端一个 warning。
+- `XianyuAutoAsync.py`
+  - `_verify_cookie_validity()`：补齐 `tempfile` / `SecureConfirm` 的本地导入，避免 cookie 健康探测误报（之前会直接 NameError）。
+
+### D. 验证方式（人工/接口）
+
+1) 走一遍扫码登录链路：`POST /qr-login/generate` -> 轮询 `GET /qr-login/check/{session_id}`  
+2) 预期状态序列：`waiting -> scanned -> confirmed -> success`  
+3) 在 `confirmed` 阶段，`/health` 仍应保持可用（不再出现“服务 listen 但接口不回”的假死现象）。
 
 ## 这轮迁移收口了什么
 

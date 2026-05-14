@@ -3000,6 +3000,7 @@ async def _run_live_instance_on_manager_loop(
     coroutine_factory: Callable[[], Awaitable[Any]],
     *,
     timeout: Optional[float] = None,
+    cancel_on_timeout: bool = True,
 ) -> Any:
     """将运行中账号实例的协程调度回 CookieManager 所属事件循环执行。"""
     manager = getattr(cookie_manager, 'manager', None)
@@ -3033,10 +3034,23 @@ async def _run_live_instance_on_manager_loop(
 
     try:
         if timeout and timeout > 0:
-            return await asyncio.wait_for(wrapped_future, timeout=timeout)
+            if cancel_on_timeout:
+                return await asyncio.wait_for(wrapped_future, timeout=timeout)
+
+            # Soft-timeout mode: do not cancel the underlying manager.loop task.
+            done, pending = await asyncio.wait(
+                {wrapped_future},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if done:
+                completed = next(iter(done))
+                return completed.result()
+            raise HTTPException(status_code=504, detail="账号处理超时，请稍后重试")
         return await wrapped_future
     except asyncio.TimeoutError:
-        thread_future.cancel()
+        if cancel_on_timeout:
+            thread_future.cancel()
         raise HTTPException(status_code=504, detail="账号处理超时，请稍后重试")
 
 
@@ -6009,18 +6023,13 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
                             managed_context=cookies_info.get('managed_context'),
                             managed_page=cookies_info.get('managed_page'),
                         )
-                        if isinstance(account_info, dict):
-                            handoff_not_started = (
-                                account_info.get('task_restarted') is False
-                                or account_info.get('real_cookie_refreshed') is False
-                            )
-                            if handoff_not_started:
-                                raise RuntimeError(
-                                    str(
-                                        account_info.get('warning_message')
-                                        or '真实Cookie已获取，但账号任务未启动'
-                                    )
-                                )
+                        # NOTE:
+                        # 扫码登录拿到真实 Cookie 后，“切换账号任务（CookieManager 更新/重启）”可能因为
+                        # 账号锁/任务取消/运行时关闭等原因变慢甚至超时。此时不应把整个扫码登录标记为失败：
+                        # - 真实 Cookie 已经写入数据库，用户不应再次扫码
+                        # - 后台任务切换可以后续重试/手动触发
+                        #
+                        # 因此这里不再把 task_restarted=False 作为硬失败条件，最多给前端一个 warning_message。
                         log_with_user('info', f"扫码登录处理完成: {session_id}, 账号: {account_info.get('account_id', 'unknown')}", current_user)
                         if callable(handoff_updater):
                             handoff_updater(session_id, 'success', account_info=account_info)
@@ -6236,6 +6245,7 @@ async def process_qr_login_cookies(
 
                     token_prewarmed = False
                     task_restarted = False
+                    task_switch_in_progress = False
                     warning_message = None
                     final_cookies = temp_instance.cookies_str or real_cookies
                     token_prewarm_timeout = max(
@@ -6277,40 +6287,80 @@ async def process_qr_login_cookies(
                             warning_message = _build_task_restart_warning(manager_runtime_issue)
                             log_with_user('warning', f"{warning_message}: {account_id}", current_user)
                         else:
-                            manager = cookie_manager.manager
+                            async def _switch_cookie_manager_runtime() -> None:
+                                manager = cookie_manager.manager
+                                if manager is None:
+                                    raise RuntimeError("CookieManager 未就绪")
+                                if is_new_account:
+                                    await manager._add_cookie_async(account_id, final_cookies, user_id=user_id)
+                                else:
+                                    # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
+                                    update_task = manager.update_cookie(account_id, final_cookies, save_to_db=False)
+                                    if asyncio.isfuture(update_task):
+                                        await update_task
+
+                            # IMPORTANT:
+                            # qr-login endpoint runs on the API server event loop (a different thread).
+                            # CookieManager methods like update_cookie() can block (future.result())
+                            # when called cross-thread. Always run the actual update on manager.loop
+                            # and await it with a timeout to avoid freezing the API thread forever.
+                            await _run_live_instance_on_manager_loop(
+                                account_id,
+                                _switch_cookie_manager_runtime,
+                                # 这里不把“任务切换”作为扫码登录成功的硬前置条件：
+                                # - 等太久用户会以为“扫了没反应”
+                                # - 但我们又希望任务切换能继续在后台完成
+                                #
+                                # 所以：设置一个软超时，并且不在超时时取消 manager.loop 内部的切换协程。
+                                timeout=15.0,
+                                cancel_on_timeout=False,
+                            )
                             if is_new_account:
-                                manager.add_cookie(account_id, final_cookies, user_id=user_id)
                                 log_with_user('info', f"已将真实cookie添加到cookie_manager: {account_id}", current_user)
                             else:
-                                # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
-                                manager.update_cookie(account_id, final_cookies, save_to_db=False)
                                 log_with_user('info', f"已更新cookie_manager中的真实cookie: {account_id}", current_user)
                             task_restarted = True
                             if not token_prewarmed:
                                 warning_message = warning_message or "真实Cookie已获取，账号任务已切换；首次Token将在后台继续初始化"
                                 log_with_user('warning', f"{warning_message}: {account_id}", current_user)
                     except Exception as task_switch_e:
-                        if token_prewarmed:
-                            XianyuLive.clear_qr_prewarmed_token(account_id)
-                        XianyuLive.clear_qr_login_grace(account_id)
-                        warning_message = f"真实Cookie已获取，但切换账号任务失败: {str(task_switch_e)}"
+                        is_soft_timeout = (
+                            isinstance(task_switch_e, HTTPException)
+                            and getattr(task_switch_e, "status_code", None) == 504
+                        )
+                        if is_soft_timeout:
+                            # 软超时：不取消 manager.loop 内部切换协程，让它继续在后台跑完。
+                            # 这里也不要清理预热 token / grace 状态，避免把“可继续接管”的上下文清掉。
+                            task_switch_in_progress = True
+                            warning_message = (
+                                warning_message
+                                or "真实Cookie已获取，但账号任务切换耗时较长，后台仍在处理中"
+                            )
+                        else:
+                            if token_prewarmed:
+                                XianyuLive.clear_qr_prewarmed_token(account_id)
+                            XianyuLive.clear_qr_login_grace(account_id)
+                            warning_message = f"真实Cookie已获取，但切换账号任务失败: {str(task_switch_e)}"
                         log_with_user('warning', f"{warning_message}: {account_id}", current_user)
 
                     if not task_restarted:
-                        if token_prewarmed:
-                            XianyuLive.clear_qr_prewarmed_token(account_id)
-                        XianyuLive.clear_qr_login_grace(account_id)
+                        if not task_switch_in_progress:
+                            if token_prewarmed:
+                                XianyuLive.clear_qr_prewarmed_token(account_id)
+                            XianyuLive.clear_qr_login_grace(account_id)
                         if not warning_message:
                             warning_message = _build_task_restart_warning(_get_cookie_manager_runtime_issue())
                             log_with_user('warning', f"{warning_message}: {account_id}", current_user)
-                        if is_new_account:
-                            db_manager.delete_cookie(account_id)
-                            log_with_user('warning', f"扫码登录未完成切换，已删除临时创建的新账号记录: {account_id}", current_user)
-                        elif previous_cookie_value:
-                            db_manager.update_cookie_account_info(account_id, cookie_value=previous_cookie_value)
-                            log_with_user('warning', f"扫码登录未完成切换，已回滚现有账号Cookie: {account_id}", current_user)
-                        else:
-                            log_with_user('warning', f"扫码登录未完成切换，但未找到可回滚的旧Cookie: {account_id}", current_user)
+
+                        # IMPORTANT:
+                        # 真实 Cookie 已经成功写入数据库（refresh_cookies_from_qr_login 内完成落库）。
+                        # 即便 CookieManager 的任务切换暂时失败/超时，也不能回滚/删除 cookie，
+                        # 否则用户需要重复扫码，体验会非常差。
+                        log_with_user(
+                            'warning',
+                            f"扫码登录真实Cookie已写入数据库，但账号任务尚未切换，将在后续重试/手动触发: {account_id}",
+                            current_user,
+                        )
 
                     # 更新风控日志状态
                     if risk_log_id:
@@ -6359,7 +6409,9 @@ async def process_qr_login_cookies(
                     return {
                         'account_id': account_id,
                         'is_new_account': is_new_account,
-                        'real_cookie_refreshed': task_restarted,  # 回滚时为 False，成功切换时为 True
+                        # 是否拿到了“真实 cookie”（通过浏览器访问 IM 等页面补齐后落库）
+                        # 与 task_restarted（CookieManager 是否已完成任务切换）是两件事，不能混用。
+                        'real_cookie_refreshed': True,
                         'cookie_length': len(final_cookies),
                         'token_prewarmed': token_prewarmed,
                         'task_restarted': task_restarted,

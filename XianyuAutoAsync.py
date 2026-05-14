@@ -7368,6 +7368,11 @@ class XianyuLive:
     async def _verify_cookie_validity(self) -> dict:
         logger.info(f"【{self.account_id}】开始验证Cookie有效性（使用真实API调用）...")
 
+        # NOTE: This method is used as a "best-effort" cookie health probe.
+        # Keep imports local to avoid module-level side effects at startup.
+        import tempfile
+        from secure_confirm_decrypted import SecureConfirm
+
         result = {
             'valid': True,
             'confirm_api': None,

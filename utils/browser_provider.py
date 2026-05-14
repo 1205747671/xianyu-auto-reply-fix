@@ -309,16 +309,27 @@ def launch_managed_browser_runtime(
     _port_reader: Optional[Callable[[str, float, Any, Callable[[float], None]], int]] = None,
     _sleep: Callable[[float], None] = time.sleep,
 ) -> ManagedBrowserRuntime:
-    # Chrome will write DevToolsActivePort into the profile dir. If the previous
-    # run was killed abruptly, the file may remain and point to a stale port,
-    # causing connect_over_cdp() to ECONNREFUSED. Always remove it before launch.
-    try:
-        (Path(user_data_dir) / DEVTOOLS_ACTIVE_PORT).unlink()
-    except FileNotFoundError:
-        pass
-    except Exception:
-        # Best-effort cleanup; the launcher will retry or fail with a clearer error.
-        pass
+    # Best-effort cleanup of stale profile lock artifacts.
+    #
+    # - Chrome will write DevToolsActivePort into the profile dir. If the previous
+    #   run was killed abruptly, the file may remain and point to a stale port,
+    #   causing connect_over_cdp() to ECONNREFUSED.
+    # - Some environments may leave lock markers like "lockfile" or Chromium
+    #   singleton files behind, which can make the next launch exit early.
+    for stale_name in (
+        DEVTOOLS_ACTIVE_PORT,
+        "lockfile",
+        "SingletonLock",
+        "SingletonCookie",
+        "SingletonSocket",
+    ):
+        try:
+            (Path(user_data_dir) / stale_name).unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            # Best-effort cleanup; the launcher will retry or fail with a clearer error.
+            pass
 
     resolved_executable_path = executable_path or ensure_binary()
     chrome_args = _build_managed_browser_launch_args(
@@ -388,13 +399,20 @@ async def launch_managed_browser_runtime_async(
     _connect_over_cdp: Optional[Callable[[str], Any]] = None,
     _port_reader: Optional[Callable[[str, float, Any], Any]] = None,
 ) -> AsyncManagedBrowserRuntime:
-    # See sync variant above: clear stale DevToolsActivePort before launching.
-    try:
-        (Path(user_data_dir) / DEVTOOLS_ACTIVE_PORT).unlink()
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
+    # See sync variant above: clear stale profile lock artifacts before launching.
+    for stale_name in (
+        DEVTOOLS_ACTIVE_PORT,
+        "lockfile",
+        "SingletonLock",
+        "SingletonCookie",
+        "SingletonSocket",
+    ):
+        try:
+            (Path(user_data_dir) / stale_name).unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
 
     resolved_executable_path = executable_path or ensure_binary()
     chrome_args = _build_managed_browser_launch_args(
@@ -491,14 +509,17 @@ async def close_managed_browser_runtime_async(
 
     if runtime.browser is not None:
         try:
-            await runtime.browser.close()
+            # Playwright's Browser.close() may hang (especially for CDP-attached
+            # runtimes). Always bound it with a timeout so runtime invalidation
+            # cannot freeze the service thread forever.
+            await asyncio.wait_for(runtime.browser.close(), timeout=close_timeout)
         except Exception:
             pass
         runtime.browser = None
 
     if runtime.playwright is not None:
         try:
-            await runtime.playwright.stop()
+            await asyncio.wait_for(runtime.playwright.stop(), timeout=close_timeout)
         except Exception:
             pass
         runtime.playwright = None
