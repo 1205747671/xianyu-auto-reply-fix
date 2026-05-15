@@ -53,6 +53,15 @@ QR_CROSS_DOMAIN_COOKIE_NAMES = {
 }
 
 
+def _is_force_headless_enabled() -> bool:
+    """Headless hard constraint (for Docker deployment).
+
+    Default: enabled. Set XY_FORCE_HEADLESS=0 to allow headed mode locally.
+    """
+    override = str(os.getenv("XY_FORCE_HEADLESS", "1") or "").strip().lower()
+    return override not in {"0", "false", "no", "off"}
+
+
 def generate_headers():
     """生成请求头"""
     return {
@@ -333,6 +342,8 @@ class QRLoginManager:
         ]
 
     def _should_show_verification_browser(self) -> bool:
+        if _is_force_headless_enabled():
+            return False
         override = str(os.getenv("XY_QR_LOGIN_SHOW_BROWSER") or "").strip().lower()
         if override:
             return override in {"1", "true", "yes", "on"}

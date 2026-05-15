@@ -2562,6 +2562,15 @@ def _require_runtime_account_id(account_id: Any, *, action_text: str = "runtime 
     return normalized_account_id
 
 
+def _is_force_headless_enabled() -> bool:
+    """Headless hard constraint (for Docker deployment).
+
+    Default: enabled. Set XY_FORCE_HEADLESS=0 to allow headed mode locally.
+    """
+    override = str(os.getenv("XY_FORCE_HEADLESS", "1") or "").strip().lower()
+    return override not in {"0", "false", "no", "off"}
+
+
 def _prepare_manual_refresh_runtime_account_id(
     account_id: Any,
     *,
@@ -5167,6 +5176,11 @@ async def manual_cookie_import(
         show_browser = bool(request.show_browser)
         user_id = current_user['user_id']
 
+        if _is_force_headless_enabled():
+            if show_browser:
+                log_with_user('info', f"XY_FORCE_HEADLESS=1，忽略 show_browser 请求，强制无头模式: {account_id}", current_user)
+            show_browser = False
+
         try:
             account_id = _require_runtime_account_id(
                 account_id,
@@ -5319,6 +5333,12 @@ async def password_login(
             except ValueError as account_scope_error:
                 return {'success': False, 'message': str(account_scope_error)}
 
+        if _is_force_headless_enabled():
+            # Docker 部署不允许有头；统一在 API 层强制无头，避免任意入口“偷偷开窗”。
+            if show_browser:
+                log_with_user('info', f"XY_FORCE_HEADLESS=1，忽略 show_browser 请求，强制无头模式: {account_id}", current_user)
+            show_browser = False
+
         # 刷新模式：从数据库读取已保存的账号密码
         if refresh_mode and account_id:
             from XianyuAutoAsync import XianyuLive
@@ -5339,6 +5359,11 @@ async def password_login(
             # 获取 show_browser 设置（只有当前端没有明确指定时，才使用数据库配置）
             if not show_browser_specified:
                 show_browser = cookie_info.get('show_browser', False)
+
+            if _is_force_headless_enabled():
+                if show_browser:
+                    log_with_user('info', f"XY_FORCE_HEADLESS=1，忽略数据库 show_browser 配置，强制无头模式: {account_id}", current_user)
+                show_browser = False
 
             log_with_user('info', f"刷新Cookie模式: {account_id}, 用户名: {account}, show_browser: {show_browser}", current_user)
 

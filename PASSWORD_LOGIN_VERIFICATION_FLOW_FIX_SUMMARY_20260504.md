@@ -82,6 +82,14 @@
 - **修复**：`utils/browser_provider.py` 在 `headless=True` 时强制追加：
   - `--headless=new`
 
+### F2. Docker 部署硬约束：服务入口统一强制 headless（忽略 show_browser）
+
+- **目标**：后续要部署到 Docker，必须保证任何入口都不会启动有头浏览器。
+- **调整**：新增环境变量 `XY_FORCE_HEADLESS`（默认开启）。开启后：
+  - `reply_server.py`：`/password-login`、`/manual-cookie-import` 忽略前端/数据库的 `show_browser`，强制无头。
+  - `utils/qr_login.py`：扫码登录验证链路在 `XY_FORCE_HEADLESS=1` 时始终无头（不再按 Windows 环境默认开窗）。
+- **说明**：本地调试若确实需要有头，可显式设置 `XY_FORCE_HEADLESS=0`，再配合对应 show_browser 开关。
+
 ### G. 旧日志/轨迹等历史数据的清理口径
 
 本轮测试前清理了以下运行期数据目录（用于排除历史干扰，不建议在生产频繁乱删 profile）：
