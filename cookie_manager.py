@@ -27,14 +27,22 @@ class CookieManager:
     def _load_from_db(self):
         """从数据库加载账号、关键词和状态。"""
         try:
-            self.cookies = db_manager.get_all_cookies()
+            raw_cookies = db_manager.get_all_cookies()
+            self.cookies = {
+                account_id: normalized_cookie
+                for account_id, cookie_value in raw_cookies.items()
+                for normalized_cookie in [str(cookie_value or "").strip()]
+                if normalized_cookie
+            }
             self.keywords = db_manager.get_all_keywords()
-            self.cookie_status = db_manager.get_all_cookie_status()
+            raw_cookie_status = db_manager.get_all_cookie_status()
+            self.cookie_status = {
+                account_id: raw_cookie_status.get(account_id, True)
+                for account_id in self.cookies.keys()
+            }
             self.auto_confirm_settings = {}
 
             for account_id in self.cookies.keys():
-                if account_id not in self.cookie_status:
-                    self.cookie_status[account_id] = True
                 self.auto_confirm_settings[account_id] = db_manager.get_auto_confirm(account_id)
 
             logger.info(

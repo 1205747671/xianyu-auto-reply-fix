@@ -200,6 +200,90 @@
 
 ---
 
+## 2026-05-15 本次二维码清画像重跑（`account_id=1`）补充结论
+
+这轮按用户要求又做了一次更干净的二维码登录回归，不是复用旧画像硬蹭结果，而是先把 `account_id=1` 的浏览器画像和旧会话状态清掉，再重新扫码：
+
+- 清理：
+  - `browser_data/user_1`
+  - `cookies.id='1'` 的旧 Cookie 值清空
+  - 账号绑定状态回退到待重新绑定
+- 重新扫码会话：
+  - `session_id=77e57396-b68a-4f46-bacc-c2544c2b2099`
+
+### 本轮结果
+
+1. **二维码登录主链路再次跑通**
+   - 前端轮询经历：
+     - `waiting`
+     - `scanned`
+     - `confirmed`
+     - `success`
+   - 最终接口返回：
+     - `status = success`
+     - `phase = handoff_completed`
+     - `handoff_status = success`
+
+2. **真实 Cookie 成功获取并重新绑定到 `account_id=1`**
+   - 本轮扫码后重新绑定：
+     - `bound_unb = 2095002164`
+     - `bind_status = active`
+   - 数据库中账号 `1` 的 Cookie 已重新写回。
+
+3. **正式实例接管和 WebSocket 正常**
+   - `/accounts/1/runtime-status` 实测返回：
+     - `instance_exists = true`
+     - `running = true`
+     - `connection_state = connected`
+     - `ws_ready = true`
+     - `session_ready = true`
+     - `has_current_token = true`
+     - `token_refresh_status = success`
+     - `message_stream_status = healthy`
+
+### 本轮额外确认出的修正点
+
+#### A. 清空旧 Cookie 后，二维码主链路仍能重新建回账号级画像
+
+这次不是拿旧浏览器数据凑合跑，而是清掉 `browser_data/user_1` 后重新扫码，最终仍然稳定落回：
+
+- `account_id = 1`
+- `browser_data/user_1`
+
+说明“按 `account_id` 复用同一 persistent profile”这条约束在二维码登录链路里是成立的。
+
+#### B. 服务启动期“空 Cookie 账号硬起任务”的脏逻辑已收口
+
+这次清空 `cookies.id='1'` 后重启服务时，暴露出一个启动期脏点：
+
+- `CookieManager` / `Start.py` 会把**空 Cookie 占位账号**也当成可运行账号；
+- 然后直接尝试启动 `XianyuLive`；
+- 日志里就会出现一次“缺少 `cookies_str`”的无意义报错。
+
+本次已补上两层修正：
+
+1. `cookie_manager.py`
+   - `_load_from_db()` 现在只把**非空 Cookie**装入运行时 `manager.cookies`
+   - 空 Cookie 占位账号不再被当成“可启动 runtime 的账号”
+
+2. `Start.py`
+   - 服务启动遍历账号时，再额外做一次 `blank cookie` 防呆判断
+   - 即使上游将来再漏数据，也不会继续裸调 `start_runtime_task()`
+
+### 本轮日志结论
+
+- `21:59:25`：二维码状态进入 `scanned`
+- `21:59:27`：进入 `handoff_processing`
+- `21:59:37`：真实 Cookie 获取并回写数据库
+- `21:59:39`：正式实例 `refresh_token` 成功
+- `21:59:40`：WebSocket 初始化完成并进入 `connected`
+
+一句话总结：
+
+> 这轮已经验证：即使先清空 `account_id=1` 的旧画像和旧 Cookie，再从二维码登录重新走一遍，仍然可以正确重建账号级持久化画像、拿到真实 Cookie、完成实例接管，并稳定进入 WebSocket `connected`；同时启动期“空 Cookie 账号硬起任务”的脏日志也已经被收掉。
+
+---
+
 ## 2026-05-14 这轮修复 / 调整（重点）
 
 这一轮主要是在 **无头 + 指纹稳定 + 登录后 Cookie 承接 / 复用** 这几个点补坑，核心目标：

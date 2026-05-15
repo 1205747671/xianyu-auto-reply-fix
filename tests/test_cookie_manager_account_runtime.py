@@ -451,6 +451,42 @@ class CookieManagerAccountRuntimeSyncTest(unittest.TestCase):
         start_task_mock.assert_called_once_with("acc-stale-live-1")
 
 
+class CookieManagerLoadFromDbTest(unittest.TestCase):
+    def test_load_from_db_ignores_blank_cookie_accounts_for_runtime_tracking(self):
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+
+        with mock.patch.object(
+            cookie_manager.db_manager,
+            "get_all_cookies",
+            return_value={
+                "acc-empty-1": "",
+                "acc-space-1": "   ",
+                "acc-live-1": " cookie=value; foo=bar ",
+            },
+        ), mock.patch.object(
+            cookie_manager.db_manager,
+            "get_all_keywords",
+            return_value={},
+        ), mock.patch.object(
+            cookie_manager.db_manager,
+            "get_all_cookie_status",
+            return_value={"acc-empty-1": True, "acc-live-1": False},
+        ), mock.patch.object(
+            cookie_manager.db_manager,
+            "get_auto_confirm",
+            return_value=False,
+        ):
+            manager = cookie_manager.CookieManager(loop)
+
+        self.assertEqual(
+            {"acc-live-1": "cookie=value; foo=bar"},
+            manager.cookies,
+        )
+        self.assertEqual({"acc-live-1": False}, manager.cookie_status)
+        self.assertEqual({"acc-live-1": False}, manager.auto_confirm_settings)
+
+
 class CookieManagerAccountRuntimeSameLoopTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         load_patcher = mock.patch.object(cookie_manager.CookieManager, "_load_from_db", lambda _self: None)

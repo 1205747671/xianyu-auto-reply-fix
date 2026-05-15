@@ -58,6 +58,13 @@ class StartBrowserRuntimeTest(unittest.TestCase):
         self.assertIn("account_id = str(entry.get('account_id') or '').strip()", source)
         self.assertNotIn("account_id = entry.get('id')", source)
 
+    def test_start_runtime_skips_blank_cookie_accounts_before_starting_runtime(self):
+        source = START_PY.read_text(encoding="utf-8")
+
+        self.assertIn("normalized_cookie_value = str(cookie_value or '').strip()", source)
+        self.assertIn("if not normalized_cookie_value:", source)
+        self.assertIn("manager.start_runtime_task(account_id, normalized_cookie_value, user_id)", source)
+
     def test_global_config_cookie_template_is_new_account_list_schema(self):
         source = GLOBAL_CONFIG_YML.read_text(encoding="utf-8")
 

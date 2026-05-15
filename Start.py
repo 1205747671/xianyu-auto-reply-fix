@@ -299,6 +299,11 @@ async def main():
             logger.info(f"跳过禁用的账号: {account_id}")
             continue
 
+        normalized_cookie_value = str(cookie_value or '').strip()
+        if not normalized_cookie_value:
+            logger.info(f"跳过空Cookie账号，不启动运行时任务: {account_id}")
+            continue
+
         try:
             # 直接启动运行时任务，不重新保存到数据库
             from db_manager import db_manager
@@ -308,7 +313,7 @@ async def main():
             logger.info(f"账号详细信息获取成功: {account_id}, user_id: {user_id}")
 
             logger.info(f"正在创建账号运行时任务: {account_id}")
-            manager.start_runtime_task(account_id, cookie_value, user_id)
+            manager.start_runtime_task(account_id, normalized_cookie_value, user_id)
             logger.info(f"启动数据库中的账号任务: {account_id} (用户ID: {user_id})")
             logger.info(f"任务已添加到管理器，当前任务数: {len(manager.tasks)}")
         except Exception as e:
