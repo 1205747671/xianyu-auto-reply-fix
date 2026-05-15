@@ -1083,6 +1083,44 @@ class QRLoginManager:
             return
         self._cleanup_session_assets(session, reason=reason)
 
+    def invalidate_account_sessions(
+        self,
+        *,
+        account_id: str,
+        user_id: Optional[int] = None,
+        reason: str = 'qr_login_session_replaced',
+    ) -> list[str]:
+        """清理同账号旧扫码会话，避免用户扫到旧二维码而前端轮询新 session。"""
+        normalized_account_id = str(account_id or '').strip()
+        if not normalized_account_id:
+            return []
+
+        replaced_session_ids = []
+        for session_id, session in list(self.sessions.items()):
+            if session is None:
+                continue
+            if str(getattr(session, 'account_id', '') or '').strip() != normalized_account_id:
+                continue
+            if user_id is not None and str(getattr(session, 'user_id', '')) != str(user_id):
+                continue
+
+            session_status = str(getattr(session, 'status', '') or '').strip()
+            handoff_status = str(getattr(session, 'handoff_status', '') or '').strip()
+            if session_status == 'success' and handoff_status == 'success':
+                continue
+
+            self._cleanup_session_assets(session, reason=reason)
+            self.sessions.pop(session_id, None)
+            replaced_session_ids.append(session_id)
+
+        if replaced_session_ids:
+            logger.info(
+                f"扫码登录为账号 {normalized_account_id} 替换旧会话 {len(replaced_session_ids)} 个: "
+                f"{', '.join(replaced_session_ids)}"
+            )
+
+        return replaced_session_ids
+
     async def _get_mh5tk(self, session: QRLoginSession) -> dict:
         """获取m_h5_tk和m_h5_tk_enc"""
         data = {"bizScene": "home"}
@@ -1313,6 +1351,7 @@ class QRLoginManager:
             session = self.sessions.get(session_id)
             if not session:
                 return
+            session_removed = False
 
             logger.info(f"开始监控二维码状态: {session_id}")
 
@@ -1324,6 +1363,7 @@ class QRLoginManager:
                 try:
                     # 检查会话是否还存在
                     if session_id not in self.sessions:
+                        session_removed = True
                         break
                     if session.status == 'success':
                         logger.info(f"扫码登录API轮询检测到会话已成功: {session_id}")
@@ -1399,7 +1439,11 @@ class QRLoginManager:
                     await asyncio.sleep(2)
 
             # 超时处理
-            if session.status not in ['success', 'expired', 'cancelled', 'verification_required', 'failed', 'confirmed']:
+            if (
+                not session_removed
+                and session_id in self.sessions
+                and session.status not in ['success', 'expired', 'cancelled', 'verification_required', 'failed', 'confirmed']
+            ):
                 self._update_session_state(
                     session,
                     status='expired',
@@ -1408,6 +1452,8 @@ class QRLoginManager:
                     browser_alive=False,
                 )
                 logger.info(f"二维码监控超时，标记为过期: {session_id}")
+            elif session_removed:
+                logger.info(f"二维码监控检测到会话已被替换/清理，停止轮询: {session_id}")
 
         except Exception as e:
             logger.error(f"监控二维码状态失败: {e}")

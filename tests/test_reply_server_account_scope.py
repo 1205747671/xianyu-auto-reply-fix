@@ -265,6 +265,24 @@ class ReplyServerAccountScopeContractTest(_ReplyServerModuleBindingMixin, unitte
             reply_server_source,
         )
 
+    def test_qr_login_handoff_uses_relaxed_soft_timeout_without_cancelling_manager_switch(self):
+        reply_server_source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "                            await _run_live_instance_on_manager_loop(\n"
+            "                                account_id,\n"
+            "                                _switch_cookie_manager_runtime,\n"
+            "                                # 这里不把“任务切换”作为扫码登录成功的硬前置条件：\n"
+            "                                # - 等太久用户会以为“扫了没反应”\n"
+            "                                # - 但我们又希望任务切换能继续在后台完成\n"
+            "                                #\n"
+            "                                # 所以：设置一个软超时，并且不在超时时取消 manager.loop 内部的切换协程。\n"
+            "                                timeout=25.0,\n"
+            "                                cancel_on_timeout=False,\n"
+            "                            )",
+            reply_server_source,
+        )
+
     def test_db_manager_and_startup_drop_cookie_id_identity_wording(self):
         db_manager_source = (REPO_ROOT / "db_manager.py").read_text(encoding="utf-8")
         start_source = (REPO_ROOT / "Start.py").read_text(encoding="utf-8")
@@ -1711,6 +1729,69 @@ class ReplyServerAccountBrowserRuntimeJanitorTest(_ReplyServerModuleBindingMixin
 
         self.assertTrue(task.cancelled())
         self.assertIsNone(getattr(reply_server.app.state, "account_browser_runtime_janitor_task", None))
+
+
+class ReplyServerQrLoginSessionIsolationTest(_ReplyServerModuleBindingMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_generate_qr_code_clears_previous_same_account_session_tracking_before_regeneration(self):
+        old_session_id = "old-qr-session"
+        reply_server.qr_check_processed.clear()
+        reply_server.qr_check_locks.clear()
+        reply_server.qr_check_processed[old_session_id] = {
+            "processed": False,
+            "processing": True,
+            "timestamp": 123.0,
+        }
+        reply_server.qr_check_locks[old_session_id] = asyncio.Lock()
+        self.addCleanup(reply_server.qr_check_processed.clear)
+        self.addCleanup(reply_server.qr_check_locks.clear)
+
+        current_user = {
+            "user_id": 1,
+            "username": "admin",
+            "is_admin": True,
+        }
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_binding_info",
+            return_value={"id": "1"},
+        ), mock.patch.object(
+            reply_server.db_manager,
+            "assert_cookie_belongs_to_user",
+            return_value=None,
+        ), mock.patch.object(
+            reply_server.qr_login_manager,
+            "cleanup_expired_sessions",
+        ), mock.patch.object(
+            reply_server.qr_login_manager,
+            "invalidate_account_sessions",
+            return_value=[old_session_id],
+        ) as invalidate_sessions, mock.patch.object(
+            reply_server.qr_login_manager,
+            "generate_qr_code",
+            new=mock.AsyncMock(
+                return_value={
+                    "success": True,
+                    "session_id": "new-qr-session",
+                    "qr_code_url": "data:image/png;base64,ZmFrZQ==",
+                }
+            ),
+        ):
+            response = await reply_server.generate_qr_code(
+                request=reply_server.QRLoginGenerateRequest(account_id="1"),
+                current_user=current_user,
+            )
+
+        invalidate_sessions.assert_called_once_with(
+            account_id="1",
+            user_id=1,
+            reason="qr_login_regenerated_same_account",
+        )
+        self.assertNotIn(old_session_id, reply_server.qr_check_processed)
+        self.assertNotIn(old_session_id, reply_server.qr_check_locks)
+        self.assertTrue(response["success"])
+        self.assertEqual("1", response["account_id"])
+        self.assertEqual("new-qr-session", response["session_id"])
 
 
 class ReplyServerVerificationMaterialStateTest(_ReplyServerModuleBindingMixin, unittest.TestCase):

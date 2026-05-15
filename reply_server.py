@@ -826,6 +826,16 @@ def cleanup_qr_check_records():
             del qr_check_locks[session_id]
 
 
+def clear_qr_check_records_for_sessions(session_ids: List[str]) -> None:
+    """按 session_id 清理扫码检查缓存，避免旧二维码状态污染新会话。"""
+    for session_id in session_ids or []:
+        normalized_session_id = str(session_id or '').strip()
+        if not normalized_session_id:
+            continue
+        qr_check_processed.pop(normalized_session_id, None)
+        qr_check_locks.pop(normalized_session_id, None)
+
+
 def load_keywords() -> List[Tuple[str, str]]:
     """读取关键字→回复映射表
 
@@ -5895,6 +5905,20 @@ async def generate_qr_code(
             if not created:
                 raise HTTPException(status_code=403, detail='账号不属于当前用户或占位创建失败')
 
+        qr_login_manager.cleanup_expired_sessions()
+        replaced_session_ids = qr_login_manager.invalidate_account_sessions(
+            account_id=account_id,
+            user_id=user_id,
+            reason='qr_login_regenerated_same_account',
+        )
+        if replaced_session_ids:
+            clear_qr_check_records_for_sessions(replaced_session_ids)
+            log_with_user(
+                'info',
+                f"二维码登录已清理同账号旧会话 {len(replaced_session_ids)} 个: {', '.join(replaced_session_ids)}",
+                current_user,
+            )
+
         log_with_user('info', f"请求生成扫码登录二维码: {account_id}", current_user)
 
         result = await qr_login_manager.generate_qr_code(
@@ -6433,7 +6457,7 @@ async def process_qr_login_cookies(
                                 # - 但我们又希望任务切换能继续在后台完成
                                 #
                                 # 所以：设置一个软超时，并且不在超时时取消 manager.loop 内部的切换协程。
-                                timeout=15.0,
+                                timeout=25.0,
                                 cancel_on_timeout=False,
                             )
                             if is_new_account:
