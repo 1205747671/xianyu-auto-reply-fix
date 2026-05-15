@@ -80,6 +80,126 @@
 
 ---
 
+## 2026-05-15 本轮完整回归（清数据 -> 人脸 -> 滑块 -> Cookie / WS 接管）
+
+本轮按用户要求做了一次更严格的真实回归，特点不是“沿用旧数据碰碰运气”，而是先把 `account_id=1` 的历史状态清干净，再走一遍完整链路：
+
+- 清理范围：
+  - `browser_data/user_1`
+  - `data/xianyu_data.db` 中 `cookies.id='1'`
+  - `data/xianyu_data.db` 中 `risk_control_logs.account_id='1'`
+  - `logs/`
+  - `static/uploads/images/`
+- 登录参数：
+  - `account_id=1`
+  - 账号：`15614318625`
+  - 模式：`show_browser=false`
+- 本轮会话：
+  - `session_id=ZgcnSXqyhqEfRuu0aLfp3A`
+
+### 本轮关键结果
+
+1. **无头账密登录 + 人脸验证 + 后续滑块全部跑通**
+   - 先触发人脸验证；
+   - 用户扫脸后，又触发了一次滑块；
+   - 滑块通过后，页面重新确认登录成功。
+
+2. **前端验证状态误判已修正**
+   - 之前存在“用户还没扫脸，接口状态却先跳成 `验证已提交，正在等待登录完成`”的问题；
+   - 根因不是用户操作错了，而是：
+     - 验证页等待期间 iframe 会反复刷新；
+     - 某些轮次新探测没拿到新的截图/链接；
+     - 旧逻辑把“当前没素材”误当成“用户已经提交验证”。
+   - 本次已在 `reply_server.py` 增加验证素材保留逻辑：
+     - 同一验证类型下，若新一轮探测没有拿到新的截图/链接；
+     - 会继续沿用会话里上一份仍然存在的有效截图 / 验证链接；
+     - 不再错误降级成“已提交等待完成”。
+
+3. **密码登录成功后 Cookie 已正确落库并由正式实例接管**
+   - `password-login/check` 最终返回：
+     - `status = success`
+     - `cookie_count = 21`
+     - `token_prewarmed = false`
+     - `real_cookie_refreshed = false`
+   - 注意这里的 `token_prewarmed=false` 是**语义修正后的正确结果**：
+     - 只表示“当前不是浏览器内提前完成正式 token 初始化”；
+     - 并不表示链路失败；
+     - 正式 token 由后台实例初始化。
+
+4. **正式实例后续链路已确认正常**
+   - `/accounts/1/runtime-status` 实测返回：
+     - `instance_exists = true`
+     - `running = true`
+     - `connection_state = connected`
+     - `ws_ready = true`
+     - `session_ready = true`
+     - `has_current_token = true`
+     - `token_refresh_status = success`
+     - `message_stream_status = healthy`
+
+### 本轮日志结论
+
+- `17:16:25`：接口返回 `需要人脸验证，请查看验证截图`
+- `17:17:51`：人脸后续补发的滑块处理成功
+- `17:17:56`：页面元素确认登录成功
+- `17:18:22`：验证完成后获取到 `25` 个浏览器侧 Cookie 字段
+- `17:18:23`：密码登录成功回写到服务侧，保护性合并后落库 `21` 个字段
+- `17:18:23`：`密码登录后的Token预检(HTTP)` 通过
+- `17:18:27`：正式实例 `refresh_token` 成功
+- `17:18:28`：WebSocket 初始化完成并进入 `connected`
+- `17:18:30`：开始正常收包、心跳和业务消息处理
+
+### 本轮额外确认到的点
+
+#### A. “接管后 profile 自抢锁”这轮没有再复发
+
+本轮没有再出现之前那种：
+
+- 登录阶段 runtime 还占着 `browser_data/user_1`
+- 正式实例或浏览器稳定化又去抢同一个 profile
+- 最终报 `profile_dir 已被其他 runtime 持有`
+
+说明本轮涉及的两处修正已经生效：
+
+- 密码登录成功后，普通登录链路会在 handoff 前释放登录阶段 runtime；
+- 浏览器稳定化 / Cookie 恢复 runtime 在释放后会立即失效缓存实例，避免 runtime manager 继续短时占用 profile。
+
+#### B. `account_id` 级画像复用已在真实链路里生效
+
+这轮是清掉 `browser_data/user_1` 后重新拉起的首轮验证；后续整条链路仍然始终围绕：
+
+- `account_id=1`
+- `browser_data/user_1`
+
+进行，没有回退成匿名临时上下文，也没有混到别的账号目录。
+
+#### C. 仍有一个“不影响主链路，但值得继续收”的点
+
+浏览器侧最终仍提示缺少两个保护字段：
+
+- `cna`
+- `havana_lgc2_77`
+
+但这次已经验证：
+
+- 浏览器业务预热能拿到 `login.token` / `loginuser.get` 的 `200` 成功响应；
+- 正式实例能正常 `refresh_token`；
+- WebSocket / 心跳 / session keepalive 全部正常。
+
+所以当前它**不会阻塞主链路**，但后续仍建议继续优化“最终持久化 Cookie 视图”的完整性，减少后续恢复链路的补票压力。
+
+#### D. “两个 Start.py” 不是两个平级服务乱跑
+
+本轮额外查到的实际情况是：
+
+- 有父进程 `Start.py`
+- 以及一个子进程 `Start.py`
+- 真正监听 `8090` 的是子进程
+
+所以这更像是启动模型里的父子进程结构，而不是两个独立服务实例都在抢同一个业务端口。它暂时不影响本轮回归结论，但后续上 Docker 前仍建议再收口一次进程模型。
+
+---
+
 ## 2026-05-14 这轮修复 / 调整（重点）
 
 这一轮主要是在 **无头 + 指纹稳定 + 登录后 Cookie 承接 / 复用** 这几个点补坑，核心目标：

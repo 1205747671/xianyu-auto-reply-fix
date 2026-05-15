@@ -9592,6 +9592,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             acquire_runtime=mock.AsyncMock(return_value=lease),
             get_fresh_page=mock.AsyncMock(return_value=(page, context)),
             release_runtime=mock.AsyncMock(return_value=None),
+            invalidate_runtime=mock.AsyncMock(return_value=True),
             resolve_profile_dir=mock.Mock(return_value=os.path.join(os.getcwd(), "browser_data", "user_2095002164")),
         )
 
@@ -9628,6 +9629,10 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         runtime_manager.release_runtime.assert_awaited_once_with(
             lease,
             reason="browser_stabilization_completed",
+        )
+        runtime_manager.invalidate_runtime.assert_awaited_once_with(
+            "2095002164",
+            reason="browser_stabilization_completed_post_release_invalidate",
         )
         context.add_cookies.assert_awaited_once()
         live.update_config_cookies.assert_awaited_once_with()
@@ -9681,6 +9686,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             acquire_runtime=mock.AsyncMock(return_value=lease),
             get_fresh_page=mock.AsyncMock(return_value=(page, context)),
             release_runtime=mock.AsyncMock(return_value=None),
+            invalidate_runtime=mock.AsyncMock(return_value=True),
             resolve_profile_dir=mock.Mock(return_value=os.path.join(os.getcwd(), "browser_data", "user_recent-slider-user")),
         )
 
@@ -9717,6 +9723,10 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         runtime_manager.release_runtime.assert_awaited_once_with(
             lease,
             reason="browser_stabilization_completed",
+        )
+        runtime_manager.invalidate_runtime.assert_awaited_once_with(
+            "recent-slider-user",
+            reason="browser_stabilization_completed_post_release_invalidate",
         )
         live.update_config_cookies.assert_awaited_once_with()
 
@@ -12447,6 +12457,42 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         messages = self._collect_logger_messages(mock_logger)
         self.assertIn("account-release-runtime-log-1", messages)
         self.assertNotIn("legacy-release-runtime-log-1", messages)
+
+    async def test_release_browser_recovery_runtime_invalidates_cached_runtime_when_requested(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live._legacy_cookie_id = "legacy-release-runtime-invalidate-1"
+        live.account_id = "account-release-runtime-invalidate-1"
+        live._safe_str = str
+        live._async_close_browser = mock.AsyncMock()
+        runtime_lease = self._build_runtime_lease("account-release-runtime-invalidate-1")
+
+        with mock.patch.object(
+            XianyuAutoAsync.account_browser_runtime_manager,
+            "release_runtime",
+            new=mock.AsyncMock(return_value=None),
+        ) as release_runtime, mock.patch.object(
+            XianyuAutoAsync.account_browser_runtime_manager,
+            "invalidate_runtime",
+            new=mock.AsyncMock(return_value=True),
+        ) as invalidate_runtime:
+            await live._release_browser_recovery_runtime(
+                runtime_lease,
+                browser=object(),
+                context=object(),
+                page=object(),
+                reason="unit_test_release_invalidate",
+                invalidate_after_release=True,
+            )
+
+        release_runtime.assert_awaited_once_with(
+            runtime_lease,
+            reason="unit_test_release_invalidate",
+        )
+        invalidate_runtime.assert_awaited_once_with(
+            "account-release-runtime-invalidate-1",
+            reason="unit_test_release_invalidate_post_release_invalidate",
+        )
+        live._async_close_browser.assert_not_awaited()
 
     async def test_release_browser_recovery_runtime_missing_lease_account_id_avoids_stale_cookie_id_fallback(self):
         live = XianyuLive.__new__(XianyuLive)

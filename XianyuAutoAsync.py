@@ -6235,8 +6235,34 @@ class XianyuLive:
                                 notification_sent = True
                                 return None
 
+                            manual_refresh_state = self.get_manual_refresh_state(current_account_id)
+                            is_handoff_recovery = bool(
+                                manual_refresh_state and manual_refresh_state.get('phase') == 'handoff_recovery'
+                            )
                             recent_slider_success = self._has_recent_slider_success()
                             max_post_slider_session_retries = 2
+
+                            if is_handoff_recovery and not post_slider_session_grace_used:
+                                handoff_grace_delay = random.uniform(1.8, 3.0)
+                                logger.warning(
+                                    f"【{log_account_id}】检测到账号刚完成Cookie交接，首轮Token刷新先进入交接缓冲窗口，"
+                                    f"等待 {handoff_grace_delay:.2f}s 后重载Cookie再重试一次"
+                                )
+                                log_captcha_event(
+                                    current_account_id,
+                                    "账号交接首轮Token刷新进入缓冲窗口",
+                                    None,
+                                    f"类型: handoff_token_retry, expire_type={expire_type}"
+                                )
+                                await asyncio.sleep(handoff_grace_delay)
+                                self._reload_latest_cookies_from_db("账号交接后的Session过期缓冲")
+                                return await self._refresh_token_impl(
+                                    captcha_retry_count,
+                                    post_slider_session_grace_used=True,
+                                    allow_password_login_recovery=allow_password_login_recovery,
+                                    manual_refresh_browser_stabilization_used=manual_refresh_browser_stabilization_used,
+                                    post_slider_session_retry_count=post_slider_session_retry_count,
+                                )
 
                             if recent_slider_success and not post_slider_session_grace_used:
                                 grace_delay = random.uniform(1.2, 2.2)
@@ -12318,6 +12344,7 @@ class XianyuLive:
         context=None,
         page=None,
         reason: str,
+        invalidate_after_release: bool = False,
         close_browser: bool = True,
         close_context: bool = True,
         close_page: bool = True,
@@ -12333,6 +12360,17 @@ class XianyuLive:
         if lease is not None:
             try:
                 await account_browser_runtime_manager.release_runtime(lease, reason=reason)
+                if invalidate_after_release and release_account_id != "default":
+                    try:
+                        await account_browser_runtime_manager.invalidate_runtime(
+                            release_account_id,
+                            reason=f"{reason}_post_release_invalidate",
+                        )
+                    except Exception as invalidate_error:
+                        logger.warning(
+                            f"【{release_account_id}】释放账号级浏览器 runtime 后尝试立即失效缓存实例失败，"
+                            f"将回退到 runtime manager 后续空闲回收: {self._safe_str(invalidate_error)}"
+                        )
                 return
             except Exception as release_error:
                 logger.warning(
@@ -12518,6 +12556,7 @@ class XianyuLive:
                         context=context,
                         page=page,
                         reason="browser_stabilization_completed",
+                        invalidate_after_release=True,
                     )
             except Exception as cleanup_e:
                 logger.warning(f"【{log_account_id}】清理浏览器资源时出错: {self._safe_str(cleanup_e)}")
@@ -12745,6 +12784,7 @@ class XianyuLive:
                         context=context,
                         page=page,
                         reason="browser_cookie_refresh_completed",
+                        invalidate_after_release=True,
                     )
             except Exception as cleanup_e:
                 logger.warning(f"【{log_account_id}】创建浏览器关闭任务时出错: {self._safe_str(cleanup_e)}")

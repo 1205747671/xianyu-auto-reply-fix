@@ -3820,6 +3820,56 @@ def _set_password_login_session_status(session_id: str, status: str, **fields):
     return True
 
 
+def _resolve_session_verification_material(
+    session: Optional[Dict[str, Any]],
+    *,
+    verification_type: Optional[str] = None,
+    screenshot_path: Optional[str] = None,
+    verification_url: Optional[str] = None,
+    qr_code_url: Optional[str] = None,
+) -> Dict[str, Optional[str]]:
+    """保留同类型验证的最近一次可用素材，避免状态误跳成“已提交”。
+
+    验证页等待期间 iframe 会反复刷新，偶发拿不到新截图不代表用户已经提交验证。
+    这时应继续暴露上一张可用截图或链接，而不是把前端状态降级成“等待完成”。
+    """
+    resolved_screenshot_path = screenshot_path if screenshot_path and os.path.exists(screenshot_path) else None
+    resolved_verification_url = str(verification_url or '').strip() or None
+    resolved_qr_code_url = str(qr_code_url or '').strip() or None
+
+    existing_session = session or {}
+    current_verification_type = str(existing_session.get('verification_type') or '').strip()
+    next_verification_type = str(verification_type or '').strip()
+    same_verification_type = (
+        not current_verification_type
+        or not next_verification_type
+        or current_verification_type == next_verification_type
+    )
+
+    if same_verification_type:
+        current_screenshot_path = existing_session.get('screenshot_path')
+        if (
+            not resolved_screenshot_path
+            and current_screenshot_path
+            and os.path.exists(current_screenshot_path)
+        ):
+            resolved_screenshot_path = current_screenshot_path
+
+        current_verification_url = str(existing_session.get('verification_url') or '').strip() or None
+        if not resolved_verification_url and current_verification_url:
+            resolved_verification_url = current_verification_url
+
+        current_qr_code_url = str(existing_session.get('qr_code_url') or '').strip() or None
+        if not resolved_qr_code_url and current_qr_code_url:
+            resolved_qr_code_url = current_qr_code_url
+
+    return {
+        'screenshot_path': resolved_screenshot_path,
+        'verification_url': resolved_verification_url,
+        'qr_code_url': resolved_qr_code_url,
+    }
+
+
 def _wait_threadsafe_future_result(
     thread_future: concurrent.futures.Future,
     timeout: float,
@@ -3959,11 +4009,11 @@ def _stabilize_password_login_cookies_after_login(
         cookies_str = _to_cookie_str(merged)
         log_with_user(
             'info',
-            f"密码登录后的Token预检(HTTP)通过，将使用预热后的Cookie继续交接: {account_id}",
+            f"密码登录后的Token预检(HTTP)通过，将使用校验通过的Cookie继续交接；正式Token仍由后台实例初始化: {account_id}",
             current_user,
         )
         return cookies_str, {
-            'token_prewarmed': True,
+            'token_prewarmed': False,
             'real_cookie_refreshed': False,
             'fallback_reason': None,
         }
@@ -4018,11 +4068,11 @@ def _stabilize_password_login_cookies_after_login(
             cookies_str = _to_cookie_str(merged)
             log_with_user(
                 'info',
-                f"复用当前 runtime 稳定化后Token预检(HTTP)通过，将使用稳定化Cookie继续交接: {account_id}",
+                f"复用当前 runtime 稳定化后Token预检(HTTP)通过，将使用稳定化Cookie继续交接；正式Token仍由后台实例初始化: {account_id}",
                 current_user,
             )
             return cookies_str, {
-                'token_prewarmed': True,
+                'token_prewarmed': False,
                 'real_cookie_refreshed': True,
                 'fallback_reason': fallback_reason_http,
             }
@@ -4478,16 +4528,26 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     _finalize_password_login_session_failure(session_id, message)
                     log_with_user('warning', f"密码登录会话检测到失效验证页，直接标记失败: {session_id}", current_user)
                     return
-                
-                # 优先使用截图路径，如果没有截图则使用验证链接
+
+                session = password_login_sessions.get(session_id) or {}
+                verification_material = _resolve_session_verification_material(
+                    session,
+                    verification_type=verification_type_label,
+                    screenshot_path=actual_screenshot_path,
+                    verification_url=verification_url,
+                )
+                actual_screenshot_path = verification_material.get('screenshot_path')
+                resolved_verification_url = verification_material.get('verification_url')
+
+                # 优先使用截图路径，如果没有截图则使用验证链接；同类型验证下沿用上一份可用素材
                 if actual_screenshot_path and os.path.exists(actual_screenshot_path):
                     # 更新会话状态，保存截图路径
                     _set_password_login_session_status(
                         session_id,
                         'verification_required',
                         screenshot_path=actual_screenshot_path,
-                        verification_url=None,
-                        qr_code_url=None,
+                        verification_url=resolved_verification_url,
+                        qr_code_url=verification_material.get('qr_code_url'),
                         verification_type=verification_type_label,
                     )
                     log_with_user('info', f"账号验证截图已保存: {session_id}, 路径: {actual_screenshot_path}", current_user)
@@ -4501,7 +4561,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                                 account_id=account_id,
                                 time_text=time.strftime('%Y-%m-%d %H:%M:%S'),
                                 verification_type=verification_type_label,
-                                verification_url=verification_url or '',
+                                verification_url=resolved_verification_url or '',
                                 error_message=message,
                                 has_screenshot=True,
                             )
@@ -4527,17 +4587,17 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     notification_thread.daemon = True
                     notification_thread.start()
                     log_with_user('info', f"已启动账号验证通知发送线程: {account_id}", current_user)
-                elif verification_url:
+                elif resolved_verification_url:
                     # 如果没有截图，使用验证链接（兼容旧版本）
                     _set_password_login_session_status(
                         session_id,
                         'verification_required',
-                        verification_url=verification_url,
+                        verification_url=resolved_verification_url,
                         screenshot_path=None,
-                        qr_code_url=None,
+                        qr_code_url=verification_material.get('qr_code_url'),
                         verification_type=verification_type_label,
                     )
-                    log_with_user('info', f"账号验证链接已保存: {session_id}, URL: {verification_url}", current_user)
+                    log_with_user('info', f"账号验证链接已保存: {session_id}, URL: {resolved_verification_url}", current_user)
                     
                     # 发送通知到用户配置的渠道
                     def send_face_verification_notification():
@@ -4548,7 +4608,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                                 account_id=account_id,
                                 time_text=time.strftime('%Y-%m-%d %H:%M:%S'),
                                 verification_type=verification_type_label,
-                                verification_url=verification_url or '无',
+                                verification_url=resolved_verification_url or '无',
                                 error_message=message,
                                 has_screenshot=False,
                             )
@@ -4573,6 +4633,12 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     notification_thread.daemon = True
                     notification_thread.start()
                     log_with_user('info', f"已启动账号验证通知发送线程: {account_id}", current_user)
+                else:
+                    log_with_user(
+                        'warning',
+                        f"账号验证回调未拿到新的截图或验证链接，保留当前会话已有验证素材: {session_id}",
+                        current_user,
+                    )
             except Exception as e:
                 log_with_user('error', f"处理账号验证通知失败: {str(e)}", current_user)
         
@@ -4794,6 +4860,33 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                             )
                             return
                 
+                if not is_refresh_mode and runtime_lease is not None:
+                    try:
+                        _release_slider_managed_runtime_sync(
+                            runtime_lease,
+                            reason='password_login_handoff_release',
+                        )
+                    except Exception as runtime_release_err:
+                        log_with_user(
+                            'warning',
+                            f"密码登录交接前释放账号runtime失败（后续正式实例仍会继续接管）: {account_id}, 错误: {str(runtime_release_err)}",
+                            current_user,
+                        )
+                    runtime_lease = None
+
+                if not is_refresh_mode:
+                    from XianyuAutoAsync import XianyuLive
+
+                    XianyuLive.mark_manual_refresh_handoff(
+                        account_id,
+                        source=manual_refresh_owner,
+                    )
+                    log_with_user(
+                        'info',
+                        f"密码登录成功后已标记账号交接恢复窗口，避免正式实例刚接管就立刻升级到浏览器恢复: {account_id}",
+                        current_user,
+                    )
+
                 is_new_account = _persist_password_login_success(
                     account_id=account_id,
                     account=account,
@@ -4811,7 +4904,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 elif stabilization_meta.get('real_cookie_refreshed'):
                     log_with_user('info', f"密码登录已通过浏览器Cookie稳定化完成交接: {account_id}", current_user)
                 else:
-                    log_with_user('info', f"密码登录已通过Token预检完成交接，无需额外浏览器Cookie刷新: {account_id}", current_user)
+                    log_with_user('info', f"密码登录Cookie已通过HTTP预检完成交接，正式Token将在后台实例初始化: {account_id}", current_user)
                 
                 # 更新会话状态
                 _set_password_login_session_status(
@@ -4834,7 +4927,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 elif stabilization_meta.get('real_cookie_refreshed'):
                     stabilization_result_text = '密码登录后浏览器Cookie稳定化成功'
                 else:
-                    stabilization_result_text = '密码登录后Token预检通过'
+                    stabilization_result_text = '密码登录后HTTP Cookie预检通过'
                 # 更新风控日志状态
                 _update_session_risk_log(
                     session_id,
@@ -5016,8 +5109,6 @@ async def _execute_manual_cookie_import(
                 import threading
 
                 actual_screenshot_path = screenshot_path_new if screenshot_path_new else screenshot_path
-                if actual_screenshot_path and not os.path.exists(actual_screenshot_path):
-                    actual_screenshot_path = None
 
                 verification_type_label = resolve_verification_type_label(
                     verification_type,
@@ -5033,10 +5124,20 @@ async def _execute_manual_cookie_import(
                     )
                     return
 
+                session = manual_cookie_import_sessions.get(session_id) or {}
+                verification_material = _resolve_session_verification_material(
+                    session,
+                    verification_type=verification_type_label,
+                    screenshot_path=actual_screenshot_path,
+                    verification_url=verification_url,
+                )
+                actual_screenshot_path = verification_material.get('screenshot_path')
+                resolved_verification_url = verification_material.get('verification_url')
+
                 _set_manual_cookie_import_session_status(
                     session_id,
                     'verification_required',
-                    verification_url=verification_url or None,
+                    verification_url=resolved_verification_url,
                     screenshot_path=actual_screenshot_path,
                     verification_type=verification_type_label,
                 )
@@ -5047,10 +5148,10 @@ async def _execute_manual_cookie_import(
                         f"手动导入 Cookie 验证截图已保存: {session_id}, 路径: {actual_screenshot_path}",
                         current_user,
                     )
-                elif verification_url:
+                elif resolved_verification_url:
                     log_with_user(
                         'info',
-                        f"手动导入 Cookie 验证链接已保存: {session_id}, URL: {verification_url}",
+                        f"手动导入 Cookie 验证链接已保存: {session_id}, URL: {resolved_verification_url}",
                         current_user,
                     )
                 else:
@@ -5066,7 +5167,7 @@ async def _execute_manual_cookie_import(
                             account_id=account_id,
                             time_text=time.strftime('%Y-%m-%d %H:%M:%S'),
                             verification_type=verification_type_label,
-                            verification_url=verification_url or '',
+                            verification_url=resolved_verification_url or '',
                             error_message=message,
                             has_screenshot=bool(actual_screenshot_path),
                         )

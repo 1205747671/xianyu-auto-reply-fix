@@ -2,6 +2,7 @@ import asyncio
 import reply_server
 from pathlib import Path
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -237,6 +238,31 @@ class ReplyServerAccountScopeContractTest(_ReplyServerModuleBindingMixin, unitte
             "                require_managed_runtime=True,\n"
             "            )",
             xianyu_async,
+        )
+
+    def test_password_login_handoff_releases_sync_runtime_before_persisting_account_task(self):
+        reply_server_source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "if not is_refresh_mode and runtime_lease is not None:\n"
+            "                    try:\n"
+            "                        _release_slider_managed_runtime_sync(\n"
+            "                            runtime_lease,\n"
+            "                            reason='password_login_handoff_release',\n"
+            "                        )\n"
+            "                    except Exception as runtime_release_err:\n"
+            "                        log_with_user(\n"
+            "                            'warning',\n"
+            "                            f\"密码登录交接前释放账号runtime失败（后续正式实例仍会继续接管）: {account_id}, 错误: {str(runtime_release_err)}\",\n"
+            "                            current_user,\n"
+            "                        )\n"
+            "                    runtime_lease = None\n"
+            "\n"
+            "                if not is_refresh_mode:\n"
+            "                    from XianyuAutoAsync import XianyuLive\n"
+            "\n"
+            "                    XianyuLive.mark_manual_refresh_handoff(",
+            reply_server_source,
         )
 
     def test_db_manager_and_startup_drop_cookie_id_identity_wording(self):
@@ -1685,6 +1711,52 @@ class ReplyServerAccountBrowserRuntimeJanitorTest(_ReplyServerModuleBindingMixin
 
         self.assertTrue(task.cancelled())
         self.assertIsNone(getattr(reply_server.app.state, "account_browser_runtime_janitor_task", None))
+
+
+class ReplyServerVerificationMaterialStateTest(_ReplyServerModuleBindingMixin, unittest.TestCase):
+    def test_resolve_session_verification_material_keeps_existing_screenshot_for_same_type(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            screenshot_path = Path(tmpdir) / "face_verify_1_latest.jpg"
+            screenshot_path.write_bytes(b"fake-image")
+
+            session = {
+                "verification_type": "人脸验证",
+                "screenshot_path": str(screenshot_path),
+                "verification_url": "https://passport.example/face",
+                "qr_code_url": None,
+            }
+
+            resolved = reply_server._resolve_session_verification_material(
+                session,
+                verification_type="人脸验证",
+                screenshot_path=None,
+                verification_url=None,
+            )
+
+            self.assertEqual(str(screenshot_path), resolved["screenshot_path"])
+            self.assertEqual("https://passport.example/face", resolved["verification_url"])
+
+    def test_resolve_session_verification_material_does_not_keep_old_screenshot_for_new_type(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            screenshot_path = Path(tmpdir) / "face_verify_1_latest.jpg"
+            screenshot_path.write_bytes(b"fake-image")
+
+            session = {
+                "verification_type": "人脸验证",
+                "screenshot_path": str(screenshot_path),
+                "verification_url": "https://passport.example/face",
+                "qr_code_url": None,
+            }
+
+            resolved = reply_server._resolve_session_verification_material(
+                session,
+                verification_type="二维码验证",
+                screenshot_path=None,
+                verification_url="https://passport.example/qr",
+            )
+
+            self.assertIsNone(resolved["screenshot_path"])
+            self.assertEqual("https://passport.example/qr", resolved["verification_url"])
 
 
 if __name__ == "__main__":

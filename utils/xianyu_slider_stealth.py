@@ -5746,12 +5746,9 @@ class XianyuSliderStealth:
         ]
         if missing_protected_fields and getattr(self, 'last_browser_cookie_warmup_session_unready', False):
             self._log_cookie_snapshot_integrity(cookies_dict, f"{scene}完成后")
-            logger.error(
-                f"【{self.pure_user_id}】❌ {scene}后关键Cookie仍未齐全，且浏览器业务预热仍提示服务端Session未就绪: "
-                f"{missing_protected_fields}"
-            )
-            return self._fail_login(
-                f"{scene}后关键Cookie仍未齐全，服务端Session仍未就绪: {', '.join(missing_protected_fields)}"
+            logger.warning(
+                f"【{self.pure_user_id}】⚠️ {scene}后关键保护字段仍未齐全，且浏览器业务预热仍提示服务端Session未就绪；"
+                f"当前不直接判失败，继续交由后续保护性合并/正式实例接管: {missing_protected_fields}"
             )
 
         missing_required_fields = [
