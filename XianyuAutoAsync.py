@@ -11591,6 +11591,16 @@ class XianyuLive:
         finally:
             logger.info(f"【{self.account_id}】Cookie刷新循环已退出")
 
+    def _prime_cookie_refresh_schedule_on_startup(self) -> bool:
+        if self.last_cookie_refresh_time > 0:
+            return False
+
+        self.last_cookie_refresh_time = time.time()
+        logger.info(
+            f"【{self.account_id}】新实例启动时初始化 Cookie 刷新基线，避免接管后立刻又触发一次浏览器刷新"
+        )
+        return True
+
     async def _execute_cookie_refresh(self, current_time):
 
         async with self.cookie_refresh_lock:
@@ -14833,6 +14843,7 @@ class XianyuLive:
 
                             if not self.cookie_refresh_task or self.cookie_refresh_task.done():
                                 logger.info(f"【{self.account_id}】启动Cookie刷新任务...")
+                                self._prime_cookie_refresh_schedule_on_startup()
                                 self.cookie_refresh_task = asyncio.create_task(self.cookie_refresh_loop())
                                 tasks_started.append("Cookie刷新")
                             else:

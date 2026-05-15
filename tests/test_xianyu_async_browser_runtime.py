@@ -213,6 +213,25 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         self.addCleanup(_restore_module_binding)
 
+    def test_prime_cookie_refresh_schedule_on_startup_seeds_baseline_once(self):
+        live = XianyuLive(
+            "unb=test-unb; cookie2=test-cookie2",
+            account_id="1",
+            register_instance=False,
+        )
+
+        with mock.patch("XianyuAutoAsync.time.time", return_value=1234.5):
+            seeded = live._prime_cookie_refresh_schedule_on_startup()
+
+        self.assertTrue(seeded)
+        self.assertEqual(live.last_cookie_refresh_time, 1234.5)
+
+        with mock.patch("XianyuAutoAsync.time.time", return_value=5678.9):
+            seeded_again = live._prime_cookie_refresh_schedule_on_startup()
+
+        self.assertFalse(seeded_again)
+        self.assertEqual(live.last_cookie_refresh_time, 1234.5)
+
     @staticmethod
     def _build_merge_result(merged_cookies_dict):
         return {
