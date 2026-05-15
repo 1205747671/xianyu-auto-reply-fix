@@ -75,7 +75,6 @@ security = HTTPBearer(auto_error=False)
 # 扫码登录检查锁 - 防止并发处理同一个session
 qr_check_locks = defaultdict(lambda: asyncio.Lock())
 qr_check_processed = {}  # 记录已处理的session: {session_id: {'processed': bool, 'timestamp': float}}
-QR_LOGIN_TOKEN_PREWARM_TIMEOUT_SECONDS = float(os.getenv("QR_LOGIN_TOKEN_PREWARM_TIMEOUT_SECONDS", "30"))
 ACCOUNT_BROWSER_RUNTIME_JANITOR_INTERVAL_SECONDS = float(
     os.getenv("ACCOUNT_BROWSER_RUNTIME_JANITOR_INTERVAL_SECONDS", "60")
 )
@@ -4028,6 +4027,21 @@ def _stabilize_password_login_cookies_after_login(
                 'fallback_reason': fallback_reason_http,
             }
 
+    log_with_user(
+        'warning',
+        (
+            f"密码登录后的同步Token预检未直接通过，本次不再二次拉起同账号 persistent profile，"
+            f"直接交接当前Cookie并由正式实例继续初始化: {account_id}"
+        ),
+        current_user,
+    )
+    return cookies_str, {
+        'token_prewarmed': False,
+        'real_cookie_refreshed': True,
+        'fallback_reason': fallback_reason_http,
+        'deferred_token_handoff': True,
+    }
+
     from XianyuAutoAsync import XianyuLive
 
     log_with_user('info', f"密码登录成功后开始执行Token预检，优先确认新Cookie可直接交接: {account_id}", current_user)
@@ -6273,38 +6287,19 @@ async def process_qr_login_cookies(
                     task_switch_in_progress = False
                     warning_message = None
                     final_cookies = temp_instance.cookies_str or real_cookies
-                    token_prewarm_timeout = max(
-                        0.1,
-                        float(QR_LOGIN_TOKEN_PREWARM_TIMEOUT_SECONDS or 0),
+
+                    # 不在扫码 handoff 阶段同步 refresh_token：
+                    # 1. 这会让临时实例和正式账号实例并发抢同一个 account_id 的验证码/滑块槽位；
+                    # 2. asyncio.wait_for() 超时取消时，Playwright/滑块资源容易残留；
+                    # 3. API check 接口会在 confirmed -> success 之间被这段同步预热拖慢。
+                    #
+                    # 真实 Cookie 已经落库，后续直接交给 CookieManager 拉起的正式实例按 account_id
+                    # 复用同一 persistent profile 继续做首次 token 初始化更稳。
+                    log_with_user(
+                        'info',
+                        f"跳过扫码登录阶段的同步Token预热，直接进入账号任务接管: {account_id}",
+                        current_user,
                     )
-
-                    try:
-                        log_with_user('info', f"开始预热扫码登录Token: {account_id}", current_user)
-                        prewarmed_token = await asyncio.wait_for(
-                            temp_instance.refresh_token(),
-                            timeout=token_prewarm_timeout,
-                        )
-                        final_cookies = temp_instance.cookies_str or real_cookies
-
-                        if prewarmed_token:
-                            XianyuLive.cache_qr_prewarmed_token(account_id, prewarmed_token)
-                            token_prewarmed = True
-                            XianyuLive.clear_qr_login_grace(account_id)
-                            log_with_user('info', f"扫码登录Token预热成功: {account_id}", current_user)
-                        else:
-                            warning_message = "真实Cookie已获取，但首次Token初始化未完成，将在账号任务启动后继续重试"
-                            log_with_user('warning', f"{warning_message}: {account_id}", current_user)
-                    except asyncio.TimeoutError:
-                        final_cookies = temp_instance.cookies_str or real_cookies
-                        warning_message = (
-                            f"真实Cookie已获取，但首次Token初始化超时（{token_prewarm_timeout:g}秒），"
-                            "将在账号任务启动后继续重试"
-                        )
-                        log_with_user('warning', f"{warning_message}: {account_id}", current_user)
-                    except Exception as token_e:
-                        final_cookies = temp_instance.cookies_str or real_cookies
-                        warning_message = f"真实Cookie已获取，但首次Token初始化异常，将在账号任务启动后继续重试: {str(token_e)}"
-                        log_with_user('warning', f"{warning_message}: {account_id}", current_user)
 
                     try:
                         manager_runtime_issue = _get_cookie_manager_runtime_issue()

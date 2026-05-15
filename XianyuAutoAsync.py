@@ -6433,7 +6433,7 @@ class XianyuLive:
             logger.error(f"【{self._canonical_account_id() or 'default'}】检查是否需要滑块验证时出错: {self._safe_str(e)}")
             return False
 
-    async def _run_slider_verification_with_managed_runtime(
+    def _run_slider_verification_with_managed_runtime_sync(
         self,
         *,
         slider,
@@ -6458,7 +6458,7 @@ class XianyuLive:
             account_id=canonical_account_id,
             purpose=purpose,
         )
-        lease = await account_browser_runtime_manager.acquire_runtime(
+        lease = account_browser_runtime_manager.acquire_runtime_sync(
             canonical_account_id,
             purpose,
             exclusive=True,
@@ -6467,7 +6467,7 @@ class XianyuLive:
         attach_succeeded = False
         current_release_reason = attach_failure_reason
         try:
-            page, context = await account_browser_runtime_manager.get_fresh_page(lease)
+            page, context = account_browser_runtime_manager.get_fresh_page_sync(lease)
             runtime = getattr(lease, "runtime", None)
             browser = getattr(runtime, "browser", None) or getattr(context, "browser", None)
             playwright = getattr(runtime, "playwright", None)
@@ -6483,7 +6483,7 @@ class XianyuLive:
             )
             attach_succeeded = True
             current_release_reason = release_reason
-            return await slider.async_run(
+            return slider.run(
                 verification_url,
                 require_managed_runtime=True,
             )
@@ -6495,7 +6495,7 @@ class XianyuLive:
                         detach_managed_runtime()
                     except Exception:
                         pass
-            await account_browser_runtime_manager.release_runtime(
+            account_browser_runtime_manager.release_runtime_sync(
                 lease,
                 reason=current_release_reason,
             )
@@ -6554,12 +6554,13 @@ class XianyuLive:
                 )
                 slider_stealth.risk_trigger_scene = 'token_refresh'
 
-                success, cookies = await self._run_slider_verification_with_managed_runtime(
+                success, cookies = await slider_stealth._run_sync_method_on_fresh_thread(
+                    self._run_slider_verification_with_managed_runtime_sync,
                     slider=slider_stealth,
                     verification_url=verification_url,
-                    purpose="verification_recovery",
-                    release_reason="captcha_verification_completed",
-                    attach_failure_reason="captcha_verification_attach_failed",
+                    purpose="token_refresh_slider",
+                    release_reason="token_refresh_slider_completed",
+                    attach_failure_reason="token_refresh_slider_attach_failed",
                 )
 
                 if success and cookies:
@@ -6695,6 +6696,8 @@ class XianyuLive:
 
             except Exception as stealth_e:
                 logger.error(f"【{current_account_id}】滑块验证异常: {self._safe_str(stealth_e)}")
+                import traceback
+                logger.error(f"【{current_account_id}】滑块验证异常堆栈:\n{traceback.format_exc()}")
                 self.last_token_refresh_status = "captcha_execution_error"
                 self.last_token_refresh_error_message = self._safe_str(stealth_e)
 
@@ -9137,12 +9140,13 @@ class XianyuLive:
                 logger.warning(f"棢测到正常的令牌过期，跳过通知: {error_message}")
                 return
 
+            is_token_related_error = self._is_token_related_error(error_message)
             notification_key = f"token:{notification_type}"
 
             if notification_type == "message_stream_stale":
                 cooldown_time = self.message_stream_notification_cooldown
                 cooldown_desc = f"{max(1, int(cooldown_time // 60))}分钟"
-            elif self._is_token_related_error(error_message):
+            elif is_token_related_error:
                 cooldown_time = self.token_refresh_notification_cooldown
                 cooldown_desc = "3小时"
             else:
@@ -9241,7 +9245,7 @@ class XianyuLive:
                 if notification_type == "message_stream_stale":
                     next_send_time = current_time + self.message_stream_notification_cooldown
                     cooldown_desc = f"{max(1, int(self.message_stream_notification_cooldown // 60))}分钟"
-                elif self._is_token_related_error(error_message):
+                elif is_token_related_error:
                     next_send_time = current_time + self.token_refresh_notification_cooldown
                     cooldown_desc = "3小时"
                 else:
@@ -9258,6 +9262,60 @@ class XianyuLive:
         finally:
             async with self.notification_lock:
                 self.pending_notification_keys.discard(f"token:{notification_type}")
+
+    def _is_token_related_error(self, error_message: str) -> bool:
+        normalized_message = self._safe_str(error_message).strip()
+        if not normalized_message:
+            return False
+
+        message_lower = normalized_message.lower()
+
+        success_markers = (
+            "login success",
+            "password_login_success",
+            "cookie_refresh_success",
+            "slider_success",
+            "slider_recovered_success",
+            "登录成功",
+            "刷新cookie成功",
+            "cookie已获取",
+            "cookie已更新",
+            "会话已恢复",
+            "验证通过",
+            "已恢复",
+            "已获取",
+            "已更新",
+            "success",
+        )
+        if any(marker.lower() in message_lower for marker in success_markers):
+            return False
+
+        if self._is_normal_token_expiry(normalized_message):
+            return True
+
+        token_related_keywords = (
+            "session过期",
+            "session expired",
+            "会话已失效",
+            "会话失效",
+            "页面会话已失效",
+            "cookie验证失败",
+            "cookie更新失败",
+            "cookie失效",
+            "cookie无效",
+            "初始化时无法获取有效token",
+            "token_init_failed",
+            "token_refresh_failed",
+            "token_refresh_exception",
+            "captcha",
+            "滑块",
+            "人脸验证",
+            "短信验证",
+            "二维码验证",
+            "验证url",
+            "passport",
+        )
+        return any(keyword.lower() in message_lower for keyword in token_related_keywords)
 
     def _is_normal_token_expiry(self, error_message: str) -> bool:
         token_error_keywords = [

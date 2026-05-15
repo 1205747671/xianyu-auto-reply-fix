@@ -765,11 +765,18 @@ class SliderConcurrencyManager:
         if not self._initialized:
             self.max_concurrent = SLIDER_MAX_CONCURRENT  # 从配置文件读取最大并发数
             self.wait_timeout = SLIDER_WAIT_TIMEOUT  # 从配置文件读取等待超时时间
+            self.same_account_stale_seconds = max(
+                15,
+                int(os.getenv("XY_SLIDER_SLOT_STALE_SECONDS", "20") or 20),
+            )
             self.active_instances = {}  # 活跃实例
             self.waiting_queue = []  # 等待队列
             self.instance_lock = threading.Lock()
             self._initialized = True
-            logger.info(f"滑块验证并发管理器初始化: 最大并发数={self.max_concurrent}, 等待超时={self.wait_timeout}秒")
+            logger.info(
+                f"滑块验证并发管理器初始化: 最大并发数={self.max_concurrent}, "
+                f"等待超时={self.wait_timeout}秒, 同账号陈旧槽位回收={self.same_account_stale_seconds}秒"
+            )
     
     def can_start_instance(self, user_id: str) -> bool:
         """检查是否可以启动新实例"""
@@ -784,9 +791,44 @@ class SliderConcurrencyManager:
                 return active_user_id
         return None
 
+    def _reap_stale_same_account_locked(self, user_id: str):
+        """回收疑似泄漏的同账号滑块槽位，避免后续实例永久排队。"""
+        active_user_id = self._find_same_account_active_locked(user_id)
+        if not active_user_id:
+            return None
+
+        active_entry = self.active_instances.get(active_user_id) or {}
+        active_instance = active_entry.get('instance')
+        start_time = float(active_entry.get('start_time') or 0.0)
+        active_age = max(0.0, time.time() - start_time) if start_time > 0 else 0.0
+        cleanup_started = bool(getattr(active_instance, '_cleanup_started', False))
+        cleanup_started_at = float(getattr(active_instance, '_cleanup_started_at', 0.0) or 0.0)
+        cleanup_age = max(0.0, time.time() - cleanup_started_at) if cleanup_started_at > 0 else None
+        registered = bool(getattr(active_instance, '_concurrency_slot_registered', False))
+
+        if active_age < self.same_account_stale_seconds:
+            return active_user_id
+
+        if cleanup_started and cleanup_age is not None and cleanup_age < 5.0:
+            return active_user_id
+
+        self.active_instances.pop(active_user_id, None)
+        while active_user_id in self.waiting_queue:
+            self.waiting_queue.remove(active_user_id)
+
+        pure_user_id = self._extract_pure_user_id(user_id)
+        cleanup_age_text = f"{cleanup_age:.1f}s" if cleanup_age is not None else "n/a"
+        logger.warning(
+            f"【{pure_user_id}】检测到同账号滑块槽位疑似泄漏，强制回收: "
+            f"active={active_user_id}, age={active_age:.1f}s, "
+            f"cleanup_started={cleanup_started}, cleanup_age={cleanup_age_text}, "
+            f"registered={registered}"
+        )
+        return None
+
     def _can_start_locked(self, user_id: str) -> bool:
         """在持锁状态下检查是否允许启动实例"""
-        same_account_active = self._find_same_account_active_locked(user_id)
+        same_account_active = self._reap_stale_same_account_locked(user_id)
         return len(self.active_instances) < self.max_concurrent and same_account_active is None
     
     def wait_for_slot(self, user_id: str, timeout: int = None) -> bool:
@@ -798,7 +840,7 @@ class SliderConcurrencyManager:
         
         while time.time() - start_time < timeout:
             with self.instance_lock:
-                same_account_active = self._find_same_account_active_locked(user_id)
+                same_account_active = self._reap_stale_same_account_locked(user_id)
                 if len(self.active_instances) < self.max_concurrent and same_account_active is None:
                     return True
             
@@ -808,7 +850,7 @@ class SliderConcurrencyManager:
                     self.waiting_queue.append(user_id)
                     # 提取纯用户ID用于日志显示
                     pure_user_id = self._extract_pure_user_id(user_id)
-                    same_account_active = self._find_same_account_active_locked(user_id)
+                    same_account_active = self._reap_stale_same_account_locked(user_id)
                     if same_account_active:
                         logger.warning(
                             f"【{pure_user_id}】同账号滑块任务正在执行({same_account_active})，进入等待队列，当前队列长度: {len(self.waiting_queue)}"
@@ -1056,6 +1098,8 @@ class XianyuSliderStealth:
                     self.browser_channel = detected_channel
         self.playwright = None
         self._concurrency_slot_registered = False
+        self._cleanup_started = False
+        self._cleanup_started_at = 0.0
         self._managed_runtime_binding = None
         
         # account_id 是账号级浏览器隔离主键，不能再擅自截断用户自定义后缀。
@@ -2618,6 +2662,7 @@ class XianyuSliderStealth:
             if getattr(self, "executable_path", None):
                 launch_options["executable_path"] = self.executable_path
             launch_options = self._sanitize_provider_launch_options(launch_options)
+            launch_options = self._apply_provider_launch_defaults(launch_options)
 
             launched_with_persistent_profile = False
             if self._should_use_account_persistent_profile():
@@ -2631,6 +2676,7 @@ class XianyuSliderStealth:
                     "accept_downloads": True,
                     "ignore_https_errors": True,
                 })
+                persistent_launch_error_to_raise = None
                 try:
                     self.context = launch_browser_persistent_context(
                         user_data_dir=user_data_dir,
@@ -2639,6 +2685,7 @@ class XianyuSliderStealth:
                     launched_with_persistent_profile = True
                     self.browser = getattr(self.context, "browser", None)
                 except Exception as persistent_launch_error:
+                    persistent_launch_error_to_raise = persistent_launch_error
                     if not self._is_profile_in_use_launch_error(persistent_launch_error):
                         raise
                     cleaned_stale_lock = self._try_cleanup_stale_chromium_singleton_lock(user_data_dir)
@@ -2651,11 +2698,13 @@ class XianyuSliderStealth:
                             launched_with_persistent_profile = True
                             self.browser = getattr(self.context, "browser", None)
                         except Exception as retry_launch_error:
+                            persistent_launch_error_to_raise = retry_launch_error
                             if not self._is_profile_in_use_launch_error(retry_launch_error):
                                 raise
                     if not launched_with_persistent_profile:
-                        self.browser = self._launch_browser_with_headless_explicit_fallback(launch_options)
-                        self.context = self.browser.new_context(**context_options)
+                        raise RuntimeError(
+                            f"账号级 persistent profile 启动失败，拒绝降级到干净上下文: {persistent_launch_error_to_raise}"
+                        ) from persistent_launch_error_to_raise
 
             if not launched_with_persistent_profile and not self.context:
                 self.browser = self._launch_browser_with_headless_explicit_fallback(launch_options)
@@ -2742,6 +2791,13 @@ class XianyuSliderStealth:
             "profile_dir": self._resolve_account_persistent_profile_dir(),
         }
         runtime_request.update(kwargs)
+        if self._should_use_account_persistent_profile():
+            runtime_request["use_persistent_context"] = True
+            runtime_request["profile_dir"] = self._resolve_account_persistent_profile_dir()
+            runtime_request["account_id"] = str(
+                runtime_request.get("account_id")
+                or getattr(self, "pure_user_id", "")
+            ).strip()
         return runtime_request
 
     def attach_managed_runtime(
@@ -7284,8 +7340,30 @@ class XianyuSliderStealth:
             # CloakBrowser humanize 会把 page.mouse.* 替换为拟人化实现（带缓动/微超调等）。
             # 本方法本身也生成了物理轨迹（含超调/回退/微调），若再叠加 humanize，容易出现“往右又往左、一顿一顿”的观感。
             # 因此在存在 page._original 时，优先用原生 Playwright 的 mouse 来执行轨迹。
-            raw_page = getattr(self.page, "_original", None) or self.page
-            mouse = raw_page.mouse
+            raw_page = getattr(self.page, "_original", None)
+            mouse = None
+            if raw_page is not None:
+                raw_move = getattr(raw_page, "mouse_move", None)
+                raw_down = getattr(raw_page, "mouse_down", None)
+                raw_up = getattr(raw_page, "mouse_up", None)
+                if callable(raw_move) and callable(raw_down) and callable(raw_up):
+                    mouse = type(
+                        "_RawMouseAdapter",
+                        (),
+                        {
+                            "move": raw_move,
+                            "down": raw_down,
+                            "up": raw_up,
+                        },
+                    )()
+                else:
+                    mouse = getattr(raw_page, "mouse", None)
+            if mouse is None:
+                if raw_page is not None:
+                    logger.debug(f"【{self.pure_user_id}】page._original 未提供原始 mouse 接口，回退到 page.mouse 执行轨迹")
+                mouse = getattr(self.page, "mouse", None)
+            if mouse is None:
+                raise AttributeError("page mouse unavailable")
 
             # 🎭 用户速度人格因子：模拟同一个人各阶段行为的一致性
             # 快用户 (0.75~0.95) 各阶段等待都偏短，慢用户 (1.05~1.25) 各阶段等待都偏长
@@ -9689,6 +9767,8 @@ class XianyuSliderStealth:
     def close_browser(self):
         """安全关闭浏览器并清理资源"""
         logger.info(f"【{self.pure_user_id}】开始清理资源...")
+        self._cleanup_started = True
+        self._cleanup_started_at = time.time()
         managed_runtime_binding = getattr(self, "_managed_runtime_binding", None) or {}
         using_managed_runtime = bool(managed_runtime_binding)
 
@@ -10802,6 +10882,7 @@ class XianyuSliderStealth:
                         context_options=context_options,
                     )
                 else:
+                    persistent_launch_error_to_raise = None
                     try:
                         context = launch_browser_persistent_context(
                             user_data_dir=user_data_dir,
@@ -10809,18 +10890,37 @@ class XianyuSliderStealth:
                             **persistent_context_options,
                         )
                     except Exception as persistent_launch_error:
+                        persistent_launch_error_to_raise = persistent_launch_error
                         if not self._is_profile_in_use_launch_error(persistent_launch_error):
                             raise
-                        used_profile_lock_fallback = True
-                        logger.warning(
-                            f"【{self.pure_user_id}】持久化浏览器目录被其他 Chromium 进程占用，"
-                            f"自动切换到干净上下文兜底登录: {persistent_launch_error}"
-                        )
-                        browser, context = self._launch_clean_cookie_seeded_context(
-                            launch_options,
-                            browser_features,
-                            context_options=context_options,
-                        )
+                        cleaned_stale_lock = self._try_cleanup_stale_chromium_singleton_lock(user_data_dir)
+                        if cleaned_stale_lock:
+                            try:
+                                context = launch_browser_persistent_context(
+                                    user_data_dir=user_data_dir,
+                                    **launch_options,
+                                    **persistent_context_options,
+                                )
+                            except Exception as retry_launch_error:
+                                persistent_launch_error_to_raise = retry_launch_error
+                                if not self._is_profile_in_use_launch_error(retry_launch_error):
+                                    raise
+                        if context is None:
+                            if self._should_use_account_persistent_profile():
+                                raise RuntimeError(
+                                    "账号级 persistent profile 启动失败，拒绝切换到干净上下文: "
+                                    f"{persistent_launch_error_to_raise}"
+                                ) from persistent_launch_error_to_raise
+                            used_profile_lock_fallback = True
+                            logger.warning(
+                                f"【{self.pure_user_id}】持久化浏览器目录被其他 Chromium 进程占用，"
+                                f"自动切换到干净上下文兜底登录: {persistent_launch_error_to_raise}"
+                            )
+                            browser, context = self._launch_clean_cookie_seeded_context(
+                                launch_options,
+                                browser_features,
+                                context_options=context_options,
+                            )
             effective_clean_context = force_clean_context or used_profile_lock_fallback
             logger.info(f"【{self.pure_user_id}】已设置浏览器语言为中文（zh-CN）")
 
@@ -11692,7 +11792,9 @@ class XianyuSliderStealth:
                 # 关闭浏览器。这里不能无限阻塞，否则上层会话会一直卡在 processing。
                 try:
                     if using_managed_runtime:
-                        self._detach_managed_runtime()
+                        # managed runtime 不归这里真正关闭，但账号级滑块槽位和临时目录
+                        # 仍然必须统一释放。
+                        self.close_browser()
                     else:
                         close_errors = []
                         # sync Playwright 的 page/context/browser 需要在创建它们的同一线程关闭，
@@ -11936,11 +12038,9 @@ class XianyuSliderStealth:
             logger.error(f"【{self.pure_user_id}】执行过程中出错: {str(e)}")
             return False, None
         finally:
-            # 关闭浏览器
-            if using_managed_runtime:
-                self._detach_managed_runtime()
-            else:
-                self.close_browser()
+            # 无论是否走 managed runtime，都必须走统一清理入口。
+            # 否则并发槽位、临时目录等只 detach 不 close，会把同账号后续滑块永久卡死。
+            self.close_browser()
 
     async def async_run(self, url: str, **kwargs):
         """异步运行主流程，返回(成功状态, cookie数据)

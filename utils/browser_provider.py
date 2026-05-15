@@ -200,7 +200,9 @@ async def _patch_browser_humanize_async(
     from cloakbrowser.human import patch_browser_async
     from cloakbrowser.human.config import resolve_config
 
-    await patch_browser_async(browser, resolve_config(human_preset, human_config))
+    patch_result = patch_browser_async(browser, resolve_config(human_preset, human_config))
+    if inspect.isawaitable(patch_result):
+        await patch_result
 
 
 def _ensure_managed_launch_args(

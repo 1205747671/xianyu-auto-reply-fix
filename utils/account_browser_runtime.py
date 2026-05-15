@@ -425,7 +425,7 @@ def _default_sync_runtime_factory(
     _ = account_id, generation, purpose, exclusive
     request = dict(runtime_request or {})
     browser_features = dict(request.get("browser_features") or {})
-    use_persistent_context = bool(request.get("use_persistent_context"))
+    use_persistent_context = bool(request.get("use_persistent_context", True))
     launch_options = dict(request.get("launch_options") or {})
     context_options = dict(request.get("context_options") or {})
     persistent_context_options = dict(request.get("persistent_context_options") or {})
