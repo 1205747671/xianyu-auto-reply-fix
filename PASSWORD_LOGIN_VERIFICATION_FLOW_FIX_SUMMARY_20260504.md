@@ -635,3 +635,155 @@ docker compose -f docker-compose-cn.yml up -d --build
 2. **所有登录 / 导入 / 恢复流程统一按 `account_id -> browser_data/user_<account_id>` 复用**
 3. **无头模式作为 Docker 部署默认前提**
 4. **后续重点继续收紧风控承接与 Cookie / Token 交接，不再回退旧浏览器栈**
+## 2026-05-16 本次新增验证结果（Cookie导入失效 / Token Refresh 命中滑块恢复链路已验证）
+
+本轮针对 `account_id=1` 做了两段连续实测，目标不是只看“Cookie 能不能导进去”，而是验证：
+
+1. **同一个 `account_id` 是否始终复用同一份 persistent profile**
+2. **Cookie 导入成功后，后续如果 token refresh 突然命中滑块 / 处罚页，恢复链路是否还能走通**
+3. **恢复完成后，Token / WebSocket / 消息流是否能重新回到正常状态**
+
+### 本轮测试对象
+
+- `account_id=1`
+- 账号：`15614318625`
+- 持久画像目录：`browser_data/user_1`
+- 本轮使用方式：
+  - 先用手动 Cookie 导入入口重新导入一遍账号 Cookie
+  - 再调用手动 Token Refresh 调试入口，模拟“运行中突然命中滑块 / 处罚页”
+
+### 第一步：手动 Cookie 导入验证通过
+
+本轮先重新调用：
+
+- `POST /manual-cookie-import`
+
+导入结果：
+
+- 返回：`success=true`
+- `session_id=6iDDiMxz528SECTePoadAw`
+- 轮询最终状态：
+  - `status=success`
+  - `account_id=1`
+  - `cookie_count=23`
+
+日志证据：
+
+- `logs/xianyu_2026-05-16.log:2507`
+  - `手动导入 Cookie 浏览器验证成功并已保存: 1, cookie_count=23`
+
+这说明本轮不是拿旧会话硬混过去，而是 **`account_id=1` 的 Cookie 导入链路本身可用**。
+
+### 第二步：模拟 Cookie 挂着挂着失效，Token Refresh 命中滑块
+
+本轮调用：
+
+- `POST /accounts/1/token-refresh`
+
+请求体：
+
+```json
+{
+  "simulate_captcha": true,
+  "allow_password_login_recovery": true
+}
+```
+
+返回结果关键字段：
+
+```json
+{
+  "success": true,
+  "result": {
+    "success": true,
+    "path": "simulated_captcha_password_login_recovery",
+    "token_received": true,
+    "slider_success": false,
+    "password_login_recovered": true
+  }
+}
+```
+
+含义很明确：
+
+- 本轮先模拟进入 `punish/captcha` 场景
+- 滑块链路本身没有拿到成功结果：`slider_success=false`
+- 但系统没有在这卡死，而是继续走了 **账号密码兜底恢复**
+- 恢复后重新拿到了 Token：`token_received=true`
+
+### 恢复链路关键日志
+
+日志文件：
+
+- `logs/xianyu_2026-05-16.log`
+
+关键节点：
+
+- `2570`
+  - `开始调试模拟 Token 刷新命中滑块`
+- `2603`
+  - `调试模拟滑块失败，改走账号密码恢复链路`
+- `2611`
+  - `密码登录刷新前已主动失效旧的账号级浏览器 runtime`
+- `2808`
+  - `Cookie更新并重启任务成功`
+- `2813`
+  - `Token刷新成功`
+
+这里最关键的一刀是：
+
+- **账密恢复前先主动失效旧的账号级 runtime**
+
+这样可以避免同一个 `browser_data/user_1` 在恢复链路里被前后两个 runtime 抢锁，不然又会冒出那种恶心人的 `DevToolsActivePort` / profile 占用问题。
+
+### 恢复完成后的 runtime / WebSocket 状态
+
+本轮恢复完成后，再查：
+
+- `GET /accounts/1/runtime-status`
+
+结果确认：
+
+- `instance_exists = true`
+- `running = true`
+- `connection_state = connected`
+- `ws_ready = true`
+- `session_ready = true`
+- `has_current_token = true`
+- `message_stream_ready = true`
+- `token_refresh_status = success`
+
+最近时间点：
+
+- `token_last_refreshed_at_display = 2026-05-16 01:05:43`
+- `session_keepalive_at_display = 2026-05-16 01:06:00`
+- `last_heartbeat_response_at_display = 2026-05-16 01:06:00`
+
+说明这轮不是“表面返回 success，背后进程其实已经死球了”，而是 **恢复后 runtime / token / websocket 都真的重新接起来了**。
+
+### 本轮结论
+
+截至 **2026-05-16**，已经可以确认：
+
+1. **Cookie 导入入口会按 `account_id=1` 复用同一份 persistent profile**
+2. **后续即使模拟“Cookie 失效 + Token Refresh 命中滑块 / 处罚页”，恢复链路也能跑通**
+3. **当滑块链路本身拿不到结果时，系统会自动切到账号密码兜底恢复**
+4. **恢复成功后，Token / WebSocket / 消息流都能重新回到正常状态**
+
+一句话收口：
+
+> 这轮已经证明，`account_id=1` 在“Cookie 导入 -> 运行中失效 -> refresh 命中滑块 -> 账密兜底恢复 -> Token / WS 恢复”这条完整链路上，能始终围绕同一份 `browser_data/user_1` 持久画像闭环跑通。
+
+### 目前仍需注意的边界
+
+这次 `simulate_captcha=true` 仍然属于 **调试模拟处罚页 / 验证页**，不是线上真实下发的可拖动远端滑块挑战。
+
+所以本轮已经证明的是：
+
+- **恢复链路正确**
+
+但还不是在证明：
+
+- **真实远端滑块一定每次都能自动过**
+
+这俩别混一块，不然脑袋一热又容易把“恢复链路验证”吹成“真实滑块通过率验证”，那就有点扯了。
