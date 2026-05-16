@@ -14,6 +14,9 @@ import time
 import json
 import os
 import re
+import shlex
+import subprocess
+import sys
 from datetime import datetime, timedelta
 import uvicorn
 import pandas as pd
@@ -4135,7 +4138,7 @@ def _stabilize_password_login_cookies_after_login(
     except Exception as stabilize_err:
         log_with_user(
             'warning',
-            f"复用当前 runtime 稳定化Cookie失败，将继续走旧的 async 兜底: {account_id}, 错误: {str(stabilize_err)}",
+            f"复用当前 runtime 稳定化Cookie失败，将直接交接当前Cookie继续后续流程: {account_id}, 错误: {str(stabilize_err)}",
             current_user,
         )
 
@@ -4181,71 +4184,6 @@ def _stabilize_password_login_cookies_after_login(
         'deferred_token_handoff': True,
     }
 
-    from XianyuAutoAsync import XianyuLive
-
-    log_with_user('info', f"密码登录成功后开始执行Token预检，优先确认新Cookie可直接交接: {account_id}", current_user)
-    runtime_account_id = _require_runtime_account_id(account_id, action_text="password login token preflight")
-    temp_xianyu = XianyuLive(
-        cookies_str=cookies_str,
-        account_id=runtime_account_id,
-        user_id=user_id,
-        register_instance=False,
-    )
-
-    try:
-        preflight_future = asyncio.run_coroutine_threadsafe(
-            temp_xianyu.preflight_token_after_password_login(),
-            request_loop,
-        )
-        _wait_threadsafe_future_result(
-            preflight_future,
-            preflight_timeout,
-            f"密码登录后的Token预检在 {preflight_timeout:.0f} 秒内未完成",
-        )
-        log_with_user('info', f"密码登录后的Token预检通过，将使用预热后的Cookie继续交接: {account_id}", current_user)
-        return temp_xianyu.cookies_str, {
-            'token_prewarmed': True,
-            'real_cookie_refreshed': False,
-            'fallback_reason': None,
-        }
-    except Exception as preflight_err:
-        fallback_reason = str(preflight_err)
-        log_with_user(
-            'warning',
-            f"密码登录后的Token预检失败，降级到浏览器Cookie稳定化: {account_id}, 原因: {fallback_reason}",
-            current_user,
-        )
-
-    temp_xianyu = XianyuLive(
-        cookies_str=cookies_str,
-        account_id=runtime_account_id,
-        user_id=user_id,
-        register_instance=False,
-    )
-    try:
-        temp_xianyu.reset_qr_cookie_refresh_flag()
-        log_with_user('info', f"已重置扫码登录Cookie刷新冷却标志，允许立即执行浏览器稳定化: {account_id}", current_user)
-    except Exception as reset_err:
-        log_with_user('debug', f"重置扫码登录Cookie刷新冷却标志失败（不影响后续稳定化）: {str(reset_err)}", current_user)
-
-    refresh_future = asyncio.run_coroutine_threadsafe(
-        temp_xianyu._refresh_cookies_via_browser(triggered_by_refresh_token=False),
-        request_loop,
-    )
-    refresh_success = _wait_threadsafe_future_result(
-        refresh_future,
-        browser_refresh_timeout,
-        f"密码登录后的浏览器Cookie稳定化在 {browser_refresh_timeout:.0f} 秒内未完成",
-    )
-    if not refresh_success:
-        raise RuntimeError("密码登录后的浏览器Cookie稳定化失败")
-
-    log_with_user('info', f"密码登录后的浏览器Cookie稳定化成功，将使用稳定化后的Cookie继续交接: {account_id}", current_user)
-    return temp_xianyu.cookies_str, {
-        'token_prewarmed': False,
-        'real_cookie_refreshed': True,
-        'fallback_reason': fallback_reason,
-    }
 
 
 def _get_latest_password_login_session_for_account(
@@ -4456,6 +4394,74 @@ def _release_slider_managed_runtime_sync(lease: Any, *, reason: str = 'released'
     if lease is None:
         return
     account_browser_runtime_manager.release_runtime_sync(lease, reason=reason)
+
+
+def _invalidate_slider_managed_runtime_sync(account_id: str, *, reason: str = 'invalidated') -> bool:
+    normalized_account_id = _require_runtime_account_id(
+        account_id,
+        action_text="slider runtime invalidate",
+    )
+    return bool(
+        account_browser_runtime_manager.invalidate_runtime_sync(
+            normalized_account_id,
+            reason=reason,
+        )
+    )
+
+
+def _escape_powershell_single_quoted(text: str) -> str:
+    return str(text or "").replace("'", "''")
+
+
+def _build_delayed_restart_command(*, delay_seconds: float = 2.0) -> Tuple[List[str], Dict[str, Any]]:
+    python = sys.executable
+    script = sys.argv[0]
+    cwd = os.getcwd()
+    current_pid = os.getpid()
+    delay_ms = max(0, int(float(delay_seconds) * 1000))
+
+    if sys.platform == 'win32':
+        helper_script = (
+            f"$parentPid={current_pid}; "
+            f"$python='{_escape_powershell_single_quoted(python)}'; "
+            f"$script='{_escape_powershell_single_quoted(script)}'; "
+            f"$cwd='{_escape_powershell_single_quoted(cwd)}'; "
+            f"Start-Sleep -Milliseconds {delay_ms}; "
+            "while (Get-Process -Id $parentPid -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 500 }; "
+            "Set-Location -LiteralPath $cwd; "
+            "Start-Process -FilePath $python -ArgumentList @($script) -WorkingDirectory $cwd -WindowStyle Hidden"
+        )
+        return (
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                helper_script,
+            ],
+            {
+                "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                "cwd": cwd,
+            },
+        )
+
+    quoted_python = shlex.quote(python)
+    quoted_script = shlex.quote(script)
+    quoted_cwd = shlex.quote(cwd)
+    helper_script = (
+        f"sleep {max(float(delay_seconds), 0.0):.3f}; "
+        f"while kill -0 {current_pid} 2>/dev/null; do sleep 0.5; done; "
+        f"cd {quoted_cwd} && exec {quoted_python} {quoted_script}"
+    )
+    return (
+        ["sh", "-c", helper_script],
+        {
+            "cwd": cwd,
+            "start_new_session": True,
+        },
+    )
 
 
 def _bind_cookie_account_unb_or_raise(account_id: str, incoming_unb: str, user_id: int):
@@ -4785,6 +4791,22 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                             current_user,
                         )
                     runtime_lease = None
+                    try:
+                        _invalidate_slider_managed_runtime_sync(
+                            account_id,
+                            reason='password_login_captured_cookies_handoff_invalidate',
+                        )
+                        log_with_user(
+                            'info',
+                            f"刷新模式已主动失效旧的账号级浏览器runtime，避免首轮接管继续占用同一profile: {account_id}",
+                            current_user,
+                        )
+                    except Exception as runtime_invalidate_err:
+                        log_with_user(
+                            'warning',
+                            f"刷新模式失效旧账号runtime失败（后续仍继续Token预检）: {account_id}, 错误: {str(runtime_invalidate_err)}",
+                            current_user,
+                        )
                 else:
                     # 普通密码登录：优先复用同一次 runtime 做 Token 预检/稳定化，减少二次拉起浏览器。
                     log_with_user(
@@ -4971,6 +4993,22 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                             current_user,
                         )
                     runtime_lease = None
+                    try:
+                        _invalidate_slider_managed_runtime_sync(
+                            account_id,
+                            reason='password_login_handoff_invalidate',
+                        )
+                        log_with_user(
+                            'info',
+                            f"密码登录交接前已主动失效旧的账号级浏览器runtime，避免正式实例首轮恢复继续抢同一profile: {account_id}",
+                            current_user,
+                        )
+                    except Exception as runtime_invalidate_err:
+                        log_with_user(
+                            'warning',
+                            f"密码登录交接前失效旧账号runtime失败（后续正式实例仍会继续接管）: {account_id}, 错误: {str(runtime_invalidate_err)}",
+                            current_user,
+                        )
 
                 if not is_refresh_mode:
                     from XianyuAutoAsync import XianyuLive
@@ -6317,34 +6355,6 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
                 )
 
             # 检查后台处理是否已完成
-                if session_id in qr_check_processed:
-                    record = qr_check_processed[session_id]
-                    if record.get('processed') and not record.get('processing'):
-                        if record.get('error'):
-                            failed_status_info = _build_handoff_state_snapshot(
-                                status_info,
-                                phase='handoff_failed',
-                                handoff_status='failed',
-                                handoff_error=record['error'],
-                            )
-                            return _build_qr_status_payload(
-                                'error',
-                                record['error'],
-                                failed_status_info,
-                                error=record['error'],
-                            )
-                    success_status_info = _build_handoff_state_snapshot(
-                        status_info,
-                        phase='handoff_completed',
-                        handoff_status='success',
-                        handoff_error=None,
-                    )
-                    success_status_info['status'] = 'success'
-                    success_status_info['account_info'] = record.get('account_info', {})
-                    return success_status_info
-                elif record.get('processing'):
-                    return _build_confirmed_handoff_payload(status_info)
-
             return status_info
 
     except HTTPException:
@@ -12645,29 +12655,15 @@ async def restart_application(current_user: Dict[str, Any] = Depends(get_current
             raise HTTPException(status_code=403, detail="只有管理员可以重启应用")
         
         log_with_user('info', "用户请求重启应用", current_user)
-        
-        import subprocess
-        import sys
-        
+
         # 返回响应后异步重启
         async def delayed_restart():
             await asyncio.sleep(2)  # 等待2秒让响应返回
             logger.info("正在重启应用...")
-            
-            # 获取当前Python解释器和脚本路径
-            python = sys.executable
-            script = sys.argv[0]
-            
-            # 在Windows上使用start命令启动新进程
-            if sys.platform == 'win32':
-                subprocess.Popen(
-                    [python, script],
-                    creationflags=subprocess.CREATE_NEW_CONSOLE
-                )
-            else:
-                # Linux/Mac
-                subprocess.Popen([python, script])
-            
+
+            command, popen_kwargs = _build_delayed_restart_command(delay_seconds=0.0)
+            subprocess.Popen(command, **popen_kwargs)
+
             # 退出当前进程
             os._exit(0)
         

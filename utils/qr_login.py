@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 
 from utils.account_browser_runtime import account_browser_runtime_manager
 from utils.image_utils import image_manager
+from utils.xianyu_slider_stealth import get_runtime_browser_identity
 
 
 QR_CROSS_DOMAIN_COOKIE_NAMES = {
@@ -64,12 +65,16 @@ def _is_force_headless_enabled() -> bool:
 
 def generate_headers():
     """生成请求头"""
+    runtime_identity = get_runtime_browser_identity()
     return {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': runtime_identity['user_agent'],
         'Accept': 'application/json, text/plain, */*',
         'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
         'Accept-Encoding': 'gzip, deflate, br',
         'Connection': 'keep-alive',
+        'sec-ch-ua': runtime_identity['sec_ch_ua'],
+        'sec-ch-ua-mobile': runtime_identity['sec_ch_ua_mobile'],
+        'sec-ch-ua-platform': runtime_identity['sec_ch_ua_platform'],
         'Sec-Fetch-Dest': 'empty',
         'Sec-Fetch-Mode': 'cors',
         'Sec-Fetch-Site': 'same-origin',
@@ -255,16 +260,19 @@ class QRLoginManager:
             return {}
 
         if session.proxy_config:
+            if not session.proxy_url:
+                session.proxy_url = self._build_proxy_url(session.proxy_config)
             return dict(session.proxy_config)
 
-        if session.user_id and session.account_id:
+        if session.account_id:
             try:
                 from db_manager import db_manager
 
                 proxy_config = dict(db_manager.get_cookie_proxy_config(session.account_id) or {})
                 session.proxy_config = proxy_config
                 session.proxy_account_id = session.account_id
-                if not self._build_proxy_url(proxy_config):
+                session.proxy_url = self._build_proxy_url(proxy_config)
+                if not session.proxy_url:
                     logger.info(f"扫码登录验证链路未匹配到可用代理，沿用直连: {session.account_id}")
                 else:
                     logger.info(f"扫码登录验证链路复用账号代理: {session.account_id}")
@@ -273,44 +281,8 @@ class QRLoginManager:
                 logger.warning(f"扫码登录验证链路读取账号代理失败，沿用直连: {session.account_id}, 错误: {e}")
                 return {}
 
-        if not session.user_id or not session.unb:
-            return {}
-
-        try:
-            from db_manager import db_manager
-            from utils.xianyu_utils import trans_cookies
-
-            existing_cookies = db_manager.get_all_cookies(session.user_id) or {}
-            matched_account_id = None
-            for account_id, cookie_value in existing_cookies.items():
-                try:
-                    existing_cookie_dict = trans_cookies(cookie_value)
-                except Exception:
-                    continue
-                if str(existing_cookie_dict.get('unb') or '').strip() == str(session.unb or '').strip():
-                    matched_account_id = account_id
-                    break
-
-            if not matched_account_id:
-                return {}
-
-            proxy_config = dict(db_manager.get_cookie_proxy_config(matched_account_id) or {})
-            session.proxy_account_id = matched_account_id
-            proxy_type = str(proxy_config.get('proxy_type') or '').strip().lower()
-            if proxy_type in {'', 'none'}:
-                logger.info(f"扫码登录验证链路未匹配到可用代理，沿用直连: {matched_account_id}")
-                return {}
-
-            session.proxy_config = proxy_config
-            session.proxy_url = self._build_proxy_url(proxy_config)
-            logger.info(
-                f"扫码登录验证链路复用账号代理: {matched_account_id}, "
-                f"server: {proxy_type}://{proxy_config.get('proxy_host')}:{proxy_config.get('proxy_port')}"
-            )
-            return dict(proxy_config)
-        except Exception as proxy_error:
-            logger.warning(f"解析扫码登录验证链路代理配置失败，忽略代理复用: {proxy_error}")
-            return {}
+        logger.warning("扫码登录验证会话缺少 account_id，拒绝按 unb 反推账号代理，沿用直连")
+        return {}
 
     def _resolve_session_proxy_url(self, session: Optional[QRLoginSession]) -> Optional[str]:
         if session and session.proxy_url:
@@ -351,18 +323,14 @@ class QRLoginManager:
         return os.name == 'nt' and not docker_env
 
     def _build_verification_context_options(self, show_browser: bool) -> Dict[str, Any]:
-        context_options: Dict[str, Any] = {
-            'locale': 'zh-CN',
-            'timezone': 'Asia/Shanghai',
-            'color_scheme': 'light',
+        _ = show_browser
+        # 验证页走的是 CloakBrowser managed runtime + persistent profile。
+        # 这里不要再把 locale/timezone/viewport 之类的身份画像参数二次塞回 provider，
+        # 避免和账号级固定指纹发生冲突。
+        return {
             'accept_downloads': True,
             'ignore_https_errors': True,
         }
-        if show_browser:
-            context_options['no_viewport'] = True
-        else:
-            context_options['viewport'] = {'width': 1600, 'height': 900}
-        return context_options
 
     def _resolve_verification_profile_dir(self, session: QRLoginSession) -> str:
         account_id = str(getattr(session, 'account_id', '') or '').strip()

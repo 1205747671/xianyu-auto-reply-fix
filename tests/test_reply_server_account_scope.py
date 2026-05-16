@@ -222,7 +222,7 @@ class ReplyServerAccountScopeContractTest(_ReplyServerModuleBindingMixin, unitte
             reply_server_source,
         )
         self.assertIn(
-            "return await slider.async_run(\n"
+            "return slider.run(\n"
             "                verification_url,\n"
             "                require_managed_runtime=True,\n"
             "            )",
@@ -257,11 +257,45 @@ class ReplyServerAccountScopeContractTest(_ReplyServerModuleBindingMixin, unitte
             "                            current_user,\n"
             "                        )\n"
             "                    runtime_lease = None\n"
+            "                    try:\n"
+            "                        _invalidate_slider_managed_runtime_sync(\n"
+            "                            account_id,\n"
+            "                            reason='password_login_handoff_invalidate',\n"
+            "                        )\n"
+            "                        log_with_user(\n"
+            "                            'info',\n"
+            "                            f\"密码登录交接前已主动失效旧的账号级浏览器runtime，避免正式实例首轮恢复继续抢同一profile: {account_id}\",\n"
+            "                            current_user,\n"
+            "                        )\n"
+            "                    except Exception as runtime_invalidate_err:\n"
+            "                        log_with_user(\n"
+            "                            'warning',\n"
+            "                            f\"密码登录交接前失效旧账号runtime失败（后续正式实例仍会继续接管）: {account_id}, 错误: {str(runtime_invalidate_err)}\",\n"
+            "                            current_user,\n"
+            "                        )\n"
             "\n"
             "                if not is_refresh_mode:\n"
             "                    from XianyuAutoAsync import XianyuLive\n"
-            "\n"
+"\n"
             "                    XianyuLive.mark_manual_refresh_handoff(",
+            reply_server_source,
+        )
+
+    def test_password_login_refresh_mode_invalidates_sync_runtime_after_capturing_cookies(self):
+        reply_server_source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "                    runtime_lease = None\n"
+            "                    try:\n"
+            "                        _invalidate_slider_managed_runtime_sync(\n"
+            "                            account_id,\n"
+            "                            reason='password_login_captured_cookies_handoff_invalidate',\n"
+            "                        )\n"
+            "                        log_with_user(\n"
+            "                            'info',\n"
+            "                            f\"刷新模式已主动失效旧的账号级浏览器runtime，避免首轮接管继续占用同一profile: {account_id}\",\n"
+            "                            current_user,\n"
+            "                        )\n",
             reply_server_source,
         )
 
@@ -1977,6 +2011,48 @@ class ReplyServerAccountBrowserRuntimeJanitorTest(_ReplyServerModuleBindingMixin
 
         self.assertTrue(task.cancelled())
         self.assertIsNone(getattr(reply_server.app.state, "account_browser_runtime_janitor_task", None))
+
+
+class ReplyServerRestartApplicationTest(_ReplyServerModuleBindingMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_restart_application_uses_hidden_helper_instead_of_spawning_second_start_process_immediately(self):
+        scheduled = {}
+
+        def fake_create_task(coro):
+            scheduled["coro"] = coro
+            return mock.Mock()
+
+        popen = mock.Mock()
+
+        with mock.patch.object(reply_server, "log_with_user"), \
+             mock.patch.object(reply_server.asyncio, "create_task", side_effect=fake_create_task), \
+             mock.patch.object(reply_server.asyncio, "sleep", new=mock.AsyncMock()), \
+             mock.patch.object(reply_server.sys, "platform", "win32"), \
+             mock.patch.object(reply_server.sys, "executable", "C:\\Python\\python.exe"), \
+             mock.patch.object(reply_server.sys, "argv", ["Start.py"]), \
+             mock.patch.object(reply_server.os, "getcwd", return_value="C:\\repo"), \
+             mock.patch.object(reply_server.os, "getpid", return_value=4321), \
+             mock.patch.object(reply_server.subprocess, "Popen", popen), \
+             mock.patch.object(reply_server.os, "_exit", side_effect=SystemExit(0)):
+            result = await reply_server.restart_application(
+                current_user={"user_id": 1, "username": "admin", "is_admin": True}
+            )
+
+            self.assertTrue(result["success"])
+            self.assertIn("coro", scheduled)
+
+            with self.assertRaises(SystemExit):
+                await scheduled["coro"]
+
+        popen.assert_called_once()
+        command = popen.call_args.args[0]
+        kwargs = popen.call_args.kwargs
+        self.assertEqual(command[0], "powershell.exe")
+        self.assertIn("-WindowStyle", command)
+        self.assertIn("Hidden", command)
+        self.assertIn("Start-Process -FilePath $python -ArgumentList @($script)", command[-1])
+        self.assertIn("Get-Process -Id $parentPid", command[-1])
+        self.assertNotIn("CREATE_NEW_CONSOLE", command[-1])
+        self.assertEqual(kwargs.get("cwd"), "C:\\repo")
 
 
 class ReplyServerQrLoginSessionIsolationTest(_ReplyServerModuleBindingMixin, unittest.IsolatedAsyncioTestCase):

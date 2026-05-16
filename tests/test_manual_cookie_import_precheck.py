@@ -103,6 +103,37 @@ class ManualCookieImportPrecheckTest(unittest.TestCase):
             "updated_cookie2",
         )
 
+    def test_probe_cookie_verification_uses_runtime_browser_identity_headers(self):
+        runtime_identity = {
+            "user_agent": "Mozilla/5.0 test Chrome/146.0.7680.177 Safari/537.36",
+            "sec_ch_ua": '"Not.A/Brand";v="8", "Chromium";v="146", "Google Chrome";v="146"',
+            "sec_ch_ua_mobile": "?0",
+            "sec_ch_ua_platform": '"Windows"',
+            "accept_language": "zh-CN,zh;q=0.9",
+        }
+
+        result, fake_session = None, None
+        with mock.patch.object(
+            slider_module,
+            "get_runtime_browser_identity",
+            return_value=runtime_identity,
+        ):
+            result, fake_session = self._run_probe(
+                {
+                    "ret": ["SUCCESS::璋冪敤鎴愬姛"],
+                    "data": {
+                        "accessToken": "oauth_access_token",
+                        "refreshToken": "oauth_refresh_token",
+                    },
+                    "v": "1.0",
+                }
+            )
+
+        self.assertEqual(fake_session.headers["user-agent"], runtime_identity["user_agent"])
+        self.assertEqual(fake_session.headers["sec-ch-ua"], runtime_identity["sec_ch_ua"])
+        self.assertEqual(fake_session.headers["sec-ch-ua-mobile"], runtime_identity["sec_ch_ua_mobile"])
+        self.assertEqual(fake_session.headers["sec-ch-ua-platform"], runtime_identity["sec_ch_ua_platform"])
+
 
 if __name__ == "__main__":
     unittest.main()

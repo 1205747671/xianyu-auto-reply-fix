@@ -42,6 +42,116 @@ class _FakeSession:
 
 
 class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
+    async def test_init_disables_password_login_recovery_during_handoff_recovery(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "handoff_init_account"
+        live.current_token = None
+        live.last_token_refresh_time = 0
+        live.token_refresh_interval = 60
+        live.last_token_refresh_status = None
+        live.last_init_failure_reason = None
+        live.last_init_failure_type = None
+        live.init_auth_failures = 1
+        live.device_id = "device-id"
+        live._canonical_account_id = lambda: "1"
+        live.get_manual_refresh_state = lambda _account_id: {
+            "phase": "handoff_recovery",
+        }
+        live.clear_init_auth_failure_state = lambda *_args, **_kwargs: None
+
+        async def fake_refresh_token(*, allow_password_login_recovery=True, **_kwargs):
+            live.current_token = "oauth_access_token"
+            return "oauth_access_token"
+
+        live.refresh_token = mock.AsyncMock(side_effect=fake_refresh_token)
+
+        async def fail_send_notification(*_args, **_kwargs):
+            raise AssertionError("init success path should not send token notification")
+
+        live.send_token_refresh_notification = fail_send_notification
+        fake_ws = mock.AsyncMock()
+
+        with mock.patch("XianyuAutoAsync.asyncio.sleep", new=mock.AsyncMock()):
+            await live.init(fake_ws)
+
+        live.refresh_token.assert_awaited_once_with(allow_password_login_recovery=False)
+        self.assertEqual(fake_ws.send.await_count, 2)
+        self.assertEqual(live.current_token, "oauth_access_token")
+        self.assertEqual(live.init_auth_failures, 0)
+
+    async def test_init_keeps_password_login_recovery_enabled_outside_handoff(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "normal_init_account"
+        live.current_token = None
+        live.last_token_refresh_time = 0
+        live.token_refresh_interval = 60
+        live.last_token_refresh_status = None
+        live.last_init_failure_reason = None
+        live.last_init_failure_type = None
+        live.init_auth_failures = 1
+        live.device_id = "device-id"
+        live._canonical_account_id = lambda: "1"
+        live.get_manual_refresh_state = lambda _account_id: None
+        live.clear_init_auth_failure_state = lambda *_args, **_kwargs: None
+
+        async def fake_refresh_token(*, allow_password_login_recovery=True, **_kwargs):
+            live.current_token = "oauth_access_token"
+            return "oauth_access_token"
+
+        live.refresh_token = mock.AsyncMock(side_effect=fake_refresh_token)
+
+        async def fail_send_notification(*_args, **_kwargs):
+            raise AssertionError("init success path should not send token notification")
+
+        live.send_token_refresh_notification = fail_send_notification
+        fake_ws = mock.AsyncMock()
+
+        with mock.patch("XianyuAutoAsync.asyncio.sleep", new=mock.AsyncMock()):
+            await live.init(fake_ws)
+
+        live.refresh_token.assert_awaited_once_with(allow_password_login_recovery=True)
+        self.assertEqual(fake_ws.send.await_count, 2)
+        self.assertEqual(live.current_token, "oauth_access_token")
+        self.assertEqual(live.init_auth_failures, 0)
+
+    async def test_init_disables_password_login_recovery_during_qr_real_cookie_handoff(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "qr_handoff_init_account"
+        live.current_token = None
+        live.last_token_refresh_time = 0
+        live.token_refresh_interval = 60
+        live.last_token_refresh_status = None
+        live.last_init_failure_reason = None
+        live.last_init_failure_type = None
+        live.init_auth_failures = 1
+        live.device_id = "device-id"
+        live._canonical_account_id = lambda: "1"
+        live.get_manual_refresh_state = lambda _account_id: None
+        live.get_qr_login_grace = lambda _account_id: {
+            "stage": "real_cookie_ready",
+        }
+        live.clear_init_auth_failure_state = lambda *_args, **_kwargs: None
+
+        async def fake_refresh_token(*, allow_password_login_recovery=True, **_kwargs):
+            live.current_token = "oauth_access_token"
+            return "oauth_access_token"
+
+        live.refresh_token = mock.AsyncMock(side_effect=fake_refresh_token)
+
+        async def fail_send_notification(*_args, **_kwargs):
+            raise AssertionError("init success path should not send token notification")
+
+        live.send_token_refresh_notification = fail_send_notification
+        fake_ws = mock.AsyncMock()
+
+        with mock.patch("XianyuAutoAsync.asyncio.sleep", new=mock.AsyncMock()):
+            await live.init(fake_ws)
+
+        live.refresh_token.assert_awaited_once_with(allow_password_login_recovery=False)
+        self.assertEqual(fake_ws.send.await_count, 2)
+        self.assertEqual(live.current_token, "oauth_access_token")
+        self.assertEqual(live.init_auth_failures, 0)
+
     async def test_refresh_token_reuses_session_and_passes_proxy(self):
         fake_response = _FakeTokenRefreshResponse()
         fake_session = _FakeSession(fake_response)

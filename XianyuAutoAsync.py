@@ -6345,8 +6345,11 @@ class XianyuLive:
                                 return None
 
                             manual_refresh_state = self.get_manual_refresh_state(current_account_id)
+                            qr_login_grace = self.get_qr_login_grace(current_account_id)
                             is_handoff_recovery = bool(
                                 manual_refresh_state and manual_refresh_state.get('phase') == 'handoff_recovery'
+                            ) or bool(
+                                qr_login_grace and qr_login_grace.get('stage') == 'real_cookie_ready'
                             )
                             recent_slider_success = self._has_recent_slider_success()
                             max_post_slider_session_retries = 2
@@ -11366,7 +11369,21 @@ class XianyuLive:
             logger.info(f"【{self.account_id}】获取初始token...")
             token_refresh_attempted = True
 
-            await self.refresh_token()
+            allow_password_login_recovery = True
+            manual_refresh_state = self.get_manual_refresh_state(current_account_id)
+            qr_login_grace = self.get_qr_login_grace(current_account_id)
+            if (
+                (manual_refresh_state and manual_refresh_state.get('phase') == 'handoff_recovery')
+                or (qr_login_grace and qr_login_grace.get('stage') == 'real_cookie_ready')
+            ):
+                allow_password_login_recovery = False
+                logger.info(
+                    f"[{self.account_id}] handoff recovery init token refresh skips password-login recovery"
+                )
+
+            await self.refresh_token(
+                allow_password_login_recovery=allow_password_login_recovery
+            )
 
         if not self.current_token:
             self.last_init_failure_type = 'init_auth_failed'
@@ -12111,11 +12128,12 @@ class XianyuLive:
             await asyncio.sleep(1)
 
             logger.info(f"【{target_account_id}】获取真实Cookie...")
-            updated_cookies = await context.cookies()
-
-            real_cookies_dict = {}
-            for cookie in updated_cookies:
-                real_cookies_dict[cookie['name']] = cookie['value']
+            real_cookies_dict = await self._stabilize_browser_context_cookies_async(
+                context,
+                page,
+                scene="浏览器稳定化Cookie",
+                initial_cookies_dict=qr_cookies_dict,
+            )
 
             existing_cookie = db_manager.get_cookie_details(target_account_id)
             existing_cookie_value = self._extract_cookie_value(existing_cookie)
@@ -12591,6 +12609,167 @@ class XianyuLive:
                 close_page=close_page,
             )
 
+    @staticmethod
+    def _normalize_browser_cookie_items(cookie_items) -> Dict[str, str]:
+        normalized: Dict[str, str] = {}
+        for cookie in cookie_items or []:
+            if not isinstance(cookie, dict):
+                continue
+            name = str(cookie.get("name") or "").strip()
+            if not name:
+                continue
+            value = cookie.get("value")
+            if value is None:
+                continue
+            normalized[name] = str(value)
+        return normalized
+
+    async def _snapshot_browser_context_cookies_async(self, context) -> Dict[str, str]:
+        if context is None:
+            return {}
+        cookie_reader = getattr(context, "cookies", None)
+        if not callable(cookie_reader):
+            return {}
+        return self._normalize_browser_cookie_items(await cookie_reader())
+
+    async def _run_browser_cookie_stabilization_action_async(
+        self,
+        page,
+        *,
+        action_name: str,
+        target_url: Optional[str] = None,
+        scene: str = "browser_cookie_stabilization",
+    ) -> bool:
+        if page is None:
+            return False
+
+        try:
+            if target_url:
+                logger.info(f"【{self.account_id}】{scene} 动作 {action_name} -> {target_url}")
+                await page.goto(target_url, wait_until='domcontentloaded', timeout=15000)
+            else:
+                logger.info(f"【{self.account_id}】{scene} 动作 {action_name}")
+                await page.reload(wait_until='domcontentloaded', timeout=12000)
+            return True
+        except Exception as action_error:
+            if 'timeout' not in str(action_error).lower():
+                logger.warning(f"【{self.account_id}】{scene} 动作 {action_name} 失败: {self._safe_str(action_error)}")
+                return False
+
+        try:
+            if target_url:
+                await page.goto(target_url, wait_until='load', timeout=20000)
+            else:
+                await page.reload(wait_until='load', timeout=15000)
+            logger.info(f"【{self.account_id}】{scene} 动作 {action_name} 降级成功")
+            return True
+        except Exception as fallback_error:
+            logger.warning(f"【{self.account_id}】{scene} 动作 {action_name} 降级失败: {self._safe_str(fallback_error)}")
+            if target_url:
+                try:
+                    await page.goto(target_url, timeout=25000)
+                    logger.info(f"【{self.account_id}】{scene} 动作 {action_name} 最基础访问成功")
+                    return True
+                except Exception as final_error:
+                    logger.warning(
+                        f"【{self.account_id}】{scene} 动作 {action_name} 最基础访问失败: {self._safe_str(final_error)}"
+                    )
+            return False
+
+    async def _stabilize_browser_context_cookies_async(
+        self,
+        context,
+        page=None,
+        *,
+        scene: str = "browser_cookie_stabilization",
+        initial_cookies_dict: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
+        best_cookies: Dict[str, str] = {}
+        try:
+            best_cookies = await self._snapshot_browser_context_cookies_async(context)
+        except Exception as snapshot_error:
+            logger.warning(f"【{self.account_id}】{scene} 初始 Cookie 快照失败: {self._safe_str(snapshot_error)}")
+            best_cookies = {}
+
+        if not best_cookies:
+            best_cookies = dict(initial_cookies_dict or {})
+
+        best_missing = [
+            key for key in REQUIRED_SESSION_COOKIE_FIELDS
+            if not best_cookies.get(key)
+        ]
+        if not best_missing or context is None or page is None:
+            return best_cookies
+
+        async def _record_snapshot(action_name: str) -> None:
+            nonlocal best_cookies, best_missing
+            current_cookies = await self._snapshot_browser_context_cookies_async(context)
+            current_missing = [
+                key for key in REQUIRED_SESSION_COOKIE_FIELDS
+                if not current_cookies.get(key)
+            ]
+            logger.info(
+                f"【{self.account_id}】{scene} 快照[{action_name}] "
+                f"field_count={len(current_cookies)} missing_required_fields={current_missing}"
+            )
+            if current_cookies and len(current_missing) < len(best_missing):
+                best_cookies = current_cookies
+                best_missing = current_missing
+
+        async def _settle_page(work_page, action_name: str, target_url: Optional[str]) -> None:
+            action_ok = await self._run_browser_cookie_stabilization_action_async(
+                work_page,
+                action_name=action_name,
+                target_url=target_url,
+                scene=scene,
+            )
+            if not action_ok:
+                return
+
+            await asyncio.sleep(1.0)
+            wait_for_load_state = getattr(work_page, "wait_for_load_state", None)
+            if callable(wait_for_load_state):
+                try:
+                    await wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
+            await asyncio.sleep(0.5)
+            await _record_snapshot(action_name)
+
+        for action_name, target_url in (
+            ("reload_current", None),
+            ("goto_home", "https://www.goofish.com/"),
+            ("goto_im", "https://www.goofish.com/im"),
+        ):
+            await _settle_page(page, action_name, target_url)
+            if not best_missing:
+                return best_cookies
+
+        fresh_page = None
+        new_page_factory = getattr(context, "new_page", None)
+        if callable(new_page_factory):
+            try:
+                fresh_page = await new_page_factory()
+                for action_name, target_url in (
+                    ("fresh_tab_home", "https://www.goofish.com/"),
+                    ("fresh_tab_im", "https://www.goofish.com/im"),
+                ):
+                    await _settle_page(fresh_page, action_name, target_url)
+                    if not best_missing:
+                        break
+            except Exception as fresh_page_error:
+                logger.warning(f"【{self.account_id}】{scene} fresh-tab 预热失败: {self._safe_str(fresh_page_error)}")
+            finally:
+                if fresh_page is not None:
+                    close_page = getattr(fresh_page, "close", None)
+                    if callable(close_page):
+                        try:
+                            await close_page()
+                        except Exception:
+                            pass
+
+        return best_cookies
+
     async def _refresh_cookies_via_browser_page(self, current_cookies_str: str, restart_on_success: bool = True):
         browser = None
         context = None
@@ -12662,11 +12841,12 @@ class XianyuLive:
             await asyncio.sleep(1)
 
             logger.info(f"【{log_account_id}】获取真实Cookie...")
-            updated_cookies = await context.cookies()
-
-            real_cookies_dict = {}
-            for cookie in updated_cookies:
-                real_cookies_dict[cookie['name']] = cookie['value']
+            real_cookies_dict = await self._stabilize_browser_context_cookies_async(
+                context,
+                page,
+                scene="扫码登录Cookie刷新",
+                initial_cookies_dict=current_cookies_dict,
+            )
 
             merge_result = self.protected_merge_cookie_dicts(current_cookies_dict, real_cookies_dict)
             real_cookies_dict = merge_result['merged_cookies_dict']

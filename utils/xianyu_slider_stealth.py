@@ -10,6 +10,7 @@ import random
 import json
 import glob
 import hashlib
+from functools import lru_cache
 import os
 import math
 import threading
@@ -164,6 +165,85 @@ def build_cookie_verification_sign(ts: str, token: str, data: str) -> str:
     return hashlib.md5(f"{token}&{ts}&34839810&{data}".encode("utf-8")).hexdigest()
 
 
+@lru_cache(maxsize=1)
+def get_runtime_browser_identity() -> Dict[str, str]:
+    info: Dict[str, str] = {}
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "cloakbrowser", "info"],
+            timeout=20,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode == 0:
+            for line in (result.stdout or "").splitlines():
+                if ":" not in line:
+                    continue
+                key, value = line.split(":", 1)
+                info[key.strip().lower()] = value.strip()
+        else:
+            logger.debug(
+                "HTTP probe 读取 CloakBrowser runtime 信息失败，stdout=%s stderr=%s",
+                (result.stdout or "").strip()[-300:],
+                (result.stderr or "").strip()[-300:],
+            )
+    except Exception as info_error:
+        logger.debug(f"HTTP probe 调用 CloakBrowser info 失败: {info_error}")
+
+    version_source = str(info.get("version") or "").strip()
+    if not version_source:
+        try:
+            from cloakbrowser.config import get_chromium_version
+
+            version_source = str(get_chromium_version() or "").strip()
+        except Exception as config_error:
+            logger.debug(f"HTTP probe 读取 cloakbrowser config 版本失败: {config_error}")
+    if not version_source:
+        version_source = str(os.getenv("XY_HTTP_PROBE_BROWSER_VERSION") or "").strip()
+    version_match = re.search(r"(\d+(?:\.\d+){1,3})", version_source)
+    full_version = version_match.group(1) if version_match else "146.0.0.0"
+    major_version = full_version.split(".", 1)[0]
+
+    platform_source = str(info.get("platform") or "").strip().lower()
+    if not platform_source:
+        try:
+            from cloakbrowser.config import get_platform_tag
+
+            platform_source = str(get_platform_tag() or "").strip().lower()
+        except Exception:
+            platform_source = sys.platform.lower()
+
+    if "darwin" in platform_source or "mac" in platform_source:
+        sec_ch_platform = "macOS"
+        ua_platform = "Macintosh; Intel Mac OS X 10_15_7"
+    elif "linux" in platform_source:
+        sec_ch_platform = "Linux"
+        ua_platform = "X11; Linux x86_64"
+    else:
+        sec_ch_platform = "Windows"
+        ua_platform = "Windows NT 10.0; Win64; x64"
+
+    return {
+        "full_version": full_version,
+        "major_version": major_version,
+        "user_agent": (
+            f"Mozilla/5.0 ({ua_platform}) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{full_version} Safari/537.36"
+        ),
+        "sec_ch_ua": (
+            f'"Not.A/Brand";v="8", "Chromium";v="{major_version}", '
+            f'"Google Chrome";v="{major_version}"'
+        ),
+        "sec_ch_ua_mobile": "?0",
+        "sec_ch_ua_platform": f'"{sec_ch_platform}"',
+        "accept_language": "zh-CN,zh;q=0.9",
+    }
+
+
 def probe_cookie_verification_from_cookie(
     cookie_text: str,
     proxy: Optional[Dict[str, Any]] = None,
@@ -176,26 +256,23 @@ def probe_cookie_verification_from_cookie(
     if not user_id or not token:
         raise ValueError("Cookie 缺少 unb 或 _m_h5_tk，无法获取最新 verification_url")
 
+    runtime_identity = get_runtime_browser_identity()
     session = requests.Session()
     session.headers.update({
         "accept": "application/json",
-        "accept-language": "zh-CN,zh;q=0.9",
+        "accept-language": runtime_identity["accept_language"],
         "cache-control": "no-cache",
         "origin": "https://www.goofish.com",
         "pragma": "no-cache",
         "priority": "u=1, i",
         "referer": "https://www.goofish.com/",
-        "sec-ch-ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
+        "sec-ch-ua": runtime_identity["sec_ch_ua"],
+        "sec-ch-ua-mobile": runtime_identity["sec_ch_ua_mobile"],
+        "sec-ch-ua-platform": runtime_identity["sec_ch_ua_platform"],
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-site",
-        "user-agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/133.0.0.0 Safari/537.36"
-        ),
+        "user-agent": runtime_identity["user_agent"],
     })
     session.cookies.update(cookies)
 
@@ -2019,6 +2096,14 @@ class XianyuSliderStealth:
     def _provider_owns_browser_identity(self) -> bool:
         return str(getattr(self, "automation_backend", "cloakbrowser") or "").strip().lower() == "cloakbrowser"
 
+    def _should_use_provider_humanize_drag(self) -> bool:
+        if not self._provider_owns_browser_identity():
+            return False
+        override = str(os.environ.get("XY_SLIDER_USE_PROVIDER_HUMANIZE_DRAG", "") or "").strip().lower()
+        if override in {"0", "false", "no", "off"}:
+            return False
+        return True
+
     def _is_high_risk_browser_scene(self) -> bool:
         scene = str(getattr(self, "risk_trigger_scene", "") or "").strip().lower()
         return scene in {
@@ -2476,17 +2561,9 @@ class XianyuSliderStealth:
 
     def _build_browser_context_options(self, browser_features: Dict[str, Any]) -> Dict[str, Any]:
         if self._provider_owns_browser_identity():
-            context_options: Dict[str, Any] = {
-                'color_scheme': browser_features['color_scheme'],
-            }
-            if not self.headless:
-                context_options['no_viewport'] = True
-            else:
-                context_options['viewport'] = {
-                    'width': browser_features['viewport_width'],
-                    'height': browser_features['viewport_height'],
-                }
-            return context_options
+            # CloakBrowser 已经在 binary/runtime 层接管指纹；这里不要再把项目侧随机 locale/timezone/viewport
+            # 强压回去，避免“浏览器原生指纹 + 项目自定义画像”互相打架。
+            return {}
         return self._build_playwright_context_options(browser_features)
 
     def _build_persistent_context_options(
@@ -2495,12 +2572,42 @@ class XianyuSliderStealth:
         context_options: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         persistent_context_options = dict(context_options or self._build_browser_context_options(browser_features))
-        if self._provider_owns_browser_identity():
-            persistent_context_options.setdefault('locale', browser_features['locale'])
-            persistent_context_options.setdefault('timezone', browser_features['timezone_id'])
         persistent_context_options.setdefault('accept_downloads', True)
         persistent_context_options.setdefault('ignore_https_errors', True)
         return persistent_context_options
+
+    def _refresh_browser_features_from_page_metrics(self, page=None) -> None:
+        if not self._provider_owns_browser_identity():
+            return
+        target_page = page or getattr(self, "page", None)
+        if target_page is None or not self.browser_features:
+            return
+        try:
+            metrics = target_page.evaluate(
+                """() => ({
+                    innerWidth: window.innerWidth || 0,
+                    innerHeight: window.innerHeight || 0,
+                    screenWidth: screen.width || 0,
+                    screenHeight: screen.height || 0,
+                    language: navigator.language || ''
+                })"""
+            )
+        except Exception as metrics_error:
+            logger.debug(f"【{self.pure_user_id}】读取 CloakBrowser 运行时页面指标失败: {metrics_error}")
+            return
+
+        if not isinstance(metrics, dict):
+            return
+
+        width = int(metrics.get("innerWidth") or 0)
+        height = int(metrics.get("innerHeight") or 0)
+        if width > 0 and height > 0:
+            self.browser_features["viewport_width"] = width
+            self.browser_features["viewport_height"] = height
+            self.browser_features["window_size"] = f"{width},{height}"
+        language = str(metrics.get("language") or "").strip()
+        if language:
+            self.browser_features["locale"] = language
 
     def _build_initial_cookie_payload(self) -> List[Dict[str, Any]]:
         if not self.initial_cookies:
@@ -2712,6 +2819,7 @@ class XianyuSliderStealth:
 
             pages = list(getattr(self.context, "pages", []) or [])
             self.page = pages[0] if pages else self.context.new_page()
+            self._refresh_browser_features_from_page_metrics(self.page)
 
             initial_cookie_payload = self._build_initial_cookie_payload()
             if initial_cookie_payload:
@@ -2833,6 +2941,7 @@ class XianyuSliderStealth:
                 self._install_stealth_init_script(page, browser_features)
             except Exception as attach_err:
                 logger.debug(f"【{self.pure_user_id}】附加受管运行时时注入脚本失败: {attach_err}")
+        self._refresh_browser_features_from_page_metrics(page)
 
     def _detach_managed_runtime(self):
         self._managed_runtime_binding = None
@@ -7316,12 +7425,8 @@ class XianyuSliderStealth:
     def simulate_slide(self, slider_button: ElementHandle, trajectory):
         """模拟滑动 - 优化版本（增强随机性+智能学习）"""
         try:
-            # 若启用 provider 内置 humanize，则优先走“简单拖拽”，避免我们自研轨迹与 humanize 叠加。
-            # 开关：XY_SLIDER_USE_PROVIDER_HUMANIZE_DRAG=1
-            if (
-                self._provider_owns_browser_identity()
-                and os.environ.get("XY_SLIDER_USE_PROVIDER_HUMANIZE_DRAG", "").strip().lower() in {"1", "true", "yes", "on"}
-            ):
+            # CloakBrowser humanize 默认接管滑块拖拽；只有显式关闭时才回退到项目侧自研轨迹。
+            if self._should_use_provider_humanize_drag():
                 return self._simulate_slide_with_provider_humanize(slider_button, trajectory)
 
             # 🧠 获取学习到的行为参数
@@ -9545,10 +9650,7 @@ class XianyuSliderStealth:
                     continue
                 
                 # 3. 生成人类化轨迹（传递尝试次数以增加随机扰动）
-                if (
-                    self._provider_owns_browser_identity()
-                    and os.environ.get("XY_SLIDER_USE_PROVIDER_HUMANIZE_DRAG", "").strip().lower() in {"1", "true", "yes", "on"}
-                ):
+                if self._should_use_provider_humanize_drag():
                     # 使用 CloakBrowser humanize 时，不再生成自研物理轨迹，避免叠加导致抽搐。
                     trajectory = [(float(slide_distance), 0.0, 0.0)]
                 else:
@@ -10926,6 +11028,7 @@ class XianyuSliderStealth:
                 browser = context.browser
             if not page:
                 page = context.new_page()
+            self._refresh_browser_features_from_page_metrics(page)
             self._apply_headless_network_fingerprint(page, browser_features)
             observed_set_cookie_updates: Dict[str, str] = {}
 
@@ -11000,7 +11103,14 @@ class XianyuSliderStealth:
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
-                        page.goto(login_url, wait_until='networkidle', timeout=60000)
+                        # /im 页面会挂长连接，等 networkidle 容易平白超时；这里先等首屏可交互即可。
+                        page.goto(login_url, wait_until='domcontentloaded', timeout=30000)
+                        try:
+                            page.wait_for_load_state('load', timeout=10000)
+                        except Exception:
+                            logger.debug(
+                                f"【{self.pure_user_id}】登录页 load 状态等待超时，继续按表单可见性推进: {login_url}"
+                            )
                         break
                     except Exception as e:
                         error_msg = str(e)

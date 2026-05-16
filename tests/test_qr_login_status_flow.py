@@ -166,6 +166,110 @@ class QRLoginStatusFlowTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "account_id"):
             manager._resolve_verification_profile_dir(session)
 
+    def test_verification_context_options_do_not_override_provider_identity(self):
+        manager = qr_login.QRLoginManager()
+
+        context_options = manager._build_verification_context_options(show_browser=False)
+
+        self.assertEqual(
+            context_options,
+            {
+                "accept_downloads": True,
+                "ignore_https_errors": True,
+            },
+        )
+        self.assertNotIn("locale", context_options)
+        self.assertNotIn("timezone", context_options)
+        self.assertNotIn("timezone_id", context_options)
+        self.assertNotIn("viewport", context_options)
+        self.assertNotIn("no_viewport", context_options)
+
+    def test_resolve_existing_account_proxy_config_uses_account_id_only(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession(
+            "qr-account-proxy-session",
+            user_id=1,
+            account_id="qr_account_42",
+        )
+        session.unb = "legacy_unb_should_not_drive_proxy_lookup"
+        fake_db = types.SimpleNamespace(
+            get_cookie_proxy_config=mock.Mock(
+                return_value={
+                    "proxy_type": "http",
+                    "proxy_host": "127.0.0.1",
+                    "proxy_port": 7890,
+                    "proxy_user": "user_a",
+                    "proxy_pass": "pass_a",
+                }
+            ),
+            get_all_cookies=mock.Mock(side_effect=AssertionError("must not fallback to unb lookup")),
+        )
+
+        with mock.patch.object(importlib.import_module("db_manager"), "db_manager", fake_db):
+            proxy_config = manager._resolve_existing_account_proxy_config(session)
+
+        self.assertEqual(proxy_config["proxy_host"], "127.0.0.1")
+        self.assertEqual(session.proxy_account_id, "qr_account_42")
+        self.assertEqual(session.proxy_url, "http://user_a:pass_a@127.0.0.1:7890")
+        fake_db.get_cookie_proxy_config.assert_called_once_with("qr_account_42")
+        fake_db.get_all_cookies.assert_not_called()
+
+    async def test_launch_verification_browser_context_keeps_humanize_and_skips_locale_timezone_injection(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession(
+            "qr-verification-runtime-request",
+            user_id=1,
+            account_id="1",
+        )
+        browser = mock.Mock()
+        context = types.SimpleNamespace(browser=browser)
+        runtime = types.SimpleNamespace(context=context, browser=browser)
+        lease = types.SimpleNamespace(runtime=runtime)
+        acquire_runtime = mock.AsyncMock(return_value=lease)
+
+        with mock.patch.object(
+            manager,
+            "_should_show_verification_browser",
+            return_value=False,
+        ), mock.patch.object(
+            qr_login.account_browser_runtime_manager,
+            "acquire_runtime",
+            acquire_runtime,
+        ):
+            returned_lease, returned_browser, returned_context, show_browser = (
+                await manager._launch_verification_browser_context(session)
+            )
+
+        self.assertIs(returned_lease, lease)
+        self.assertIs(returned_browser, browser)
+        self.assertIs(returned_context, context)
+        self.assertFalse(show_browser)
+
+        runtime_request = acquire_runtime.await_args.kwargs["runtime_request"]
+        self.assertEqual(runtime_request["account_id"], "1")
+        self.assertEqual(runtime_request["purpose"], "qr_login_verification")
+        self.assertTrue(runtime_request["use_persistent_context"])
+        self.assertTrue(runtime_request["profile_dir"].endswith("browser_data\\user_1") or runtime_request["profile_dir"].endswith("browser_data/user_1"))
+
+        launch_options = runtime_request["launch_options"]
+        self.assertTrue(launch_options["headless"])
+        self.assertTrue(launch_options["humanize"])
+        self.assertEqual(launch_options["human_preset"], "careful")
+
+        persistent_context_options = runtime_request["persistent_context_options"]
+        self.assertEqual(
+            persistent_context_options,
+            {
+                "accept_downloads": True,
+                "ignore_https_errors": True,
+            },
+        )
+        self.assertNotIn("locale", persistent_context_options)
+        self.assertNotIn("timezone", persistent_context_options)
+        self.assertNotIn("timezone_id", persistent_context_options)
+        self.assertNotIn("viewport", persistent_context_options)
+        self.assertNotIn("no_viewport", persistent_context_options)
+
     async def test_monitor_qr_status_requires_complete_cookies_before_api_success(self):
         manager = qr_login.QRLoginManager()
         session = qr_login.QRLoginSession("qr-incomplete-cookie-session")
@@ -510,7 +614,7 @@ class ReplyServerQrLoginStatusFlowTest(unittest.TestCase):
             [("qr-session-handoff-sync", "qr_login_handoff_completed")],
         )
 
-    def test_check_qr_code_status_marks_handoff_failed_when_cookie_processing_does_not_restart_task(self):
+    def test_check_qr_code_status_keeps_handoff_success_when_cookie_processing_does_not_restart_task(self):
         session_id = "qr-session-handoff-task-not-restarted"
         warning_message = "真实Cookie已获取，但账号任务未启动"
         process_mock = mock.AsyncMock(return_value={
@@ -568,18 +672,20 @@ class ReplyServerQrLoginStatusFlowTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "confirmed")
         self.assertEqual(fake_manager.handoff_updates[0][1], "processing")
+        self.assertEqual(fake_manager.handoff_updates[-1][1], "success")
         self.assertEqual(
-            fake_manager.handoff_updates[-1],
-            (session_id, "failed", {"error": warning_message}),
+            fake_manager.handoff_updates[-1][2]["account_info"]["warning_message"],
+            warning_message,
+        )
+        self.assertFalse(
+            fake_manager.handoff_updates[-1][2]["account_info"]["task_restarted"],
         )
         self.assertEqual(
-            reply_server.qr_check_processed[session_id],
-            {
-                "processed": True,
-                "processing": False,
-                "timestamp": reply_server.qr_check_processed[session_id]["timestamp"],
-                "error": warning_message,
-            },
+            reply_server.qr_check_processed[session_id]["account_info"]["warning_message"],
+            warning_message,
+        )
+        self.assertFalse(
+            reply_server.qr_check_processed[session_id]["account_info"]["task_restarted"],
         )
         self.assertEqual(
             fake_manager.release_calls,
@@ -1060,6 +1166,7 @@ class ReplyServerQrLoginStatusFlowTest(unittest.TestCase):
         fake_db.assert_cookie_belongs_to_user = mock.Mock()
         fake_db.create_cookie_account_placeholder.return_value = True
         fake_manager = mock.Mock()
+        fake_manager.invalidate_account_sessions.return_value = []
         fake_manager.generate_qr_code = mock.AsyncMock(return_value={
             "success": True,
             "session_id": "qr-session",
@@ -1100,6 +1207,7 @@ class ReplyServerQrLoginStatusFlowTest(unittest.TestCase):
         }
         fake_db.assert_cookie_belongs_to_user = mock.Mock(return_value=True)
         fake_manager = mock.Mock()
+        fake_manager.invalidate_account_sessions.return_value = []
         fake_manager.generate_qr_code = mock.AsyncMock(return_value={
             "success": True,
             "session_id": "qr-session-existing",

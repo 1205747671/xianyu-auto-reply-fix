@@ -3183,9 +3183,9 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             context=context,
         )
         runtime_manager = types.SimpleNamespace(
-            acquire_runtime=mock.AsyncMock(return_value=lease),
-            get_fresh_page=mock.AsyncMock(return_value=(page, context)),
-            release_runtime=mock.AsyncMock(return_value=None),
+            acquire_runtime_sync=mock.Mock(return_value=lease),
+            get_fresh_page_sync=mock.Mock(return_value=(page, context)),
+            release_runtime_sync=mock.Mock(return_value=None),
         )
 
         class _FakeSlider:
@@ -3216,10 +3216,13 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 self.context = kwargs.get("context")
                 self.page = kwargs.get("page")
 
-            async def async_run(self, verification_url, **kwargs):
+            def run(self, verification_url, **kwargs):
                 captured["verification_url"] = verification_url
-                captured["async_run_kwargs"] = kwargs
+                captured["run_kwargs"] = kwargs
                 return False, {}
+
+            async def _run_sync_method_on_fresh_thread(self, func, *args, **kwargs):
+                return func(*args, **kwargs)
 
         fake_db = mock.Mock()
         fake_db.get_cookie_details.return_value = {"show_browser": False}
@@ -3243,18 +3246,18 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         fake_db.get_cookie_details.assert_called_once_with("acc-captcha-runtime-1")
         self.assertEqual(
             captured["request_kwargs"],
-            {"account_id": "acc-captcha-runtime-1", "purpose": "verification_recovery"},
+            {"account_id": "acc-captcha-runtime-1", "purpose": "token_refresh_slider"},
         )
-        runtime_manager.acquire_runtime.assert_awaited_once_with(
+        runtime_manager.acquire_runtime_sync.assert_called_once_with(
             "acc-captcha-runtime-1",
-            "verification_recovery",
+            "token_refresh_slider",
             exclusive=True,
             runtime_request=mock.ANY,
         )
-        runtime_manager.get_fresh_page.assert_awaited_once_with(lease)
-        runtime_manager.release_runtime.assert_awaited_once_with(
+        runtime_manager.get_fresh_page_sync.assert_called_once_with(lease)
+        runtime_manager.release_runtime_sync.assert_called_once_with(
             lease,
-            reason="captcha_verification_completed",
+            reason="token_refresh_slider_completed",
         )
         self.assertIs(captured["attach_kwargs"]["lease"], lease)
         self.assertIs(captured["attach_kwargs"]["runtime"], lease.runtime)
@@ -3264,7 +3267,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["init_kwargs"]["user_id"], "acc-captcha-runtime-1")
         self.assertTrue(captured["init_kwargs"]["use_account_persistent_profile"])
         self.assertEqual(captured["verification_url"], "https://verify.example.com/slider")
-        self.assertTrue(captured["async_run_kwargs"]["require_managed_runtime"])
+        self.assertTrue(captured["run_kwargs"]["require_managed_runtime"])
         logged_accounts = [
             call.kwargs.get("account_id", call.args[0] if call.args else None)
             for call in log_captcha_event.call_args_list
@@ -3403,9 +3406,9 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             context=context,
         )
         runtime_manager = types.SimpleNamespace(
-            acquire_runtime=mock.AsyncMock(return_value=lease),
-            get_fresh_page=mock.AsyncMock(return_value=(page, context)),
-            release_runtime=mock.AsyncMock(return_value=None),
+            acquire_runtime_sync=mock.Mock(return_value=lease),
+            get_fresh_page_sync=mock.Mock(return_value=(page, context)),
+            release_runtime_sync=mock.Mock(return_value=None),
         )
 
         class _FakeSlider:
@@ -3429,12 +3432,15 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 self.context = kwargs.get("context")
                 self.page = kwargs.get("page")
 
-            async def async_run(self, verification_url, **kwargs):
+            def run(self, verification_url, **kwargs):
                 return True, {
                     "unb": "user1",
                     "cookie2": "v2",
                     "x5sec": "x5-token",
                 }
+
+            async def _run_sync_method_on_fresh_thread(self, func, *args, **kwargs):
+                return func(*args, **kwargs)
 
         fake_db = mock.Mock()
         fake_db.get_cookie_details.return_value = {"show_browser": False}
@@ -9053,6 +9059,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         page = mock.Mock()
         page.goto = mock.AsyncMock()
         page.reload = mock.AsyncMock()
+        page.wait_for_load_state = mock.AsyncMock()
         page.close = mock.AsyncMock()
 
         context = mock.Mock()
@@ -9129,10 +9136,132 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             lease,
             reason="qr_cookie_refresh_completed",
         )
-        context.cookies.assert_awaited_once()
+        self.assertEqual(context.cookies.await_count, 4)
         update_cookie_account_info.assert_not_called()
         save_cookie.assert_not_called()
         live._set_runtime_cookie_state.assert_not_called()
+
+    async def test_refresh_cookies_from_qr_login_uses_home_and_fresh_tab_to_fill_missing_required_fields(self):
+        page = mock.Mock()
+        page.goto = mock.AsyncMock()
+        page.reload = mock.AsyncMock()
+        page.wait_for_load_state = mock.AsyncMock()
+        page.close = mock.AsyncMock()
+
+        fresh_page = mock.Mock()
+        fresh_page.goto = mock.AsyncMock()
+        fresh_page.reload = mock.AsyncMock()
+        fresh_page.wait_for_load_state = mock.AsyncMock()
+        fresh_page.close = mock.AsyncMock()
+
+        qr_cookie_items = [
+            {"name": "unb", "value": "new-unb"},
+            {"name": "sgcookie", "value": "new-sg"},
+            {"name": "cookie2", "value": "new-cookie2"},
+            {"name": "t", "value": "new-t"},
+            {"name": "_tb_token_", "value": "new-tb-token"},
+        ]
+        stabilized_cookie_items = qr_cookie_items + [
+            {"name": "_m_h5_tk", "value": "new-token_123"},
+            {"name": "_m_h5_tk_enc", "value": "new-enc"},
+            {"name": "cna", "value": "new-cna"},
+        ]
+
+        context = mock.Mock()
+        context.browser = mock.Mock()
+        context.browser.close = mock.AsyncMock()
+        context.add_cookies = mock.AsyncMock()
+        context.new_page = mock.AsyncMock(return_value=fresh_page)
+        context.cookies = mock.AsyncMock(
+            side_effect=[
+                list(qr_cookie_items),
+                list(qr_cookie_items),
+                list(qr_cookie_items),
+                list(qr_cookie_items),
+                list(stabilized_cookie_items),
+            ]
+        )
+        context.close = mock.AsyncMock()
+
+        live = XianyuLive.__new__(XianyuLive)
+        live._legacy_cookie_id = "legacy-qr-fresh-tab-recovery"
+        live.account_id = "account-qr-fresh-tab-recovery"
+        live.user_id = 7
+        live.qr_cookie_refresh_cooldown = 180
+        live.last_qr_cookie_refresh_time = 0
+        live._safe_str = str
+        live._extract_cookie_value = lambda cookie_record: (cookie_record or {}).get("cookie")
+        live._summarize_cookie_string = lambda cookie_string: cookie_string
+        live._set_runtime_cookie_state = mock.Mock()
+        live.protected_merge_cookie_dicts = lambda existing, incoming: self._build_merge_result(incoming)
+
+        qr_cookies_str = (
+            "unb=qr-unb; sgcookie=qr-sg; cookie2=qr-cookie2; "
+            "t=qr-t; _tb_token_=qr-tb-token"
+        )
+        lease = self._build_runtime_lease(
+            live.account_id,
+            browser=context.browser,
+            context=context,
+        )
+        runtime_manager = types.SimpleNamespace(
+            acquire_runtime=mock.AsyncMock(return_value=lease),
+            get_fresh_page=mock.AsyncMock(return_value=(page, context)),
+            release_runtime=mock.AsyncMock(return_value=None),
+            resolve_profile_dir=mock.Mock(
+                return_value=os.path.join(os.getcwd(), "browser_data", "user_account-qr-fresh-tab-recovery")
+            ),
+        )
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "account_browser_runtime_manager",
+            new=runtime_manager,
+        ), \
+             mock.patch("XianyuAutoAsync.asyncio.sleep", new=mock.AsyncMock()), \
+             mock.patch("XianyuAutoAsync.db_manager.get_cookie_details", return_value={"cookie": ""}) as get_cookie_details, \
+             mock.patch("XianyuAutoAsync.db_manager.update_cookie_account_info", return_value=True) as update_cookie_account_info, \
+             mock.patch("XianyuAutoAsync.db_manager.save_cookie", return_value=True) as save_cookie:
+            result = await live.refresh_cookies_from_qr_login(
+                qr_cookies_str,
+                account_id="account-qr-fresh-tab-recovery",
+            )
+
+        self.assertTrue(result)
+        runtime_manager.acquire_runtime.assert_awaited_once_with(
+            "account-qr-fresh-tab-recovery",
+            "verification_recovery",
+            exclusive=True,
+            runtime_request=mock.ANY,
+        )
+        runtime_manager.get_fresh_page.assert_awaited_once_with(lease)
+        runtime_manager.release_runtime.assert_awaited_once_with(
+            lease,
+            reason="qr_cookie_refresh_completed",
+        )
+        context.add_cookies.assert_awaited_once()
+        context.new_page.assert_awaited_once_with()
+        self.assertEqual(
+            page.goto.await_args_list,
+            [
+                mock.call("https://www.goofish.com/im", wait_until="domcontentloaded", timeout=15000),
+                mock.call("https://www.goofish.com/", wait_until="domcontentloaded", timeout=15000),
+                mock.call("https://www.goofish.com/im", wait_until="domcontentloaded", timeout=15000),
+            ],
+        )
+        page.reload.assert_awaited()
+        self.assertEqual(
+            fresh_page.goto.await_args_list,
+            [
+                mock.call("https://www.goofish.com/", wait_until="domcontentloaded", timeout=15000),
+            ],
+        )
+        fresh_page.close.assert_awaited_once_with()
+        self.assertEqual(context.cookies.await_count, 5)
+        get_cookie_details.assert_called()
+        update_cookie_account_info.assert_called_once()
+        save_cookie.assert_not_called()
+        live._set_runtime_cookie_state.assert_called_once()
 
     async def test_refresh_cookies_from_qr_login_rejects_legacy_cookie_id_contract(self):
         page = mock.Mock()

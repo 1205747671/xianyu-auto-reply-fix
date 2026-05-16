@@ -6,6 +6,7 @@ import tempfile
 import types
 import inspect
 import unittest
+from pathlib import Path
 from unittest import mock
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -411,7 +412,7 @@ class SliderVerificationGuardsTest(unittest.TestCase):
 
         self.assertTrue(slider.check_page_changed())
 
-    def test_run_uses_attached_managed_runtime_without_reinitializing_or_closing_external_browser(self):
+    def test_run_uses_attached_managed_runtime_without_reinitializing_and_detaches_binding_on_cleanup(self):
         page = _FakePage(
             title="验证码",
             url="https://passport.goofish.com/iv/test",
@@ -449,14 +450,15 @@ class SliderVerificationGuardsTest(unittest.TestCase):
             )
         )
         slider.init_browser = mock.Mock(side_effect=AssertionError("should not init browser"))
-        slider.close_browser = mock.Mock(side_effect=AssertionError("should not close external runtime"))
+        original_close_browser = slider.close_browser
+        slider.close_browser = mock.Mock(wraps=original_close_browser)
 
         success, cookies = slider.run("https://passport.goofish.com/iv/test")
 
         self.assertTrue(success)
         self.assertEqual(cookies, {"unb": "u", "cookie2": "c"})
         slider.init_browser.assert_not_called()
-        slider.close_browser.assert_not_called()
+        slider.close_browser.assert_called_once()
         slider._detach_managed_runtime.assert_called_once()
 
     def test_run_rejects_missing_managed_runtime_when_explicitly_required(self):
@@ -837,7 +839,7 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         self.assertTrue(page.activated)
         self.assertNotEqual(slider.last_verification_feedback.get("status"), "hard_block")
 
-    def test_finalize_logged_in_cookies_fails_when_session_still_unready(self):
+    def test_finalize_logged_in_cookies_defers_failure_when_session_still_unready_but_required_fields_exist(self):
         page = _FakePage(title="闲鱼消息", url="https://www.goofish.com/im")
         cookies_missing_cna = {
             "unb": "u",
@@ -871,8 +873,8 @@ class SliderVerificationGuardsTest(unittest.TestCase):
             scene="单测收口",
         )
 
-        self.assertIsNone(result)
-        self.assertIn("服务端Session仍未就绪", slider.last_login_error)
+        self.assertEqual(result, cookies_missing_cna)
+        self.assertEqual(slider.last_login_error, "")
 
     @mock.patch("utils.xianyu_slider_stealth.time.sleep", return_value=None)
     def test_find_slider_elements_reactivates_recoverable_punish_shell(self, _mock_sleep):
@@ -1184,6 +1186,8 @@ class SliderVerificationGuardsTest(unittest.TestCase):
             headless=True,
             proxy={"server": "http://127.0.0.1:8888"},
             args=["--foo"],
+            humanize=True,
+            human_preset="default",
             user_agent="unit-test-agent",
             locale="zh-CN",
             timezone_id="Asia/Shanghai",
@@ -1234,7 +1238,7 @@ class SliderVerificationGuardsTest(unittest.TestCase):
 
     @mock.patch("utils.xianyu_slider_stealth.launch_browser")
     @mock.patch("utils.xianyu_slider_stealth.launch_browser_persistent_context")
-    def test_init_browser_falls_back_to_temporary_context_when_stale_lock_cleanup_not_allowed(self, mock_launch_persistent, mock_launch_browser):
+    def test_init_browser_rejects_fallback_to_temporary_context_when_stale_lock_cleanup_not_allowed(self, mock_launch_persistent, mock_launch_browser):
         slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
         slider.use_account_persistent_profile = True
         slider.account_persistent_profile_dir = "browser_data/user_fallback"
@@ -1253,35 +1257,20 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         slider._is_profile_in_use_launch_error = lambda exc: "profile appears to be in use" in str(exc).lower()
         slider._try_cleanup_stale_chromium_singleton_lock = mock.Mock(return_value=False)
 
-        fake_page = mock.Mock()
-        fake_context = mock.Mock()
-        fake_context.pages = []
-        fake_context.new_page.return_value = fake_page
-        fake_browser = mock.Mock()
-        fake_browser.new_context.return_value = fake_context
         mock_launch_persistent.side_effect = RuntimeError(
             "BrowserType.launch_persistent_context: The profile appears to be in use by another Chromium process"
         )
-        mock_launch_browser.return_value = fake_browser
 
-        slider.init_browser()
+        with self.assertRaisesRegex(RuntimeError, "拒绝降级到干净上下文"):
+            slider.init_browser()
 
         mock_launch_persistent.assert_called_once()
         slider._try_cleanup_stale_chromium_singleton_lock.assert_called_once_with("browser_data/user_fallback")
-        mock_launch_browser.assert_called_once_with(
-            headless=True,
-            proxy={"server": "http://127.0.0.1:8888"},
-            args=["--foo"],
-        )
-        fake_browser.new_context.assert_called_once_with(locale="zh-CN", timezone_id="Asia/Shanghai")
-        fake_context.add_cookies.assert_called_once_with(
-            [{"name": "x5sec", "value": "v", "domain": ".goofish.com", "path": "/"}]
-        )
-        slider._install_stealth_init_script.assert_called_once_with(fake_page, {"user_agent": "fallback-agent"})
+        mock_launch_browser.assert_not_called()
 
     @mock.patch("utils.xianyu_slider_stealth.launch_browser")
     @mock.patch("utils.xianyu_slider_stealth.launch_browser_persistent_context")
-    def test_init_browser_persistent_fallback_retries_default_chromium_when_explicit_headless_launch_fails(
+    def test_init_browser_persistent_rejects_default_chromium_fallback_when_profile_launch_stays_locked(
         self,
         mock_launch_persistent,
         mock_launch_browser,
@@ -1307,46 +1296,19 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         slider._is_profile_in_use_launch_error = lambda exc: "profile appears to be in use" in str(exc).lower()
         slider._try_cleanup_stale_chromium_singleton_lock = mock.Mock(return_value=False)
 
-        fake_page = mock.Mock()
-        fake_context = mock.Mock()
-        fake_context.pages = []
-        fake_context.new_page.return_value = fake_page
-        fake_browser = mock.Mock()
-        fake_browser.new_context.return_value = fake_context
         mock_launch_persistent.side_effect = RuntimeError(
             "BrowserType.launch_persistent_context: The profile appears to be in use by another Chromium process"
         )
-        mock_launch_browser.side_effect = [
-            RuntimeError("explicit browser launch failed"),
-            fake_browser,
-        ]
 
-        slider.init_browser()
+        with self.assertRaisesRegex(RuntimeError, "拒绝降级到干净上下文"):
+            slider.init_browser()
 
         mock_launch_persistent.assert_called_once()
         slider._try_cleanup_stale_chromium_singleton_lock.assert_called_once_with(
             "browser_data/user_fallback_explicit"
         )
-        self.assertEqual(mock_launch_browser.call_count, 2)
-        self.assertEqual(
-            mock_launch_browser.call_args_list[0].kwargs,
-            {
-                "headless": True,
-                "proxy": {"server": "http://127.0.0.1:8888"},
-                "args": ["--foo"],
-                "channel": "msedge",
-                "executable_path": "C:/Browsers/msedge.exe",
-            },
-        )
-        self.assertEqual(
-            mock_launch_browser.call_args_list[1].kwargs,
-            {
-                "headless": True,
-                "proxy": {"server": "http://127.0.0.1:8888"},
-                "args": ["--foo"],
-            },
-        )
-        slider._install_stealth_init_script.assert_called_once_with(fake_page, {"user_agent": "fallback-browser-agent"})
+        mock_launch_browser.assert_not_called()
+        slider._install_stealth_init_script.assert_not_called()
 
     @mock.patch("utils.xianyu_slider_stealth.launch_browser")
     def test_init_browser_headless_falls_back_when_explicit_browser_launch_fails(self, mock_launch_browser):
@@ -1660,6 +1622,70 @@ class SliderRunInlineVerificationProbeTest(unittest.TestCase):
         self.assertEqual(result, (True, {"cookie2": "browser_cookie2"}))
         slider._finalize_logged_in_cookies.assert_called_once()
         slider.close_browser.assert_called_once_with()
+
+
+class CloakBrowserProviderContractTest(unittest.TestCase):
+    def test_provider_context_options_do_not_reinject_project_identity(self):
+        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
+        slider.automation_backend = "cloakbrowser"
+        slider.headless = True
+
+        browser_features = {
+            "color_scheme": "dark",
+            "locale": "zh-CN",
+            "timezone_id": "Asia/Shanghai",
+            "viewport_width": 1600,
+            "viewport_height": 900,
+        }
+
+        context_options = slider._build_browser_context_options(browser_features)
+        persistent_options = slider._build_persistent_context_options(
+            browser_features,
+            context_options=context_options,
+        )
+
+        self.assertEqual(context_options, {})
+        self.assertNotIn("locale", persistent_options)
+        self.assertNotIn("timezone", persistent_options)
+        self.assertTrue(persistent_options["accept_downloads"])
+        self.assertTrue(persistent_options["ignore_https_errors"])
+
+    def test_provider_humanize_drag_is_enabled_by_default(self):
+        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
+        slider.automation_backend = "cloakbrowser"
+        slider.page = _FakePage()
+        slider.pure_user_id = "provider_drag_default"
+        slider.current_trajectory_data = {}
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            with mock.patch.object(
+                slider,
+                "_simulate_slide_with_provider_humanize",
+                return_value=True,
+            ) as provider_drag:
+                result = slider.simulate_slide(_FakeElement(), [(180.0, 0.0, 0.0)])
+
+        self.assertTrue(result)
+        provider_drag.assert_called_once()
+
+    def test_provider_humanize_drag_can_be_disabled_explicitly(self):
+        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
+        slider.automation_backend = "cloakbrowser"
+        slider.page = _FakePage()
+        slider.pure_user_id = "provider_drag_disabled"
+        slider.current_trajectory_data = {}
+
+        with mock.patch.dict(os.environ, {"XY_SLIDER_USE_PROVIDER_HUMANIZE_DRAG": "0"}, clear=False):
+            self.assertFalse(slider._should_use_provider_humanize_drag())
+
+
+class PasswordLoginNavigationContractTest(unittest.TestCase):
+    def test_password_login_im_navigation_does_not_wait_for_networkidle(self):
+        source = (Path(PROJECT_ROOT) / "utils" / "xianyu_slider_stealth.py").read_text(encoding="utf-8")
+
+        self.assertIn("page.goto(login_url, wait_until='domcontentloaded', timeout=30000)", source)
+        self.assertIn("page.wait_for_load_state('load', timeout=10000)", source)
+        self.assertNotIn("page.goto(login_url, wait_until='networkidle', timeout=60000)", source)
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,8 +1,8 @@
-# 闲鱼账号验证 / Cookie / 保活链路修复总结（更新至 2026-05-15）
+# 闲鱼账号验证 / Cookie / 保活链路修复总结（更新至 2026-05-17）
 
 ## 当前结论
 
-截至 **2026-05-15**，这条链路现在要分两层看：
+截至 **2026-05-17**，这条链路现在要分两层看：
 
 1. **浏览器运行时已经统一**
    - 项目活跃浏览器链路已经统一到 `CloakBrowser` provider。
@@ -23,6 +23,349 @@
 一句话说透：
 
 > 现在主要问题不再是“浏览器链路根本跑不起来”，而是“滑块之后账号是否还要继续做人机验证，以及保活恢复能不能正确承接这个状态”。
+
+---
+
+## 2026-05-17 本次代码级收口（指纹 / 滑块 / 账号级画像继续收紧）
+
+这轮重点不是重新吹“能登录了”，而是把 **CloakBrowser 自己负责的那层能力** 和 **项目侧自己乱加的一层** 往开掰，省得又把同一个 `account_id` 弄成两套画像、两套路数。
+
+### A. 滑块优先走 CloakBrowser 自己的 humanize 拖拽
+
+涉及文件：
+
+- `utils/xianyu_slider_stealth.py`
+- `tests/test_slider_verification_guards.py`
+
+本次调整：
+
+1. 新增 `_should_use_provider_humanize_drag()`
+   - 只要当前 automation backend 是 `cloakbrowser`
+   - 默认就走 provider 自己的 humanize drag
+   - 只有显式设置 `XY_SLIDER_USE_PROVIDER_HUMANIZE_DRAG=0/false/no/off` 才回退到项目侧自研轨迹
+
+2. `simulate_slide()` / 轨迹生成分支同步收口
+   - 默认直接走 `_simulate_slide_with_provider_humanize()`
+   - 不再要求额外开环境变量才启用 provider 拖拽
+
+这样做的意义很直接：**昨天已经验证能过的滑块，今天别又让项目侧物理轨迹上去瞎搅和。**
+
+### B. CloakBrowser 接管画像时，项目侧不再二次塞 locale / timezone / viewport
+
+涉及文件：
+
+- `utils/xianyu_slider_stealth.py`
+- `utils/qr_login.py`
+- `tests/test_slider_verification_guards.py`
+- `tests/test_qr_login_status_flow.py`
+
+本次调整：
+
+1. `XianyuSliderStealth._build_browser_context_options()`
+   - 对 `cloakbrowser` 直接返回空 dict
+   - 不再把项目侧随机 `locale/timezone/viewport/color_scheme` 强塞回 provider
+
+2. `XianyuSliderStealth._build_persistent_context_options()`
+   - 只保留真正通用的：
+     - `accept_downloads=True`
+     - `ignore_https_errors=True`
+
+3. `QRLoginManager._build_verification_context_options()`
+   - 二维码验证页同样只保留通用上下文参数
+   - 不再在验证 runtime 里额外覆盖身份画像
+
+一句话：**同一个 `account_id` 的持久画像，由 CloakBrowser runtime 说了算；项目侧别再自作聪明叠一层伪指纹。**
+
+### C. 运行时页面指标反向回填到 `browser_features`
+
+涉及文件：
+
+- `utils/xianyu_slider_stealth.py`
+
+本次调整：
+
+1. 新增 `_refresh_browser_features_from_page_metrics()`
+   - 从真实页面读取：
+     - `window.innerWidth`
+     - `window.innerHeight`
+     - `screen.width`
+     - `screen.height`
+     - `navigator.language`
+   - 再回填到 `browser_features`
+
+2. 在以下入口补调用：
+   - 持久化 context 首次拿到 page 后
+   - attach managed runtime 后
+   - 浏览器恢复页 / 稳定化页打开后
+
+目的不是“造新画像”，而是**让后续逻辑看到的页面尺寸 / 语言尽量贴近 provider 真实 runtime，而不是继续抱着项目侧旧默认值瞎算。**
+
+### D. 账密登录页不再死等 `networkidle`
+
+涉及文件：
+
+- `utils/xianyu_slider_stealth.py`
+- `tests/test_slider_verification_guards.py`
+
+本次调整：
+
+- `page.goto(login_url, wait_until='networkidle', timeout=60000)`
+  改成：
+  - `wait_until='domcontentloaded'`
+  - 再补一个短 `page.wait_for_load_state('load', timeout=10000)`
+
+原因很朴素：`/im` 页挂长连接，死等 `networkidle` 本来就容易超时，这种写法跟自己较劲没区别。
+
+### E. 本轮最小验证
+
+- `python -m py_compile utils/xianyu_slider_stealth.py utils/qr_login.py XianyuAutoAsync.py`
+- `pytest tests/test_slider_verification_guards.py -q`
+- `pytest tests/test_qr_login_status_flow.py -q -k "verification_context_options or launch_verification_browser_context_keeps_humanize"`
+- `pytest tests/test_xianyu_token_refresh_request.py -q`
+
+结果：
+
+- `tests/test_slider_verification_guards.py`：通过
+- `tests/test_qr_login_status_flow.py` 指纹 / context 相关新增用例：通过
+- `tests/test_xianyu_token_refresh_request.py`：覆盖交接阶段 `allow_password_login_recovery` 行为，通过
+
+### F. 交接前主动失效旧 sync runtime，减少首轮接管撞 profile
+
+涉及文件：
+
+- `reply_server.py`
+- `XianyuAutoAsync.py`
+- `tests/test_xianyu_token_refresh_request.py`
+
+本次调整：
+
+1. 刷新模式拿到新 Cookie 后
+   - 先 `release` 当前 sync runtime
+   - 再显式 `invalidate_runtime_sync(account_id, ...)`
+
+2. 普通密码登录完成交接前
+   - 同样在 handoff 前主动失效旧 sync runtime
+
+3. 二维码真实 Cookie 刚接管时
+   - `init()` 首轮 token refresh 也按 handoff recovery 对待
+   - 先禁掉 password-login recovery，避免刚接管就又掉回账密恢复
+
+一句话：**接管就是接管，旧 runtime 该让位就让位，别还趴在同一个 `browser_data/user_<account_id>` 上装死。**
+
+### G. 重启接口不再当场复制第二个 `Start.py`
+
+涉及文件：
+
+- `reply_server.py`
+- `tests/test_reply_server_account_scope.py`
+
+本次调整：
+
+1. `/api/update/restart`
+   - 不再在 Windows 下直接 `CREATE_NEW_CONSOLE + Popen([python, Start.py])`
+   - 改成拉起一个隐藏 helper
+   - helper 等当前进程退出后，再启动新的 `Start.py`
+
+2. 这样收掉的现象
+   - 父子两个 `Start.py` 同时并存
+   - 两个控制台窗口
+   - 进入有头链路时，两个进程各拉一套浏览器，用户看到“双浏览器 / 双窗口”
+
+---
+
+## 2026-05-17 本次二维码真实回归（Cookie 稳定化收口后已跑通）
+
+这轮不是“扫上了就算赢”，而是把二维码登录后那段最容易半截子掉地上的 Cookie 补全过程，按之前账密链路已经验证过的稳定化套路重新收口了一遍。
+
+### A. 旧二维码链路的真实根因
+
+之前二维码扫码成功后，`refresh_cookies_from_qr_login()` 只做了比较糙的一步：
+
+- `goto /im`
+- `reload`
+- 抓一次 `context.cookies()`
+- 如果缺 `_m_h5_tk / _m_h5_tk_enc` 这类关键字段，就直接判失败
+
+这就有个很蠢但很真实的问题：**扫码 API 已经成功，浏览器上下文里也已经是登录态，但 Cookie 还没在当前页访问链路里稳定长全。**
+
+换句话说，旧逻辑不是“没登录上”，而是**登录成功后的真实 Cookie 稳定化闭环没走完**。
+
+### B. 本次代码级收口
+
+涉及文件：
+
+- `XianyuAutoAsync.py`
+- `tests/test_xianyu_async_browser_runtime.py`
+
+本次调整：
+
+1. 在 `XianyuAutoAsync.py` 新增 async 版浏览器 Cookie 稳定化 helper
+   - `_normalize_browser_cookie_items`
+   - `_snapshot_browser_context_cookies_async`
+   - `_run_browser_cookie_stabilization_action_async`
+   - `_stabilize_browser_context_cookies_async`
+
+2. `refresh_cookies_from_qr_login()` 改为接入同一套稳定化闭环
+   - 先吃当前 `goto /im + reload` 后已经拿到的 Cookie 快照
+   - 只有核心会话字段还缺时，才继续补动作：
+     - `reload_current`
+     - `goto_home`
+     - `goto_im`
+     - `fresh_tab_home`
+     - `fresh_tab_im`
+
+3. 稳定化是否继续推进，统一按 `REQUIRED_SESSION_COOKIE_FIELDS` 判断
+   - 不再因为某些保护字段没齐就无脑继续折腾
+   - 这样能避免二维码刚接管时又平白多开 tab、多跑一轮 runtime
+
+一句话：**二维码链路现在不再是“扫完就抓一把 Cookie 碰运气”，而是和账密链路一样，拿浏览器上下文把真实会话字段补稳定再落库。**
+
+### C. 真实回归结果
+
+本轮真实扫码回归参数：
+
+- `account_id=1`
+- 二维码会话：`cec1d021-ebbb-446c-90cd-e1a03a58a6f0`
+- 二维码图片：`tmp_qr_account1_latest.png`
+
+最终结果：
+
+1. 二维码扫码确认后，状态成功切到：
+   - `status=success`
+   - `handoff_status=success`
+   - `real_cookie_refreshed=true`
+   - `task_restarted=true`
+
+2. 真实 Cookie 成功补全并落库
+   - 成功补出 `_m_h5_tk`
+   - 成功补出 `_m_h5_tk_enc`
+   - 同时拿到 `mtop_partitioned_detect`
+
+3. 账号任务接管成功
+   - `instance_exists=true`
+   - `running=true`
+   - `connection_state=connected`
+   - `ws_ready=true`
+   - `session_ready=true`
+   - `has_current_token=true`
+   - `token_refresh_status=success`
+
+4. 数据库状态正常
+   - `cookies.id='1'`
+   - `bind_status='active'`
+   - `bound_unb='2095002164'`
+
+### D. 关键日志证据
+
+日志文件：
+
+- `logs/xianyu_2026-05-17.log`
+
+关键证据：
+
+- `新增的Cookie字段 (3个): mtop_partitioned_detect, _m_h5_tk, _m_h5_tk_enc`
+- `真实Cookie已成功保存到数据库`
+- `已将真实cookie添加到cookie_manager: 1`
+- `WebSocket连接建立成功，开始初始化...`
+- `Token刷新成功`
+- `新实例启动时初始化 Cookie 刷新基线，避免接管后立刻又触发一次浏览器刷新`
+
+### E. 本轮最小验证
+
+- `pytest tests/test_xianyu_async_browser_runtime.py -q -k "refresh_cookies_from_qr_login_uses_home_and_fresh_tab_to_fill_missing_required_fields or refresh_cookies_from_qr_login_rejects_missing_required_fields_without_persisting or refresh_cookies_via_browser_page_reuses_persistent_profile_during_qr_grace"`
+- `pytest tests/test_xianyu_async_browser_runtime.py -q -k "refresh_cookies_from_qr_login or refresh_cookies_via_browser_page"`
+- `pytest tests/test_qr_login_status_flow.py -q -k "verification_context_options or launch_verification_browser_context_keeps_humanize or proxy_config_uses_account_id_only"`
+
+结果：
+
+- `tests/test_xianyu_async_browser_runtime.py` 相关稳定化用例：通过
+- `tests/test_qr_login_status_flow.py` 二维码上下文 / `account_id` 收口用例：通过
+
+---
+
+## 2026-05-16 本次代码级收口（CloakBrowser 升级 + 登录链路清理）
+
+这轮不是再跑人工扫码，而是把前面已经定位出来的几个“过渡期脏点”真正收掉，避免后面又绕回旧语义。
+
+### A. CloakBrowser 已升级到当前最新版
+
+- Python 包：`cloakbrowser==0.3.28`
+- 本机 runtime：`146.0.7680.177.4`
+- 校验命令：
+  - `python -m pip show cloakbrowser`
+  - `python -m cloakbrowser info`
+
+这一步的目的很直接：把本地 / Docker 后续安装都钉到同一版，别再出现“本机一个 wrapper、容器里另一个 wrapper”的鬼故事。
+
+### B. HTTP Cookie 预检不再写死旧版 Chrome 头
+
+涉及文件：
+
+- `utils/xianyu_slider_stealth.py`
+- `utils/qr_login.py`
+
+本次调整：
+
+1. 新增 `get_runtime_browser_identity()`
+   - 先读 `python -m cloakbrowser info`
+   - 失败再回退到 `cloakbrowser.config`
+   - 动态派生：
+     - `User-Agent`
+     - `sec-ch-ua`
+     - `sec-ch-ua-mobile`
+     - `sec-ch-ua-platform`
+
+2. `probe_cookie_verification_from_cookie()`
+   - 不再写死 `Chrome/133`
+   - 改为复用当前 CloakBrowser runtime 的真实版本信息
+
+3. `generate_headers()`
+   - 二维码登录 API 请求头也统一改成同一套 runtime 身份
+
+这样做的意义是：**HTTP 预检和真实浏览器 runtime 的“浏览器身份”终于对齐了**，不会再出现一边拿旧 133 去探，一边实际浏览器已经是 146 的拧巴状态。
+
+### C. 二维码验证代理严格按 `account_id` 走
+
+涉及文件：
+
+- `utils/qr_login.py`
+
+本次调整：
+
+1. `_resolve_existing_account_proxy_config()`
+   - 只认 `session.account_id`
+   - 删除按 `unb` 反推旧账号代理的 fallback
+
+2. 同时补了一个小坑
+   - 账号分支命中代理配置时，顺手回填 `session.proxy_url`
+   - 避免 `session.proxy_config` 有值但 `session.proxy_url` 没同步，后面又二次解析
+
+一句话：**扫码登录的验证浏览器，现在也和密码登录、Cookie 导入一样，彻底按 `account_id` 收口。**
+
+### D. 清掉 `reply_server.py` 里的死代码 / 脏控制流
+
+本次调整：
+
+1. `_stabilize_password_login_cookies_after_login()`
+   - 删除 `return` 后残留的旧：
+     - `preflight_token_after_password_login()`
+     - `_refresh_cookies_via_browser()`
+   - 顺手修正文案，避免日志还在假装会“继续走旧 async 兜底”
+
+2. `/qr-login/check/{session_id}`
+   - 删除 confirmed 返回后那段不可达的 handoff 分支
+   - 避免后续维护再被这坨死分支带歪
+
+### E. 本次最小验证
+
+- `python -m py_compile utils/xianyu_slider_stealth.py utils/qr_login.py reply_server.py`
+- `pytest tests/test_manual_cookie_import_precheck.py -q`
+- `pytest tests/test_qr_login_status_flow.py -k "profile or proxy_config_uses_account_id_only" -q`
+
+结果：
+
+- 语法通过
+- 新增 / 相关最小测试通过
 
 ---
 

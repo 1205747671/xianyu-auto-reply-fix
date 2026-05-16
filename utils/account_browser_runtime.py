@@ -262,6 +262,22 @@ def _close_sync_page(page: Any) -> None:
     close()
 
 
+def _reuse_runtime_page_if_available(runtime: Any, context: Any, lease_pages: list[Any]) -> Optional[Any]:
+    if lease_pages:
+        return None
+    page = getattr(runtime, "page", None)
+    if page is None:
+        return None
+    if _safe_bool_call(page, "is_closed") is True:
+        runtime.page = None
+        return None
+
+    context_pages = getattr(context, "pages", None)
+    if isinstance(context_pages, (list, tuple)) and context_pages and page not in context_pages:
+        return None
+    return page
+
+
 def _pop_locale_and_timezone(options: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     locale = options.pop("locale", None)
     timezone = options.pop("timezone", None)
@@ -782,15 +798,21 @@ class AccountBrowserRuntimeManager:
     async def get_fresh_page(self, lease: AccountBrowserRuntimeLease) -> Tuple[Any, Any]:
         if lease.released:
             raise RuntimeError("runtime lease has already been released")
-        context = getattr(lease.runtime, "context", None)
+        runtime = lease.runtime
+        context = getattr(runtime, "context", None)
         if context is None:
             raise RuntimeError("runtime context is unavailable")
+        reused_page = _reuse_runtime_page_if_available(runtime, context, lease.pages)
+        if reused_page is not None:
+            lease.pages.append(reused_page)
+            return reused_page, context
         new_page = getattr(context, "new_page", None)
         if not callable(new_page):
             raise RuntimeError("runtime context cannot create pages")
         page = new_page()
         if inspect.isawaitable(page):
             page = await page
+        runtime.page = page
         lease.pages.append(page)
         return page, context
 
@@ -1001,6 +1023,10 @@ class AccountBrowserRuntimeManager:
         closed = _safe_bool_call(context, "is_closed")
         if closed is True:
             raise RuntimeError("runtime context is closed")
+        reused_page = _reuse_runtime_page_if_available(runtime, context, lease.pages)
+        if reused_page is not None:
+            lease.pages.append(reused_page)
+            return reused_page, context
         page = context.new_page()
         runtime.page = page
         lease.pages.append(page)
