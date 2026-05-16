@@ -306,10 +306,12 @@ class ReplyServerAccountScopeContractTest(_ReplyServerModuleBindingMixin, unitte
         self.assertIn('@app.get("/accounts/{account_id}/runtime-status")', source)
         self.assertIn('@app.get("/accounts/{account_id}/conversations/{conversation_id}/history")', source)
         self.assertIn('@app.post("/accounts/{account_id}/session-keepalive")', source)
+        self.assertIn('@app.post("/accounts/{account_id}/token-refresh")', source)
         self.assertNotIn('@app.get("/cookie/{account_id}/details")', source)
         self.assertNotIn('@app.get("/cookies/{account_id}/runtime-status")', source)
         self.assertNotIn('@app.get("/cookies/{account_id}/conversations/{conversation_id}/history")', source)
         self.assertNotIn('@app.post("/cookies/{account_id}/session-keepalive")', source)
+        self.assertNotIn('@app.post("/cookies/{account_id}/token-refresh")', source)
         self.assertNotIn("def _ensure_cookie_access(", source)
         self.assertIn('_ensure_account_access(account_id, current_user, "访问")', source)
         self.assertNotIn("live_instance = XianyuLive.get_instance(account_id)", source)
@@ -828,6 +830,97 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
         current_live.keep_session_alive.assert_awaited_once_with()
         self.assertEqual(run_mock.await_count, 2)
 
+    async def test_trigger_runtime_token_refresh_routes_via_managed_account_runtime(self):
+        current_live = SimpleNamespace(
+            refresh_token=mock.AsyncMock(return_value="token-debug-1"),
+            last_token_refresh_status="success",
+            last_token_refresh_error_message=None,
+        )
+        manager_loop_state = {"active": False}
+
+        def get_instance_only_on_manager_loop(_account_id):
+            if not manager_loop_state["active"]:
+                raise AssertionError("runtime lookup should stay inside manager loop")
+            return current_live
+
+        fake_manager = SimpleNamespace(
+            get_xianyu_instance=mock.Mock(side_effect=get_instance_only_on_manager_loop),
+        )
+
+        async def execute_on_manager_loop(_account_id, coroutine_factory, timeout=None):
+            manager_loop_state["active"] = True
+            access_token = reply_server._MANAGED_LIVE_INSTANCE_ACCESS.set(True)
+            try:
+                return await coroutine_factory()
+            finally:
+                reply_server._MANAGED_LIVE_INSTANCE_ACCESS.reset(access_token)
+                manager_loop_state["active"] = False
+
+        with mock.patch.object(reply_server, "cookie_manager", SimpleNamespace(manager=fake_manager)), \
+             mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-refresh-1"), \
+             mock.patch.object(reply_server, "_run_live_instance_on_manager_loop", side_effect=execute_on_manager_loop) as run_mock, \
+             mock.patch.object(reply_server, "_build_live_runtime_status", mock.AsyncMock(return_value={"running": True})), \
+             mock.patch.object(reply_server, "log_with_user"):
+            response = await reply_server.trigger_runtime_token_refresh(
+                "acc-refresh-1",
+                request=reply_server.RuntimeTokenRefreshRequest(),
+                current_user={"user_id": 1},
+            )
+
+        self.assertTrue(response["success"])
+        self.assertEqual(response["account_id"], "acc-refresh-1")
+        self.assertFalse(response["simulate_captcha"])
+        self.assertEqual(response["result"]["path"], "refresh_token")
+        self.assertEqual(fake_manager.get_xianyu_instance.call_count, 1)
+        current_live.refresh_token.assert_awaited_once_with(allow_password_login_recovery=True)
+        self.assertEqual(run_mock.await_count, 1)
+
+    async def test_trigger_runtime_token_refresh_simulated_captcha_uses_debug_recovery(self):
+        current_live = SimpleNamespace(
+            debug_force_captcha_recovery=mock.AsyncMock(
+                return_value={
+                    "success": True,
+                    "path": "simulated_captcha_password_login_recovery",
+                    "token_received": True,
+                }
+            ),
+        )
+        manager_loop_state = {"active": False}
+
+        def get_instance_only_on_manager_loop(_account_id):
+            if not manager_loop_state["active"]:
+                raise AssertionError("runtime lookup should stay inside manager loop")
+            return current_live
+
+        fake_manager = SimpleNamespace(
+            get_xianyu_instance=mock.Mock(side_effect=get_instance_only_on_manager_loop),
+        )
+
+        async def execute_on_manager_loop(_account_id, coroutine_factory, timeout=None):
+            manager_loop_state["active"] = True
+            access_token = reply_server._MANAGED_LIVE_INSTANCE_ACCESS.set(True)
+            try:
+                return await coroutine_factory()
+            finally:
+                reply_server._MANAGED_LIVE_INSTANCE_ACCESS.reset(access_token)
+                manager_loop_state["active"] = False
+
+        with mock.patch.object(reply_server, "cookie_manager", SimpleNamespace(manager=fake_manager)), \
+             mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-refresh-2"), \
+             mock.patch.object(reply_server, "_run_live_instance_on_manager_loop", side_effect=execute_on_manager_loop), \
+             mock.patch.object(reply_server, "_build_live_runtime_status", mock.AsyncMock(return_value={"running": True})), \
+             mock.patch.object(reply_server, "log_with_user"):
+            response = await reply_server.trigger_runtime_token_refresh(
+                "acc-refresh-2",
+                request=reply_server.RuntimeTokenRefreshRequest(simulate_captcha=True),
+                current_user={"user_id": 1},
+            )
+
+        self.assertTrue(response["success"])
+        self.assertTrue(response["simulate_captcha"])
+        self.assertIn("debug_acc-refresh-2", response["verification_url"])
+        current_live.debug_force_captcha_recovery.assert_awaited_once()
+
     async def test_reset_qr_cookie_refresh_cooldown_routes_runtime_call_via_manager_loop(self):
         live_instance = SimpleNamespace(
             get_qr_cookie_refresh_remaining_time=mock.Mock(return_value=123),
@@ -1076,6 +1169,18 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
 
     async def test_order_history_sync_prefers_managed_runtime_helper_for_detail_refresh(self):
         job_id = "history-sync-job-managed"
+        managed_list_result = {
+            "orders": [{
+                "order_id": "order-history-1",
+                "item_id": "item-history-1",
+                "buyer_id": "buyer-history-1",
+                "buyer_nick": "buyer-history-nick-1",
+                "sid": "sid-history-1",
+            }],
+            "scanned_count": 1,
+            "matched_count": 1,
+            "out_of_range_count": 0,
+        }
         fake_fetcher = SimpleNamespace(
             fetch_recent_orders=mock.AsyncMock(return_value={
                 "orders": [{
@@ -1092,7 +1197,10 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
             fetch_order_detail=mock.AsyncMock(return_value=None),
             close=mock.AsyncMock(),
         )
-        managed_call = mock.AsyncMock(return_value={"order_id": "order-history-1", "order_status": "shipped"})
+        managed_call = mock.AsyncMock(side_effect=[
+            managed_list_result,
+            {"order_id": "order-history-1", "order_status": "shipped"},
+        ])
         job = {
             "request": {
                 "start_date": "2026-05-01",
@@ -1119,9 +1227,11 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
 
         self.assertEqual(job["status"], "completed")
         fetcher_cls.assert_called_once_with("cookie-value", account_id="acc-history-1", headless=True)
-        managed_call.assert_awaited_once()
-        self.assertEqual(managed_call.await_args.args[0], "acc-history-1")
-        self.assertTrue(callable(managed_call.await_args.args[1]))
+        self.assertEqual(managed_call.await_count, 2)
+        self.assertEqual(managed_call.await_args_list[0].args[0], "acc-history-1")
+        self.assertTrue(callable(managed_call.await_args_list[0].args[1]))
+        self.assertEqual(managed_call.await_args_list[1].args[0], "acc-history-1")
+        self.assertTrue(callable(managed_call.await_args_list[1].args[1]))
         fake_fetcher.fetch_order_detail.assert_not_awaited()
         save_detail_mock.assert_called_once_with(
             "acc-history-1",
@@ -1135,6 +1245,136 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
             {"order_id": "order-history-1", "order_status": "shipped"},
         )
         save_candidate_mock.assert_not_called()
+
+    async def test_order_history_sync_prefers_managed_runtime_helper_for_order_list(self):
+        job_id = "history-sync-job-managed-list"
+        managed_list_result = {
+            "orders": [{
+                "order_id": "order-history-list-1",
+                "item_id": "item-history-list-1",
+                "buyer_id": "buyer-history-list-1",
+                "buyer_nick": "buyer-history-list-nick-1",
+                "sid": "sid-history-list-1",
+            }],
+            "scanned_count": 1,
+            "matched_count": 1,
+            "out_of_range_count": 0,
+        }
+        fake_fetcher = SimpleNamespace(
+            fetch_recent_orders=mock.AsyncMock(return_value={
+                "orders": [],
+                "scanned_count": 0,
+                "matched_count": 0,
+                "out_of_range_count": 0,
+            }),
+            fetch_order_detail=mock.AsyncMock(return_value=None),
+            close=mock.AsyncMock(),
+        )
+        managed_call = mock.AsyncMock(side_effect=[
+            managed_list_result,
+            {"order_id": "order-history-list-1", "order_status": "shipped"},
+        ])
+        job = {
+            "request": {
+                "start_date": "2026-05-01",
+                "end_date": "2026-05-02",
+                "account_id": "acc-history-list-1",
+                "max_orders": 1,
+                "fetch_details": True,
+            },
+            "user_info": {"user_id": 1},
+            "status": "queued",
+        }
+        reply_server.order_history_sync_jobs[job_id] = job
+        try:
+            with mock.patch.object(reply_server.db_manager, "get_all_cookies", return_value={"acc-history-list-1": "cookie-value"}), \
+                 mock.patch("utils.order_history_sync.OrderHistoryPageFetcher", return_value=fake_fetcher) as fetcher_cls, \
+                 mock.patch.object(reply_server, "_run_managed_live_instance_call", managed_call), \
+                 mock.patch.object(reply_server, "_save_history_order_detail_result", return_value=True) as save_detail_mock, \
+                 mock.patch.object(reply_server, "_save_history_order_candidate", return_value=True) as save_candidate_mock, \
+                 mock.patch.object(reply_server, "_cleanup_order_history_sync_jobs"):
+                await reply_server._run_order_history_sync_job(job_id)
+        finally:
+            reply_server.order_history_sync_jobs.pop(job_id, None)
+            reply_server.order_history_sync_tasks.pop(job_id, None)
+
+        self.assertEqual(job["status"], "completed")
+        fetcher_cls.assert_called_once_with("cookie-value", account_id="acc-history-list-1", headless=True)
+        self.assertEqual(managed_call.await_count, 2)
+        self.assertEqual(managed_call.await_args_list[0].args[0], "acc-history-list-1")
+        self.assertTrue(callable(managed_call.await_args_list[0].args[1]))
+        fake_fetcher.fetch_recent_orders.assert_not_awaited()
+        fake_fetcher.fetch_order_detail.assert_not_awaited()
+        save_detail_mock.assert_called_once_with(
+            "acc-history-list-1",
+            {
+                "order_id": "order-history-list-1",
+                "item_id": "item-history-list-1",
+                "buyer_id": "buyer-history-list-1",
+                "buyer_nick": "buyer-history-list-nick-1",
+                "sid": "sid-history-list-1",
+            },
+            {"order_id": "order-history-list-1", "order_status": "shipped"},
+        )
+        save_candidate_mock.assert_not_called()
+
+    async def test_order_history_sync_falls_back_to_fetcher_when_managed_order_list_missing(self):
+        job_id = "history-sync-job-list-fallback"
+        fake_fetcher = SimpleNamespace(
+            fetch_recent_orders=mock.AsyncMock(return_value={
+                "orders": [{
+                    "order_id": "order-history-list-2",
+                    "item_id": "item-history-list-2",
+                    "buyer_id": "buyer-history-list-2",
+                    "buyer_nick": "buyer-history-list-nick-2",
+                    "sid": "sid-history-list-2",
+                }],
+                "scanned_count": 1,
+                "matched_count": 1,
+                "out_of_range_count": 0,
+            }),
+            fetch_order_detail=mock.AsyncMock(return_value=None),
+            close=mock.AsyncMock(),
+        )
+        managed_call = mock.AsyncMock(side_effect=[
+            reply_server.HTTPException(status_code=400, detail="账号未启动，暂无法执行当前操作"),
+        ])
+        job = {
+            "request": {
+                "start_date": "2026-05-01",
+                "end_date": "2026-05-02",
+                "account_id": "acc-history-list-2",
+                "max_orders": 1,
+                "fetch_details": False,
+            },
+            "user_info": {"user_id": 1},
+            "status": "queued",
+        }
+        reply_server.order_history_sync_jobs[job_id] = job
+        try:
+            with mock.patch.object(reply_server.db_manager, "get_all_cookies", return_value={"acc-history-list-2": "cookie-value"}), \
+                 mock.patch("utils.order_history_sync.OrderHistoryPageFetcher", return_value=fake_fetcher), \
+                 mock.patch.object(reply_server, "_run_managed_live_instance_call", managed_call), \
+                 mock.patch.object(reply_server, "_save_history_order_candidate", return_value=True) as save_candidate_mock, \
+                 mock.patch.object(reply_server, "_cleanup_order_history_sync_jobs"):
+                await reply_server._run_order_history_sync_job(job_id)
+        finally:
+            reply_server.order_history_sync_jobs.pop(job_id, None)
+            reply_server.order_history_sync_tasks.pop(job_id, None)
+
+        self.assertEqual(job["status"], "completed")
+        managed_call.assert_awaited_once()
+        fake_fetcher.fetch_recent_orders.assert_awaited_once()
+        save_candidate_mock.assert_called_once_with(
+            "acc-history-list-2",
+            {
+                "order_id": "order-history-list-2",
+                "item_id": "item-history-list-2",
+                "buyer_id": "buyer-history-list-2",
+                "buyer_nick": "buyer-history-list-nick-2",
+                "sid": "sid-history-list-2",
+            },
+        )
 
     async def test_order_history_sync_falls_back_to_fetcher_when_managed_runtime_missing(self):
         job_id = "history-sync-job-fallback"
@@ -1182,7 +1422,7 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
             reply_server.order_history_sync_tasks.pop(job_id, None)
 
         self.assertEqual(job["status"], "completed")
-        managed_call.assert_awaited_once()
+        self.assertEqual(managed_call.await_count, 2)
         fake_fetcher.fetch_order_detail.assert_awaited_once_with("order-history-2", force_refresh=True)
         save_detail_mock.assert_called_once_with(
             "acc-history-2",
@@ -1250,7 +1490,15 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
             fetch_order_detail=mock.AsyncMock(return_value=None),
             close=mock.AsyncMock(),
         )
-        managed_call = mock.AsyncMock(side_effect=RuntimeError("detail boom"))
+        managed_call = mock.AsyncMock(side_effect=[
+            {
+                "orders": [candidate],
+                "scanned_count": 1,
+                "matched_count": 1,
+                "out_of_range_count": 0,
+            },
+            RuntimeError("detail boom"),
+        ])
         job = {
             "request": {
                 "start_date": "2026-05-01",
@@ -1276,7 +1524,7 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
             reply_server.order_history_sync_tasks.pop(job_id, None)
 
         self.assertEqual(job["status"], "completed")
-        managed_call.assert_awaited_once()
+        self.assertEqual(managed_call.await_count, 2)
         fake_fetcher.fetch_order_detail.assert_not_awaited()
         save_detail_mock.assert_not_called()
         save_candidate_mock.assert_called_once_with("acc-history-3", candidate)

@@ -65,6 +65,9 @@ class _FakeMouse:
         if self._on_click:
             self._on_click()
 
+    def move(self, *_args, **_kwargs):
+        return None
+
 
 class _FakePage:
     def __init__(self, *, title="", url="", selectors=None):
@@ -649,6 +652,46 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         self.assertEqual(slider.last_verification_feedback.get("source"), "feedback_block")
 
     @mock.patch("utils.xianyu_slider_stealth.time.sleep", return_value=None)
+    def test_wait_for_context_login_recovers_recoverable_punish_shell_before_failing_fast(self, _mock_sleep):
+        page = _RecoverablePunishPage()
+        verify_frame = _FakeVerificationFrame(
+            verification_type="qr_verify",
+            verify_url=page.url,
+        )
+        success_cookies = {
+            "unb": "u",
+            "sgcookie": "s",
+            "cookie2": "c2",
+            "_m_h5_tk": "tk",
+            "_m_h5_tk_enc": "tk_enc",
+            "t": "t_cookie",
+        }
+        slider = self._make_slider(page)
+        slider.last_login_error = ""
+        slider._select_monitor_page = lambda _context, fallback_page=None: fallback_page or page
+        slider._attempt_solve_slider_on_page = lambda _page: False
+        slider._probe_context_login_success = lambda _context, _page: (True, page, dict(success_cookies))
+        slider._detect_pending_identity_verification_cookie_state = lambda _cookies: []
+        slider._detect_qr_code_verification = lambda _page: (True, verify_frame)
+        slider._verification_target_is_timed_out = lambda _frame, fallback_page=None: False
+        slider._notify_verification_required = lambda *_args, **_kwargs: None
+        slider._merge_runtime_feedback = lambda *_args, **_kwargs: None
+
+        login_success, success_page = slider._wait_for_context_login(
+            context=object(),
+            fallback_page=page,
+            max_wait_time=10,
+            check_interval=1,
+            verification_type="qr_verify",
+            verification_url=verify_frame.verify_url,
+        )
+
+        self.assertTrue(login_success)
+        self.assertIs(success_page, page)
+        self.assertTrue(page.activated)
+        self.assertNotEqual(slider.last_verification_feedback.get("status"), "hard_block")
+
+    @mock.patch("utils.xianyu_slider_stealth.time.sleep", return_value=None)
     def test_wait_for_context_login_fast_fails_on_access_denied_page_without_active_verification_frame(self, _mock_sleep):
         page = _AccessDeniedPage()
         slider = self._make_slider(page)
@@ -769,6 +812,30 @@ class SliderVerificationGuardsTest(unittest.TestCase):
                     self.assertEqual(remaining, [self._normalize_path(current_path)])
                 else:
                     self.assertEqual(remaining, [])
+
+    @mock.patch("utils.xianyu_slider_stealth.time.sleep", return_value=None)
+    def test_process_verification_requirement_recovers_recoverable_punish_shell_before_failing(self, _mock_sleep):
+        page = _RecoverablePunishPage()
+        slider = self._make_slider(page)
+        slider._verification_target_is_timed_out = lambda _frame, fallback_page=None: False
+        slider._notify_verification_required = lambda *_args, **_kwargs: None
+        slider._wait_for_context_login = lambda *args, **kwargs: (True, page)
+        slider._finalize_logged_in_cookies = lambda *args, **kwargs: {"cookie2": "ok"}
+
+        qr_frame = _FakeVerificationFrame(
+            verification_type="face_verify",
+            verify_url=page.url,
+        )
+
+        result = slider._process_verification_requirement(
+            context=object(),
+            fallback_page=page,
+            qr_frame=qr_frame,
+        )
+
+        self.assertEqual(result, {"cookie2": "ok"})
+        self.assertTrue(page.activated)
+        self.assertNotEqual(slider.last_verification_feedback.get("status"), "hard_block")
 
     def test_finalize_logged_in_cookies_fails_when_session_still_unready(self):
         page = _FakePage(title="闲鱼消息", url="https://www.goofish.com/im")
@@ -1541,6 +1608,58 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         )
 
         self.assertIsNone(result)
+
+
+class SliderRunInlineVerificationProbeTest(unittest.TestCase):
+    @mock.patch("utils.xianyu_slider_stealth.time.sleep", return_value=None)
+    @mock.patch("utils.xianyu_slider_stealth.random.uniform", return_value=0.3)
+    @mock.patch("utils.xianyu_slider_stealth.random.randint", return_value=600)
+    def test_run_recovers_success_when_verification_probe_solves_slider_inline(
+        self,
+        _mock_randint,
+        _mock_uniform,
+        _mock_sleep,
+    ):
+        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
+        page = _FakePage(
+            title="验证码拦截",
+            url="https://passport.goofish.com/verify",
+        )
+        slider.pure_user_id = "inline_probe_success"
+        slider.page = page
+        slider.context = object()
+        slider.headless = True
+        slider.disable_headless_warmup = True
+        slider.slider_max_retries = 4
+        slider.last_login_error = ""
+        slider.last_verification_feedback = {}
+        slider._managed_runtime_binding = object()
+        slider._check_date_validity = mock.Mock(return_value=True)
+        slider._warmup_slider_context = mock.Mock()
+        slider._is_hard_block_page = mock.Mock(return_value=False)
+        slider._simulate_human_page_behavior = mock.Mock()
+        slider.solve_slider = mock.Mock(return_value=False)
+        slider._should_abort_token_refresh_slider_flow_after_failure = mock.Mock(return_value=(False, ""))
+        slider._select_monitor_page = mock.Mock(side_effect=lambda _context, fallback=None: fallback or page)
+        slider._probe_context_login_success = mock.Mock(return_value=(True, page, {}))
+        slider._finalize_logged_in_cookies = mock.Mock(return_value={"cookie2": "browser_cookie2"})
+        slider.close_browser = mock.Mock()
+
+        def detect_side_effect(_monitor_page):
+            slider.last_verification_feedback = {
+                "status": "success",
+                "source": "container_missing",
+                "message": "滑块容器已消失",
+            }
+            return False, None
+
+        slider._detect_qr_code_verification = mock.Mock(side_effect=detect_side_effect)
+
+        result = slider.run("https://passport.goofish.com/verify")
+
+        self.assertEqual(result, (True, {"cookie2": "browser_cookie2"}))
+        slider._finalize_logged_in_cookies.assert_called_once()
+        slider.close_browser.assert_called_once_with()
 
 if __name__ == "__main__":
     unittest.main()

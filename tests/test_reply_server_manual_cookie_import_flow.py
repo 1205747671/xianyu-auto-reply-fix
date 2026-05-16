@@ -989,6 +989,11 @@ class _FakePasswordLoginPreflightSuccessLive:
     def reset_qr_cookie_refresh_flag(self):
         type(self).reset_calls += 1
 
+    @staticmethod
+    def mark_manual_refresh_handoff(account_id=None, source='manual_refresh_handoff', ttl=None):
+        _ = account_id, source, ttl
+        return {"updated": True, "phase": "handoff_recovery"}
+
     async def _refresh_cookies_via_browser(self, triggered_by_refresh_token=False):
         _ = triggered_by_refresh_token
         type(self).browser_refresh_calls += 1

@@ -787,3 +787,98 @@ docker compose -f docker-compose-cn.yml up -d --build
 - **真实远端滑块一定每次都能自动过**
 
 这俩别混一块，不然脑袋一热又容易把“恢复链路验证”吹成“真实滑块通过率验证”，那就有点扯了。
+
+---
+
+## 2026-05-16 历史订单链路专项排查结论
+
+### 结论
+
+本轮已确认：
+
+1. `account_id=1` 的 **runtime / token / websocket / 消息流本身正常**
+2. 历史订单同步失败的根因，**不是** 指纹浏览器数据没复用，也 **不是** Cookie 丢失
+3. 真正的问题是：当前账号访问
+   - `https://seller.goofish.com/?site=COMMONPRO#/seller-trade/order-manage`
+   时，页面会进入 **无权限页**
+4. 因此后续调用
+   - `mtop.taobao.idle.trade.merchant.sold.get`
+   返回 `PERMISSION_EXCEPTION::无权限访问`
+   是账号对该卖家工作台域无权限，不是请求参数细节问题
+
+### 本轮真实验证
+
+- 服务健康检查正常时，`/accounts/1/runtime-status` 显示：
+  - `connection_state=connected`
+  - `ws_ready=true`
+  - `session_ready=true`
+  - `has_current_token=true`
+- 真实调用：
+  - `POST /api/orders/history-sync`
+  - `account_id=1`
+  - 仍然失败
+- 直接用当前 `account_id=1` 的 Cookie 做两类验证：
+  - 纯 HTTP 请求 `mtop.taobao.idle.trade.merchant.sold.get`
+  - 浏览器上下文内 `fetch(...)`
+  - 结果都一致：`PERMISSION_EXCEPTION::无权限访问`
+
+### 页面级证据
+
+无头浏览器打开卖家工作台后，约 5 秒内可稳定观察到：
+
+- 页面正文包含：
+  - `当前账号没有访问权限`
+  - `请切换账号重试，或联系对接人员确认`
+- 最终 URL 会进入：
+  - `#/no-permission?...`
+- 页面标题会变成：
+  - `禁止访问`
+
+这说明当前账号在 **seller.goofish.com 卖家工作台** 这条链路上本身就没有权限。
+
+### 代码侧本轮调整
+
+本轮已在 `utils/order_history_sync.py` 增加保护：
+
+1. 历史订单列表浏览器预热页增加 **无权限页识别**
+2. 如果页面已经进入 seller workbench 的 `no-permission` / “当前账号没有访问权限”态：
+   - 直接报明确错误
+   - 不再继续把问题伪装成普通 Cookie 鉴权失败
+3. 当列表 API 返回 `PERMISSION_EXCEPTION` 时，也会再次结合页面正文做判断
+
+### 新增测试
+
+新增测试文件：
+
+- `tests/test_order_history_sync_browser.py`
+
+覆盖点：
+
+1. 预热页直接显示“当前账号没有访问权限”时，历史订单抓取快速失败
+2. 列表 API 返回 `PERMISSION_EXCEPTION` 且页面正文已显示无权限时，报错明确落到“卖家工作台无权限访问”
+
+### 对订单链路的实际影响
+
+要分清两件事：
+
+1. **实时订单链路**
+   - 主要来源于 IM / WebSocket 消息
+   - 识别订单 ID 后再抓订单详情落库
+   - 这条链路不依赖 seller 工作台历史列表
+2. **历史订单补录链路**
+   - 当前实现依赖 seller workbench 的 `merchant.sold.get`
+   - 对 `account_id=1` 来说，这条路当前走不通
+
+所以现状是：
+
+- 实时订单 / 后续订单详情链路可以正常工作
+- 历史订单列表同步会因为 seller workbench 无权限而失败
+
+### 后续建议
+
+如果后面要继续做“历史订单补录”，不要再默认认定是浏览器画像、Cookie、Token 或 runtime 复用的问题，先看账号对 seller 工作台有没有权限。
+
+更稳的方向有两个：
+
+1. 继续依赖 **实时消息 + 订单详情增量沉淀**
+2. 另找 **非 seller.goofish 工作台域** 的历史订单来源，再做接入验证

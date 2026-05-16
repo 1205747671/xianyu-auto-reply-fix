@@ -5818,7 +5818,10 @@ class XianyuSliderStealth:
                     continue
                 if hard_block_target is not None and candidate_target is hard_block_target:
                     continue
-                hard_block = self._detect_special_captcha_block(candidate_target)
+                hard_block = self._resolve_special_captcha_block_with_recovery(
+                    candidate_target,
+                    "验证等待轮询",
+                )
                 if hard_block:
                     hard_block_target = candidate_target
                     hard_block_url = (
@@ -6147,7 +6150,10 @@ class XianyuSliderStealth:
                 continue
             if hard_block_target is not None and candidate_target is hard_block_target:
                 continue
-            hard_block = self._detect_special_captcha_block(candidate_target)
+            hard_block = self._resolve_special_captcha_block_with_recovery(
+                candidate_target,
+                "验证页进入前检查",
+            )
             if hard_block:
                 hard_block_target = candidate_target
                 break
@@ -7783,15 +7789,8 @@ class XianyuSliderStealth:
             return False
 
         try:
-            special_block = self._detect_special_captcha_block(target_page)
-            special_block = self._wait_for_punish_slider_dom_ready_if_needed(
+            special_block = self._resolve_special_captcha_block_with_recovery(
                 target_page,
-                special_block,
-                "初始页面拦截判定",
-            )
-            special_block = self._recover_punish_slider_shell_if_possible(
-                target_page,
-                special_block,
                 "初始页面拦截判定",
             )
             if special_block:
@@ -8007,6 +8006,29 @@ class XianyuSliderStealth:
 
         return None
 
+    def _resolve_special_captcha_block_with_recovery(
+        self,
+        target,
+        context_label: str,
+        max_wait_seconds: float = 1.2,
+        poll_interval: float = 0.25,
+    ) -> Optional[Dict[str, Any]]:
+        """统一处理 pureCaptcha 壳页恢复，避免不同流程前后判定打架。"""
+        current_block = self._detect_special_captcha_block(target)
+        current_block = self._wait_for_punish_slider_dom_ready_if_needed(
+            target,
+            current_block,
+            context_label,
+            max_wait_seconds=max_wait_seconds,
+            poll_interval=poll_interval,
+        )
+        current_block = self._recover_punish_slider_shell_if_possible(
+            target,
+            current_block,
+            context_label,
+        )
+        return current_block
+
     def _has_recoverable_punish_slider_shell(self, target) -> bool:
         """识别 pureCaptcha 壳页里仍可被点活的滑块容器。"""
         if not target:
@@ -8200,15 +8222,8 @@ class XianyuSliderStealth:
             if not fast_mode:
                 time.sleep(0.1)
 
-            current_block = self._detect_special_captcha_block(self.page)
-            current_block = self._wait_for_punish_slider_dom_ready_if_needed(
+            current_block = self._resolve_special_captcha_block_with_recovery(
                 self.page,
-                current_block,
-                "主页面滑块探测",
-            )
-            current_block = self._recover_punish_slider_shell_if_possible(
-                self.page,
-                current_block,
                 "主页面滑块探测",
             )
             if current_block:
@@ -8234,15 +8249,8 @@ class XianyuSliderStealth:
                 frames = self.page.frames
                 for idx, frame in enumerate(frames):
                     try:
-                        frame_block = self._detect_special_captcha_block(frame)
-                        frame_block = self._wait_for_punish_slider_dom_ready_if_needed(
+                        frame_block = self._resolve_special_captcha_block_with_recovery(
                             frame,
-                            frame_block,
-                            f"Frame {idx} 滑块探测",
-                        )
-                        frame_block = self._recover_punish_slider_shell_if_possible(
-                            frame,
-                            frame_block,
                             f"Frame {idx} 滑块探测",
                         )
                         if frame_block:
@@ -9435,15 +9443,8 @@ class XianyuSliderStealth:
                 last_attempt = attempt
                 logger.info(f"【{self.pure_user_id}】开始处理滑块验证... (第{attempt}/{max_retries}次尝试)")
 
-                current_block = self._detect_special_captcha_block(self.page)
-                current_block = self._wait_for_punish_slider_dom_ready_if_needed(
+                current_block = self._resolve_special_captcha_block_with_recovery(
                     self.page,
-                    current_block,
-                    f"滑块第{attempt}次尝试起始页",
-                )
-                current_block = self._recover_punish_slider_shell_if_possible(
-                    self.page,
-                    current_block,
                     f"滑块第{attempt}次尝试起始页",
                 )
                 if current_block:
@@ -11859,6 +11860,67 @@ class XianyuSliderStealth:
         """兼容旧入口，转发到 `login_with_password_browser()`。"""
         return self.login_with_password_browser(account, password, show_browser=show_browser, **kwargs)
 
+    def _consume_inline_slider_success_after_verification_probe(
+        self,
+        context,
+        monitor_page,
+        *,
+        notification_callback: Optional[Callable] = None,
+        notification_scene: str = '手动导入 Cookie',
+        success_scene: str = '验证页内联滑块补处理',
+    ) -> Optional[Tuple[bool, Any]]:
+        """处理 `_detect_qr_code_verification()` 内部已自动过滑块、但未直接返回业务结果的场景。"""
+        feedback = self.last_verification_feedback or {}
+        if str(feedback.get("status") or "").strip().lower() != "success":
+            return None
+
+        accepted_sources = {
+            "frame_detached",
+            "container_missing",
+            "page_changed",
+            "login_element_detected",
+            "context_login_confirmed",
+            "soft_success_cookie_pending",
+        }
+        feedback_source = str(feedback.get("source") or "").strip()
+        if feedback_source not in accepted_sources:
+            return None
+
+        logger.info(
+            f"【{self.pure_user_id}】检测到验证探测阶段已内联处理滑块成功，"
+            f"继续补做登录态/身份验证收口: source={feedback_source}"
+        )
+
+        active_monitor_page = self._select_monitor_page(context, monitor_page) or monitor_page
+        login_success, active_page, _ = self._probe_context_login_success(context, active_monitor_page)
+        if login_success:
+            logger.success(f"【{self.pure_user_id}】✅ 内联滑块通过后已确认登录态，继续获取 Cookie")
+            return True, self._finalize_logged_in_cookies(
+                context,
+                active_page or active_monitor_page,
+                scene=success_scene,
+                notification_callback=notification_callback,
+                notification_scene=notification_scene,
+            )
+
+        refreshed_monitor_page = self._select_monitor_page(
+            context,
+            active_page or active_monitor_page,
+        ) or active_page or active_monitor_page
+        has_qr, qr_frame = self._detect_qr_code_verification(refreshed_monitor_page)
+        if has_qr:
+            logger.warning(f"【{self.pure_user_id}】内联滑块通过后进入身份验证页，转入验证等待流程")
+            return True, self._process_verification_requirement(
+                context,
+                refreshed_monitor_page,
+                qr_frame,
+                notification_callback=notification_callback,
+                notification_scene=notification_scene,
+            )
+
+        logger.warning(f"【{self.pure_user_id}】内联滑块通过后仍未确认登录态，也未发现身份验证页")
+        return False, None
+
     def run(
         self,
         url: str,
@@ -11947,6 +12009,16 @@ class XianyuSliderStealth:
                         )
                         if verification_result:
                             return True, verification_result
+                    else:
+                        inline_slider_result = self._consume_inline_slider_success_after_verification_probe(
+                            self.context,
+                            monitor_page,
+                            notification_callback=notification_callback,
+                            notification_scene=notification_scene,
+                            success_scene="验证页处罚态滑块补处理",
+                        )
+                        if inline_slider_result is not None:
+                            return inline_slider_result
                     return False, None
 
                 self._simulate_human_page_behavior()
@@ -11984,6 +12056,15 @@ class XianyuSliderStealth:
                         if verification_result:
                             return True, verification_result
                         return False, None
+                    inline_slider_result = self._consume_inline_slider_success_after_verification_probe(
+                        self.context,
+                        monitor_page,
+                        notification_callback=notification_callback,
+                        notification_scene=notification_scene,
+                        success_scene="滑块通过后验证页补处理",
+                    )
+                    if inline_slider_result is not None:
+                        return inline_slider_result
                     
                     # 在关闭浏览器前获取cookie
                     try:
@@ -12010,6 +12091,16 @@ class XianyuSliderStealth:
                         )
                         if verification_result:
                             return True, verification_result
+                    else:
+                        inline_slider_result = self._consume_inline_slider_success_after_verification_probe(
+                            self.context,
+                            monitor_page,
+                            notification_callback=notification_callback,
+                            notification_scene=notification_scene,
+                            success_scene="滑块失败后验证页补处理",
+                        )
+                        if inline_slider_result is not None:
+                            return inline_slider_result
                     self._save_debug_snapshot("run_failed", getattr(self, "_detected_slider_frame", None))
                 
                 return success, cookies
@@ -12029,6 +12120,15 @@ class XianyuSliderStealth:
                     if verification_result:
                         return True, verification_result
                     return False, None
+                inline_slider_result = self._consume_inline_slider_success_after_verification_probe(
+                    self.context,
+                    monitor_page,
+                    notification_callback=notification_callback,
+                    notification_scene=notification_scene,
+                    success_scene="无验证码页验证探测补处理",
+                )
+                if inline_slider_result is not None:
+                    return inline_slider_result
                 return True, None
                 
         except Exception as e:

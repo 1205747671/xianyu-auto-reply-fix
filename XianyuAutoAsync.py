@@ -5684,6 +5684,115 @@ class XianyuLive:
                 allow_password_login_recovery=allow_password_login_recovery,
             )
 
+    async def debug_force_captcha_recovery(
+        self,
+        verification_url: str,
+        allow_password_login_recovery: bool = True,
+    ) -> Dict[str, Any]:
+        current_account_id = self._canonical_account_id()
+        log_account_id = current_account_id or "default"
+        if not current_account_id:
+            logger.error(f"【{log_account_id}】调试模拟滑块恢复缺少 canonical account_id")
+            return {
+                "success": False,
+                "path": "missing_account_id",
+                "token_received": False,
+                "slider_success": False,
+                "password_login_recovered": False,
+                "last_token_refresh_status": "missing_account_id",
+                "last_token_refresh_error_message": "missing canonical account_id for debug captcha recovery",
+            }
+
+        target_verification_url = str(verification_url or "").strip()
+        if not target_verification_url:
+            target_verification_url = (
+                "https://h5api.m.goofish.com/mtop.taobao.idlemessage.pc.login.token/"
+                f"punish?x5step=2&action=captcha&pureCaptcha=true&x5secdata=debug_{current_account_id}"
+            )
+
+        logger.warning(
+            f"【{log_account_id}】开始调试模拟 Token 刷新命中滑块: "
+            f"verification_url={target_verification_url}"
+        )
+        self.last_token_refresh_status = "debug_simulated_captcha_started"
+        self.last_token_refresh_error_message = None
+
+        fake_res_json = {
+            "ret": ["FAIL_SYS_USER_VALIDATE::DEBUG_SIMULATED_CAPTCHA"],
+            "data": {
+                "url": target_verification_url,
+            },
+        }
+        risk_session_id = self._new_risk_session_id("slider")
+        slider_error_message = None
+
+        try:
+            new_cookies_str = await self._handle_captcha_verification(fake_res_json)
+            if new_cookies_str:
+                logger.info(f"【{log_account_id}】调试模拟滑块链路返回新 Cookie，准备继续刷新 Token")
+                await self._restart_instance()
+                settle_delay = random.uniform(*self.post_slider_token_retry_delay)
+                await asyncio.sleep(settle_delay)
+                self._reload_latest_cookies_from_db("debug_simulated_captcha_success")
+                token = await self.refresh_token(
+                    allow_password_login_recovery=allow_password_login_recovery,
+                )
+                return {
+                    "success": bool(token),
+                    "path": "simulated_captcha_slider_success",
+                    "token_received": bool(token),
+                    "slider_success": True,
+                    "password_login_recovered": False,
+                    "verification_url": target_verification_url,
+                    "last_token_refresh_status": self.last_token_refresh_status,
+                    "last_token_refresh_error_message": self.last_token_refresh_error_message,
+                }
+            slider_error_message = (
+                getattr(self, "last_token_refresh_error_message", None)
+                or "slider_verification_returned_empty_cookie"
+            )
+            logger.warning(f"【{log_account_id}】调试模拟滑块链路未拿到新 Cookie: {slider_error_message}")
+        except Exception as debug_captcha_error:
+            slider_error_message = self._safe_str(debug_captcha_error)
+            logger.error(f"【{log_account_id}】调试模拟滑块链路异常: {slider_error_message}")
+
+        self.last_token_refresh_status = "debug_simulated_captcha_failed"
+        self.last_token_refresh_error_message = slider_error_message or "debug simulated captcha failed"
+
+        if allow_password_login_recovery:
+            logger.warning(f"【{log_account_id}】调试模拟滑块失败，改走账号密码恢复链路")
+            refresh_success = await self._try_password_login_refresh(
+                "调试模拟滑块验证失败",
+                risk_session_id=risk_session_id,
+                trigger_scene="token_refresh_debug",
+                ignore_slider_failed_backoff=True,
+            )
+            if refresh_success:
+                token = await self.refresh_token(
+                    allow_password_login_recovery=allow_password_login_recovery,
+                )
+                return {
+                    "success": bool(token),
+                    "path": "simulated_captcha_password_login_recovery",
+                    "token_received": bool(token),
+                    "slider_success": False,
+                    "password_login_recovered": True,
+                    "verification_url": target_verification_url,
+                    "last_token_refresh_status": self.last_token_refresh_status,
+                    "last_token_refresh_error_message": self.last_token_refresh_error_message,
+                }
+
+        return {
+            "success": False,
+            "path": "simulated_captcha_failed",
+            "token_received": False,
+            "slider_success": False,
+            "password_login_recovered": False,
+            "verification_url": target_verification_url,
+            "last_token_refresh_status": self.last_token_refresh_status,
+            "last_token_refresh_error_message": self.last_token_refresh_error_message,
+        }
+
     def _is_auth_failure_ret(self, ret_value: Any) -> bool:
         if isinstance(ret_value, str):
             ret_text = ret_value
@@ -7118,6 +7227,20 @@ class XianyuLive:
                     f"【{log_account_id}】{reuse_account_persistent_profile_reason}，"
                     "优先复用账号持久化画像，禁用干净上下文"
                 )
+                try:
+                    invalidated = await slider._run_sync_method_on_fresh_thread(
+                        account_browser_runtime_manager.invalidate_runtime_sync,
+                        resolved_account_id,
+                        reason="password_login_refresh_prepare",
+                    )
+                    if invalidated:
+                        logger.info(f"【{log_account_id}】密码登录刷新前已主动失效旧的账号级浏览器 runtime")
+                        await asyncio.sleep(0.8)
+                except Exception as invalidate_error:
+                    logger.warning(
+                        f"【{log_account_id}】密码登录刷新前失效账号级浏览器 runtime 失败，继续尝试启动新 runtime: "
+                        f"{self._safe_str(invalidate_error)}"
+                    )
             result = await slider._run_sync_method_on_fresh_thread(
                 self._run_password_login_with_managed_runtime,
                 slider=slider,
@@ -9497,6 +9620,76 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"【{self.account_id}】免拼发货模块调用失败: {self._safe_str(e)}")
             return {"error": f"免拼发货模块调用失败: {self._safe_str(e)}", "order_id": order_id}
+
+    async def fetch_recent_order_history_candidates(
+        self,
+        max_orders: int = 100,
+        utc_start: str = None,
+        utc_end_exclusive: str = None,
+    ):
+        current_account_id = self._canonical_account_id()
+        if not current_account_id:
+            logger.error("【default】历史订单列表抓取缺少 canonical account_id，拒绝继续运行")
+            return {
+                "orders": [],
+                "scanned_count": 0,
+                "matched_count": 0,
+                "out_of_range_count": 0,
+                "pages_scanned": 0,
+                "stopped_by_range": False,
+            }
+
+        runtime_lease = None
+        history_fetcher = None
+        try:
+            from utils.order_history_sync import OrderHistoryPageFetcher
+
+            history_fetcher = OrderHistoryPageFetcher(
+                self.cookies_str,
+                account_id=current_account_id,
+                headless=True,
+            )
+            runtime_lease = await account_browser_runtime_manager.acquire_runtime(
+                current_account_id,
+                "order_history_sync",
+                exclusive=False,
+                runtime_request={
+                    "headless": True,
+                    "cookie_string": self.cookies_str,
+                    "account_id": current_account_id,
+                },
+            )
+            page, context = await account_browser_runtime_manager.get_fresh_page(runtime_lease)
+            fetch_result = await history_fetcher.fetch_recent_orders_via_browser(
+                page,
+                context,
+                max_orders=max_orders,
+                utc_start=utc_start,
+                utc_end_exclusive=utc_end_exclusive,
+            )
+
+            if history_fetcher.cookie_string and history_fetcher.cookie_string != self.cookies_str:
+                self._set_runtime_cookie_state(
+                    cookies_str=history_fetcher.cookie_string,
+                    cookies_dict=history_fetcher.cookies,
+                    source="order_history_sync_browser",
+                )
+
+            return fetch_result
+        finally:
+            if history_fetcher is not None:
+                try:
+                    await history_fetcher.close()
+                except Exception as close_error:
+                    logger.warning(f"【{current_account_id}】关闭历史订单抓取器失败: {self._safe_str(close_error)}")
+            if runtime_lease is not None:
+                try:
+                    await account_browser_runtime_manager.release_runtime(
+                        runtime_lease,
+                        reason="order_history_sync_finished",
+                    )
+                except Exception as release_error:
+                    logger.warning(f"【{current_account_id}】释放历史订单 runtime lease 失败: {self._safe_str(release_error)}")
 
     async def fetch_order_detail_info(self, order_id: str, item_id: str = None, buyer_id: str = None, debug_headless: bool = None, sid: str = None, force_refresh: bool = False, buyer_nick: str = None, buyer_id_source: str = None):
         current_account_id = self._canonical_account_id()

@@ -2488,6 +2488,12 @@ class ManualCookieImportRequest(BaseModel):
     show_browser: bool = False
 
 
+class RuntimeTokenRefreshRequest(BaseModel):
+    simulate_captcha: bool = False
+    verification_url: Optional[str] = None
+    allow_password_login_recovery: bool = True
+
+
 class QRLoginGenerateRequest(BaseModel):
     account_id: Optional[str] = None
 
@@ -3528,6 +3534,79 @@ async def trigger_session_keepalive(account_id: str, current_user: Dict[str, Any
         raise HTTPException(status_code=400, detail=safe_client_error("手动轻量保活失败，请稍后重试"))
 
 
+def _build_debug_token_refresh_verification_url(account_id: str) -> str:
+    safe_account_id = re.sub(r"[^0-9A-Za-z_-]", "", str(account_id or "").strip()) or "debug"
+    return (
+        "https://h5api.m.goofish.com/mtop.taobao.idlemessage.pc.login.token/"
+        f"punish?x5step=2&action=captcha&pureCaptcha=true&x5secdata=debug_{safe_account_id}"
+    )
+
+
+@app.post("/accounts/{account_id}/token-refresh")
+async def trigger_runtime_token_refresh(
+    account_id: str,
+    request: Optional[RuntimeTokenRefreshRequest] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """手动触发当前在线实例的 Token 刷新，可选模拟命中滑块恢复链路。"""
+    try:
+        account_id = _ensure_account_access(account_id, current_user, "操作")
+        request = request or RuntimeTokenRefreshRequest()
+
+        log_with_user(
+            'info',
+            (
+                f"手动触发账号 {account_id} Token 刷新: "
+                f"simulate_captcha={request.simulate_captcha}, "
+                f"allow_password_login_recovery={request.allow_password_login_recovery}"
+            ),
+            current_user,
+        )
+
+        verification_url = str(request.verification_url or '').strip()
+        if request.simulate_captcha and not verification_url:
+            verification_url = _build_debug_token_refresh_verification_url(account_id)
+
+        async def _execute_refresh(live_instance):
+            if request.simulate_captcha:
+                return await live_instance.debug_force_captcha_recovery(
+                    verification_url=verification_url,
+                    allow_password_login_recovery=request.allow_password_login_recovery,
+                )
+
+            token = await live_instance.refresh_token(
+                allow_password_login_recovery=request.allow_password_login_recovery,
+            )
+            return {
+                'success': bool(token),
+                'path': 'refresh_token',
+                'token_received': bool(token),
+                'last_token_refresh_status': getattr(live_instance, 'last_token_refresh_status', None),
+                'last_token_refresh_error_message': getattr(live_instance, 'last_token_refresh_error_message', None),
+            }
+
+        result = await _run_managed_live_instance_call(
+            account_id,
+            _execute_refresh,
+            timeout=180,
+            missing_detail=f"账号 {account_id} 未启动，暂无法执行 Token 刷新",
+        )
+        runtime_status = await _build_live_runtime_status(account_id)
+        return {
+            'success': bool(result.get('success')) if isinstance(result, dict) else bool(result),
+            'account_id': account_id,
+            'simulate_captcha': request.simulate_captcha,
+            'verification_url': verification_url or None,
+            'result': result,
+            'runtime_status': runtime_status,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"手动触发 Token 刷新失败: {account_id} - {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=400, detail=safe_client_error("手动触发 Token 刷新失败，请稍后重试"))
+
+
 # ========================= 代理配置相关接口 =========================
 
 class ProxyConfig(BaseModel):
@@ -4441,14 +4520,23 @@ def _persist_manual_cookie_import_success(
     cookies_str: str,
 ):
     cookie_dict = trans_cookies(cookies_str)
-    _bind_cookie_account_unb_or_raise(account_id, cookie_dict.get('unb'), user_id)
     existing_same_user_cookie = db_manager.get_all_cookies(user_id)
     is_new_account = account_id not in existing_same_user_cookie
     if is_new_account:
-        db_manager.save_cookie(account_id, cookies_str, user_id)
+        if not db_manager.save_cookie(account_id, cookies_str, user_id):
+            raise RuntimeError(f"保存账号信息失败: {account_id}")
+        try:
+            _bind_cookie_account_unb_or_raise(account_id, cookie_dict.get('unb'), user_id)
+        except Exception:
+            try:
+                db_manager.delete_cookie(account_id)
+            except Exception:
+                pass
+            raise
         if cookie_manager.manager:
             cookie_manager.manager.add_cookie(account_id, cookies_str, user_id=user_id)
     else:
+        _bind_cookie_account_unb_or_raise(account_id, cookie_dict.get('unb'), user_id)
         db_manager.update_cookie_account_info(account_id, cookie_value=cookies_str)
         if cookie_manager.manager:
             if account_id in getattr(cookie_manager.manager, 'cookies', {}):
@@ -11283,11 +11371,29 @@ async def _run_order_history_sync_job(job_id: str) -> None:
             history_fetcher = OrderHistoryPageFetcher(cookie_string, account_id=account_id, headless=True)
 
             try:
-                fetch_result = await history_fetcher.fetch_recent_orders(
-                    max_orders=remaining_limit,
-                    utc_start=utc_start,
-                    utc_end_exclusive=utc_end_exclusive,
-                )
+                try:
+                    fetch_result = await _run_managed_live_instance_call(
+                        account_id,
+                        lambda current_live_instance: current_live_instance.fetch_recent_order_history_candidates(
+                            max_orders=remaining_limit,
+                            utc_start=utc_start,
+                            utc_end_exclusive=utc_end_exclusive,
+                        ),
+                        missing_detail='账号未启动，暂无法执行当前操作',
+                    )
+                except HTTPException as managed_exc:
+                    if managed_exc.status_code in {400, 500} and str(managed_exc.detail) in managed_runtime_fallback_details:
+                        logger.info(
+                            f"历史订单列表抓取未命中受管 runtime，回退 fetcher: "
+                            f"account_id={account_id}, reason={managed_exc.detail}"
+                        )
+                        fetch_result = await history_fetcher.fetch_recent_orders(
+                            max_orders=remaining_limit,
+                            utc_start=utc_start,
+                            utc_end_exclusive=utc_end_exclusive,
+                        )
+                    else:
+                        raise
                 candidates = list(fetch_result.get('orders') or [])
                 scanned_count = int(fetch_result.get('scanned_count') or 0)
                 matched_count = int(fetch_result.get('matched_count') or 0)
