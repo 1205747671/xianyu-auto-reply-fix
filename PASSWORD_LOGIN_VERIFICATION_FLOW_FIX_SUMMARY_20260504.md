@@ -1225,3 +1225,168 @@ docker compose -f docker-compose-cn.yml up -d --build
 
 1. 继续依赖 **实时消息 + 订单详情增量沉淀**
 2. 另找 **非 seller.goofish 工作台域** 的历史订单来源，再做接入验证
+---
+
+## 2026-05-17 历史订单链路二次收口（回退到 HTTP 列表抓取后真实回归通过）
+
+### 本次结论
+
+这轮已经确认：
+
+1. **2026-05-16 新接入的“managed runtime fresh page + browser fetch 历史订单列表”就是问题点**
+2. `account_id=2` 在运行态恢复正常前，历史订单列表无论走浏览器抓取还是 HTTP 抓取，都会因为会话本身还没恢复而报 `Session过期`
+3. `account_id=2` 在扫码接管、滑块恢复、Token 初始化全部完成后，**把历史订单列表抓取改回旧的 HTTP 链路，已经真实跑通**
+
+一句话收口：
+
+> 问题不是“账号级画像没复用”，也不是“扫码链路没接管”；真正把历史订单拖死的是那层后加的浏览器列表抓取。去掉它之后，账号恢复完成即可以正常补录历史订单。
+
+### 代码调整
+
+文件：
+
+- `XianyuAutoAsync.py`
+
+本次把：
+
+- `fetch_recent_order_history_candidates()`
+
+从：
+
+- `acquire_runtime(...)`
+- `get_fresh_page(...)`
+- `history_fetcher.fetch_recent_orders_via_browser(...)`
+
+改回：
+
+- 直接 `history_fetcher.fetch_recent_orders(...)`
+
+同时把 Cookie 同步来源标记从：
+
+- `order_history_sync_browser`
+
+改成：
+
+- `order_history_sync_http`
+
+这次调整保留了“使用当前 live instance 最新 Cookie”这一点，但去掉了“再套一层 fresh page/context”的不稳定因素，行为重新对齐到 5 月 5 日前已经验证过的老链路。
+
+### 新增测试
+
+文件：
+
+- `tests/test_xianyu_async_browser_runtime.py`
+
+新增用例验证：
+
+1. 历史订单列表不会再申请 managed browser runtime
+2. 不会再走 `fetch_recent_orders_via_browser`
+3. 会直接走 `fetch_recent_orders`
+4. 抓取过程中如果 Cookie 有更新，会继续同步回 live instance
+
+本地验证命令：
+
+```bash
+python -m pytest tests/test_xianyu_async_browser_runtime.py -k "fetch_recent_order_history_candidates_uses_http_fetcher_with_live_cookies or refresh_cookies_from_qr_login_reopens_account_runtime_when_managed_runtime_lease_already_released"
+```
+
+结果：
+
+- `2 passed`
+
+### 本次真实回归（account_id=2）
+
+#### A. 先恢复账号运行态
+
+这轮先对 `account_id=2` 重新发起二维码登录并扫码：
+
+- 二维码会话：`96f07cfb-51a7-4963-a148-8e91c603045f`
+
+关键日志：
+
+- `2026-05-17 02:38:21`
+  - `【2】真实Cookie已成功保存到数据库`
+- `2026-05-17 02:38:39`
+  - `/qr-login/check/...` 返回 `phase=handoff_completed`
+- `2026-05-17 02:38:24 ~ 02:39:45`
+  - 命中 `FAIL_SYS_USER_VALIDATE`
+  - 自动滑块恢复成功
+  - Token 刷新恢复成功
+- `2026-05-17 02:39:51`
+  - runtime 回到 `connected`
+
+最终 `GET /accounts/2/runtime-status` 确认：
+
+- `connection_state = connected`
+- `ws_ready = true`
+- `session_ready = true`
+- `has_current_token = true`
+- `token_refresh_status = success`
+- `session_keepalive_status = success`
+
+#### B. 再跑历史订单同步
+
+真实调用：
+
+- `POST /api/orders/history-sync`
+- `account_id = 2`
+- `start_date = 2026-05-01`
+- `end_date = 2026-05-17`
+- `max_orders = 50`
+- `fetch_details = true`
+
+任务：
+
+- `job_id = history_sync_b104df85f6fc3b6f`
+
+结果：
+
+- `status = completed`
+- `orders_discovered = 6`
+- `matched_orders = 1`
+- `orders_processed = 1`
+- `orders_saved = 1`
+- `orders_failed = 0`
+
+关键日志证据：
+
+- `2026-05-17 02:40:21`
+  - `【2】历史订单列表第 1 页抓取完成: page_items=6, scanned=6, in_range=1, before_range=5, after_range=0, unknown_anchor=0, captured=1, totalCount=6, nextPage=False`
+- `2026-05-17 02:40:40`
+  - 新订单写库成功：
+    - `order_id=3299107478187006390`
+    - `account_id=2`
+
+同时 `/api/orders` 已能读到这条订单：
+
+- `order_id = 3299107478187006390`
+- `account_id = 2`
+- `order_status = completed`
+
+### 这次修复真正说明了什么
+
+要把时间线看清楚：
+
+1. **02:34 那次失败**
+   - 当时账号运行态还没恢复好
+   - 即使已经切到 HTTP 列表抓取，也仍然会报：
+     - `历史订单列表 API 调用失败: ['FAIL_SYS_SESSION_EXPIRED::Session过期']`
+
+2. **02:39:51 之后**
+   - `account_id=2` 已经重新 `connected`
+   - Token / keepalive 都恢复正常
+
+3. **02:40:20 再跑**
+   - 历史订单同步完成
+
+因此这次修复的准确结论不是“改完以后任何时刻都能跑”，而是：
+
+> **改完以后，只要账号运行态已经恢复到有效登录态，历史订单链路就不会再被那条浏览器列表抓取链路拖死。**
+
+### 当前建议
+
+如果后面还要继续围绕历史订单补录做增强，默认策略就应该是：
+
+1. **列表优先走 HTTP 抓取**
+2. **详情继续允许复用当前账号 runtime**
+3. 不要再轻易把“列表抓取”改回需要 fresh page/context 的浏览器链路，除非有新的硬证据证明 HTTP 路径不够用

@@ -9652,20 +9652,7 @@ class XianyuLive:
                 account_id=current_account_id,
                 headless=True,
             )
-            runtime_lease = await account_browser_runtime_manager.acquire_runtime(
-                current_account_id,
-                "order_history_sync",
-                exclusive=False,
-                runtime_request={
-                    "headless": True,
-                    "cookie_string": self.cookies_str,
-                    "account_id": current_account_id,
-                },
-            )
-            page, context = await account_browser_runtime_manager.get_fresh_page(runtime_lease)
-            fetch_result = await history_fetcher.fetch_recent_orders_via_browser(
-                page,
-                context,
+            fetch_result = await history_fetcher.fetch_recent_orders(
                 max_orders=max_orders,
                 utc_start=utc_start,
                 utc_end_exclusive=utc_end_exclusive,
@@ -9675,7 +9662,7 @@ class XianyuLive:
                 self._set_runtime_cookie_state(
                     cookies_str=history_fetcher.cookie_string,
                     cookies_dict=history_fetcher.cookies,
-                    source="order_history_sync_browser",
+                    source="order_history_sync_http",
                 )
 
             return fetch_result

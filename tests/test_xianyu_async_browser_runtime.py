@@ -11138,6 +11138,106 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(sleep_mock.await_count, 3)
         live._set_runtime_cookie_state.assert_called_once()
 
+    async def test_fetch_recent_order_history_candidates_uses_http_fetcher_with_live_cookies(self):
+        if "aiohttp" not in sys.modules:
+            aiohttp_stub = types.ModuleType("aiohttp")
+
+            class _ClientTimeout:
+                def __init__(self, *args, **kwargs):
+                    self.args = args
+                    self.kwargs = kwargs
+
+            class _ClientSession:
+                pass
+
+            aiohttp_stub.ClientTimeout = _ClientTimeout
+            aiohttp_stub.ClientSession = _ClientSession
+            sys.modules["aiohttp"] = aiohttp_stub
+        if "loguru" not in sys.modules:
+            loguru_stub = types.ModuleType("loguru")
+            loguru_stub.logger = mock.Mock()
+            sys.modules["loguru"] = loguru_stub
+
+        from utils import order_history_sync as order_history_sync_module
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "acc-order-live"
+        live.cookies_str = "unb=test-unb; _m_h5_tk=test-token_123; cookie2=test-cookie2"
+        live._safe_str = str
+        live._set_runtime_cookie_state = mock.Mock()
+
+        fake_fetcher = types.SimpleNamespace(
+            cookie_string="unb=test-unb; _m_h5_tk=test-token_456; cookie2=test-cookie2; x5sec=test-x5",
+            cookies={
+                "unb": "test-unb",
+                "_m_h5_tk": "test-token_456",
+                "cookie2": "test-cookie2",
+                "x5sec": "test-x5",
+            },
+            fetch_recent_orders=mock.AsyncMock(
+                return_value={
+                    "orders": [{"order_id": "order-1"}],
+                    "scanned_count": 1,
+                    "matched_count": 1,
+                    "out_of_range_count": 0,
+                }
+            ),
+            fetch_recent_orders_via_browser=mock.AsyncMock(
+                side_effect=AssertionError("should not use browser order-list fetch path")
+            ),
+            close=mock.AsyncMock(),
+        )
+        runtime_manager = types.SimpleNamespace(
+            acquire_runtime=mock.AsyncMock(
+                side_effect=AssertionError("order history list should not acquire managed browser runtime")
+            ),
+            get_fresh_page=mock.AsyncMock(
+                side_effect=AssertionError("order history list should not request fresh runtime page")
+            ),
+            release_runtime=mock.AsyncMock(
+                side_effect=AssertionError("order history list should not release managed browser runtime")
+            ),
+        )
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "account_browser_runtime_manager",
+            new=runtime_manager,
+        ), mock.patch.object(
+            order_history_sync_module,
+            "OrderHistoryPageFetcher",
+            return_value=fake_fetcher,
+        ) as fetcher_cls:
+            result = await live.fetch_recent_order_history_candidates(
+                max_orders=5,
+                utc_start="2026-05-01 00:00:00",
+                utc_end_exclusive="2026-05-02 00:00:00",
+            )
+
+        self.assertEqual(result["matched_count"], 1)
+        fetcher_cls.assert_called_once_with(
+            "unb=test-unb; _m_h5_tk=test-token_123; cookie2=test-cookie2",
+            account_id="acc-order-live",
+            headless=True,
+        )
+        fake_fetcher.fetch_recent_orders.assert_awaited_once_with(
+            max_orders=5,
+            utc_start="2026-05-01 00:00:00",
+            utc_end_exclusive="2026-05-02 00:00:00",
+        )
+        fake_fetcher.fetch_recent_orders_via_browser.assert_not_awaited()
+        fake_fetcher.close.assert_awaited_once()
+        live._set_runtime_cookie_state.assert_called_once_with(
+            cookies_str="unb=test-unb; _m_h5_tk=test-token_456; cookie2=test-cookie2; x5sec=test-x5",
+            cookies_dict={
+                "unb": "test-unb",
+                "_m_h5_tk": "test-token_456",
+                "cookie2": "test-cookie2",
+                "x5sec": "test-x5",
+            },
+            source="order_history_sync_http",
+        )
+
     async def test_refresh_cookies_from_qr_login_returns_false_when_reopen_after_released_lease_fails(self):
         stale_runtime = mock.Mock()
         stale_runtime.close = mock.AsyncMock()
