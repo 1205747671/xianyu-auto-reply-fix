@@ -3621,6 +3621,41 @@ class ProxyConfig(BaseModel):
     proxy_pass: Optional[str] = ''
 
 
+def _normalize_proxy_config_snapshot(
+    proxy_type: Optional[str] = None,
+    proxy_host: Optional[str] = None,
+    proxy_port: Optional[int] = None,
+    proxy_user: Optional[str] = None,
+    proxy_pass: Optional[str] = None,
+    *,
+    collapse_disabled_fields: bool = False,
+) -> Dict[str, Any]:
+    normalized_type = str(proxy_type or 'none').strip().lower() or 'none'
+    normalized_host = str(proxy_host or '').strip()
+    normalized_user = str(proxy_user or '').strip()
+    normalized_pass = str(proxy_pass or '').strip()
+    try:
+        normalized_port = int(proxy_port or 0)
+    except (TypeError, ValueError):
+        normalized_port = 0
+
+    snapshot = {
+        'proxy_type': normalized_type,
+        'proxy_host': normalized_host,
+        'proxy_port': normalized_port,
+        'proxy_user': normalized_user,
+        'proxy_pass': normalized_pass,
+    }
+    if collapse_disabled_fields and normalized_type == 'none':
+        snapshot.update({
+            'proxy_host': '',
+            'proxy_port': 0,
+            'proxy_user': '',
+            'proxy_pass': '',
+        })
+    return snapshot
+
+
 @app.get("/accounts/{account_id}/proxy")
 def get_cookie_proxy_config(account_id: str, include_secret: bool = False, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取账号的代理配置"""
@@ -3650,55 +3685,86 @@ def get_cookie_proxy_config(account_id: str, include_secret: bool = False, curre
 
 @app.post("/accounts/{account_id}/proxy")
 def update_cookie_proxy_config(account_id: str, config: ProxyConfig, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """更新账号的代理配置"""
+    """Update account proxy config."""
     if cookie_manager.manager is None:
-        raise HTTPException(status_code=500, detail='CookieManager 未就绪')
+        raise HTTPException(status_code=500, detail='CookieManager unavailable')
     try:
-        account_id = _ensure_account_access(account_id, current_user, "操作")
+        account_id = _ensure_account_access(account_id, current_user, "\u64cd\u4f5c")
 
-        # 验证代理类型
         valid_proxy_types = ['none', 'http', 'https', 'socks5']
         if config.proxy_type not in valid_proxy_types:
-            raise HTTPException(status_code=400, detail=f"无效的代理类型，支持的类型: {', '.join(valid_proxy_types)}")
+            raise HTTPException(status_code=400, detail='\u65e0\u6548\u7684\u4ee3\u7406\u7c7b\u578b')
 
-        # 如果设置了代理类型（非none），验证必要字段
         if config.proxy_type != 'none':
             if not config.proxy_host:
-                raise HTTPException(status_code=400, detail="代理地址不能为空")
+                raise HTTPException(status_code=400, detail='\u4ee3\u7406\u5730\u5740\u4e0d\u80fd\u4e3a\u7a7a')
             if not config.proxy_port or config.proxy_port <= 0:
-                raise HTTPException(status_code=400, detail="代理端口无效")
+                raise HTTPException(status_code=400, detail='\u4ee3\u7406\u7aef\u53e3\u65e0\u6548')
 
-        # 更新数据库
-        success = db_manager.update_cookie_proxy_config(
-            account_id,
+        current_proxy_config = _normalize_proxy_config_snapshot(
+            **(db_manager.get_cookie_proxy_config(account_id) or {})
+        )
+        desired_proxy_config = _normalize_proxy_config_snapshot(
             proxy_type=config.proxy_type,
             proxy_host=config.proxy_host,
             proxy_port=config.proxy_port,
             proxy_user=config.proxy_user,
-            proxy_pass=config.proxy_pass
+            proxy_pass=config.proxy_pass,
         )
-        
+        current_effective_proxy_config = _normalize_proxy_config_snapshot(
+            **current_proxy_config,
+            collapse_disabled_fields=True,
+        )
+        desired_effective_proxy_config = _normalize_proxy_config_snapshot(
+            **desired_proxy_config,
+            collapse_disabled_fields=True,
+        )
+
+        if current_proxy_config == desired_proxy_config:
+            logger.info(f"Proxy config unchanged; skip runtime restart: {account_id}")
+            return {
+                'success': True,
+                'msg': '\u4ee3\u7406\u914d\u7f6e\u672a\u53d8\u5316',
+                'task_restarted': False,
+            }
+
+        success = db_manager.update_cookie_proxy_config(
+            account_id,
+            proxy_type=desired_proxy_config['proxy_type'],
+            proxy_host=desired_proxy_config['proxy_host'],
+            proxy_port=desired_proxy_config['proxy_port'],
+            proxy_user=desired_proxy_config['proxy_user'],
+            proxy_pass=desired_proxy_config['proxy_pass'],
+        )
         if not success:
-            raise HTTPException(status_code=400, detail="更新代理配置失败")
-        
-        # 重启账号任务以应用新的代理配置
-        logger.info(f"代理配置已更新，重启账号任务: {account_id}")
+            raise HTTPException(status_code=400, detail='\u66f4\u65b0\u4ee3\u7406\u914d\u7f6e\u5931\u8d25')
+
+        if current_effective_proxy_config == desired_effective_proxy_config:
+            logger.info(f"Proxy storage changed but effective config unchanged; skip runtime restart: {account_id}")
+            return {
+                'success': True,
+                'msg': '\u4ee3\u7406\u914d\u7f6e\u5df2\u66f4\u65b0\uff0c\u65e0\u9700\u91cd\u542f\u8d26\u53f7\u4efb\u52a1',
+                'task_restarted': False,
+            }
+
+        logger.info(f"Proxy config changed; restart account runtime: {account_id}")
         cookie_value = _get_user_cookies_map(current_user).get(account_id)
         if cookie_value:
             cookie_manager.manager.update_cookie(account_id, cookie_value, save_to_db=False)
-        
+
         return {
             'success': True,
-            'msg': '代理配置已更新，账号任务已重启'
+            'msg': '\u4ee3\u7406\u914d\u7f6e\u5df2\u66f4\u65b0\uff0c\u8d26\u53f7\u4efb\u52a1\u5df2\u91cd\u542f',
+            'task_restarted': bool(cookie_value),
         }
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"更新代理配置失败: {mask_sensitive_text(e)}")
-        raise HTTPException(status_code=400, detail=safe_client_error("更新代理配置失败，请稍后重试"))
+        logger.error(f"proxy update failed: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=400, detail=safe_client_error('\u66f4\u65b0\u4ee3\u7406\u914d\u7f6e\u5931\u8d25'))
 
 
-# ========================= 账号密码登录相关接口 =========================
+# ========================= account password login routes =========================
 
 def _new_risk_log_session_id(prefix: str = 'risk') -> str:
     return f"{prefix}_{secrets.token_hex(8)}"
@@ -4010,7 +4076,7 @@ def _build_verification_required_status_payload(
         message = pending_completion_message or f'{verification_type}已提交，正在等待当前流程完成，请勿关闭当前页面'
 
     payload = {
-        'status': 'verification_required',
+        'status': 'verification_processing' if verification_pending_completion else 'verification_required',
         'verification_url': verification_url,
         'screenshot_path': screenshot_path,
         'verification_type': verification_type,
@@ -4079,6 +4145,7 @@ def _stabilize_password_login_cookies_after_login(
 ) -> Tuple[str, Dict[str, Any]]:
     # 优先走纯 HTTP Token 探测 + 复用当前 managed runtime 的 Cookie 稳定化，
     # 避免“密码登录成功 -> Token 预检失败 -> 再次申请 runtime”导致的二次拉起浏览器。
+    from XianyuAutoAsync import XianyuLive
     from utils.xianyu_slider_stealth import probe_cookie_verification_from_cookie
 
     def _to_cookie_str(cookie_dict: Dict[str, Any]) -> str:
@@ -4091,6 +4158,30 @@ def _stabilize_password_login_cookies_after_login(
 
     def _probe_cookie(cookie_text: str) -> Dict[str, Any]:
         return probe_cookie_verification_from_cookie(cookie_text, proxy=proxy_config)
+
+    def _try_prewarm_password_login_token(
+        cookie_text: str,
+        *,
+        stage_label: str,
+    ) -> Tuple[str, bool]:
+        temp_xianyu = XianyuLive(
+            cookies_str=cookie_text,
+            account_id=account_id,
+            user_id=user_id,
+            register_instance=False,
+        )
+        preflight_future = asyncio.run_coroutine_threadsafe(
+            temp_xianyu.preflight_token_after_password_login(),
+            request_loop,
+        )
+        token_result = _wait_threadsafe_future_result(
+            preflight_future,
+            preflight_timeout,
+            f"{stage_label}在 {preflight_timeout:.0f} 秒内未完成",
+        )
+        updated_cookie_str = temp_xianyu.cookies_str or cookie_text
+        token_ready = bool(getattr(temp_xianyu, 'current_token', None) or token_result)
+        return updated_cookie_str, token_ready
 
     log_with_user(
         'info',
@@ -4112,13 +4203,31 @@ def _stabilize_password_login_cookies_after_login(
         merged = trans_cookies(cookies_str)
         merged.update(probe_result.get('session_cookies') or {})
         cookies_str = _to_cookie_str(merged)
+        token_prewarmed = False
+        try:
+            cookies_str, token_prewarmed = _try_prewarm_password_login_token(
+                cookies_str,
+                stage_label='密码登录后的Token预热交接预检',
+            )
+            if token_prewarmed:
+                log_with_user(
+                    'info',
+                    f"密码登录后的Token预热交接预检通过，将复用预热Token直接交接正式实例: {account_id}",
+                    current_user,
+                )
+        except Exception as prewarm_err:
+            log_with_user(
+                'warning',
+                f"密码登录后的Token预热交接预检失败，将继续沿用当前Cookie交接: {account_id}, 错误: {str(prewarm_err)}",
+                current_user,
+            )
         log_with_user(
             'info',
             f"密码登录后的Token预检(HTTP)通过，将使用校验通过的Cookie继续交接；正式Token仍由后台实例初始化: {account_id}",
             current_user,
         )
         return cookies_str, {
-            'token_prewarmed': False,
+            'token_prewarmed': token_prewarmed,
             'real_cookie_refreshed': False,
             'fallback_reason': None,
         }
@@ -4171,16 +4280,61 @@ def _stabilize_password_login_cookies_after_login(
             merged = trans_cookies(cookies_str)
             merged.update(probe_result.get('session_cookies') or {})
             cookies_str = _to_cookie_str(merged)
+            token_prewarmed = False
+            try:
+                cookies_str, token_prewarmed = _try_prewarm_password_login_token(
+                    cookies_str,
+                    stage_label='密码登录稳定化后的Token预热交接预检',
+                )
+                if token_prewarmed:
+                    log_with_user(
+                        'info',
+                        f"密码登录稳定化后的Token预热交接预检通过，将复用预热Token直接交接正式实例: {account_id}",
+                        current_user,
+                    )
+            except Exception as prewarm_err:
+                log_with_user(
+                    'warning',
+                    f"密码登录稳定化后的Token预热交接预检失败，将继续沿用稳定化Cookie交接: {account_id}, 错误: {str(prewarm_err)}",
+                    current_user,
+                )
             log_with_user(
                 'info',
                 f"复用当前 runtime 稳定化后Token预检(HTTP)通过，将使用稳定化Cookie继续交接；正式Token仍由后台实例初始化: {account_id}",
                 current_user,
             )
             return cookies_str, {
-                'token_prewarmed': False,
+                'token_prewarmed': token_prewarmed,
                 'real_cookie_refreshed': True,
                 'fallback_reason': fallback_reason_http,
             }
+
+    token_prewarmed = False
+    try:
+        cookies_str, token_prewarmed = _try_prewarm_password_login_token(
+            cookies_str,
+            stage_label='密码登录后的最终Token预热交接预检',
+        )
+        if token_prewarmed:
+            log_with_user(
+                'info',
+                f"密码登录后的最终Token预热交接预检通过，将直接交接预热Token给正式实例: {account_id}",
+                current_user,
+            )
+            return cookies_str, {
+                'token_prewarmed': True,
+                'real_cookie_refreshed': bool(stabilized_cookie_dict),
+                'fallback_reason': fallback_reason_http,
+            }
+    except Exception as prewarm_err:
+        log_with_user(
+            'warning',
+            (
+                f"密码登录后的最终Token预热交接预检失败，仍将退回延后交接模式: {account_id}, "
+                f"错误: {str(prewarm_err)}"
+            ),
+            current_user,
+        )
 
     log_with_user(
         'warning',
@@ -4191,8 +4345,8 @@ def _stabilize_password_login_cookies_after_login(
         current_user,
     )
     return cookies_str, {
-        'token_prewarmed': False,
-        'real_cookie_refreshed': True,
+        'token_prewarmed': token_prewarmed,
+        'real_cookie_refreshed': bool(stabilized_cookie_dict),
         'fallback_reason': fallback_reason_http,
         'deferred_token_handoff': True,
     }
@@ -4262,6 +4416,79 @@ def _build_face_verification_screenshot_info(account_id: str, file_path: str) ->
         'size': stat.st_size,
         'created_time': stat.st_ctime,
         'created_time_str': datetime.fromtimestamp(stat.st_ctime).strftime('%Y-%m-%d %H:%M:%S')
+    }
+
+
+def _delete_account_face_verification_screenshots(
+    account_id: str,
+    *,
+    current_user: Optional[Dict[str, Any]] = None,
+) -> int:
+    import glob
+
+    screenshots_dir = os.path.join(static_dir, 'uploads', 'images')
+    patterns = [
+        os.path.join(screenshots_dir, f'face_verify_{account_id}_*.jpg'),
+        os.path.join(screenshots_dir, f'face_verify_{account_id}_*.png'),
+    ]
+    screenshot_files: List[str] = []
+    for pattern in patterns:
+        screenshot_files.extend(glob.glob(pattern))
+
+    deleted_count = 0
+    for file_path in screenshot_files:
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                deleted_count += 1
+                if current_user is not None:
+                    log_with_user(
+                        'info',
+                        f"删除账号 {account_id} 的验证截图: {os.path.basename(file_path)}",
+                        current_user,
+                    )
+        except Exception as exc:
+            if current_user is not None:
+                log_with_user('warning', f"删除账号截图失败: {file_path}, 错误: {str(exc)}", current_user)
+            else:
+                logger.warning(f"删除账号截图失败: {file_path}, error={exc}")
+    return deleted_count
+
+
+def _purge_account_local_artifacts(
+    account_id: str,
+    *,
+    current_user: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    import shutil
+
+    base_dir = str(getattr(account_browser_runtime_manager, "base_dir", os.getcwd()) or os.getcwd())
+    profile_dir = os.path.join(base_dir, "browser_data", f"user_{account_id}")
+    browser_profile_deleted = False
+    browser_profile_error = None
+
+    if os.path.exists(profile_dir):
+        try:
+            shutil.rmtree(profile_dir)
+            browser_profile_deleted = True
+            if current_user is not None:
+                log_with_user('info', f"已删除账号画像目录: {profile_dir}", current_user)
+        except Exception as exc:
+            browser_profile_error = str(exc)
+            if current_user is not None:
+                log_with_user('warning', f"删除账号画像目录失败: {profile_dir}, 错误: {browser_profile_error}", current_user)
+            else:
+                logger.warning(f"删除账号画像目录失败: {profile_dir}, error={exc}")
+    deleted_screenshot_count = _delete_account_face_verification_screenshots(
+        account_id,
+        current_user=current_user,
+    )
+
+    return {
+        'profile_dir': profile_dir,
+        'browser_profile_deleted': browser_profile_deleted,
+        'browser_profile_error': browser_profile_error,
+        'deleted_face_verification_screenshots': deleted_screenshot_count,
     }
 
 
@@ -5050,6 +5277,10 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 
                 if is_refresh_mode:
                     log_with_user('info', f"刷新模式已完成Token预检，直接切换到通过预检的新Cookie: {account_id}", current_user)
+                elif stabilization_meta.get('token_prewarmed') and stabilization_meta.get('real_cookie_refreshed'):
+                    log_with_user('info', f"密码登录已完成浏览器Cookie稳定化并预热Token交接: {account_id}", current_user)
+                elif stabilization_meta.get('token_prewarmed'):
+                    log_with_user('info', f"密码登录已完成Token预热交接，正式实例将直接复用预热Token: {account_id}", current_user)
                 elif stabilization_meta.get('real_cookie_refreshed'):
                     log_with_user('info', f"密码登录已通过浏览器Cookie稳定化完成交接: {account_id}", current_user)
                 else:
@@ -5073,6 +5304,10 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 )
                 if is_refresh_mode:
                     stabilization_result_text = '刷新模式Token预检通过'
+                elif stabilization_meta.get('token_prewarmed') and stabilization_meta.get('real_cookie_refreshed'):
+                    stabilization_result_text = '密码登录后浏览器Cookie稳定化并预热Token成功'
+                elif stabilization_meta.get('token_prewarmed'):
+                    stabilization_result_text = '密码登录后Token预热交接成功'
                 elif stabilization_meta.get('real_cookie_refreshed'):
                     stabilization_result_text = '密码登录后浏览器Cookie稳定化成功'
                 else:
@@ -5127,13 +5362,14 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 except Exception as cleanup_e:
                     log_with_user('warning', f"清理实例时出错: {str(cleanup_e)}", current_user)
 
-                try:
-                    _release_slider_managed_runtime_sync(
-                        runtime_lease,
-                        reason='password_login_completed',
-                    )
-                except Exception as runtime_release_err:
-                    log_with_user('warning', f"释放账号运行时失败: {account_id}, 错误: {str(runtime_release_err)}", current_user)
+                if runtime_lease is not None:
+                    try:
+                        _release_slider_managed_runtime_sync(
+                            runtime_lease,
+                            reason='password_login_completed',
+                        )
+                    except Exception as runtime_release_err:
+                        log_with_user('warning', f"释放账号运行时失败: {account_id}, 错误: {str(runtime_release_err)}", current_user)
 
                 if manual_refresh_acquired:
                     try:
@@ -5962,8 +6198,6 @@ async def delete_account_face_verification_screenshot(
 ):
     """删除指定账号的人脸验证截图"""
     try:
-        import glob
-        
         # 检查账号是否属于当前用户
         user_id = current_user['user_id']
         cookie_info = db_manager.get_cookie_details(account_id)
@@ -5972,21 +6206,10 @@ async def delete_account_face_verification_screenshot(
                 'success': False,
                 'message': '无权访问该账号'
             }
-        
-        # 删除该账号的所有验证截图
-        screenshots_dir = os.path.join(static_dir, 'uploads', 'images')
-        pattern = os.path.join(screenshots_dir, f'face_verify_{account_id}_*.jpg')
-        screenshot_files = glob.glob(pattern)
-        
-        deleted_count = 0
-        for file_path in screenshot_files:
-            try:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                    deleted_count += 1
-                    log_with_user('info', f"删除账号 {account_id} 的验证截图: {os.path.basename(file_path)}", current_user)
-            except Exception as e:
-                log_with_user('error', f"删除截图失败 {file_path}: {str(e)}", current_user)
+        deleted_count = _delete_account_face_verification_screenshots(
+            account_id,
+            current_user=current_user,
+        )
         
         return {
             'success': True,
@@ -7852,7 +8075,8 @@ def remove_cookie(account_id: str, current_user: Dict[str, Any] = Depends(get_cu
         account_id = _ensure_account_access(account_id, current_user, "操作")
 
         cookie_manager.manager.remove_cookie(account_id)
-        return {"msg": "removed"}
+        artifacts = _purge_account_local_artifacts(account_id, current_user=current_user)
+        return {"msg": "removed", "artifacts": artifacts}
     except HTTPException:
         raise
     except Exception as e:

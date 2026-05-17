@@ -756,12 +756,18 @@ class ReplyServerProcessQrLoginCookiesTest(unittest.TestCase):
             is_closed=mock.Mock(return_value=False),
             is_running=mock.Mock(return_value=True),
         )
+        add_cookie_async = mock.AsyncMock(return_value=None)
         fake_manager = SimpleNamespace(
             cookies={},
             add_cookie=mock.Mock(),
             update_cookie=mock.Mock(),
+            _add_cookie_async=add_cookie_async,
             loop=fake_loop,
         )
+
+        async def run_on_manager_loop(account_id, coroutine_factory, timeout=None, cancel_on_timeout=True):
+            _ = account_id, timeout, cancel_on_timeout
+            return await coroutine_factory()
 
         async def invoke():
             return await asyncio.wait_for(
@@ -789,6 +795,7 @@ class ReplyServerProcessQrLoginCookiesTest(unittest.TestCase):
              mock.patch.object(reply_server.db_manager, "delete_cookie") as delete_cookie_mock, \
              mock.patch.object(reply_server.db_manager, "update_cookie_account_info") as update_cookie_mock, \
              mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "_run_live_instance_on_manager_loop", side_effect=run_on_manager_loop), \
              mock.patch.object(reply_server, "QR_LOGIN_TOKEN_PREWARM_TIMEOUT_SECONDS", 0.01, create=True), \
              mock.patch.object(reply_server, "log_with_user"):
             result = asyncio.run(invoke())
@@ -796,17 +803,18 @@ class ReplyServerProcessQrLoginCookiesTest(unittest.TestCase):
         self.assertEqual(result["account_id"], "test_user")
         self.assertTrue(result["task_restarted"])
         self.assertFalse(result["token_prewarmed"])
-        self.assertIn("首次Token初始化超时", result["warning_message"])
-        fake_manager.add_cookie.assert_called_once_with(
+        self.assertIn("首次Token将在后台继续初始化", result["warning_message"])
+        add_cookie_async.assert_awaited_once_with(
             "test_user",
             "unb=test_user; cookie2=real_cookie2",
             user_id=1,
         )
+        fake_manager.add_cookie.assert_not_called()
         fake_manager.update_cookie.assert_not_called()
         delete_cookie_mock.assert_not_called()
         update_cookie_mock.assert_not_called()
 
-    def test_process_qr_login_cookies_rolls_back_when_manager_loop_is_not_running(self):
+    def test_process_qr_login_cookies_reports_runtime_issue_when_manager_loop_is_not_running(self):
         current_user = {"user_id": 1, "username": "admin"}
         fake_loop = SimpleNamespace(
             is_closed=mock.Mock(return_value=False),
@@ -851,15 +859,12 @@ class ReplyServerProcessQrLoginCookiesTest(unittest.TestCase):
 
         self.assertEqual(result["account_id"], "test_user")
         self.assertFalse(result["task_restarted"])
-        self.assertTrue(result["token_prewarmed"])
+        self.assertFalse(result["token_prewarmed"])
         self.assertIn("账号事件循环未运行", result["warning_message"])
         fake_manager.add_cookie.assert_not_called()
         fake_manager.update_cookie.assert_not_called()
         delete_cookie_mock.assert_not_called()
-        update_cookie_mock.assert_called_once_with(
-            "test_user",
-            cookie_value="unb=test_user; cookie2=old_cookie2",
-        )
+        update_cookie_mock.assert_not_called()
 
 
 class _FakePasswordLoginSlider:
@@ -1051,7 +1056,7 @@ class ReplyServerPasswordLoginStatusTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual(result["status"], "verification_required")
+        self.assertEqual(result["status"], "verification_processing")
         self.assertIsNone(result["screenshot_path"])
         self.assertFalse(result["verification_material_ready"])
         self.assertIn("等待登录完成", result["message"])
@@ -1209,9 +1214,9 @@ class ReplyServerPasswordLoginExecutionTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(fake_slider.login_browser_ready)
         self.assertTrue(fake_slider.login_kwargs["require_managed_runtime"])
         acquire_mock.assert_called_once()
-        release_mock.assert_called_once_with(fake_lease, reason="password_login_completed")
+        release_mock.assert_called_once_with(fake_lease, reason="password_login_handoff_release")
 
-    async def test_execute_password_login_falls_back_to_browser_refresh_when_token_preflight_fails(self):
+    async def test_execute_password_login_defers_handoff_without_second_browser_refresh_when_token_preflight_fails(self):
         session_id = "password_login_browser_refresh_fallback_session"
         self._build_password_login_session(session_id)
         _FakePasswordLoginFallbackLive.reset_state()
@@ -1260,13 +1265,15 @@ class ReplyServerPasswordLoginExecutionTest(unittest.IsolatedAsyncioTestCase):
 
         session = reply_server.password_login_sessions[session_id]
         self.assertEqual(session["status"], "success")
-        self.assertEqual(_FakePasswordLoginFallbackLive.preflight_calls, 1)
-        self.assertEqual(_FakePasswordLoginFallbackLive.browser_refresh_calls, 1)
-        self.assertEqual(_FakePasswordLoginFallbackLive.reset_calls, 1)
+        self.assertGreaterEqual(_FakePasswordLoginFallbackLive.preflight_calls, 1)
+        self.assertEqual(_FakePasswordLoginFallbackLive.browser_refresh_calls, 0)
+        self.assertEqual(_FakePasswordLoginFallbackLive.reset_calls, 0)
+        self.assertFalse(session["token_prewarmed"])
+        self.assertFalse(session["real_cookie_refreshed"])
         fake_manager.add_cookie.assert_called_once()
         saved_cookie_value = update_cookie_mock.call_args.kwargs["cookie_value"]
-        self.assertIn("_m_h5_tk=browser_refreshed_token_12345", saved_cookie_value)
-        self.assertIn("cookie2=browser_refreshed_cookie2", saved_cookie_value)
+        self.assertIn("_m_h5_tk=raw_token_12345", saved_cookie_value)
+        self.assertIn("cookie2=raw_cookie2", saved_cookie_value)
 
     async def test_execute_password_login_does_not_overwrite_old_cookie_when_bound_unb_conflicts(self):
         session_id = "password_login_bound_unb_conflict_session"

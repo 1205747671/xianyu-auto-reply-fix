@@ -232,9 +232,14 @@ def _read_devtools_active_port(
         if process.poll() is not None:
             raise RuntimeError("CloakBrowser process exited before DevToolsActivePort was ready")
         if port_file.exists():
-            lines = port_file.read_text(encoding="utf-8").splitlines()
-            if lines and lines[0].strip():
-                return int(lines[0].strip())
+            try:
+                lines = port_file.read_text(encoding="utf-8").splitlines()
+                if lines and lines[0].strip():
+                    return int(lines[0].strip())
+            except (OSError, ValueError):
+                # Windows 上 Chromium/CloakBrowser 初始写入 DevToolsActivePort 时
+                # 可能短暂持有独占锁，继续轮询即可。
+                pass
         sleep(0.1)
     raise TimeoutError(f"Timed out waiting for {DEVTOOLS_ACTIVE_PORT}")
 
@@ -250,9 +255,14 @@ async def _read_devtools_active_port_async(
         if process.poll() is not None:
             raise RuntimeError("CloakBrowser process exited before DevToolsActivePort was ready")
         if port_file.exists():
-            lines = port_file.read_text(encoding="utf-8").splitlines()
-            if lines and lines[0].strip():
-                return int(lines[0].strip())
+            try:
+                lines = port_file.read_text(encoding="utf-8").splitlines()
+                if lines and lines[0].strip():
+                    return int(lines[0].strip())
+            except (OSError, ValueError):
+                # Windows 上 Chromium/CloakBrowser 初始写入 DevToolsActivePort 时
+                # 可能短暂持有独占锁，继续轮询即可。
+                pass
         await asyncio.sleep(0.1)
     raise TimeoutError(f"Timed out waiting for {DEVTOOLS_ACTIVE_PORT}")
 

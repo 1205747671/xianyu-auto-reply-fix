@@ -691,26 +691,84 @@ function getRuntimeStatusRecentAnchor(runtimeStatus) {
     return timestamps.length ? Math.max(...timestamps) : 0;
 }
 
-function shouldAutoRetryRuntimeStatus(runtimeStatus) {
-    if (!runtimeStatus?.running) {
-        return false;
+function getRuntimeStatusErrorMessage(error) {
+    if (!error) {
+        return '运行态刷新失败';
+    }
+    if (typeof error === 'string') {
+        return error.trim() || '运行态刷新失败';
+    }
+    if (typeof error?.message === 'string' && error.message.trim()) {
+        return error.message.trim();
+    }
+    return '运行态刷新失败';
+}
+
+function markRuntimeStatusFetchFailure(runtimeStatus, error) {
+    const errorMessage = getRuntimeStatusErrorMessage(error);
+    const staleAt = Math.floor(Date.now() / 1000);
+    const normalizedRuntimeStatus = runtimeStatus ? { ...runtimeStatus } : {};
+    normalizedRuntimeStatus.runtime_status_fetch_error = errorMessage;
+    normalizedRuntimeStatus.runtime_status_stale = true;
+    normalizedRuntimeStatus.runtime_status_stale_at = staleAt;
+    return normalizedRuntimeStatus;
+}
+
+function getRuntimeStatusRetryPlan(runtimeStatus, options = {}) {
+    const normalizedRuntimeStatus = runtimeStatus || {};
+    const requestFailed = Boolean(options.requestFailed);
+    if (!normalizedRuntimeStatus.running) {
+        return { enabled: false, delayMs: 0, reason: 'not_running' };
     }
 
-    const connectionState = String(runtimeStatus.connection_state || '').trim();
-    if (connectionState === 'connecting' || connectionState === 'reconnecting') {
-        return true;
+    const connectionState = String(normalizedRuntimeStatus.connection_state || '').trim();
+    if (
+        connectionState === 'connecting'
+        || connectionState === 'reconnecting'
+        || normalizedRuntimeStatus.manual_refresh_active
+    ) {
+        return {
+            enabled: true,
+            delayMs: requestFailed ? 2500 : 3000,
+            reason: requestFailed ? 'transient_error' : 'transient',
+        };
     }
 
-    if (isRuntimeStatusHealthy(runtimeStatus)) {
-        return false;
+    if (requestFailed || normalizedRuntimeStatus.runtime_status_fetch_error) {
+        return {
+            enabled: true,
+            delayMs: isRuntimeStatusHealthy(normalizedRuntimeStatus) ? 12000 : 5000,
+            reason: 'fetch_failed',
+        };
     }
 
-    const recentAnchor = getRuntimeStatusRecentAnchor(runtimeStatus);
+    if (isRuntimeStatusHealthy(normalizedRuntimeStatus)) {
+        return { enabled: true, delayMs: 15000, reason: 'healthy' };
+    }
+
+    const recentAnchor = getRuntimeStatusRecentAnchor(normalizedRuntimeStatus);
     if (!recentAnchor) {
-        return false;
+        return { enabled: true, delayMs: 6000, reason: 'no_recent_anchor' };
     }
 
-    return ((Date.now() / 1000) - recentAnchor) <= 90;
+    return { enabled: true, delayMs: 5000, reason: 'unhealthy' };
+}
+
+function shouldAutoRetryRuntimeStatus(runtimeStatus, options = {}) {
+    return getRuntimeStatusRetryPlan(runtimeStatus, options).enabled;
+}
+
+function getRuntimeRefreshStateText(runtimeStatus) {
+    const normalizedRuntimeStatus = runtimeStatus || {};
+    const errorMessage = String(normalizedRuntimeStatus.runtime_status_fetch_error || '').trim();
+    if (!errorMessage) {
+        return '正常';
+    }
+
+    const staleAtText = formatAboutRuntimeTime('', normalizedRuntimeStatus.runtime_status_stale_at);
+    return staleAtText === '暂无记录'
+        ? '失败后重试中'
+        : `失败后重试中 · ${staleAtText}`;
 }
 
 function getMessageStreamRuntimeDisplay(runtimeStatus) {
@@ -752,7 +810,7 @@ function getMessageStreamRuntimeDisplay(runtimeStatus) {
     return { status, note };
 }
 
-function scheduleDashboardRuntimeAutoRetry(accounts) {
+function scheduleDashboardRuntimeAutoRetry(accounts, options = {}) {
     if (dashboardRuntimeRetryTimer) {
         clearTimeout(dashboardRuntimeRetryTimer);
         dashboardRuntimeRetryTimer = null;
@@ -762,19 +820,19 @@ function scheduleDashboardRuntimeAutoRetry(accounts) {
         return;
     }
 
-    if (!Array.isArray(accounts) || !accounts.some(account => shouldAutoRetryRuntimeStatus(account.runtime_status))) {
+    const retryPlans = Array.isArray(accounts)
+        ? accounts
+            .map(account => getRuntimeStatusRetryPlan(account.runtime_status, options))
+            .filter(plan => plan.enabled)
+        : [];
+    if (!retryPlans.length) {
         return;
     }
 
-    if (Date.now() - lastDashboardRuntimeRetryAt < 15000) {
+    const delay = retryPlans.reduce((minDelay, plan) => Math.min(minDelay, plan.delayMs), retryPlans[0].delayMs);
+    if (Date.now() - lastDashboardRuntimeRetryAt < Math.max(1200, delay - 500)) {
         return;
     }
-
-    const hasTransientState = accounts.some(account => {
-        const connectionState = String(account?.runtime_status?.connection_state || '').trim();
-        return connectionState === 'connecting' || connectionState === 'reconnecting';
-    });
-    const delay = hasTransientState ? 3500 : 5000;
 
     dashboardRuntimeRetryTimer = setTimeout(() => {
         dashboardRuntimeRetryTimer = null;
@@ -786,7 +844,7 @@ function scheduleDashboardRuntimeAutoRetry(accounts) {
     }, delay);
 }
 
-function scheduleAboutRuntimeAutoRetry(accountId, runtimeStatus) {
+function scheduleAboutRuntimeAutoRetry(accountId, runtimeStatus, options = {}) {
     if (aboutRuntimeRetryTimer) {
         clearTimeout(aboutRuntimeRetryTimer);
         aboutRuntimeRetryTimer = null;
@@ -801,16 +859,14 @@ function scheduleAboutRuntimeAutoRetry(accountId, runtimeStatus) {
         return;
     }
 
-    if (!shouldAutoRetryRuntimeStatus(runtimeStatus)) {
+    const retryPlan = getRuntimeStatusRetryPlan(runtimeStatus, options);
+    if (!retryPlan.enabled) {
         return;
     }
 
-    if (Date.now() - lastAboutRuntimeRetryAt < 12000) {
+    if (Date.now() - lastAboutRuntimeRetryAt < Math.max(1200, retryPlan.delayMs - 500)) {
         return;
     }
-
-    const connectionState = String(runtimeStatus?.connection_state || '').trim();
-    const delay = (connectionState === 'connecting' || connectionState === 'reconnecting') ? 3000 : 5000;
 
     aboutRuntimeRetryTimer = setTimeout(() => {
         aboutRuntimeRetryTimer = null;
@@ -822,7 +878,7 @@ function scheduleAboutRuntimeAutoRetry(accountId, runtimeStatus) {
         }
         lastAboutRuntimeRetryAt = Date.now();
         loadAboutRuntimeStatus(normalizedAccountId);
-    }, delay);
+    }, retryPlan.delayMs);
 }
 
 function renderDashboardAccountRuntimeSnapshot(runtimeStatus) {
@@ -854,12 +910,17 @@ function renderDashboardAccountRuntimeSnapshot(runtimeStatus) {
         ? getAboutStatusVariant('stream', messageStreamStatus)
         : 'secondary';
     const runningHealthy = isRuntimeStatusHealthy(normalizedRuntimeStatus);
+    const runtimeFetchError = String(normalizedRuntimeStatus.runtime_status_fetch_error || '').trim();
+    const runtimeStatusStale = Boolean(normalizedRuntimeStatus.runtime_status_stale && runtimeFetchError);
     const summaryText = !normalizedRuntimeStatus.running
         ? '未运行'
-        : (runningHealthy ? '运行正常' : '部分异常');
+        : (runtimeStatusStale ? '缓存状态' : (runningHealthy ? '运行正常' : '部分异常'));
     const summaryTone = !normalizedRuntimeStatus.running
         ? 'secondary'
-        : (runningHealthy ? 'success' : 'warning');
+        : (runtimeStatusStale ? 'warning' : (runningHealthy ? 'success' : 'warning'));
+    const summaryDetail = runtimeStatusStale
+        ? `运行态刷新失败，当前展示缓存结果：${runtimeFetchError}`
+        : summaryText;
     const items = [
         { label: '连接', text: connectionText, tone: connectionTone },
         { label: '保活', text: keepaliveText, tone: keepaliveTone },
@@ -869,7 +930,7 @@ function renderDashboardAccountRuntimeSnapshot(runtimeStatus) {
 
     return `
         <div class="dashboard-account-runtime" aria-label="账号运行态快照">
-            <div class="dashboard-account-runtime-summary is-${summaryTone}">
+            <div class="dashboard-account-runtime-summary is-${summaryTone}" title="${escapeHtml(summaryDetail)}">
                 <span class="dashboard-account-runtime-summary-dot" aria-hidden="true"></span>
                 <span class="dashboard-account-runtime-summary-text">${escapeHtml(summaryText)}</span>
             </div>
@@ -1115,6 +1176,12 @@ async function refreshDashboardRuntimeSnapshots() {
         scheduleDashboardRuntimeAutoRetry(dashboardData.accounts);
     } catch (error) {
         console.error('刷新仪表盘运行态失败:', error);
+        dashboardData.accounts = dashboardData.accounts.map(account => ({
+            ...account,
+            runtime_status: markRuntimeStatusFetchFailure(account.runtime_status, error),
+        }));
+        renderDashboardAccountOverview(dashboardData.accounts, dashboardData.totalItems || 0);
+        scheduleDashboardRuntimeAutoRetry(dashboardData.accounts, { requestFailed: true });
     }
 }
 
@@ -3599,6 +3666,15 @@ function getAboutRuntimeOverview(runtimeStatus, readinessCount = 0) {
         };
     }
 
+    const runtimeFetchError = String(runtimeStatus?.runtime_status_fetch_error || '').trim();
+    if (runtimeFetchError) {
+        return {
+            tone: 'warning',
+            title: '状态刷新失败，当前显示缓存结果',
+            note: `前端正在自动重试；最近一次刷新失败原因：${runtimeFetchError}`,
+        };
+    }
+
     if (runtimeStatus?.connection_state === 'connecting' || runtimeStatus?.connection_state === 'reconnecting') {
         if (runtimeStatus?.manual_refresh_active) {
             return {
@@ -3664,6 +3740,7 @@ function renderAboutRuntimeStatus(runtimeStatus) {
         runtimeStatus.last_message_received_at_display,
         runtimeStatus.last_message_received_at
     );
+    const runtimeRefreshDisplay = getRuntimeRefreshStateText(runtimeStatus);
     const stateChangedDisplay = formatAboutRuntimeTime(
         runtimeStatus.state_last_changed_at_display,
         runtimeStatus.state_last_changed_at
@@ -3751,6 +3828,7 @@ function renderAboutRuntimeStatus(runtimeStatus) {
                 </div>
             </div>
             <div class="account-diagnostics-status-meta">
+                ${buildAboutRuntimeMetaItem('运行态刷新', runtimeRefreshDisplay)}
                 ${buildAboutRuntimeMetaItem('最近收到消息', lastMessageDisplay)}
                 ${buildAboutRuntimeMetaItem('状态变化时间', stateChangedDisplay)}
             </div>
@@ -3897,6 +3975,17 @@ async function loadAboutRuntimeStatus(accountId = '') {
         scheduleAboutRuntimeAutoRetry(normalizedAccountId, runtimeStatus);
     } catch (error) {
         console.error('加载账号运行态失败:', error);
+        const targetAccount = aboutDiagnosticsAccounts.find(account => getCookieDetailsAccountId(account) === normalizedAccountId);
+        const fallbackRuntimeStatus = markRuntimeStatusFetchFailure(
+            targetAccount?.runtime_status || selectedAccount?.runtime_status || null,
+            error,
+        );
+        if (targetAccount) {
+            targetAccount.runtime_status = fallbackRuntimeStatus;
+            renderAboutAccountMeta(targetAccount);
+        }
+        renderAboutRuntimeStatus(fallbackRuntimeStatus);
+        scheduleAboutRuntimeAutoRetry(normalizedAccountId, fallbackRuntimeStatus, { requestFailed: true });
     }
 }
 
@@ -11705,11 +11794,14 @@ async function checkManualCookieImportStatus() {
                 case 'processing':
                     break;
                 case 'verification_required':
+                case 'verification_processing':
+                    const manualImportVerificationPendingCompletion = Boolean(data.verification_pending_completion) || data.status === 'verification_processing';
                     showPasswordLoginQRCode(
                         data.screenshot_path || data.verification_url,
                         data.screenshot_path,
                         data.verification_type,
-                        data.message
+                        data.message,
+                        manualImportVerificationPendingCompletion
                     );
                     break;
                 case 'success':
@@ -12006,14 +12098,21 @@ function startRefreshCookiePolling(sessionId, accountId) {
                     updateRefreshCookieStatus('正在登录中，请稍候...');
                     break;
                 case 'verification_required':
+                case 'verification_processing':
+                    const refreshVerificationPendingCompletion = Boolean(data.verification_pending_completion) || data.status === 'verification_processing';
                     // 需要身份验证，显示验证截图或链接
-                    updateRefreshCookieStatus(`需要${getPasswordLoginVerificationTypeLabel(data.verification_type)}，请查看弹出的验证窗口`);
+                    updateRefreshCookieStatus(
+                        data.status === 'verification_processing'
+                            ? (data.message || '验证已提交，系统正在自动完成后续处理，请勿关闭当前窗口')
+                            : `需要${getPasswordLoginVerificationTypeLabel(data.verification_type)}，请查看弹出的验证窗口`
+                    );
                     // 使用账号密码登录的验证显示函数
                     showPasswordLoginQRCode(
                         data.screenshot_path || data.verification_url || data.qr_code_url,
                         data.screenshot_path,
                         data.verification_type,
-                        data.message
+                        data.message,
+                        refreshVerificationPendingCompletion
                     );
                     break;
                 case 'success':
@@ -12170,13 +12269,16 @@ async function checkPasswordLoginStatus() {
                     // 处理中，继续等待
                     break;
                 case 'verification_required':
+                case 'verification_processing':
+                    const verificationPendingCompletion = Boolean(data.verification_pending_completion) || data.status === 'verification_processing';
+                    // 验证材料已提交，后台正在自动完成后续接管/预热
                     // 需要身份验证，显示验证截图或链接
                     showPasswordLoginQRCode(
                         data.screenshot_path || data.verification_url || data.qr_code_url,
                         data.screenshot_path,
                         data.verification_type,
                         data.message,
-                        Boolean(data.verification_pending_completion)
+                        verificationPendingCompletion
                     );
                     // 继续监控（人脸认证后需要继续等待登录完成）
                     break;

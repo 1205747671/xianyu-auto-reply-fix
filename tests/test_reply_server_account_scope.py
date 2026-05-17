@@ -1,11 +1,17 @@
 import asyncio
-import reply_server
+import os
 from pathlib import Path
 import sys
 import tempfile
 from types import SimpleNamespace
+import types
 import unittest
 from unittest import mock
+
+if "loguru" not in sys.modules:
+    loguru_stub = types.ModuleType("loguru")
+    loguru_stub.logger = mock.Mock()
+    sys.modules["loguru"] = loguru_stub
 
 import reply_server
 
@@ -280,6 +286,79 @@ class ReplyServerAccountScopeContractTest(_ReplyServerModuleBindingMixin, unitte
             "                    XianyuLive.mark_manual_refresh_handoff(",
             reply_server_source,
         )
+
+
+class ReplyServerProxyUpdateBehaviorTest(_ReplyServerModuleBindingMixin, unittest.TestCase):
+    def test_update_cookie_proxy_config_skips_restart_when_effective_config_unchanged(self):
+        fake_manager = mock.Mock()
+        fake_db = mock.Mock()
+        fake_db.get_cookie_proxy_config.return_value = {
+            "proxy_type": "none",
+            "proxy_host": "",
+            "proxy_port": 0,
+            "proxy_user": "",
+            "proxy_pass": "",
+        }
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(reply_server, "cookie_manager", SimpleNamespace(manager=fake_manager)), \
+             mock.patch.object(reply_server, "_ensure_account_access", return_value="1"):
+            result = reply_server.update_cookie_proxy_config(
+                "1",
+                reply_server.ProxyConfig(
+                    proxy_type="none",
+                    proxy_host="",
+                    proxy_port=0,
+                    proxy_user="",
+                    proxy_pass="",
+                ),
+                current_user={"user_id": 1, "username": "tester"},
+            )
+
+        self.assertTrue(result["success"])
+        self.assertFalse(result["task_restarted"])
+        fake_db.update_cookie_proxy_config.assert_not_called()
+        fake_manager.update_cookie.assert_not_called()
+
+    def test_update_cookie_proxy_config_restarts_when_effective_config_changes(self):
+        fake_manager = mock.Mock()
+        fake_db = mock.Mock()
+        fake_db.get_cookie_proxy_config.return_value = {
+            "proxy_type": "none",
+            "proxy_host": "",
+            "proxy_port": 0,
+            "proxy_user": "",
+            "proxy_pass": "",
+        }
+        fake_db.update_cookie_proxy_config.return_value = True
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(reply_server, "cookie_manager", SimpleNamespace(manager=fake_manager)), \
+             mock.patch.object(reply_server, "_ensure_account_access", return_value="1"), \
+             mock.patch.object(reply_server, "_get_user_cookies_map", return_value={"1": "cookie2=v1"}):
+            result = reply_server.update_cookie_proxy_config(
+                "1",
+                reply_server.ProxyConfig(
+                    proxy_type="http",
+                    proxy_host="127.0.0.1",
+                    proxy_port=1081,
+                    proxy_user="",
+                    proxy_pass="",
+                ),
+                current_user={"user_id": 1, "username": "tester"},
+            )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["task_restarted"])
+        fake_db.update_cookie_proxy_config.assert_called_once_with(
+            "1",
+            proxy_type="http",
+            proxy_host="127.0.0.1",
+            proxy_port=1081,
+            proxy_user="",
+            proxy_pass="",
+        )
+        fake_manager.update_cookie.assert_called_once_with("1", "cookie2=v1", save_to_db=False)
 
     def test_password_login_refresh_mode_invalidates_sync_runtime_after_capturing_cookies(self):
         reply_server_source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
@@ -2162,6 +2241,89 @@ class ReplyServerVerificationMaterialStateTest(_ReplyServerModuleBindingMixin, u
 
             self.assertIsNone(resolved["screenshot_path"])
             self.assertEqual("https://passport.example/qr", resolved["verification_url"])
+
+    def test_build_verification_required_status_payload_uses_processing_state_after_screenshot_is_consumed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            consumed_screenshot_path = Path(tmpdir) / "face_verify_1_latest.jpg"
+
+            session = {
+                "verification_type": "face_verify",
+                "screenshot_path": str(consumed_screenshot_path),
+                "verification_url": "https://passport.example/fallback",
+                "qr_code_url": "https://passport.example/qr",
+            }
+
+            payload = reply_server._build_verification_required_status_payload(
+                session,
+                pending_completion_message="验证已提交，正在等待登录完成，请勿关闭当前页面",
+            )
+
+            self.assertEqual("verification_processing", payload["status"])
+            self.assertTrue(payload["verification_pending_completion"])
+            self.assertIsNone(payload["screenshot_path"])
+            self.assertIsNone(payload["verification_url"])
+            self.assertEqual(
+                "验证已提交，正在等待登录完成，请勿关闭当前页面",
+                payload["message"],
+            )
+
+
+class ReplyServerVerificationUiContractTest(_ReplyServerModuleBindingMixin, unittest.TestCase):
+    def test_password_login_modal_handles_verification_processing_without_fallback_button(self):
+        app_js = (REPO_ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("case 'verification_processing':", app_js)
+        self.assertIn("showPasswordLoginQRCode(", app_js)
+        self.assertIn("Boolean(data.verification_pending_completion)", app_js)
+        self.assertIn("data.status === 'verification_processing'", app_js)
+
+
+class ReplyServerAccountDeletionCleanupTest(_ReplyServerModuleBindingMixin, unittest.TestCase):
+    def test_purge_account_local_artifacts_removes_profile_and_face_verification_images(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            browser_profile_dir = Path(temp_dir) / "browser_data" / "user_1"
+            browser_profile_dir.mkdir(parents=True, exist_ok=True)
+            (browser_profile_dir / "Preferences").write_text("{}", encoding="utf-8")
+
+            static_root = Path(temp_dir) / "static"
+            screenshots_dir = static_root / "uploads" / "images"
+            screenshots_dir.mkdir(parents=True, exist_ok=True)
+            screenshot_jpg = screenshots_dir / "face_verify_1_test.jpg"
+            screenshot_png = screenshots_dir / "face_verify_1_test.png"
+            screenshot_jpg.write_bytes(b"jpg")
+            screenshot_png.write_bytes(b"png")
+
+            with mock.patch.object(reply_server, "static_dir", str(static_root)), \
+                 mock.patch.object(reply_server, "account_browser_runtime_manager", SimpleNamespace(base_dir=temp_dir)), \
+                 mock.patch.object(reply_server, "log_with_user"):
+                result = reply_server._purge_account_local_artifacts(
+                    "1",
+                    current_user={"user_id": 1, "username": "admin"},
+                )
+
+            self.assertEqual(result["deleted_face_verification_screenshots"], 2)
+            self.assertTrue(result["browser_profile_deleted"])
+            self.assertFalse(browser_profile_dir.exists())
+            self.assertFalse(screenshot_jpg.exists())
+            self.assertFalse(screenshot_png.exists())
+
+    def test_remove_cookie_route_also_purges_account_local_artifacts(self):
+        fake_manager = SimpleNamespace(remove_cookie=mock.Mock())
+        current_user = {"user_id": 1, "username": "admin"}
+
+        with mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "_ensure_account_access", return_value="1"), \
+             mock.patch.object(
+                 reply_server,
+                 "_purge_account_local_artifacts",
+                 return_value={"browser_profile_deleted": True},
+             ) as purge_mock:
+            result = reply_server.remove_cookie("1", current_user=current_user)
+
+        fake_manager.remove_cookie.assert_called_once_with("1")
+        purge_mock.assert_called_once_with("1", current_user=current_user)
+        self.assertEqual(result["msg"], "removed")
+        self.assertTrue(result["artifacts"]["browser_profile_deleted"])
 
 
 if __name__ == "__main__":

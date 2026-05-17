@@ -1390,3 +1390,204 @@ python -m pytest tests/test_xianyu_async_browser_runtime.py -k "fetch_recent_ord
 1. **列表优先走 HTTP 抓取**
 2. **详情继续允许复用当前账号 runtime**
 3. 不要再轻易把“列表抓取”改回需要 fresh page/context 的浏览器链路，除非有新的硬证据证明 HTTP 路径不够用
+---
+
+## 2026-05-17 本轮补充：验证处理中态、避免误导兜底按钮、减少二次浏览器拉起
+
+### 1. 人脸/验证材料提交后，后端状态从 `verification_required` 细分为 `verification_processing`
+
+这轮确认的真实链路不是“人脸没过”，而是：
+
+1. 人脸验证已经成功提交
+2. 后端继续做 Cookie / Token 稳定化与接管
+3. 业务预热阶段可能再次遇到后置滑块
+4. 滑块自动处理完成后，才最终进入登录成功 / 链路恢复
+
+之前这里一直返回 `verification_required`，前端就会继续把“打开兜底验证页面”那套按钮亮出来，用户会误以为还得继续手动操作。
+
+本次调整后：
+
+- `reply_server._build_verification_required_status_payload(...)`
+  - 当截图已经被消费、验证材料已提交、当前只是在等后台自动收尾时
+  - 返回 `status = verification_processing`
+- 保留：
+  - `verification_pending_completion = true`
+  - 不再继续下发可重复点击的兜底验证材料
+
+### 2. 前端三条轮询链路统一识别 `verification_processing`
+
+已覆盖：
+
+- 密码登录轮询
+- 刷新 Cookie 轮询
+- 手动导入 Cookie 轮询
+
+行为统一改为：
+
+- 如果是 `verification_processing`
+  - 展示“验证已提交，系统正在自动完成后续处理，请勿关闭当前窗口”
+  - 继续轮询
+  - 不再误导性展示兜底验证按钮
+
+### 3. 密码登录后，不再为了 token 失败再二次拉起浏览器
+
+当前策略：
+
+1. 优先用当前登录得到的 Cookie 做 HTTP 预检
+2. 如果可以，尝试直接做 token 预热交接
+3. 如果 HTTP 预检不通过，再优先复用当前 managed runtime 做 Cookie 稳定化
+4. 如果 token 预热仍失败，不再额外再起一轮同账号浏览器去刷
+5. 直接进入“延后交接”，让正式实例后续继续完成初始化
+
+本次还顺手修了两个细节：
+
+- token 预热结果既识别 `current_token`，也识别预检协程的返回值
+- runtime 如果已经在 handoff 前释放，finally 不再重复释放一遍
+
+### 4. 二维码登录相关测试契约同步更新
+
+测试层面现在明确约束：
+
+- 扫码登录真实 Cookie 落库后，账号任务切换要走 manager loop
+- manager loop 不可用时，返回 runtime 问题提示，不再假装 token 已预热成功
+- 不再要求扫码阶段同步完成 token 预热
+
+### 5. 账号删除 / 清理时，账号级本地画像与验证截图一起清掉
+
+新增统一清理逻辑：
+
+- `browser_data/user_{account_id}`
+- `static/uploads/images/face_verify_{account_id}_*.jpg|png`
+
+并挂到：
+
+- `remove_cookie(account_id)`
+
+### 6. 本轮新增/更新测试
+
+覆盖点：
+
+- `tests/test_reply_server_account_scope.py`
+  - `verification_processing` 状态构造
+  - 前端处理 `verification_processing` 的契约
+  - 删除账号时画像/验证截图一起清理
+- `tests/test_reply_server_manual_cookie_import_flow.py`
+  - 密码登录 handoff 释放时机
+  - token 预热失败时走“延后交接”而不是二次浏览器刷新
+  - 扫码登录在 manager loop 场景下的切换行为
+
+### 7. 本轮本地验证结果
+
+执行：
+
+```bash
+python -m pytest tests/test_reply_server_manual_cookie_import_flow.py
+python -m pytest tests/test_qr_login_status_flow.py
+python -m pytest tests/test_reply_server_account_scope.py -k "verification"
+```
+
+结果：
+
+- `16 passed`
+- `40 passed`
+- `5 passed`
+
+### 8. 回归前现场清理
+
+为避免旧数据串味，本轮回归前已清空：
+
+- `data/xianyu_data.db`
+- `data/qr_login/*`
+- `logs/*`
+- `browser_data/*`
+- `static/uploads/images/*`
+- `trajectory_history/*`
+- `tmp_qr_*.png`
+- `realtime.log`
+- `tmp_service_stdout.log`
+- `tmp_service_stderr.log`
+
+并确认当时残留的两个 `Start.py` 进程已全部停止后再重启服务。
+
+---
+
+## 2026-05-18 补充：编辑账号资料后误触发账号重启的问题
+
+### 1. 现象
+
+- 前一轮 `account_id=1` 扫码登录已经成功，`Cookie -> Token -> WebSocket` 链路都正常；
+- 之后只是在账号管理里给这个账号补了用户名密码，结果运行态被打断，紧接着又进入滑块/风控恢复链路；
+- 用户体感上就是：**“刚刚明明连上了，编辑一下账号资料反而失败了。”**
+
+### 2. 根因
+
+不是 `POST /accounts/1/account-info` 把 cookie 覆盖坏了，真正的问题是：
+
+- 前端保存账号资料时，会顺手再调一次 `POST /accounts/1/proxy`
+- 后端旧逻辑里，**代理配置接口不管代理有没有变化，都会直接重启账号任务**
+- 于是刚恢复好的运行态被人为打断，立刻重新走：
+  - runtime 退出
+  - token refresh
+  - 可能触发滑块/风控
+
+也就是说，**“编辑账号资料后失败”本质上不是资料保存失败，而是代理保存接口的无脑重启副作用。**
+
+### 3. 日志证据
+
+日志文件：
+
+- `logs/xianyu_2026-05-18.log`
+
+关键时间点：
+
+1. `2026-05-18 00:32:24.615`
+   - `POST /accounts/1/account-info`
+2. `2026-05-18 00:32:24.640`
+   - `Cookie值未变化，无需重启任务: 1`
+   - 说明：**补用户名密码这一步本身没有触发 cookie 重启**
+3. `2026-05-18 00:32:24.650`
+   - `POST /accounts/1/proxy`
+4. `2026-05-18 00:32:24.657`
+   - `代理配置已更新，重启账号任务: 1`
+   - 说明：**真正把运行态打断的是代理配置接口**
+
+后面日志马上就能看到：
+
+- 旧实例停止
+- WebSocket 退出
+- 重新进入 token / 滑块恢复链路
+
+### 4. 修复
+
+涉及文件：
+
+- `reply_server.py`
+- `tests/test_reply_server_proxy_restart_guard_contract.py`
+
+新增逻辑：
+
+1. 给代理配置加统一归一化快照 `_normalize_proxy_config_snapshot()`
+2. 先比较“当前配置”和“目标配置”
+   - **完全没变化：直接返回，不重启任务**
+3. 再比较“实际生效配置”
+   - 对 `proxy_type=none` 的情况，把 `host/port/user/pass` 统一折叠为空值后再比较
+   - 避免只是清理残留字段，也误判成“需要重启”
+4. 只有**实际生效代理真的变化了**，才重启账号任务
+
+一句话：
+
+> **编辑账号资料时，如果代理没变，就不该把已经跑稳的账号运行态狠狠干掉。**
+
+### 5. 本轮验证
+
+执行：
+
+```bash
+python -m py_compile reply_server.py
+python -m pytest tests/test_reply_server_proxy_restart_guard_contract.py -q
+```
+
+结果：
+
+- `py_compile` 通过
+- `2 passed`
