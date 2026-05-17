@@ -3984,14 +3984,26 @@ def _build_verification_required_status_payload(
     verification_url = session.get('verification_url')
     verification_type = session.get('verification_type') or '身份验证'
     qr_code_url = session.get('qr_code_url')
+    session_had_screenshot = bool(screenshot_path)
 
     if screenshot_path and not os.path.exists(screenshot_path):
         screenshot_path = None
         session['screenshot_path'] = None
 
+    verification_pending_completion = bool(
+        pending_completion_message
+        and session_had_screenshot
+        and not screenshot_path
+    )
+    if verification_pending_completion:
+        verification_url = None
+        qr_code_url = None
+
     verification_material_ready = bool(screenshot_path or verification_url or qr_code_url)
     if screenshot_path:
         message = f'需要{verification_type}，请查看验证截图'
+    elif verification_pending_completion:
+        message = pending_completion_message
     elif verification_url:
         message = f'需要{verification_type}，请点击验证链接'
     else:
@@ -4003,6 +4015,7 @@ def _build_verification_required_status_payload(
         'screenshot_path': screenshot_path,
         'verification_type': verification_type,
         'verification_material_ready': verification_material_ready,
+        'verification_pending_completion': verification_pending_completion,
         'message': message,
     }
     if include_qr_code_url:

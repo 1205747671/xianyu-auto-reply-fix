@@ -9642,7 +9642,6 @@ class XianyuLive:
                 "stopped_by_range": False,
             }
 
-        runtime_lease = None
         history_fetcher = None
         try:
             from utils.order_history_sync import OrderHistoryPageFetcher
@@ -9672,14 +9671,6 @@ class XianyuLive:
                     await history_fetcher.close()
                 except Exception as close_error:
                     logger.warning(f"【{current_account_id}】关闭历史订单抓取器失败: {self._safe_str(close_error)}")
-            if runtime_lease is not None:
-                try:
-                    await account_browser_runtime_manager.release_runtime(
-                        runtime_lease,
-                        reason="order_history_sync_finished",
-                    )
-                except Exception as release_error:
-                    logger.warning(f"【{current_account_id}】释放历史订单 runtime lease 失败: {self._safe_str(release_error)}")
 
     async def fetch_order_detail_info(self, order_id: str, item_id: str = None, buyer_id: str = None, debug_headless: bool = None, sid: str = None, force_refresh: bool = False, buyer_nick: str = None, buyer_id_source: str = None):
         current_account_id = self._canonical_account_id()

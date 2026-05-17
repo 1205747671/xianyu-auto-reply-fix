@@ -3600,6 +3600,13 @@ function getAboutRuntimeOverview(runtimeStatus, readinessCount = 0) {
     }
 
     if (runtimeStatus?.connection_state === 'connecting' || runtimeStatus?.connection_state === 'reconnecting') {
+        if (runtimeStatus?.manual_refresh_active) {
+            return {
+                tone: 'info',
+                title: '接管恢复中',
+                note: '账号刚完成登录或刷新交接，实例正在重连并重新初始化；如果长时间不恢复，优先看 Token 卡片里的最近错误。',
+            };
+        }
         return {
             tone: 'info',
             title: '连接正在恢复',
@@ -3631,18 +3638,28 @@ function renderAboutRuntimeStatus(runtimeStatus) {
         return;
     }
 
-    const lastConnectionDisplay = formatAboutRuntimeTime(
+    const rawLastConnectionDisplay = formatAboutRuntimeTime(
         runtimeStatus.last_successful_connection_at_display,
         runtimeStatus.last_successful_connection_at
     );
+    const lastConnectionDisplay = (
+        runtimeStatus.manual_refresh_active
+        && (runtimeStatus.connection_state === 'connecting' || runtimeStatus.connection_state === 'reconnecting')
+    )
+        ? `${rawLastConnectionDisplay} · 当前处于登录/刷新后的接管恢复窗口`
+        : rawLastConnectionDisplay;
     const keepaliveDisplay = formatAboutRuntimeTime(
         runtimeStatus.session_keepalive_at_display,
         runtimeStatus.session_keepalive_at
     );
-    const tokenRefreshDisplay = formatAboutRuntimeTime(
+    const rawTokenRefreshDisplay = formatAboutRuntimeTime(
         runtimeStatus.token_last_refreshed_at_display,
         runtimeStatus.token_last_refreshed_at
     );
+    const tokenErrorNote = String(runtimeStatus.token_refresh_error_message || '').trim();
+    const tokenRefreshDisplay = tokenErrorNote
+        ? `${rawTokenRefreshDisplay} · 最近错误：${tokenErrorNote}`
+        : rawTokenRefreshDisplay;
     const lastMessageDisplay = formatAboutRuntimeTime(
         runtimeStatus.last_message_received_at_display,
         runtimeStatus.last_message_received_at
@@ -3673,7 +3690,6 @@ function renderAboutRuntimeStatus(runtimeStatus) {
         : readinessSignalItems.some(item => item.ready)
             ? 'warning'
             : 'danger';
-
     statusContainer.innerHTML = `
         <div class="account-diagnostics-status-shell">
             <div class="account-diagnostics-status-note-bar is-${overview.tone}">
@@ -12159,7 +12175,8 @@ async function checkPasswordLoginStatus() {
                         data.screenshot_path || data.verification_url || data.qr_code_url,
                         data.screenshot_path,
                         data.verification_type,
-                        data.message
+                        data.message,
+                        Boolean(data.verification_pending_completion)
                     );
                     // 继续监控（人脸认证后需要继续等待登录完成）
                     break;
@@ -12304,7 +12321,7 @@ function bindPasswordLoginQRModalEvents(modalElement) {
 }
 
 // 显示账号密码登录验证
-function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationType, statusMessage = '') {
+function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationType, statusMessage = '', verificationPendingCompletion = false) {
     // 使用现有的二维码登录模态框
     let modal = document.getElementById('passwordLoginQRModal');
     if (!modal) {
@@ -12339,6 +12356,22 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationTy
     const statusText = document.getElementById('passwordLoginQRStatusText');
     const verificationTypeLabel = getPasswordLoginVerificationTypeLabel(verificationType);
     const fallbackWaitingMessage = statusMessage || '验证已提交，正在等待服务端完成登录，请勿关闭当前窗口';
+
+    if (verificationPendingCompletion) {
+        if (screenshotImg) {
+            screenshotImg.onerror = null;
+            screenshotImg.src = '';
+            screenshotImg.style.display = 'none';
+        }
+        if (linkButton) {
+            linkButton.style.display = 'none';
+            linkButton.removeAttribute('href');
+        }
+        if (statusText) {
+            statusText.textContent = fallbackWaitingMessage;
+        }
+        return;
+    }
     
     if (screenshotPath) {
         // 显示截图
