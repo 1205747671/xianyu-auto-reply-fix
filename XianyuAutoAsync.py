@@ -40,6 +40,19 @@ from utils.account_browser_runtime import account_browser_runtime_manager
 
 DELIVERY_BATCH_MAX_UNITS = 10
 DELIVERY_BATCH_MAX_CHARS = 1200
+
+
+def _resolve_websocket_open_timeout(default: int = 30) -> int:
+    raw = os.environ.get('XY_WS_OPEN_TIMEOUT')
+    if raw is None or str(raw).strip() == '':
+        return default
+    try:
+        return max(5, int(float(raw)))
+    except (TypeError, ValueError):
+        return default
+
+
+WEBSOCKET_OPEN_TIMEOUT = _resolve_websocket_open_timeout()
 PROTECTED_SESSION_COOKIE_FIELDS = (
     'unb',
     'sgcookie',
@@ -1555,6 +1568,7 @@ class XianyuLive:
         if self.register_instance and not self._canonical_account_id():
             raise ValueError("register_instance=True requires non-empty account_id")
         self.base_url = WEBSOCKET_URL
+        self.websocket_open_timeout = WEBSOCKET_OPEN_TIMEOUT
 
         if 'unb' not in self.cookies:
             raise ValueError(f"【{init_log_account_id}】Cookie中缺少必需的'unb'字段，当前字段: {list(self.cookies.keys())}")
@@ -13365,6 +13379,7 @@ class XianyuLive:
             async with websockets.connect(
                 self.base_url,
                 extra_headers=headers,
+                open_timeout=self.websocket_open_timeout,
                 close_timeout=5
             ) as websocket:
                 result = await self._handle_websocket_connection(websocket, toid, item_id, text)
@@ -13380,6 +13395,7 @@ class XianyuLive:
                 async with websockets.connect(
                     self.base_url,
                     additional_headers=headers,
+                    open_timeout=self.websocket_open_timeout,
                     close_timeout=5
                 ) as websocket:
                     result = await self._handle_websocket_connection(websocket, toid, item_id, text)
@@ -13404,6 +13420,7 @@ class XianyuLive:
             async with websockets.connect(
                 self.base_url,
                 extra_headers=headers,
+                open_timeout=self.websocket_open_timeout,
                 close_timeout=5
             ) as websocket:
                 result = await self._handle_websocket_connection_steps(websocket, toid, item_id, delivery_steps)
@@ -13419,6 +13436,7 @@ class XianyuLive:
                 async with websockets.connect(
                     self.base_url,
                     additional_headers=headers,
+                    open_timeout=self.websocket_open_timeout,
                     close_timeout=5
                 ) as websocket:
                     result = await self._handle_websocket_connection_steps(websocket, toid, item_id, delivery_steps)
@@ -13477,7 +13495,7 @@ class XianyuLive:
         import websockets
 
         websockets_version = getattr(websockets, '__version__', '未知')
-        logger.info(f"【{self.account_id}】websockets库版本: {websockets_version}")
+        logger.info(f"【{self.account_id}】websockets库版本: {websockets_version}, open_timeout={self.websocket_open_timeout}s")
 
         proxy_url = self._get_proxy_url()
         proxy_sock = None
@@ -13538,7 +13556,8 @@ class XianyuLive:
 
         try:
             connect_kwargs = {
-                'extra_headers': headers
+                'extra_headers': headers,
+                'open_timeout': self.websocket_open_timeout,
             }
             if proxy_sock:
                 connect_kwargs['sock'] = proxy_sock
@@ -13555,7 +13574,8 @@ class XianyuLive:
                 logger.warning(f"【{self.account_id}】websockets库不支持extra_headers参数，尝试additional_headers")
                 try:
                     connect_kwargs = {
-                        'additional_headers': headers
+                        'additional_headers': headers,
+                        'open_timeout': self.websocket_open_timeout,
                     }
                     if proxy_sock:
                         connect_kwargs['sock'] = proxy_sock

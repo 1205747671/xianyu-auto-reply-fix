@@ -232,6 +232,35 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(seeded_again)
         self.assertEqual(live.last_cookie_refresh_time, 1234.5)
 
+    def test_resolve_websocket_open_timeout_reads_env_override(self):
+        from XianyuAutoAsync import _resolve_websocket_open_timeout
+
+        with mock.patch.dict(os.environ, {"XY_WS_OPEN_TIMEOUT": "45"}, clear=False):
+            self.assertEqual(_resolve_websocket_open_timeout(default=30), 45)
+
+        with mock.patch.dict(os.environ, {"XY_WS_OPEN_TIMEOUT": "2"}, clear=False):
+            self.assertEqual(_resolve_websocket_open_timeout(default=30), 5)
+
+        with mock.patch.dict(os.environ, {"XY_WS_OPEN_TIMEOUT": "not-a-number"}, clear=False):
+            self.assertEqual(_resolve_websocket_open_timeout(default=30), 30)
+
+        env_without_override = {k: v for k, v in os.environ.items() if k != "XY_WS_OPEN_TIMEOUT"}
+        with mock.patch.dict(os.environ, env_without_override, clear=True):
+            self.assertEqual(_resolve_websocket_open_timeout(default=30), 30)
+
+    def test_xianyu_live_propagates_websocket_open_timeout_to_instance(self):
+        from XianyuAutoAsync import WEBSOCKET_OPEN_TIMEOUT
+
+        live = XianyuLive(
+            "unb=test-unb; cookie2=test-cookie2",
+            account_id="1",
+            register_instance=False,
+        )
+
+        self.assertEqual(live.websocket_open_timeout, WEBSOCKET_OPEN_TIMEOUT)
+        self.assertGreaterEqual(live.websocket_open_timeout, 5)
+
+
     @staticmethod
     def _build_merge_result(merged_cookies_dict):
         return {
