@@ -5543,6 +5543,41 @@ class XianyuLive:
             merge_result['new_fields'],
         )
 
+    def _has_business_ready_cookie_shape(self, cookies_dict: Dict[str, str]) -> bool:
+        cookies_dict = cookies_dict or {}
+        required_without_cna = (
+            'unb',
+            'sgcookie',
+            'cookie2',
+            '_m_h5_tk',
+            '_m_h5_tk_enc',
+            't',
+        )
+        if not all(cookies_dict.get(key) for key in required_without_cna):
+            return False
+
+        return bool(
+            cookies_dict.get('_tb_token_')
+            or cookies_dict.get('x5sec')
+            or cookies_dict.get('x5secdata')
+        )
+
+    def _should_accept_business_ready_cookie_handoff(
+        self,
+        cookies_dict: Dict[str, str],
+        *,
+        missing_required_fields: Optional[List[str]] = None,
+    ) -> bool:
+        normalized_missing_required_fields = [
+            str(field).strip()
+            for field in (missing_required_fields or [])
+            if str(field).strip()
+        ]
+        if normalized_missing_required_fields and any(field != 'cna' for field in normalized_missing_required_fields):
+            return False
+
+        return self._has_business_ready_cookie_shape(cookies_dict)
+
     def _log_protected_merge_event(self, event_name: str, merge_result: Dict[str, Any]):
         if not merge_result:
             return
@@ -6745,8 +6780,29 @@ class XianyuLive:
                     )
 
                     if missing_required_fields:
-                        logger.error(f"【{self.account_id}】滑块验证后的Cookie仍缺失核心字段，放弃写回数据库: {', '.join(missing_required_fields)}")
-                        return None
+                        accept_business_ready_handoff = False
+                        helper = getattr(slider_stealth, '_should_accept_business_ready_cookie_handoff', None)
+                        if callable(helper):
+                            try:
+                                accept_business_ready_handoff = bool(
+                                    helper(
+                                        updated_cookies,
+                                        missing_required_fields=missing_required_fields,
+                                    )
+                                )
+                            except Exception as business_ready_err:
+                                logger.warning(
+                                    f"【{self.account_id}】滑块验证后评估 business-ready Cookie 失败: "
+                                    f"{self._safe_str(business_ready_err)}"
+                                )
+                        if accept_business_ready_handoff:
+                            logger.warning(
+                                f"【{self.account_id}】滑块验证后的Cookie仅缺少 cna，"
+                                "但浏览器业务预热已证明会话可用，继续写回数据库"
+                            )
+                        else:
+                            logger.error(f"【{self.account_id}】滑块验证后的Cookie仍缺失核心字段，放弃写回数据库: {', '.join(missing_required_fields)}")
+                            return None
 
                     try:
                         old_cookies_str = self.cookies_str
@@ -11891,6 +11947,7 @@ class XianyuLive:
         context = managed_context
         page = managed_page
         runtime_lease = managed_runtime_lease
+        owns_runtime_lease = False
         close_browser = False
         close_context = False
         close_page = False
@@ -12031,6 +12088,7 @@ class XianyuLive:
                     target_account_id=target_account_id,
                     runtime_purpose="verification_recovery",
                 )
+                owns_runtime_lease = runtime_lease is not None
                 if context is None:
                     return False
             else:
@@ -12136,8 +12194,17 @@ class XianyuLive:
 
             missing_required_fields = merge_result['missing_required_fields']
             if missing_required_fields:
-                logger.error(f"【{target_account_id}】扫码登录真实Cookie仍缺失核心字段，放弃保存: {', '.join(missing_required_fields)}")
-                return False
+                if self._should_accept_business_ready_cookie_handoff(
+                    real_cookies_dict,
+                    missing_required_fields=missing_required_fields,
+                ):
+                    logger.warning(
+                        f"【{target_account_id}】扫码登录真实Cookie仅缺少 cna，"
+                        "但业务关键字段已齐，按 business-ready Cookie 继续保存"
+                    )
+                else:
+                    logger.error(f"【{target_account_id}】扫码登录真实Cookie仍缺失核心字段，放弃保存: {', '.join(missing_required_fields)}")
+                    return False
 
             real_cookies_str = '; '.join([f"{k}={v}" for k, v in real_cookies_dict.items()])
 
@@ -12256,6 +12323,7 @@ class XianyuLive:
                         context=context,
                         page=page,
                         reason="qr_cookie_refresh_completed",
+                        invalidate_after_release=owns_runtime_lease,
                     )
                 elif browser or context:
                     await self._async_close_browser(

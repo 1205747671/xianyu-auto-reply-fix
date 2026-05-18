@@ -2810,6 +2810,78 @@ class ReplyServerPasswordLoginStabilizationTest(_ReplyServerModuleBindingMixin, 
         self.assertEqual({"status": "handled"}, result)
         slider_like._perform_browser_cookie_warmup_probes.assert_not_called()
 
+    def test_finalize_cookie_handoff_or_fail_accepts_business_ready_cookie_when_only_cna_missing(self):
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        slider_like = SimpleNamespace(
+            pure_user_id="3",
+            _PROTECTED_SESSION_COOKIE_FIELDS=(
+                "unb",
+                "sgcookie",
+                "cookie2",
+                "_m_h5_tk",
+                "_m_h5_tk_enc",
+                "t",
+                "cna",
+                "havana_lgc2_77",
+            ),
+            _REQUIRED_SESSION_COOKIE_FIELDS=(
+                "unb",
+                "sgcookie",
+                "cookie2",
+                "_m_h5_tk",
+                "_m_h5_tk_enc",
+                "t",
+                "cna",
+            ),
+            _IDENTITY_VERIFY_PENDING_COOKIE_FIELDS=(),
+            last_browser_cookie_warmup_session_unready=False,
+            last_browser_cookie_warmup_probe_status={
+                "login_token_fetch": True,
+                "login_user_fetch": True,
+            },
+            _log_cookie_snapshot_integrity=mock.Mock(),
+            _fail_login=mock.Mock(return_value=False),
+        )
+        slider_like._has_business_ready_cookie_shape = (
+            slider_stealth.XianyuSliderStealth._has_business_ready_cookie_shape.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+        slider_like._has_browser_cookie_warmup_probe_business_ready = (
+            slider_stealth.XianyuSliderStealth._has_browser_cookie_warmup_probe_business_ready.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+        slider_like._should_accept_business_ready_cookie_handoff = (
+            slider_stealth.XianyuSliderStealth._should_accept_business_ready_cookie_handoff.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+        slider_like._finalize_cookie_handoff_or_fail = (
+            slider_stealth.XianyuSliderStealth._finalize_cookie_handoff_or_fail.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+
+        result = slider_like._finalize_cookie_handoff_or_fail(
+            {
+                "unb": "u1",
+                "sgcookie": "sg1",
+                "cookie2": "c2",
+                "_m_h5_tk": "tk_1",
+                "_m_h5_tk_enc": "enc1",
+                "t": "t1",
+                "_tb_token_": "tb1",
+                "x5sec": "x5_1",
+            },
+            scene="滑块通过后验证页补处理",
+        )
+
+        self.assertIsInstance(result, dict)
+        self.assertEqual("u1", result["unb"])
+        slider_like._fail_login.assert_not_called()
+
     def test_detect_post_slider_blocking_state_allows_transient_punish_shell_to_clear(self):
         import utils.xianyu_slider_stealth as slider_stealth
 

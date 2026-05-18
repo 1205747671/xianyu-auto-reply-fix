@@ -1997,3 +1997,125 @@ python -m pytest tests/test_reply_server_proxy_restart_guard_contract.py -q
 3. 不动已经跑通的人脸 / 滑块 / token / WS 主线
 
 也就是说，后面该优化的是“确认时机”，不是再去乱拆已通的验证链路。
+
+---
+
+## 2026-05-18 补充：扫码登录链路收尾，修正 cna-only 拦截与 runtime 释放后滑块接管问题
+
+### 1. 本轮现场问题
+
+这轮不是“扫码没成功”，而是**扫码成功后，后续收口有两处硬伤**：
+
+1. **扫码真实 Cookie 只缺 `cna` 时，被当成失败**
+   - 扫码后的浏览器稳定化已经拿到：
+     - `_m_h5_tk`
+     - `_m_h5_tk_enc`
+     - `cookie2`
+     - `sgcookie`
+     - `t`
+     - `unb`
+     - `_tb_token_ / x5sec / tfstk`
+   - 业务其实已经可用
+   - 但旧逻辑还在按“缺一个 `cna` 就整条链路失败”处理
+
+2. **扫码真实 Cookie 入库后，后续 token 预检一旦触发滑块，接管会撞到旧 runtime / profile**
+   - 一次是：
+     - `账号级 browser profile 已被其他 runtime 持有`
+   - 另一次是：
+     - `账号 5 的 sync runtime 正在失效回收，旧 lease 未释放`
+   - 说明扫码 cookie 刷新链路虽然表面结束了，但账号级 runtime 的释放/失效收口还差一口气
+
+这俩问题凑一块，前面看着像“扫码后还是不稳”，其实毛病都在**扫码成功后的收尾阶段**。
+
+### 2. 本次代码调整
+
+涉及文件：
+
+- `XianyuAutoAsync.py`
+- `utils/xianyu_slider_stealth.py`
+- `tests/test_reply_server_account_scope.py`
+- `tests/test_reply_server_manual_cookie_import_flow.py`
+
+本轮补了三件事：
+
+1. **扫码真实 Cookie 支持 cna-only business-ready 放行**
+   - 位置：`XianyuAutoAsync.py -> refresh_cookies_from_qr_login(...)`
+   - 当缺失字段仅剩 `cna`
+   - 且其它业务关键字段已经齐
+   - 不再直接判失败，允许继续入库和后续接管
+
+2. **扫码自建 recovery runtime 释放后，立即走 invalidate_after_release**
+   - 位置：`XianyuAutoAsync.py`
+   - 只对本次扫码刷新链路里“自己新申请”的 runtime 做额外失效收口
+   - 避免后续 token 预检 / 滑块恢复刚上来又撞到旧 lease、旧 profile claim
+
+3. **滑块成功后的 Cookie finalize 也同步接受 cna-only business-ready**
+   - 位置：
+     - `utils/xianyu_slider_stealth.py`
+     - `XianyuAutoAsync.py`
+   - 这样后续如果 token 预检触发滑块
+   - 即使滑块后 Cookie 仍只差 `cna`
+   - 也不会再因为这一个字段把整条恢复链路打废
+
+### 3. 本次真实验证结果
+
+这次是先让用户完成扫码，然后我继续拿本轮扫码 Cookie 做后续链路回归。
+
+最终验证通过：
+
+- `account_info.real_cookie_refreshed=True`
+- `cookie_saved=True`
+- `preflight_token_received=True`
+- `ws_connected=True`
+- `ws_connection_state=connected`
+- `session_keepalive_ok=True`
+- `last_session_keepalive_status=success`
+
+同时日志里确认：
+
+- 扫码真实 Cookie 获取成功
+- 真实 Cookie 已写入数据库
+- 后续 token 预检成功
+- WebSocket 建连成功
+- heartbeat 正常
+- 轻量会话保活成功
+
+### 4. 本轮额外观察
+
+本轮后续 token / websocket / keepalive 都通了，说明：
+
+- 扫码登录主链路本身没崩
+- 真正要命的是“扫码后收尾”
+  - `cna` 单字段拦截过严
+  - runtime / lease 释放不彻底
+
+这类问题要是后面再冒出来，优先查：
+
+1. 当前缺的是不是只有 `cna`
+2. 浏览器业务预热是否已经证明会话可用
+3. 当前 profile claim / runtime lease 是否已正确释放
+
+别再一上来就怀疑扫码本身，容易把人带沟里。
+
+### 5. 本轮验证命令
+
+执行：
+
+```bash
+.\.venv\Scripts\python.exe -m py_compile .\XianyuAutoAsync.py .\utils\xianyu_slider_stealth.py .\tests\test_reply_server_account_scope.py .\tests\test_reply_server_manual_cookie_import_flow.py
+.\.venv\Scripts\python.exe -m pytest .\tests\test_reply_server_account_scope.py -q -k "finalize_cookie_handoff_or_fail_accepts_business_ready_cookie_when_only_cna_missing"
+.\.venv\Scripts\python.exe -m pytest .\tests\test_reply_server_manual_cookie_import_flow.py -q -k "XianyuLiveBusinessReadyCookieHandoffTest"
+```
+
+结果：
+
+- `py_compile` 通过
+- `1 passed`
+- `2 passed`
+
+另外还做了真实链路回归，确认：
+
+- 扫码后真实 Cookie 入库成功
+- token 预检成功
+- ws 成功
+- heartbeat / keepalive 成功

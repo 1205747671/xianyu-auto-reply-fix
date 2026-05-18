@@ -6113,13 +6113,24 @@ class XianyuSliderStealth:
             if not cookies_dict.get(key)
         ]
         if missing_required_fields:
+            if self._should_accept_business_ready_cookie_handoff(
+                cookies_dict,
+                missing_required_fields=missing_required_fields,
+            ):
+                logger.warning(
+                    f"[{self.pure_user_id}] {scene} cookie snapshot only misses cna, "
+                    "but browser warmup already proved business-ready session; continue handoff"
+                )
+            else:
+                self._log_cookie_snapshot_integrity(cookies_dict, f"{scene}完成后")
+                logger.error(
+                    f"[{self.pure_user_id}] {scene} cookie snapshot still misses required fields: {missing_required_fields}"
+                )
+                return self._fail_login(
+                    f"{scene}后Cookie仍缺失核心字段: {', '.join(missing_required_fields)}"
+                )
+
             self._log_cookie_snapshot_integrity(cookies_dict, f"{scene}完成后")
-            logger.error(
-                f"[{self.pure_user_id}] {scene} cookie snapshot still misses required fields: {missing_required_fields}"
-            )
-            return self._fail_login(
-                f"{scene}后Cookie仍缺失核心字段: {', '.join(missing_required_fields)}"
-            )
 
         self._log_cookie_snapshot_integrity(cookies_dict, f"{scene}完成后")
         logger.success(f"[{self.pure_user_id}] {scene} cookie finalize completed, field_count={len(cookies_dict)}")

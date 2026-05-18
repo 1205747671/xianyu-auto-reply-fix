@@ -1331,5 +1331,48 @@ class ReplyServerPasswordLoginExecutionTest(unittest.IsolatedAsyncioTestCase):
         fake_manager.update_cookie.assert_not_called()
 
 
+class XianyuLiveBusinessReadyCookieHandoffTest(unittest.TestCase):
+    def test_accepts_qr_cookie_when_only_cna_missing_but_business_fields_ready(self):
+        import XianyuAutoAsync
+
+        live = XianyuAutoAsync.XianyuLive.__new__(XianyuAutoAsync.XianyuLive)
+        cookies = {
+            "unb": "2095002164",
+            "sgcookie": "sg",
+            "cookie2": "cookie2v",
+            "_m_h5_tk": "token_123",
+            "_m_h5_tk_enc": "enc_123",
+            "t": "t_123",
+            "_tb_token_": "tb_123",
+        }
+
+        accepted = live._should_accept_business_ready_cookie_handoff(
+            cookies,
+            missing_required_fields=["cna"],
+        )
+
+        self.assertTrue(accepted)
+
+    def test_rejects_qr_cookie_when_missing_more_than_cna(self):
+        import XianyuAutoAsync
+
+        live = XianyuAutoAsync.XianyuLive.__new__(XianyuAutoAsync.XianyuLive)
+        cookies = {
+            "unb": "2095002164",
+            "sgcookie": "sg",
+            "cookie2": "cookie2v",
+            "_m_h5_tk": "token_123",
+            "t": "t_123",
+            "_tb_token_": "tb_123",
+        }
+
+        accepted = live._should_accept_business_ready_cookie_handoff(
+            cookies,
+            missing_required_fields=["cna", "_m_h5_tk_enc"],
+        )
+
+        self.assertFalse(accepted)
+
+
 if __name__ == "__main__":
     unittest.main()
