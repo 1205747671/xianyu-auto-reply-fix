@@ -5896,10 +5896,13 @@ class XianyuSliderStealth:
         if not page:
             return False
 
-        slider_selectors = [
+        strong_slider_selectors = [
             '#nc_1_n1z',
-            '.nc-container',
             '.nc_scale',
+            '#nc_1_n1t',
+        ]
+        slider_shell_selectors = [
+            '.nc-container',
             '.nc-wrapper',
             '#baxia-dialog-content',
             '.nc_wrapper',
@@ -5912,8 +5915,9 @@ class XianyuSliderStealth:
         except Exception:
             pass
 
+        shell_hits = []
         for frame in frames_to_check:
-            for selector in slider_selectors:
+            for selector in strong_slider_selectors:
                 try:
                     element = frame.query_selector(selector)
                     if element and element.is_visible():
@@ -5921,6 +5925,58 @@ class XianyuSliderStealth:
                         return True
                 except Exception:
                     continue
+            for selector in slider_shell_selectors:
+                try:
+                    element = frame.query_selector(selector)
+                    if element and element.is_visible():
+                        shell_hits.append((frame, selector))
+                except Exception:
+                    continue
+
+        if not shell_hits:
+            return False
+
+        slider_text_tokens = (
+            '滑块',
+            '拖动',
+            'captcha',
+            'punish',
+            '验证失败',
+            '点击框体重试',
+            '请按住滑块',
+            '拖动到最右边',
+        )
+        for frame, selector in shell_hits:
+            frame_url = ""
+            frame_title = ""
+            frame_text = ""
+            try:
+                frame_url = str(getattr(frame, 'url', '') or '')
+            except Exception:
+                frame_url = ""
+            try:
+                raw_title = frame.title() if callable(getattr(frame, 'title', None)) else getattr(frame, 'title', '')
+                frame_title = str(raw_title or '')
+            except Exception:
+                frame_title = ""
+            try:
+                frame_text = str(frame.inner_text('body', timeout=1200) or '')
+            except Exception:
+                try:
+                    frame_text = str(frame.content() or '')
+                except Exception:
+                    frame_text = ""
+
+            frame_text_lower = frame_text.lower()
+            if (
+                self._looks_like_verification_url(frame_url) or
+                self._looks_like_verification_title(frame_title) or
+                any(token in frame_text or token in frame_text_lower for token in slider_text_tokens)
+            ):
+                logger.info(f"【{self.pure_user_id}】检测到滑块外壳且页面仍命中验证码特征: {selector}")
+                return True
+
+        logger.debug(f"【{self.pure_user_id}】仅检测到残留滑块外壳，未命中可操作验证码特征，忽略本次滑块判定")
 
         return False
 

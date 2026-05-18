@@ -162,6 +162,22 @@ class _DelayedPunishSliderPage(_FakePage):
         return None
 
 
+class _StaleSliderShellPage(_FakePage):
+    def __init__(self):
+        super().__init__(
+            title="闲鱼消息",
+            url="https://www.goofish.com/im",
+            selectors={
+                ".nc-container": _FakeElement(),
+            },
+        )
+
+    def inner_text(self, selector, timeout=None):
+        if selector != "body":
+            raise AssertionError(f"unexpected selector: {selector}")
+        return "消息列表"
+
+
 class _FakeVerificationFrame:
     def __init__(self, *, verification_type="qr_verify", verify_url="", screenshot_path=None):
         self.verification_type = verification_type
@@ -620,6 +636,7 @@ class SliderVerificationGuardsTest(unittest.TestCase):
             "_m_h5_tk": "tk",
             "_m_h5_tk_enc": "tk_enc",
             "t": "t_cookie",
+            "cna": "cna_cookie",
         }
         slider = self._make_slider(page)
         slider.last_login_error = ""
@@ -667,6 +684,7 @@ class SliderVerificationGuardsTest(unittest.TestCase):
             "_m_h5_tk": "tk",
             "_m_h5_tk_enc": "tk_enc",
             "t": "t_cookie",
+            "cna": "cna_cookie",
         }
         slider = self._make_slider(page)
         slider.last_login_error = ""
@@ -1017,6 +1035,14 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         slider = self._make_slider(page)
 
         result = slider._is_hard_block_page(page)
+
+        self.assertFalse(result)
+
+    def test_page_has_slider_ignores_stale_shell_container_on_im_page(self):
+        page = _StaleSliderShellPage()
+        slider = self._make_slider(page)
+
+        result = slider._page_has_slider(page)
 
         self.assertFalse(result)
 
