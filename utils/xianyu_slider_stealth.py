@@ -6215,6 +6215,7 @@ class XianyuSliderStealth:
         last_verification_type = verification_type or 'unknown'
         last_verification_url = verification_url or None
         last_verification_screenshot_path = verification_screenshot_path or None
+        processing_notification_sent = False
 
         while waited_time < max_wait_time:
             monitor_page = self._select_monitor_page(context, monitor_page)
@@ -6239,6 +6240,21 @@ class XianyuSliderStealth:
                     logger.debug(
                         f"[{self.pure_user_id}] 验证等待期间复核当前页登录态失败: {login_probe_err}"
                     )
+                if (
+                    not processing_notification_sent
+                    and last_verification_type in {'face_verify', 'sms_verify', 'qr_verify'}
+                    and (last_verification_url or last_verification_screenshot_path)
+                ):
+                    logger.info(
+                        f"【{self.pure_user_id}】验证页已退出，切换为“等待登录完成”提示，"
+                        "隐藏前端辅助验证入口"
+                    )
+                    self._notify_verification_processing(
+                        last_verification_type,
+                        notification_callback,
+                        notification_scene,
+                    )
+                    processing_notification_sent = True
 
             hard_block = None
             hard_block_target = None
@@ -6299,6 +6315,17 @@ class XianyuSliderStealth:
                     if not (success_cookies or {}).get(key)
                 ]
                 if pending_identity_markers:
+                    if not has_verification:
+                        visible_login_ui, visible_page = self._should_handoff_visible_login_ui_for_cookie_finalize(
+                            context,
+                            success_page or monitor_page,
+                        )
+                        if visible_login_ui:
+                            logger.warning(
+                                f"【{self.pure_user_id}】验证页已退出且页面已呈现登录态，"
+                                f"尽管待确认Cookie标记仍存在，仍直接交给Cookie稳定化继续收口: {pending_identity_markers}"
+                            )
+                            return True, visible_page or success_page or monitor_page
                     logger.warning(
                         f"【{self.pure_user_id}】验证等待期间虽然检测到页面已登录，"
                         f"但待确认Cookie标记仍存在，继续等待后续验证完成: {pending_identity_markers}"
@@ -6317,6 +6344,7 @@ class XianyuSliderStealth:
                     return True, success_page or monitor_page
 
             if has_verification and refreshed_frame:
+                processing_notification_sent = False
                 refreshed_type = getattr(refreshed_frame, 'verification_type', None) or 'unknown'
                 refreshed_url = getattr(refreshed_frame, 'verify_url', None)
                 if not refreshed_url and hasattr(refreshed_frame, 'url'):
@@ -6519,6 +6547,41 @@ class XianyuSliderStealth:
             logger.error(f"【{self.pure_user_id}】发送验证通知失败: {notify_err}")
             import traceback
             logger.error(traceback.format_exc())
+
+    def _notify_verification_processing(
+        self,
+        verification_type: str,
+        notification_callback: Optional[Callable],
+        notification_scene: str,
+        message: Optional[str] = None,
+    ):
+        if not notification_callback:
+            return
+
+        notification_message = (
+            message
+            or '验证已提交，正在等待登录完成，请勿关闭当前页面'
+        )
+
+        try:
+            notification_callback(
+                notification_message,
+                None,
+                None,
+                None,
+                verification_type=verification_type,
+                verification_pending_completion=True,
+            )
+        except TypeError:
+            notification_callback(
+                notification_message,
+                None,
+                None,
+                None,
+                verification_type,
+            )
+        except Exception as notify_err:
+            logger.warning(f"【{self.pure_user_id}】发送验证处理中通知失败: {notify_err}")
 
     def _process_verification_requirement(
         self,

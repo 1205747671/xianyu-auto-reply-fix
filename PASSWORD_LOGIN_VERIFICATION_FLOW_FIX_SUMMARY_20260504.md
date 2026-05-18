@@ -1889,3 +1889,111 @@ python -m pytest tests/test_reply_server_proxy_restart_guard_contract.py -q
 - finalize 收口函数职责更清楚
 
 后续如果还要继续往二维码登录、Cookie 导入登录、token 刷新滑块恢复上复用，这次收口会省不少脏活。
+
+---
+
+## 2026-05-18 补充：直接托管浏览器实测账密登录后，Cookie 入库 + WS/心跳全链路打通
+
+### 1. 这次先把一个容易混淆的点钉死
+
+`utils/xianyu_slider_stealth.py` 里的 `login_with_password_browser()` 只负责两件事：
+
+1. 用 account 级 persistent profile 跑账密登录
+2. 在登录成功后拿到当前浏览器上下文里的真实 Cookie
+
+它**不负责正式入库**。
+
+真正把账密登录结果写入数据库、绑定 `user_id`、补账号信息并启动后续链路的收口逻辑，在：
+
+- `reply_server.py` -> `_persist_password_login_success(...)`
+
+之前本地调试时之所以一度看起来“浏览器都关了、数据肯定也保存了”，其实那只是：
+
+- 浏览器 profile 已落盘
+
+不是：
+
+- 数据库里的 Cookie 已正式保存
+
+这个坑要记住，不然后面再看“浏览器数据在、数据库没数据”的现象时，又容易瞎判断。
+
+### 2. 这轮真实托管回归结论
+
+本轮使用无头托管方式直接跑 `accountid=5` 账密登录，后面不走服务接口中转，直接验证登录成功后的整条链路。
+
+确认结果：
+
+- 登录成功
+- 成功拿到真实 Cookie
+- Cookie 正式入库成功
+- `bound_unb` 正常
+- token 预热成功
+- WebSocket 建连成功
+- heartbeat 正常
+- session keepalive 正常
+
+关键结果摘要：
+
+- `success=True`
+- `cookie_count=19`
+- `has_x5sec=True`
+- `cookie_persisted_in_db=True`
+- `cookie_persist_user_id=1`
+- `preflight_token_received=True`
+- `ws_connected=True`
+- `ws_connection_state=connected`
+- `session_keepalive_ok=True`
+
+数据库侧也已确认：
+
+- `accountid=5` 存在有效 Cookie
+- `user_id=1`
+- `bound_unb=2095002164`
+- `username=15614318625`
+
+### 3. 这轮代码调整点
+
+涉及文件：
+
+- `reply_server.py`
+- `utils/xianyu_slider_stealth.py`
+- `tests/test_reply_server_account_scope.py`
+
+本轮主要不是改登录大结构，而是把“验证页退出后到最终登录收口”这段补齐：
+
+1. **验证材料提交后，前端状态进入 `verification_processing`**
+   - 后端通过 `verification_pending_completion` 显式标记“验证已提交，正在自动收口”
+   - 这个阶段不再继续给前端展示“打开辅助链接”按钮
+
+2. **验证页退出后主动推送 processing 状态**
+   - `utils/xianyu_slider_stealth.py` 新增 `_notify_verification_processing(...)`
+   - 避免用户明明已经扫完，页面还卡在“仍需验证”的错觉里
+
+3. **页面已明显呈现登录态时，允许更早 handoff 到 Cookie finalize**
+   - 即便某些 `pending identity marker` Cookie 还没完全消失
+   - 只要验证页已经退出、页面已进入可识别登录态，就不再傻等
+
+4. **补测试覆盖**
+   - 显式 `verification_pending_completion` 状态构造
+   - 验证页退出后的 processing 通知
+   - pending marker 尚存但页面已登录时直接 handoff
+
+### 4. 当前剩余可继续优化点
+
+本轮链路已经打通，但还能继续抠一个性能点：
+
+- 登录成功后的“已登录确认”还有点偏慢
+
+现象是：
+
+- 页面实际上已经到 IM 登录态
+- 但 `.rc-virtual-list-holder-inner` 这类列表容器还没完全稳定
+- 于是探测逻辑会多绕几轮才进入最终收口
+
+后续优化方向应该是：
+
+1. 利用更早的 IM 登录态信号提前认定成功
+2. 更早 handoff 到 Cookie finalize
+3. 不动已经跑通的人脸 / 滑块 / token / WS 主线
+
+也就是说，后面该优化的是“确认时机”，不是再去乱拆已通的验证链路。

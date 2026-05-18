@@ -2316,6 +2316,29 @@ class ReplyServerVerificationMaterialStateTest(_ReplyServerModuleBindingMixin, u
         self.assertTrue(payload["verification_pending_completion"])
         self.assertIn("自动处理", payload["message"])
 
+    def test_build_verification_required_status_payload_honors_explicit_processing_marker(self):
+        session = {
+            "verification_type": "face_verify",
+            "screenshot_path": None,
+            "verification_url": "https://passport.example/fallback",
+            "qr_code_url": "https://passport.example/qr",
+            "verification_pending_completion": True,
+        }
+
+        payload = reply_server._build_verification_required_status_payload(
+            session,
+            pending_completion_message="验证已提交，正在等待登录完成，请勿关闭当前页面",
+        )
+
+        self.assertEqual("verification_processing", payload["status"])
+        self.assertTrue(payload["verification_pending_completion"])
+        self.assertFalse(payload["show_verification_link_button"])
+        self.assertIsNone(payload["verification_url"])
+        self.assertEqual(
+            "验证已提交，正在等待登录完成，请勿关闭当前页面",
+            payload["message"],
+        )
+
 
 class ReplyServerVerificationUiContractTest(_ReplyServerModuleBindingMixin, unittest.TestCase):
     def test_password_login_modal_handles_verification_processing_without_fallback_button(self):
@@ -2948,7 +2971,93 @@ class ReplyServerPasswordLoginStabilizationTest(_ReplyServerModuleBindingMixin, 
 
         self.assertTrue(result)
         slider_like._collect_page_text_for_detection.assert_called_once_with(page)
-        slider_like._page_has_login_form.assert_called_once_with(page)
+
+    def test_wait_for_context_login_marks_processing_when_verification_ui_exits(self):
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        monitor_page = object()
+        notification_callback = mock.Mock()
+        slider_like = SimpleNamespace(
+            pure_user_id="3",
+            _REQUIRED_SESSION_COOKIE_FIELDS=(),
+            _PROTECTED_SESSION_COOKIE_FIELDS=(),
+            _select_monitor_page=mock.Mock(return_value=monitor_page),
+            _ensure_active_verification_session=mock.Mock(return_value=None),
+            _attempt_solve_slider_on_page=mock.Mock(),
+            _detect_qr_code_verification=mock.Mock(return_value=(False, None)),
+            _check_login_success_by_element=mock.Mock(return_value=False),
+            _resolve_special_captcha_block_with_recovery=mock.Mock(return_value=None),
+            _probe_context_login_success=mock.Mock(return_value=(True, monitor_page, {})),
+            _detect_pending_identity_verification_cookie_state=mock.Mock(return_value=[]),
+        )
+        slider_like._notify_verification_processing = (
+            slider_stealth.XianyuSliderStealth._notify_verification_processing.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+
+        login_success, success_page = slider_stealth.XianyuSliderStealth._wait_for_context_login(
+            slider_like,
+            context=object(),
+            fallback_page=monitor_page,
+            max_wait_time=10,
+            check_interval=1,
+            verification_type='face_verify',
+            verification_url='https://passport.example/verify',
+            verification_screenshot_path='static/uploads/images/face_verify_3_latest.jpg',
+            notification_callback=notification_callback,
+            notification_scene='账号密码登录',
+        )
+
+        self.assertTrue(login_success)
+        self.assertIs(success_page, monitor_page)
+        notification_callback.assert_called_once()
+        self.assertEqual(
+            '验证已提交，正在等待登录完成，请勿关闭当前页面',
+            notification_callback.call_args.args[0],
+        )
+        self.assertTrue(notification_callback.call_args.kwargs['verification_pending_completion'])
+
+    def test_wait_for_context_login_handoffs_visible_login_ui_even_if_pending_markers_remain(self):
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        monitor_page = object()
+        slider_like = SimpleNamespace(
+            pure_user_id="3",
+            _REQUIRED_SESSION_COOKIE_FIELDS=(),
+            _PROTECTED_SESSION_COOKIE_FIELDS=(),
+            _select_monitor_page=mock.Mock(return_value=monitor_page),
+            _ensure_active_verification_session=mock.Mock(return_value=None),
+            _attempt_solve_slider_on_page=mock.Mock(),
+            _detect_qr_code_verification=mock.Mock(return_value=(False, None)),
+            _check_login_success_by_element=mock.Mock(return_value=False),
+            _resolve_special_captcha_block_with_recovery=mock.Mock(return_value=None),
+            _probe_context_login_success=mock.Mock(return_value=(True, monitor_page, {"ivActionType": "1"})),
+            _detect_pending_identity_verification_cookie_state=mock.Mock(return_value=["ivActionType"]),
+            _should_handoff_visible_login_ui_for_cookie_finalize=mock.Mock(return_value=(True, monitor_page)),
+        )
+        slider_like._notify_verification_processing = (
+            slider_stealth.XianyuSliderStealth._notify_verification_processing.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+
+        login_success, success_page = slider_stealth.XianyuSliderStealth._wait_for_context_login(
+            slider_like,
+            context=object(),
+            fallback_page=monitor_page,
+            max_wait_time=10,
+            check_interval=1,
+            verification_type='face_verify',
+            verification_url='https://passport.example/verify',
+            verification_screenshot_path='static/uploads/images/face_verify_3_latest.jpg',
+            notification_callback=None,
+            notification_scene='账号密码登录',
+        )
+
+        self.assertTrue(login_success)
+        self.assertIs(success_page, monitor_page)
+        slider_like._should_handoff_visible_login_ui_for_cookie_finalize.assert_called_once()
 
 
 class ReplyServerAccountDeletionCleanupTest(_ReplyServerModuleBindingMixin, unittest.TestCase):

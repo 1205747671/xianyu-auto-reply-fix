@@ -3954,6 +3954,7 @@ def _set_password_login_session_status(session_id: str, status: str, **fields):
         session['screenshot_path'] = None
         session['qr_code_url'] = None
         session['verification_type'] = None
+        session['verification_pending_completion'] = False
 
     if next_status in PASSWORD_LOGIN_TERMINAL_STATUSES:
         session['completed_at'] = time.time()
@@ -4047,7 +4048,8 @@ def _build_verification_required_status_payload(
             for token in ('punish?', 'x5step=2', 'action=captcha', 'purecaptcha')
         )
     )
-    verification_pending_completion = bool(
+    session_marked_processing = bool(session.get('verification_pending_completion'))
+    verification_pending_completion = session_marked_processing or bool(
         pending_completion_message
         and session_had_screenshot
         and not screenshot_path
@@ -4981,6 +4983,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
             verification_url: str = None,
             screenshot_path_new: str = None,
             verification_type: str = None,
+            verification_pending_completion: bool = False,
         ):
             """账号验证通知回调（同步）
             
@@ -5015,6 +5018,19 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 actual_screenshot_path = verification_material.get('screenshot_path')
                 resolved_verification_url = verification_material.get('verification_url')
 
+                if verification_pending_completion:
+                    _set_password_login_session_status(
+                        session_id,
+                        'verification_required',
+                        screenshot_path=None,
+                        verification_url=None,
+                        qr_code_url=None,
+                        verification_type=verification_type_label or session.get('verification_type'),
+                        verification_pending_completion=True,
+                    )
+                    log_with_user('info', f"账号验证已提交，进入自动收口等待阶段: {session_id}", current_user)
+                    return
+
                 # 优先使用截图路径，如果没有截图则使用验证链接；同类型验证下沿用上一份可用素材
                 if actual_screenshot_path and os.path.exists(actual_screenshot_path):
                     # 更新会话状态，保存截图路径
@@ -5025,6 +5041,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                         verification_url=resolved_verification_url,
                         qr_code_url=verification_material.get('qr_code_url'),
                         verification_type=verification_type_label,
+                        verification_pending_completion=False,
                     )
                     log_with_user('info', f"账号验证截图已保存: {session_id}, 路径: {actual_screenshot_path}", current_user)
                     
@@ -5072,6 +5089,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                         screenshot_path=None,
                         qr_code_url=verification_material.get('qr_code_url'),
                         verification_type=verification_type_label,
+                        verification_pending_completion=False,
                     )
                     log_with_user('info', f"账号验证链接已保存: {session_id}, URL: {resolved_verification_url}", current_user)
                     
