@@ -1656,3 +1656,236 @@ python -m pytest tests/test_reply_server_proxy_restart_guard_contract.py -q
 
 - `py_compile` 通过
 - `2 passed`
+
+---
+
+## 2026-05-18 本次账密真实托管回归（account_id=1）
+
+这次不是走正式服务接口回归，而是直接用手工托管入口复现真实链路：
+
+- 入口：`debug_manual_password_login.py`
+- 账号：`account_id=1`
+- 用户名：`15614318625`
+- 密码：`qq1205747671`
+- 模式：`--headless`
+
+### 1. 先确认的真实问题
+
+前一版代码里，账密登录在人脸通过后，后续 `token_refresh` 业务预热命中 `punish` / `x5step=2` 滑块时，虽然：
+
+- 滑块本身已经自动通过
+- `x5sec` / `x5secdata` 已刷新
+- 页面也已经退出验证页
+
+但代码没有把这条链路当成“可以继续收口”的成功分支，反而又掉回 `_process_verification_requirement(...)` 的人工验证等待分支，导致看起来像：
+
+- 人脸明明扫完了
+- 滑块也过了
+- 结果程序还在继续等“身份验证”
+
+这是假阻塞，不是真没过。
+
+### 2. 本次代码调整
+
+涉及文件：
+
+- `utils/xianyu_slider_stealth.py`
+- `reply_server.py`
+- `tests/test_reply_server_account_scope.py`
+
+本次新增/收口：
+
+1. **浏览器业务预热验证页自动续解后，允许直接回到 Cookie 收口**
+   - 位置：`_consume_browser_cookie_warmup_verification_hint(...)`
+   - 逻辑：
+     - 如果 `token_refresh` 验证页里的滑块已经自动通过
+     - 且验证页已经退出
+     - 且 Cookie 出现了有效刷新（如 `x5sec` 变化）
+   - 则不再重新掉回人工验证等待，而是直接重新进入 `_finalize_logged_in_cookies(...)`
+
+2. **清理 warmup handoff 状态**
+   - 自动续解成功后，主动清空：
+     - `last_browser_cookie_warmup_verification_hint`
+     - `last_browser_cookie_warmup_session_unready`
+   - 避免旧的 warmup 验证提示残留，后面又把流程拽回错误分支
+
+3. **只缺 `cna` 时允许按业务就绪态交接**
+   - 位置：`reply_server.py`
+   - 当浏览器业务预热已证明会话可用，且缺失仅剩 `cna` 时：
+     - 允许本次账密交接成功
+     - 后续由正式实例继续观察/补齐
+
+4. **补测试**
+   - 新增覆盖：
+     - 预热验证页自动滑块成功后直接回收口
+     - IM 空会话页按已登录处理
+     - pending identity marker 在业务已就绪时不再二次拉验证页
+
+### 3. 本次真实回归结果
+
+本轮真实无头托管链路结果：
+
+1. 账密登录进入人脸验证
+2. 人脸扫码完成
+3. 后续命中 `token_refresh` 风控滑块
+4. 滑块自动通过
+5. 返回 `https://www.goofish.com/im`
+6. 页面识别到 **IM 空会话登录态**
+7. 业务预热成功：
+   - `login_token_fetch` 成功
+   - `login_user_fetch` 成功
+   - `userId=2095002164`
+8. 清理 pending identity markers：
+   - `ivActionType`
+   - `tmp0`
+   - `siv20`
+   - `last_u_xianyu_web`
+9. 最终返回成功 Cookie
+
+命令输出结果：
+
+- `success=True`
+- `last_login_error=`
+- `cookie_count=21`
+- `has_x5sec=True`
+
+### 4. 仍可继续优化的点
+
+这轮虽然成功，但还看到一个可收紧点：
+
+- `人脸验证验证完成稳定化动作: goto_home -> https://www.goofish.com/`
+- 有一次 `Timeout 15000ms exceeded`
+- 不影响最终成功，但会白等一段时间
+
+后续可以继续优化：
+
+1. 减少 `goto_home` 这类对最终成功帮助不大的稳定化动作
+2. 在已确认 `login_token_fetch + login_user_fetch` 均成功时，更早结束无效页面预热
+
+### 5. 本次验证命令
+
+执行：
+
+```bash
+.\.venv\Scripts\python.exe -m py_compile utils\xianyu_slider_stealth.py tests\test_reply_server_account_scope.py
+.\.venv\Scripts\python.exe -m pytest tests\test_reply_server_account_scope.py -q
+.\.venv\Scripts\python.exe .\debug_manual_password_login.py --account-id 1 --account 15614318625 --password qq1205747671 --headless --verification-wait-timeout 900 --keep-verification-screenshot
+```
+
+结果：
+
+- `py_compile` 通过
+- `102 passed`
+- 手工托管账密真实回归成功
+
+### 6. 关于“服务是否已经更新”
+
+这次要分清两件事：
+
+1. **仓库代码已经更新**
+   - 上面这些修复已经改进当前工作区代码
+
+2. **正式服务进程这次没有跟着一起重启验证**
+   - 我刚才跑的是 `debug_manual_password_login.py` 手工托管链路
+   - 不是 `Start.py` / `reply_server.py` 正式服务接口在跑
+
+所以准确说法是：
+
+> **代码已经改了，但正式服务进程如果还没重启，就还没加载这次新代码。**
+## 2026-05-18 本次结构收口（business-ready / verification recovery / finalize）
+
+这次不是继续堆补丁，而是把已经跑通的账密登录收口逻辑做了最小结构整理，目标是：
+- 保持现有行为不变
+- 降低 utils/xianyu_slider_stealth.py 内部重复逻辑
+- 让后续继续改登录链路时，不至于两边规则漂移、越改越邪门
+
+### 1. 统一 business-ready 判定
+
+位置：utils/xianyu_slider_stealth.py
+
+新增并收口：
+- _has_business_ready_cookie_shape(...)
+- _has_browser_cookie_warmup_probe_business_ready(...)
+- _should_accept_business_ready_cookie_handoff(...)
+
+调整后：
+- 浏览器 warmup 已证明 login_token_fetch + login_user_fetch 成功
+- 且 Cookie 已具备业务可用形态（允许只差 cna）
+- 则统一按“business-ready handoff”处理
+
+同时：
+- eply_server.py 中 _should_accept_password_login_business_ready_handoff(...)
+- 不再自己维护一套“只差 cna 是否可放行”的规则
+- 改为复用 slider_instance._should_accept_business_ready_cookie_handoff(...)
+
+这样避免两边各写一套判断，后面再改一次又分叉。
+
+### 2. 抽验证恢复 helper
+
+位置：utils/xianyu_slider_stealth.py
+
+新增：
+- _recover_verification_url_with_auto_slider_then_finalize(...)
+
+收口前，下面两条链路都各自复制了一遍：
+1. 打开验证 URL
+2. 检测 slider / pureCaptcha
+3. 尝试自动滑块
+4. 成功后回 inalize
+5. 不成功再落入人工验证等待
+
+现在统一由 helper 处理，覆盖：
+- _handle_pending_identity_verification_state(...)
+- _consume_browser_cookie_warmup_verification_hint(...)
+
+其中 warmup verification hint 那条链路仍保留原先的重要行为：
+- 自动滑块后如果验证页已退出
+- 且 Cookie 出现有效刷新
+- 即便当下还没立即探测到明确登录页，也允许直接回到 inalize 收口
+
+### 3. 瘦身 _finalize_logged_in_cookies()
+
+位置：utils/xianyu_slider_stealth.py
+
+原来 _finalize_logged_in_cookies() 里面把：
+- Cookie 快照
+- Set-Cookie 合并
+- stabilize
+- browser warmup
+- warmup verification hint 消费
+- pending identity 处理
+- 最终失败/成功收口
+
+全堆在一个函数里，读起来挺埋汰。
+
+这次拆成 3 段内部 helper：
+- _collect_logged_in_cookie_snapshot(...)
+- _stabilize_and_warmup_logged_in_cookies(...)
+- _finalize_cookie_handoff_or_fail(...)
+
+作用是：
+- 只做文件内结构收口
+- 不改对外行为
+- 让后面继续查“为什么成功后又多走一步”“为什么少字段还能交接”时，定位更直接
+
+### 4. 本次验证
+
+执行：
+`ash
+.\.venv\Scripts\python.exe -m py_compile .\utils\xianyu_slider_stealth.py .\tests\test_reply_server_account_scope.py .\reply_server.py
+.\.venv\Scripts\python.exe -m pytest .\tests\test_reply_server_account_scope.py -q
+`
+
+结果：
+- py_compile 通过
+- 102 passed
+- 9 subtests passed
+
+### 5. 结论
+
+这次改动不是新增功能，而是把前面已经确认正确的账密登录成功链路做结构收紧：
+- business-ready 规则不再双份维护
+- 验证恢复逻辑不再复制粘贴
+- finalize 收口函数职责更清楚
+
+后续如果还要继续往二维码登录、Cookie 导入登录、token 刷新滑块恢复上复用，这次收口会省不少脏活。

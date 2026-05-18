@@ -1214,6 +1214,8 @@ class XianyuSliderStealth:
         self.last_login_error = ""
         self.last_browser_cookie_warmup_verification_hint = None
         self.last_browser_cookie_warmup_session_unready = False
+        self.last_browser_cookie_warmup_probe_status = {}
+        self.last_cookie_business_ready = False
         self._slider_refresh_mode = False
         self.risk_session_id = None
         self.risk_trigger_scene = None
@@ -2366,6 +2368,50 @@ class XianyuSliderStealth:
                     hasAWSC: !!window.AWSC,
                     hasAwscEt: !!window.__awsc_et__,
                     hasNC: !!window.nc,
+                    bodyTextSample: (() => {
+                        try {
+                            return ((document.body && (document.body.innerText || document.body.textContent)) || '')
+                                .replace(/\\s+/g, ' ')
+                                .trim()
+                                .slice(0, 1500);
+                        } catch (e) {
+                            return '';
+                        }
+                    })(),
+                    iframeSources: Array.from(document.querySelectorAll('iframe'))
+                        .slice(0, 12)
+                        .map((item, index) => ({
+                            index,
+                            id: item.id || '',
+                            name: item.getAttribute('name') || '',
+                            src: item.getAttribute('src') || '',
+                            visible: (() => {
+                                try {
+                                    const style = window.getComputedStyle(item);
+                                    const rect = item.getBoundingClientRect();
+                                    return !!style && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                                } catch (e) {
+                                    return false;
+                                }
+                            })(),
+                        })),
+                    hasRcListHolder: !!document.querySelector('.rc-virtual-list-holder-inner'),
+                    rcListChildCount: (() => {
+                        try {
+                            const node = document.querySelector('.rc-virtual-list-holder-inner');
+                            return node ? node.children.length : -1;
+                        } catch (e) {
+                            return -1;
+                        }
+                    })(),
+                    hasLoginAccountInput: !!document.querySelector('#fm-login-id, input[name="fm-login-id"]'),
+                    hasPasswordInput: !!document.querySelector('#fm-login-password, input[name="fm-login-password"], input[type="password"]'),
+                    hasAlibabaLoginBox: !!document.querySelector('iframe#alibaba-login-box'),
+                    primaryButtonTexts: Array.from(document.querySelectorAll('button,a,[role="button"]'))
+                        .slice(0, 20)
+                        .map((node) => ((node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim()))
+                        .filter(Boolean)
+                        .slice(0, 12),
                 };
             }
         """
@@ -2380,6 +2426,53 @@ class XianyuSliderStealth:
                 debug_info[target_name] = {"error": str(e)}
 
         return debug_info
+
+    def _summarize_cookie_dict_for_debug(self, cookies_dict: Optional[Dict[str, str]]) -> Dict[str, Any]:
+        normalized = dict(cookies_dict or {})
+        if not normalized:
+            return {
+                "field_count": 0,
+                "present_required_fields": [],
+                "missing_required_fields": list(self._REQUIRED_SESSION_COOKIE_FIELDS),
+                "present_protected_fields": [],
+                "missing_protected_fields": list(self._PROTECTED_SESSION_COOKIE_FIELDS),
+                "pending_identity_markers": [],
+                "x5_cookie_fields": [],
+                "cookie_keys_sample": [],
+            }
+
+        present_required_fields = [
+            key for key in self._REQUIRED_SESSION_COOKIE_FIELDS
+            if normalized.get(key)
+        ]
+        missing_required_fields = [
+            key for key in self._REQUIRED_SESSION_COOKIE_FIELDS
+            if not normalized.get(key)
+        ]
+        present_protected_fields = [
+            key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
+            if normalized.get(key)
+        ]
+        missing_protected_fields = [
+            key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
+            if not normalized.get(key)
+        ]
+        pending_identity_markers = self._detect_pending_identity_verification_cookie_state(normalized)
+        x5_cookie_fields = sorted(
+            key for key in normalized.keys()
+            if str(key).lower().startswith(self._X5_COOKIE_PREFIX)
+        )
+
+        return {
+            "field_count": len(normalized),
+            "present_required_fields": present_required_fields,
+            "missing_required_fields": missing_required_fields,
+            "present_protected_fields": present_protected_fields,
+            "missing_protected_fields": missing_protected_fields,
+            "pending_identity_markers": pending_identity_markers,
+            "x5_cookie_fields": x5_cookie_fields,
+            "cookie_keys_sample": sorted(normalized.keys())[:40],
+        }
 
     def _merge_runtime_feedback(self, search_target=None):
         feedback = dict(self.last_verification_feedback or {})
@@ -3390,6 +3483,13 @@ class XianyuSliderStealth:
                     logger.debug(f"【{self.pure_user_id}】保存Frame HTML失败: {frame_err}")
 
             runtime_debug = self._collect_runtime_debug_info(search_target)
+            context_cookie_summary = {}
+            try:
+                context_cookie_summary = self._summarize_cookie_dict_for_debug(
+                    self._snapshot_context_cookies(getattr(self, "context", None), page=self.page)
+                )
+            except Exception as cookie_summary_err:
+                context_cookie_summary = {"error": str(cookie_summary_err)}
             meta = {
                 "user_id": self.pure_user_id,
                 "reason": reason,
@@ -3398,6 +3498,7 @@ class XianyuSliderStealth:
                 "frame_url": frame_url,
                 "feedback": dict(self.last_verification_feedback or {}),
                 "runtime_debug": runtime_debug,
+                "context_cookie_summary": context_cookie_summary,
                 "profile_id": self.profile_id,
                 "headless": self.headless,
                 "automation_backend": self.automation_backend,
@@ -4061,34 +4162,180 @@ class XianyuSliderStealth:
 
         return any(token in sample_text for token in ("password", "pwd"))
 
+    def _recover_verification_url_with_auto_slider_then_finalize(
+        self,
+        *,
+        context,
+        verification_url: str,
+        fallback_page,
+        cookies_dict: Dict[str, str],
+        finalize_scene: str,
+        notification_callback: Optional[Callable] = None,
+        notification_scene: str = '璐﹀彿瀵嗙爜鐧诲綍',
+        verification_type_hint: Optional[str] = None,
+        risk_trigger_scene: Optional[str] = None,
+        clear_handoff_state: Optional[Callable[[], None]] = None,
+        allow_cookie_refresh_handoff: bool = False,
+    ):
+        if not verification_url or not context:
+            return None
+
+        verify_page = None
+        previous_risk_trigger_scene = getattr(self, 'risk_trigger_scene', None)
+        try:
+            if risk_trigger_scene:
+                self.risk_trigger_scene = risk_trigger_scene
+
+            verify_page = context.new_page()
+            logger.info(f"[{self.pure_user_id}] open verification url for recovery: {verification_url}")
+            verify_page.goto(verification_url, wait_until="domcontentloaded", timeout=30000)
+            time.sleep(2)
+
+            recovered_slider_detected = self._page_has_slider(verify_page)
+            recovered_purecaptcha_detected = any(
+                token in verification_url.lower()
+                for token in ('purecaptcha=', 'action=captcha', 'punish?', 'x5step=2')
+            )
+            if recovered_slider_detected or recovered_purecaptcha_detected:
+                logger.info(
+                    f"[{self.pure_user_id}] recovered verification page hit "
+                    f"{'slider' if recovered_slider_detected else 'pureCaptcha'}, try auto solve first"
+                )
+                solved = self._attempt_solve_slider_on_page(verify_page)
+                if solved:
+                    login_success, active_page, _ = self._probe_context_login_success(context, verify_page)
+                    if login_success:
+                        if clear_handoff_state:
+                            clear_handoff_state()
+                        logger.success(f"[{self.pure_user_id}] recovered verification page auto-solve handoff succeeded")
+                        return self._finalize_logged_in_cookies(
+                            context,
+                            active_page or verify_page,
+                            scene=finalize_scene,
+                            notification_callback=notification_callback,
+                            notification_scene=notification_scene,
+                        )
+
+                    if allow_cookie_refresh_handoff:
+                        refreshed_cookies = self._snapshot_context_cookies(context, page=verify_page)
+                        auto_handoff_page = (
+                            self._select_monitor_page(context, fallback_page or verify_page)
+                            or fallback_page
+                            or verify_page
+                        )
+                        verification_still_visible, _ = self._detect_qr_code_verification(auto_handoff_page)
+                        if (
+                            not verification_still_visible and
+                            self._has_meaningful_cookie_refresh(cookies_dict or {}, refreshed_cookies or {})
+                        ):
+                            if clear_handoff_state:
+                                clear_handoff_state()
+                            logger.warning(
+                                f"[{self.pure_user_id}] recovered verification page exited and cookies refreshed, "
+                                "handoff back to finalize"
+                            )
+                            return self._finalize_logged_in_cookies(
+                                context,
+                                auto_handoff_page,
+                                scene=finalize_scene,
+                                notification_callback=notification_callback,
+                                notification_scene=notification_scene,
+                                extra_cookie_updates=refreshed_cookies,
+                            )
+
+                    logger.warning(
+                        f"[{self.pure_user_id}] recovered verification page auto-solve finished but login state "
+                        "is still not confirmed, continue verification flow"
+                    )
+                else:
+                    logger.warning(
+                        f"[{self.pure_user_id}] recovered verification page auto-solve failed, continue "
+                        "verification flow"
+                    )
+
+            verification_type = str(verification_type_hint or '').strip() or self._detect_verification_type(verify_page)
+            if verification_type == 'unknown' and 'identity_verify' in verification_url.lower():
+                verification_type = 'face_verify'
+
+            verification_screenshot = self._capture_verification_screenshot(verify_page)
+            verification_wrapper = VerificationFrameWrapper(
+                verify_page,
+                verification_type=verification_type,
+                verify_url=verification_url,
+                screenshot_path=verification_screenshot,
+            )
+            logger.warning(
+                f"[{self.pure_user_id}] recovered verification page still requires manual follow-up, "
+                "switch into verification wait flow"
+            )
+            return self._process_verification_requirement(
+                context,
+                verify_page,
+                verification_wrapper,
+                notification_callback,
+                notification_scene,
+            )
+        except Exception as open_verify_err:
+            logger.warning(
+                f"[{self.pure_user_id}] open recovered verification url failed: {open_verify_err}"
+            )
+            try:
+                if verify_page:
+                    verify_page.close()
+            except Exception:
+                pass
+        finally:
+            if risk_trigger_scene:
+                self.risk_trigger_scene = previous_risk_trigger_scene
+
     def _handle_pending_identity_verification_state(
         self,
         context,
         fallback_page,
         cookies_dict: Dict[str, str],
         notification_callback: Optional[Callable] = None,
-        notification_scene: str = '账号密码登录',
+        notification_scene: str = '璐﹀彿瀵嗙爜鐧诲綍',
     ):
-        """处理“前端已登录但服务端仍要求二次身份校验”的半登录态。"""
+        """Handle the half-logged-in state where identity verification is still pending."""
         pending_identity_markers = self._detect_pending_identity_verification_cookie_state(cookies_dict)
         if not pending_identity_markers:
             return None
 
         logger.error(
-            f"【{self.pure_user_id}】检测到前端已登录但仍处于二次身份校验态，"
-            f"待确认Cookie标记: {pending_identity_markers}"
+            f"[{self.pure_user_id}] pending identity verification markers detected: {pending_identity_markers}"
         )
         logger.error(
-            f"【{self.pure_user_id}】该状态下通常不会下发完整业务会话Cookie，"
-            f"例如 havana_lgc2_77 / x5secdata"
+            f"[{self.pure_user_id}] this state usually blocks protected session cookies like havana_lgc2_77/x5secdata"
         )
+
+        missing_required_fields = [
+            key for key in self._REQUIRED_SESSION_COOKIE_FIELDS
+            if not cookies_dict.get(key)
+        ]
+        if self._should_accept_business_ready_cookie_handoff(
+            cookies_dict,
+            missing_required_fields=missing_required_fields,
+        ):
+            fallback_cookies = dict(cookies_dict)
+            cleared_pending_markers = [
+                key for key in self._IDENTITY_VERIFY_PENDING_COOKIE_FIELDS
+                if fallback_cookies.pop(key, None) is not None
+            ]
+            self.last_cookie_business_ready = True
+            logger.warning(
+                f"[{self.pure_user_id}] browser warmup already proved business-ready session, skip reopening verification; "
+                f"cleared pending markers: {cleared_pending_markers}"
+            )
+            return fallback_cookies
 
         monitor_page = self._select_monitor_page(context, fallback_page) or fallback_page
         if monitor_page:
             try:
                 has_qr, qr_frame = self._detect_qr_code_verification(monitor_page)
                 if has_qr:
-                    logger.warning(f"【{self.pure_user_id}】半登录态下检测到可见身份验证页，转入验证等待流程")
+                    logger.warning(
+                        f"[{self.pure_user_id}] pending identity verification page is still visible, switch into verification wait flow"
+                    )
                     return self._process_verification_requirement(
                         context,
                         monitor_page,
@@ -4100,76 +4347,22 @@ class XianyuSliderStealth:
                 raise
             except Exception as verify_probe_err:
                 logger.warning(
-                    f"【{self.pure_user_id}】半登录态复检身份验证页失败，准备尝试反查验证链接: {verify_probe_err}"
+                    f"[{self.pure_user_id}] failed to re-check pending identity verification page: {verify_probe_err}"
                 )
 
         verification_url = self._resolve_pending_identity_verification_url(cookies_dict)
         if verification_url and context:
-            verify_page = None
-            try:
-                verify_page = context.new_page()
-                logger.info(f"【{self.pure_user_id}】打开反查到的身份验证链接...")
-                verify_page.goto(verification_url, wait_until="domcontentloaded", timeout=30000)
-                time.sleep(2)
-
-                recovered_slider_detected = self._page_has_slider(verify_page)
-                recovered_purecaptcha_detected = any(
-                    token in verification_url.lower()
-                    for token in ('purecaptcha=', 'action=captcha', 'punish?', 'x5step=2')
-                )
-                if recovered_slider_detected or recovered_purecaptcha_detected:
-                    logger.info(
-                        f"【{self.pure_user_id}】半登录态恢复页命中"
-                        f"{'滑块' if recovered_slider_detected else 'pureCaptcha'}特征，优先尝试自动续解"
-                    )
-                    solved = self._attempt_solve_slider_on_page(verify_page)
-                    if solved:
-                        login_success, active_page, _ = self._probe_context_login_success(context, verify_page)
-                        if login_success:
-                            logger.success(f"【{self.pure_user_id}】✅ 半登录态恢复页滑块续解后已确认登录成功")
-                            return self._finalize_logged_in_cookies(
-                                context,
-                                active_page or verify_page,
-                                scene="半登录态恢复页自动续解",
-                                notification_callback=notification_callback,
-                                notification_scene=notification_scene,
-                            )
-                        logger.warning(
-                            f"【{self.pure_user_id}】半登录态恢复页滑块已处理，但暂未确认登录成功，继续走验证识别流程"
-                        )
-                    else:
-                        logger.warning(
-                            f"【{self.pure_user_id}】半登录态恢复页自动续解未成功，继续判断是否需要人工验证"
-                        )
-
-                verification_type = self._detect_verification_type(verify_page)
-                if verification_type == 'unknown' and 'identity_verify' in verification_url.lower():
-                    verification_type = 'face_verify'
-
-                verification_screenshot = self._capture_verification_screenshot(verify_page)
-                verification_wrapper = VerificationFrameWrapper(
-                    verify_page,
-                    verification_type=verification_type,
-                    verify_url=verification_url,
-                    screenshot_path=verification_screenshot,
-                )
-                logger.warning(f"【{self.pure_user_id}】已根据半登录态Cookie恢复身份验证页面，转入验证等待流程")
-                return self._process_verification_requirement(
-                    context,
-                    verify_page,
-                    verification_wrapper,
-                    notification_callback,
-                    notification_scene,
-                )
-            except Exception as open_verify_err:
-                logger.warning(
-                    f"【{self.pure_user_id}】打开反查到的身份验证链接失败: {open_verify_err}"
-                )
-                try:
-                    if verify_page:
-                        verify_page.close()
-                except Exception:
-                    pass
+            recovered_result = self._recover_verification_url_with_auto_slider_then_finalize(
+                context=context,
+                verification_url=verification_url,
+                fallback_page=fallback_page,
+                cookies_dict=cookies_dict,
+                finalize_scene='半登录态恢复页自动续解',
+                notification_callback=notification_callback,
+                notification_scene=notification_scene,
+            )
+            if recovered_result is not None:
+                return recovered_result
 
             self._notify_verification_required(
                 'qr_verify',
@@ -4179,13 +4372,9 @@ class XianyuSliderStealth:
                 notification_scene,
             )
             return self._fail_login(
-                "检测到二次身份校验未完成，请按通知中的验证链接完成验证后重试"
+                '妫€娴嬪埌浜屾韬唤鏍￠獙鏈畬鎴愶紝璇锋寜閫氱煡涓殑楠岃瘉閾炬帴瀹屾垚楠岃瘉鍚庨噸璇曠櫥褰€'
             )
 
-        missing_required_fields = [
-            key for key in self._REQUIRED_SESSION_COOKIE_FIELDS
-            if not cookies_dict.get(key)
-        ]
         if not missing_required_fields:
             fallback_cookies = dict(cookies_dict)
             cleared_pending_markers = [
@@ -4193,14 +4382,13 @@ class XianyuSliderStealth:
                 if fallback_cookies.pop(key, None) is not None
             ]
             logger.warning(
-                f"【{self.pure_user_id}】半登录态未恢复出新的验证页，但当前核心会话字段已齐全；"
-                f"回退为受保护Cookie交接，待上层合并补齐缺失字段。"
-                f"已清理待确认标记: {cleared_pending_markers}"
+                f"[{self.pure_user_id}] no new verification page was recovered, but required session cookies are already present; "
+                f"clear pending markers and hand off protected cookies: {cleared_pending_markers}"
             )
             return fallback_cookies
 
         return self._fail_login(
-            "检测到二次身份校验未完成，当前仅形成前端登录态，服务端会话未建立"
+            '妫€娴嬪埌浜屾韬唤鏍￠獙鏈畬鎴愶紝褰撳墠浠呭舰鎴愬墠绔櫥褰曟€侊紝鏈嶅姟绔細璇濇湭寤虹珛'
         )
 
     def _extract_set_cookie_updates_from_playwright_response(self, response) -> Dict[str, str]:
@@ -4464,6 +4652,9 @@ class XianyuSliderStealth:
             return initial_cookies or {}
 
         self.last_browser_cookie_warmup_verification_hint = None
+        self.last_browser_cookie_warmup_session_unready = False
+        self.last_browser_cookie_warmup_probe_status = {}
+        self.last_cookie_business_ready = False
         best_cookies = dict(initial_cookies or self._snapshot_context_cookies(context, page=page))
         best_missing = [
             key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
@@ -4524,6 +4715,8 @@ class XianyuSliderStealth:
                             f"【{self.pure_user_id}】{scene}浏览器业务预热[{probe_name}]返回了后续验证提示: "
                             f"{verification_hint.get('verification_url')}"
                         )
+                    if self._is_browser_cookie_warmup_probe_business_success(probe_name, probe_result):
+                        self.last_browser_cookie_warmup_probe_status[probe_name] = True
             except Exception as probe_e:
                 logger.warning(f"【{self.pure_user_id}】{scene}浏览器业务预热[{probe_name}]失败: {probe_e}")
                 continue
@@ -4561,8 +4754,118 @@ class XianyuSliderStealth:
 
         if best_cookies.get('havana_lgc2_77'):
             self.last_browser_cookie_warmup_verification_hint = None
+        self.last_cookie_business_ready = self._has_browser_cookie_warmup_business_ready_signal(best_cookies)
+        if self.last_cookie_business_ready:
+            logger.info(
+                f"【{self.pure_user_id}】{scene}浏览器业务预热已证明当前会话可用，"
+                f"probe_status={self.last_browser_cookie_warmup_probe_status}"
+            )
 
         return best_cookies
+
+    def _should_skip_redundant_browser_cookie_warmup(self, cookies_dict: Dict[str, str]) -> bool:
+        verification_hint = getattr(self, 'last_browser_cookie_warmup_verification_hint', None) or {}
+        if verification_hint.get('verification_url'):
+            return True
+
+        if bool(getattr(self, 'last_browser_cookie_warmup_probe_status', {}) or {}):
+            return True
+
+        if getattr(self, 'last_browser_cookie_warmup_session_unready', False):
+            return True
+
+        if self._has_browser_cookie_warmup_business_ready_signal(cookies_dict or {}):
+            return True
+
+        return False
+
+    def _has_business_ready_cookie_shape(self, cookies_dict: Dict[str, str]) -> bool:
+        cookies_dict = cookies_dict or {}
+        required_without_cna = (
+            'unb',
+            'sgcookie',
+            'cookie2',
+            '_m_h5_tk',
+            '_m_h5_tk_enc',
+            't',
+        )
+        if not all(cookies_dict.get(key) for key in required_without_cna):
+            return False
+
+        return bool(
+            cookies_dict.get('_tb_token_')
+            or cookies_dict.get('x5sec')
+            or cookies_dict.get('x5secdata')
+        )
+
+    def _has_browser_cookie_warmup_probe_business_ready(self) -> bool:
+        if getattr(self, 'last_browser_cookie_warmup_session_unready', False):
+            return False
+
+        probe_status = getattr(self, 'last_browser_cookie_warmup_probe_status', {}) or {}
+        return bool(probe_status.get('login_token_fetch') and probe_status.get('login_user_fetch'))
+
+    def _should_accept_business_ready_cookie_handoff(
+        self,
+        cookies_dict: Dict[str, str],
+        missing_required_fields: Optional[List[str]] = None,
+    ) -> bool:
+        normalized_missing_required_fields = [
+            str(field).strip()
+            for field in (missing_required_fields or [])
+            if str(field).strip()
+        ]
+        if normalized_missing_required_fields and any(field != 'cna' for field in normalized_missing_required_fields):
+            return False
+
+        return (
+            self._has_browser_cookie_warmup_probe_business_ready()
+            and self._has_business_ready_cookie_shape(cookies_dict)
+        )
+
+    def _is_browser_cookie_warmup_probe_business_success(
+        self,
+        probe_name: str,
+        probe_result: Dict[str, Any],
+    ) -> bool:
+        if not isinstance(probe_result, dict):
+            return False
+        if not probe_result.get('ok'):
+            return False
+
+        raw_text = str(probe_result.get('text') or '').strip()
+        if not raw_text:
+            return False
+
+        try:
+            payload = json.loads(raw_text)
+        except Exception:
+            return False
+
+        ret_items = payload.get('ret')
+        if isinstance(ret_items, list):
+            ret_values = [str(item) for item in ret_items if item is not None]
+        elif ret_items is None:
+            ret_values = []
+        else:
+            ret_values = [str(ret_items)]
+        ret_summary = " ".join(ret_values)
+        if 'SUCCESS::调用成功' not in ret_summary:
+            return False
+
+        data_payload = payload.get('data')
+        if not isinstance(data_payload, dict):
+            data_payload = {}
+
+        probe_name = str(probe_name or '').strip().lower()
+        if probe_name == 'login_token_fetch':
+            return bool(data_payload.get('accessToken'))
+        if probe_name == 'login_user_fetch':
+            return bool(data_payload.get('userId'))
+        return False
+
+    def _has_browser_cookie_warmup_business_ready_signal(self, cookies_dict: Dict[str, str]) -> bool:
+        return self._should_accept_business_ready_cookie_handoff(cookies_dict)
 
     def _extract_browser_cookie_warmup_verification_hint(
         self,
@@ -4784,7 +5087,7 @@ class XianyuSliderStealth:
         fallback_page,
         cookies_dict: Dict[str, str],
         notification_callback: Optional[Callable] = None,
-        notification_scene: str = '账号密码登录',
+        notification_scene: str = '璐﹀彿瀵嗙爜鐧诲綍',
     ):
         verification_hint = getattr(self, 'last_browser_cookie_warmup_verification_hint', None) or {}
         verification_url = str(verification_hint.get('verification_url') or '').strip()
@@ -4794,84 +5097,31 @@ class XianyuSliderStealth:
         if cookies_dict.get('havana_lgc2_77'):
             return None
 
+        def _clear_warmup_verification_handoff_state():
+            self.last_browser_cookie_warmup_verification_hint = None
+            self.last_browser_cookie_warmup_session_unready = False
+
         logger.warning(
-            f"【{self.pure_user_id}】检测到浏览器业务预热返回后续验证入口，"
-            f"当前 havana_lgc2_77 仍缺失，转入验证接管: {verification_url}"
+            f"[{self.pure_user_id}] browser warmup returned verification handoff while havana_lgc2_77 is still missing: {verification_url}"
         )
 
-        verify_page = None
         override_risk_trigger_scene = self._infer_browser_cookie_warmup_risk_trigger_scene(
             verification_hint,
             verification_url,
         )
-        previous_risk_trigger_scene = getattr(self, 'risk_trigger_scene', None)
-        try:
-            if override_risk_trigger_scene:
-                if override_risk_trigger_scene != previous_risk_trigger_scene:
-                    logger.info(
-                        f"【{self.pure_user_id}】浏览器业务预热验证页临时切换 risk_trigger_scene="
-                        f"{override_risk_trigger_scene}（from {previous_risk_trigger_scene or 'unset'}）"
-                    )
-                self.risk_trigger_scene = override_risk_trigger_scene
-
-            verify_page = context.new_page()
-            verify_page.goto(verification_url, wait_until="domcontentloaded", timeout=30000)
-            time.sleep(2)
-
-            recovered_slider_detected = self._page_has_slider(verify_page)
-            recovered_purecaptcha_detected = any(
-                token in verification_url.lower()
-                for token in ('purecaptcha=', 'action=captcha', 'punish?', 'x5step=2')
-            )
-            if recovered_slider_detected or recovered_purecaptcha_detected:
-                logger.info(
-                    f"【{self.pure_user_id}】浏览器业务预热返回的验证页命中"
-                    f"{'滑块' if recovered_slider_detected else 'pureCaptcha'}特征，优先尝试自动续解"
-                )
-                solved = self._attempt_solve_slider_on_page(verify_page)
-                if solved:
-                    login_success, active_page, _ = self._probe_context_login_success(context, verify_page)
-                    if login_success:
-                        logger.success(f"【{self.pure_user_id}】✅ 浏览器业务预热验证页自动续解后已确认登录成功")
-                        return self._finalize_logged_in_cookies(
-                            context,
-                            active_page or verify_page,
-                            scene="浏览器业务预热验证页自动续解",
-                            notification_callback=notification_callback,
-                            notification_scene=notification_scene,
-                        )
-
-            verification_type = str(verification_hint.get('verification_type') or '').strip() or self._detect_verification_type(verify_page)
-            if verification_type == 'unknown' and 'identity_verify' in verification_url.lower():
-                verification_type = 'face_verify'
-
-            verification_screenshot = self._capture_verification_screenshot(verify_page)
-            verification_wrapper = VerificationFrameWrapper(
-                verify_page,
-                verification_type=verification_type,
-                verify_url=verification_url,
-                screenshot_path=verification_screenshot,
-            )
-            return self._process_verification_requirement(
-                context,
-                verify_page,
-                verification_wrapper,
-                notification_callback,
-                notification_scene,
-            )
-        except Exception as open_verify_err:
-            logger.warning(
-                f"【{self.pure_user_id}】打开浏览器业务预热返回的验证入口失败: {open_verify_err}"
-            )
-            try:
-                if verify_page:
-                    verify_page.close()
-            except Exception:
-                pass
-        finally:
-            if override_risk_trigger_scene:
-                self.risk_trigger_scene = previous_risk_trigger_scene
-        return None
+        return self._recover_verification_url_with_auto_slider_then_finalize(
+            context=context,
+            verification_url=verification_url,
+            fallback_page=fallback_page,
+            cookies_dict=cookies_dict,
+            finalize_scene='浏览器业务预热验证页自动续解',
+            notification_callback=notification_callback,
+            notification_scene=notification_scene,
+            verification_type_hint=str(verification_hint.get('verification_type') or '').strip() or None,
+            risk_trigger_scene=override_risk_trigger_scene,
+            clear_handoff_state=_clear_warmup_verification_handoff_state,
+            allow_cookie_refresh_handoff=True,
+        )
 
     def _safe_page_url(self, page) -> str:
         try:
@@ -5585,6 +5835,23 @@ class XianyuSliderStealth:
 
         return False, monitor_page, cookie_dict
 
+    def _should_handoff_visible_login_ui_for_cookie_finalize(self, context, fallback_page=None) -> Tuple[bool, Any]:
+        monitor_page = self._select_monitor_page(context, fallback_page) if context else fallback_page
+        if not monitor_page:
+            return False, fallback_page
+
+        try:
+            if self._check_login_success_by_element(monitor_page):
+                logger.warning(
+                    f"【{self.pure_user_id}】页面已呈现登录态，但上下文探测尚未完全确认；"
+                    "直接交给 Cookie 稳定化流程继续收口"
+                )
+                return True, monitor_page
+        except Exception as visible_probe_err:
+            logger.debug(f"【{self.pure_user_id}】复核页面登录态用于 finalize 交接失败: {visible_probe_err}")
+
+        return False, monitor_page
+
     def _recover_from_missing_login_inputs(
         self,
         context,
@@ -5744,28 +6011,13 @@ class XianyuSliderStealth:
         except Exception as e:
             logger.error(f"【{self.pure_user_id}】删除截图时出错: {e}")
 
-    def _finalize_logged_in_cookies(
+    def _collect_logged_in_cookie_snapshot(
         self,
         context,
-        page,
-        *,
+        target_page,
         scene: str,
-        notification_callback: Optional[Callable] = None,
-        notification_scene: str = '账号密码登录',
         extra_cookie_updates: Optional[Dict[str, str]] = None,
-    ):
-        """登录态已确认后，尽量获取完整 Cookie，并对半登录态做最后兜底。"""
-        target_page = page
-        try:
-            if target_page and hasattr(target_page, 'is_closed') and target_page.is_closed():
-                target_page = None
-        except Exception:
-            pass
-
-        if not target_page:
-            target_page = self._select_monitor_page(context, page)
-
-        self.last_browser_cookie_warmup_session_unready = False
+    ) -> Dict[str, str]:
         cookies_dict = self._snapshot_context_cookies(context, page=target_page)
         if extra_cookie_updates:
             merged_from_network = dict(cookies_dict)
@@ -5777,26 +6029,32 @@ class XianyuSliderStealth:
                 if key in extra_cookie_updates
             ]
             logger.info(
-                f"【{self.pure_user_id}】已合并登录响应中的 {len(extra_cookie_updates)} 个Set-Cookie到{scene}快照: "
+                f"[{self.pure_user_id}] merged {len(extra_cookie_updates)} response cookies into {scene} snapshot: "
                 f"{observed_names[:16]}{' ...' if len(observed_names) > 16 else ''}"
             )
             if observed_protected:
                 logger.info(
-                    f"【{self.pure_user_id}】登录响应中包含关键会话Cookie: {observed_protected}"
+                    f"[{self.pure_user_id}] response cookies include protected session fields: {observed_protected}"
                 )
-        logger.info(f"【{self.pure_user_id}】{scene}后获取到 {len(cookies_dict)} 个Cookie字段")
 
-        if not cookies_dict:
-            logger.error(f"【{self.pure_user_id}】❌ {scene}后未获取到Cookie")
-            return self._fail_login(f"{scene}后未获取到Cookie")
+        logger.info(f"[{self.pure_user_id}] {scene} captured {len(cookies_dict)} cookies")
+        return cookies_dict
 
+    def _stabilize_and_warmup_logged_in_cookies(
+        self,
+        context,
+        target_page,
+        cookies_dict: Dict[str, str],
+        *,
+        scene: str,
+    ) -> Dict[str, str]:
         missing_protected_fields = [
             key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
             if not cookies_dict.get(key)
         ]
         if missing_protected_fields:
             logger.warning(
-                f"【{self.pure_user_id}】{scene}后Cookie仍缺少关键字段，先执行标准稳定化: "
+                f"[{self.pure_user_id}] {scene} is still missing protected cookie fields, run standard stabilization first: "
                 f"{missing_protected_fields}"
             )
             stabilized_cookies = self._stabilize_logged_in_context_cookies(
@@ -5812,18 +6070,108 @@ class XianyuSliderStealth:
             if not cookies_dict.get(key)
         ]
         if missing_protected_fields and target_page:
+            if self._should_skip_redundant_browser_cookie_warmup(cookies_dict):
+                logger.info(
+                    f"[{self.pure_user_id}] {scene} already has warmup verdict, skip duplicate browser warmup: "
+                    f"{missing_protected_fields}"
+                )
+            else:
+                logger.warning(
+                    f"[{self.pure_user_id}] {scene} still misses protected fields after stabilization, continue browser warmup: "
+                    f"{missing_protected_fields}"
+                )
+                warmed_cookies = self._perform_browser_cookie_warmup_probes(
+                    context,
+                    target_page,
+                    scene=scene,
+                    initial_cookies=cookies_dict,
+                )
+                if warmed_cookies:
+                    cookies_dict = warmed_cookies
+
+        return cookies_dict
+
+    def _finalize_cookie_handoff_or_fail(
+        self,
+        cookies_dict: Dict[str, str],
+        *,
+        scene: str,
+    ):
+        missing_protected_fields = [
+            key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
+            if not cookies_dict.get(key)
+        ]
+        if missing_protected_fields and getattr(self, 'last_browser_cookie_warmup_session_unready', False):
+            self._log_cookie_snapshot_integrity(cookies_dict, f"{scene}完成后")
             logger.warning(
-                f"【{self.pure_user_id}】{scene}标准稳定化后仍缺少关键字段，继续执行浏览器业务预热: "
-                f"{missing_protected_fields}"
+                f"[{self.pure_user_id}] {scene} still misses protected fields, and browser warmup marked session unready; "
+                f"keep handing off to upper-layer protected merge: {missing_protected_fields}"
             )
-            warmed_cookies = self._perform_browser_cookie_warmup_probes(
-                context,
-                target_page,
-                scene=scene,
-                initial_cookies=cookies_dict,
+
+        missing_required_fields = [
+            key for key in self._REQUIRED_SESSION_COOKIE_FIELDS
+            if not cookies_dict.get(key)
+        ]
+        if missing_required_fields:
+            self._log_cookie_snapshot_integrity(cookies_dict, f"{scene}完成后")
+            logger.error(
+                f"[{self.pure_user_id}] {scene} cookie snapshot still misses required fields: {missing_required_fields}"
             )
-            if warmed_cookies:
-                cookies_dict = warmed_cookies
+            return self._fail_login(
+                f"{scene}后Cookie仍缺失核心字段: {', '.join(missing_required_fields)}"
+            )
+
+        self._log_cookie_snapshot_integrity(cookies_dict, f"{scene}完成后")
+        logger.success(f"[{self.pure_user_id}] {scene} cookie finalize completed, field_count={len(cookies_dict)}")
+        cleared_pending_markers = []
+        sanitized_cookies = dict(cookies_dict)
+        for key in self._IDENTITY_VERIFY_PENDING_COOKIE_FIELDS:
+            if sanitized_cookies.pop(key, None) is not None:
+                cleared_pending_markers.append(key)
+        if cleared_pending_markers:
+            logger.info(
+                f"[{self.pure_user_id}] {scene} cleared pending identity markers: {cleared_pending_markers}"
+            )
+        return sanitized_cookies
+
+    def _finalize_logged_in_cookies(
+        self,
+        context,
+        page,
+        *,
+        scene: str,
+        notification_callback: Optional[Callable] = None,
+        notification_scene: str = '璐﹀彿瀵嗙爜鐧诲綍',
+        extra_cookie_updates: Optional[Dict[str, str]] = None,
+    ):
+        """Finalize cookie handoff after login is already confirmed."""
+        target_page = page
+        try:
+            if target_page and hasattr(target_page, 'is_closed') and target_page.is_closed():
+                target_page = None
+        except Exception:
+            pass
+
+        if not target_page:
+            target_page = self._select_monitor_page(context, page)
+
+        self.last_browser_cookie_warmup_session_unready = False
+        cookies_dict = self._collect_logged_in_cookie_snapshot(
+            context,
+            target_page,
+            scene,
+            extra_cookie_updates=extra_cookie_updates,
+        )
+        if not cookies_dict:
+            logger.error(f"[{self.pure_user_id}] {scene} returned no cookies")
+            return self._fail_login(f"{scene}鍚庢湭鑾峰彇鍒癈ookie")
+
+        cookies_dict = self._stabilize_and_warmup_logged_in_cookies(
+            context,
+            target_page,
+            cookies_dict,
+            scene=scene,
+        )
 
         warmup_hint_result = self._consume_browser_cookie_warmup_verification_hint(
             context,
@@ -5848,44 +6196,7 @@ class XianyuSliderStealth:
         if self.last_login_error and self.last_login_error != pending_identity_error_before:
             return None
 
-        missing_protected_fields = [
-            key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
-            if not cookies_dict.get(key)
-        ]
-        if missing_protected_fields and getattr(self, 'last_browser_cookie_warmup_session_unready', False):
-            self._log_cookie_snapshot_integrity(cookies_dict, f"{scene}完成后")
-            logger.warning(
-                f"【{self.pure_user_id}】⚠️ {scene}后关键保护字段仍未齐全，且浏览器业务预热仍提示服务端Session未就绪；"
-                f"当前不直接判失败，继续交由后续保护性合并/正式实例接管: {missing_protected_fields}"
-            )
-
-        missing_required_fields = [
-            key for key in self._REQUIRED_SESSION_COOKIE_FIELDS
-            if not cookies_dict.get(key)
-        ]
-        if missing_required_fields:
-            self._log_cookie_snapshot_integrity(cookies_dict, f"{scene}完成后")
-            logger.error(
-                f"【{self.pure_user_id}】❌ {scene}后Cookie仍缺失核心字段: "
-                f"{missing_required_fields}"
-            )
-            return self._fail_login(
-                f"{scene}后Cookie仍缺失核心字段: {', '.join(missing_required_fields)}"
-            )
-
-        self._log_cookie_snapshot_integrity(cookies_dict, f"{scene}完成后")
-        logger.success(f"【{self.pure_user_id}】✅ {scene}后Cookie获取完成，字段数: {len(cookies_dict)}")
-        cleared_pending_markers = []
-        sanitized_cookies = dict(cookies_dict)
-        for key in self._IDENTITY_VERIFY_PENDING_COOKIE_FIELDS:
-            if sanitized_cookies.pop(key, None) is not None:
-                cleared_pending_markers.append(key)
-        if cleared_pending_markers:
-            logger.info(
-                f"[{self.pure_user_id}] {scene} cleared pending identity markers: "
-                f"{cleared_pending_markers}"
-            )
-        return sanitized_cookies
+        return self._finalize_cookie_handoff_or_fail(cookies_dict, scene=scene)
 
     def _wait_for_context_login(
         self,
@@ -9223,6 +9534,85 @@ class XianyuSliderStealth:
             self._merge_runtime_feedback(target_frame if 'target_frame' in locals() else None)
             return False
 
+    def _confirm_post_slider_success_transition(
+        self,
+        current_block: Optional[Dict[str, Any]],
+        primary_target=None,
+    ) -> bool:
+        if not isinstance(current_block, dict):
+            return False
+        if current_block.get("kind") != "punish_captcha":
+            return False
+
+        monitor_target = primary_target or self.page
+        logger.info(
+            f"【{self.pure_user_id}】滑块后命中 punish_captcha，进入过渡复核窗口，"
+            "先确认是否只是旧 frame 残留或页面尚在跳转"
+        )
+
+        try:
+            time.sleep(0.8)
+        except Exception:
+            pass
+
+        try:
+            refreshed_block = self._resolve_special_captcha_block_with_recovery(
+                monitor_target,
+                "滑块后过渡复核",
+                max_wait_seconds=1.2,
+                poll_interval=0.2,
+            )
+        except Exception:
+            refreshed_block = current_block
+
+        if not refreshed_block:
+            self.last_verification_feedback = {
+                "status": "success",
+                "source": "post_slider_transition_cleared",
+                "message": "滑块后处罚页残留已自行消失",
+            }
+            return True
+
+        try:
+            if self.check_page_changed():
+                self.last_verification_feedback = {
+                    "status": "success",
+                    "source": "post_slider_page_changed",
+                    "message": "滑块后页面已脱离验证链路",
+                }
+                return True
+        except Exception:
+            pass
+
+        try:
+            if self._check_login_success_by_element(self.page):
+                self.last_verification_feedback = {
+                    "status": "success",
+                    "source": "post_slider_login_element_detected",
+                    "message": "滑块后已检测到登录成功元素",
+                }
+                return True
+        except Exception:
+            pass
+
+        if self.context:
+            try:
+                context_login_success, _, _ = self._probe_context_login_success(
+                    self.context,
+                    self.page,
+                )
+                if context_login_success:
+                    self.last_verification_feedback = {
+                        "status": "success",
+                        "source": "post_slider_context_login_confirmed",
+                        "message": "滑块后上下文登录状态已确认",
+                    }
+                    return True
+            except Exception as probe_error:
+                logger.debug(f"【{self.pure_user_id}】滑块后过渡复核探测上下文登录态失败: {probe_error}")
+
+        return False
+
     def _detect_post_slider_blocking_state(self, primary_target=None):
         """滑块动作后兜底探测处罚页/硬拒绝，避免把容器切换误判成成功。"""
         targets = []
@@ -9237,26 +9627,41 @@ class XianyuSliderStealth:
                 continue
             targets.append(candidate)
 
+        detected_blocks = []
         for target in targets:
             try:
-                current_block = self._detect_special_captcha_block(target)
+                current_block = self._resolve_special_captcha_block_with_recovery(
+                    target,
+                    "滑块动作后检查",
+                    max_wait_seconds=1.2,
+                    poll_interval=0.2,
+                )
             except Exception:
                 current_block = None
             if not current_block:
                 continue
+            detected_blocks.append((target, current_block))
 
-            self.last_verification_feedback = {
-                "status": "hard_block",
-                "source": current_block["kind"],
-                "message": current_block["message"],
-                "url": current_block.get("url") or "",
-                "title": current_block.get("title") or "",
-            }
-            try:
-                self._merge_runtime_feedback(target)
-            except Exception:
-                pass
-            return current_block
+        if not detected_blocks:
+            return None
+
+        for target, current_block in detected_blocks:
+            if self._confirm_post_slider_success_transition(current_block, primary_target=target):
+                return None
+
+        target, current_block = detected_blocks[0]
+        self.last_verification_feedback = {
+            "status": "hard_block",
+            "source": current_block["kind"],
+            "message": current_block["message"],
+            "url": current_block.get("url") or "",
+            "title": current_block.get("title") or "",
+        }
+        try:
+            self._merge_runtime_feedback(target)
+        except Exception:
+            pass
+        return current_block
 
         return None
     
@@ -10006,6 +10411,28 @@ class XianyuSliderStealth:
                     logger.info(f"【{self.pure_user_id}】================================================")
                     return False
             else:
+                try:
+                    page_text = self._collect_page_text_for_detection(page)
+                except Exception:
+                    page_text = ""
+
+                empty_state_markers = (
+                    "暂无会话",
+                    "尚未选择任何联系人",
+                )
+                if (
+                    page_text and
+                    all(marker in page_text for marker in empty_state_markers) and
+                    self._is_logged_in_url(self._safe_page_url(page)) and
+                    not self._page_has_login_form(page)
+                ):
+                    logger.success(
+                        f"【{self.pure_user_id}】✅ 检测到 IM 空会话登录态，"
+                        "按已登录处理"
+                    )
+                    logger.info(f"【{self.pure_user_id}】================================================")
+                    return True
+
                 logger.debug(f"【{self.pure_user_id}】未找到目标元素: {selector}")
                 logger.info(f"【{self.pure_user_id}】================================================")
                 return False
@@ -11628,7 +12055,6 @@ class XianyuSliderStealth:
                 
                 try:
                     # 检查页面内容是否包含滑块相关元素
-                    page_content = page.content()
                     has_slider = False
 
                     # 检测滑块元素
@@ -11852,12 +12278,24 @@ class XianyuSliderStealth:
                                 logger.success(f"【{self.pure_user_id}】✅ 滑块验证后，登录验证成功！")
                                 login_success = True
                             else:
-                                # 滑块验证后仍未登录成功，继续检测二维码/人脸验证（此时应该不会再检测到滑块）
-                                logger.info(f"【{self.pure_user_id}】等待1秒后继续检测是否需要二维码/人脸验证...")
-                                time.sleep(1)
-                                logger.info(f"【{self.pure_user_id}】滑块验证后，继续检测是否需要二维码/人脸验证...")
-                                monitor_page = self._select_monitor_page(context, active_page or monitor_page)
-                                has_qr, qr_frame = self._detect_qr_code_verification(monitor_page)
+                                login_ui_visible, visible_page = self._should_handoff_visible_login_ui_for_cookie_finalize(
+                                    context,
+                                    active_page or monitor_page,
+                                )
+                                if login_ui_visible:
+                                    logger.warning(
+                                        f"【{self.pure_user_id}】滑块/验证后页面已呈现登录态，"
+                                        "但上下文探测尚未完全确认；提前交给 Cookie 稳定化流程收口"
+                                    )
+                                    login_success = True
+                                    active_page = visible_page or active_page or monitor_page
+                                else:
+                                    # 滑块验证后仍未登录成功，继续检测二维码/人脸验证（此时应该不会再检测到滑块）
+                                    logger.info(f"【{self.pure_user_id}】等待1秒后继续检测是否需要二维码/人脸验证...")
+                                    time.sleep(1)
+                                    logger.info(f"【{self.pure_user_id}】滑块验证后，继续检测是否需要二维码/人脸验证...")
+                                    monitor_page = self._select_monitor_page(context, active_page or monitor_page)
+                                    has_qr, qr_frame = self._detect_qr_code_verification(monitor_page)
                         
                         if has_qr:
                             return self._process_verification_requirement(
@@ -11869,15 +12307,41 @@ class XianyuSliderStealth:
                             )
                         else:
                             logger.info(f"【{self.pure_user_id}】未检测到二维码/人脸验证")
-                            # 再次检查登录状态，确保登录成功
-                            logger.info(f"【{self.pure_user_id}】等待1秒后再次检查登录状态...")
-                            time.sleep(1)
-                            login_success, active_page, _ = self._probe_context_login_success(context, active_page or page)
-                            if not login_success:
-                                logger.error(f"【{self.pure_user_id}】❌ 登录状态未确认，无法获取Cookie")
-                                return self._fail_login("登录状态未确认，无法获取Cookie")
+                            if login_success:
+                                logger.success(f"【{self.pure_user_id}】✅ 页面已呈现登录态，跳过重复登录探测，直接进入 Cookie 收口")
                             else:
-                                logger.success(f"【{self.pure_user_id}】✅ 登录状态已确认")
+                                # 再次检查登录状态，确保登录成功
+                                logger.info(f"【{self.pure_user_id}】等待1秒后再次检查登录状态...")
+                                time.sleep(1)
+                                login_success, active_page, _ = self._probe_context_login_success(context, active_page or page)
+                                if not login_success:
+                                    login_ui_visible, visible_page = self._should_handoff_visible_login_ui_for_cookie_finalize(
+                                        context,
+                                        active_page or page,
+                                    )
+                                    if login_ui_visible:
+                                        login_success = True
+                                        active_page = visible_page or active_page or page
+                                    else:
+                                        try:
+                                            final_monitor_page = self._select_monitor_page(context, active_page or page) or active_page or page
+                                            final_cookie_summary = self._summarize_cookie_dict_for_debug(
+                                                self._snapshot_context_cookies(context, page=final_monitor_page)
+                                            )
+                                            logger.error(
+                                                f"【{self.pure_user_id}】登录最终未确认: "
+                                                f"url={self._safe_page_url(final_monitor_page)} "
+                                                f"required_missing={final_cookie_summary.get('missing_required_fields')} "
+                                                f"protected_missing={final_cookie_summary.get('missing_protected_fields')} "
+                                                f"pending_identity={final_cookie_summary.get('pending_identity_markers')}"
+                                            )
+                                            self._save_debug_snapshot("login_state_unconfirmed", final_monitor_page)
+                                        except Exception as final_probe_err:
+                                            logger.warning(f"【{self.pure_user_id}】保存登录未确认快照失败: {final_probe_err}")
+                                        logger.error(f"【{self.pure_user_id}】❌ 登录状态未确认，无法获取Cookie")
+                                        return self._fail_login("登录状态未确认，无法获取Cookie")
+                                else:
+                                    logger.success(f"【{self.pure_user_id}】✅ 登录状态已确认")
                     
                     # 【重要】只有在 login_success = True 的情况下，才获取Cookie
                     if not login_success:

@@ -2572,6 +2572,384 @@ class ReplyServerPasswordLoginStabilizationTest(_ReplyServerModuleBindingMixin, 
         slider_like._check_login_success_by_element.assert_called_once_with(monitor_page)
         slider_like._probe_context_login_success.assert_not_called()
 
+    def test_pending_identity_handoff_skips_reopening_verification_when_browser_warmup_already_proved_business_ready(self):
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        monitor_page = object()
+        slider_like = SimpleNamespace(
+            pure_user_id="3",
+            last_browser_cookie_warmup_probe_status={
+                "login_token_fetch": True,
+                "login_user_fetch": True,
+            },
+            last_browser_cookie_warmup_session_unready=False,
+            _REQUIRED_SESSION_COOKIE_FIELDS=(
+                "unb",
+                "sgcookie",
+                "cookie2",
+                "_m_h5_tk",
+                "_m_h5_tk_enc",
+                "t",
+                "cna",
+            ),
+            _IDENTITY_VERIFY_PENDING_COOKIE_FIELDS=(
+                "ivActionType",
+                "tmp0",
+                "siv20",
+                "last_u_xianyu_web",
+            ),
+            _detect_pending_identity_verification_cookie_state=mock.Mock(
+                return_value=["ivActionType", "tmp0"]
+            ),
+            _select_monitor_page=mock.Mock(return_value=monitor_page),
+            _detect_qr_code_verification=mock.Mock(return_value=(False, None)),
+            _resolve_pending_identity_verification_url=mock.Mock(
+                side_effect=AssertionError("business-ready handoff should not reopen verification url")
+            ),
+            _fail_login=mock.Mock(
+                side_effect=AssertionError("business-ready handoff should not fail")
+            ),
+        )
+        slider_like._has_business_ready_cookie_shape = (
+            slider_stealth.XianyuSliderStealth._has_business_ready_cookie_shape.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+        slider_like._has_browser_cookie_warmup_probe_business_ready = (
+            slider_stealth.XianyuSliderStealth._has_browser_cookie_warmup_probe_business_ready.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+        slider_like._should_accept_business_ready_cookie_handoff = (
+            slider_stealth.XianyuSliderStealth._should_accept_business_ready_cookie_handoff.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+        slider_like._has_browser_cookie_warmup_business_ready_signal = (
+            slider_stealth.XianyuSliderStealth._has_browser_cookie_warmup_business_ready_signal.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+
+        result = slider_stealth.XianyuSliderStealth._handle_pending_identity_verification_state(
+            slider_like,
+            context=object(),
+            fallback_page=monitor_page,
+            cookies_dict={
+                "unb": "u1",
+                "sgcookie": "sg1",
+                "cookie2": "c2",
+                "_m_h5_tk": "tk_1",
+                "_m_h5_tk_enc": "enc1",
+                "t": "t1",
+                "_tb_token_": "tb1",
+                "x5sec": "x5_1",
+                "ivActionType": "face",
+                "tmp0": "1",
+            },
+            notification_callback=None,
+            notification_scene="账号密码登录",
+        )
+
+        self.assertEqual("u1", result["unb"])
+        self.assertNotIn("ivActionType", result)
+        self.assertNotIn("tmp0", result)
+        slider_like._resolve_pending_identity_verification_url.assert_not_called()
+        slider_like._fail_login.assert_not_called()
+
+    def test_password_login_business_ready_handoff_allows_only_cna_missing(self):
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        slider_instance = SimpleNamespace(
+            last_cookie_business_ready=True,
+            last_browser_cookie_warmup_probe_status={
+                "login_token_fetch": True,
+                "login_user_fetch": True,
+            },
+            last_browser_cookie_warmup_session_unready=False,
+        )
+        slider_instance._has_business_ready_cookie_shape = (
+            slider_stealth.XianyuSliderStealth._has_business_ready_cookie_shape.__get__(
+                slider_instance, SimpleNamespace
+            )
+        )
+        slider_instance._has_browser_cookie_warmup_probe_business_ready = (
+            slider_stealth.XianyuSliderStealth._has_browser_cookie_warmup_probe_business_ready.__get__(
+                slider_instance, SimpleNamespace
+            )
+        )
+        slider_instance._should_accept_business_ready_cookie_handoff = (
+            slider_stealth.XianyuSliderStealth._should_accept_business_ready_cookie_handoff.__get__(
+                slider_instance, SimpleNamespace
+            )
+        )
+
+        accepted = reply_server._should_accept_password_login_business_ready_handoff(
+            {
+                "missing_required_fields": ["cna"],
+                "incoming_cookies_dict": {
+                    "unb": "u1",
+                    "sgcookie": "sg1",
+                    "cookie2": "c2",
+                    "_m_h5_tk": "tk_1",
+                    "_m_h5_tk_enc": "enc1",
+                    "t": "t1",
+                    "_tb_token_": "tb1",
+                    "x5sec": "x5_1",
+                },
+            },
+            slider_instance,
+        )
+
+        self.assertTrue(accepted)
+
+    def test_finalize_logged_in_cookies_skips_duplicate_browser_warmup_after_stabilization(self):
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        target_page = object()
+        cookies_after_stabilize = {
+            "unb": "u1",
+            "sgcookie": "sg1",
+            "cookie2": "c2",
+            "_m_h5_tk": "tk_1",
+            "_m_h5_tk_enc": "enc1",
+            "t": "t1",
+            "_tb_token_": "tb1",
+            "x5sec": "x5_1",
+        }
+        slider_like = SimpleNamespace(
+            pure_user_id="3",
+            last_login_error=None,
+            last_browser_cookie_warmup_verification_hint={
+                "verification_url": "https://example.invalid/punish"
+            },
+            last_browser_cookie_warmup_probe_status={"login_token_fetch": True},
+            last_browser_cookie_warmup_session_unready=False,
+            _PROTECTED_SESSION_COOKIE_FIELDS=("cna", "havana_lgc2_77"),
+            _REQUIRED_SESSION_COOKIE_FIELDS=("unb", "sgcookie", "cookie2", "_m_h5_tk", "_m_h5_tk_enc", "t"),
+            _IDENTITY_VERIFY_PENDING_COOKIE_FIELDS=(),
+            _snapshot_context_cookies=mock.Mock(return_value=cookies_after_stabilize),
+            _stabilize_logged_in_context_cookies=mock.Mock(return_value=cookies_after_stabilize),
+            _perform_browser_cookie_warmup_probes=mock.Mock(
+                side_effect=AssertionError("should skip duplicate warmup")
+            ),
+            _consume_browser_cookie_warmup_verification_hint=mock.Mock(return_value={"status": "handled"}),
+            _handle_pending_identity_verification_state=mock.Mock(return_value=None),
+        )
+        slider_like._has_business_ready_cookie_shape = (
+            slider_stealth.XianyuSliderStealth._has_business_ready_cookie_shape.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+        slider_like._has_browser_cookie_warmup_probe_business_ready = (
+            slider_stealth.XianyuSliderStealth._has_browser_cookie_warmup_probe_business_ready.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+        slider_like._should_accept_business_ready_cookie_handoff = (
+            slider_stealth.XianyuSliderStealth._should_accept_business_ready_cookie_handoff.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+        slider_like._has_browser_cookie_warmup_business_ready_signal = (
+            slider_stealth.XianyuSliderStealth._has_browser_cookie_warmup_business_ready_signal.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+        slider_like._should_skip_redundant_browser_cookie_warmup = (
+            slider_stealth.XianyuSliderStealth._should_skip_redundant_browser_cookie_warmup.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+        slider_like._collect_logged_in_cookie_snapshot = (
+            slider_stealth.XianyuSliderStealth._collect_logged_in_cookie_snapshot.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+        slider_like._stabilize_and_warmup_logged_in_cookies = (
+            slider_stealth.XianyuSliderStealth._stabilize_and_warmup_logged_in_cookies.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+        slider_like._finalize_cookie_handoff_or_fail = (
+            slider_stealth.XianyuSliderStealth._finalize_cookie_handoff_or_fail.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+
+        result = slider_stealth.XianyuSliderStealth._finalize_logged_in_cookies(
+            slider_like,
+            context=object(),
+            page=target_page,
+            scene="账号密码登录",
+        )
+
+        self.assertEqual({"status": "handled"}, result)
+        slider_like._perform_browser_cookie_warmup_probes.assert_not_called()
+
+    def test_detect_post_slider_blocking_state_allows_transient_punish_shell_to_clear(self):
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        stale_frame = object()
+        live_page = object()
+        slider_like = SimpleNamespace(
+            pure_user_id="3",
+            page=live_page,
+            context=None,
+            _detected_slider_frame=None,
+            last_verification_feedback={},
+            _resolve_special_captcha_block_with_recovery=mock.Mock(
+                side_effect=[
+                    {
+                        "kind": "punish_captcha",
+                        "message": "pure captcha shell",
+                        "url": "https://example.invalid/punish",
+                        "title": "captcha",
+                    },
+                    None,
+                    None,
+                ]
+            ),
+            check_page_changed=mock.Mock(return_value=False),
+            _check_login_success_by_element=mock.Mock(return_value=False),
+            _probe_context_login_success=mock.Mock(return_value=(False, None, {})),
+            _merge_runtime_feedback=mock.Mock(),
+        )
+        slider_like._confirm_post_slider_success_transition = (
+            slider_stealth.XianyuSliderStealth._confirm_post_slider_success_transition.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+
+        with mock.patch.object(slider_stealth.time, "sleep", lambda *_args, **_kwargs: None):
+            result = slider_stealth.XianyuSliderStealth._detect_post_slider_blocking_state(
+                slider_like,
+                primary_target=stale_frame,
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            "post_slider_transition_cleared",
+            slider_like.last_verification_feedback.get("source"),
+        )
+        slider_like._merge_runtime_feedback.assert_not_called()
+
+    def test_visible_login_ui_can_handoff_to_cookie_finalize_when_context_probe_lags(self):
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        monitor_page = object()
+        slider_like = SimpleNamespace(
+            pure_user_id="3",
+            _select_monitor_page=mock.Mock(return_value=monitor_page),
+            _check_login_success_by_element=mock.Mock(return_value=True),
+        )
+
+        should_handoff, handoff_page = (
+            slider_stealth.XianyuSliderStealth._should_handoff_visible_login_ui_for_cookie_finalize(
+                slider_like,
+                context=object(),
+                fallback_page=monitor_page,
+            )
+        )
+
+        self.assertTrue(should_handoff)
+        self.assertIs(handoff_page, monitor_page)
+        slider_like._check_login_success_by_element.assert_called_once_with(monitor_page)
+
+    def test_browser_cookie_warmup_hint_auto_slider_success_can_handoff_back_to_finalize(self):
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        verify_page = SimpleNamespace()
+        fallback_page = object()
+        refreshed_cookies = {
+            "unb": "u1",
+            "sgcookie": "sg1",
+            "cookie2": "c2",
+            "_m_h5_tk": "tk_2",
+            "_m_h5_tk_enc": "enc2",
+            "t": "t1",
+            "x5sec": "x5_new",
+        }
+        slider_like = SimpleNamespace(
+            pure_user_id="3",
+            last_browser_cookie_warmup_verification_hint={
+                "verification_url": "https://example.invalid/punish?x5step=2",
+                "verification_type": "unknown",
+            },
+            last_browser_cookie_warmup_session_unready=True,
+            _PROTECTED_SESSION_COOKIE_FIELDS=("cna", "havana_lgc2_77"),
+            _infer_browser_cookie_warmup_risk_trigger_scene=mock.Mock(return_value="token_refresh"),
+            _page_has_slider=mock.Mock(return_value=True),
+            _attempt_solve_slider_on_page=mock.Mock(return_value=True),
+            _probe_context_login_success=mock.Mock(return_value=(False, None, {})),
+            _snapshot_context_cookies=mock.Mock(return_value=refreshed_cookies),
+            _select_monitor_page=mock.Mock(return_value=fallback_page),
+            _detect_qr_code_verification=mock.Mock(return_value=(False, None)),
+            _has_meaningful_cookie_refresh=mock.Mock(return_value=True),
+            _finalize_logged_in_cookies=mock.Mock(return_value={"ok": True}),
+        )
+        fake_context = SimpleNamespace(new_page=mock.Mock(return_value=verify_page))
+        verify_page.goto = mock.Mock()
+        slider_like._recover_verification_url_with_auto_slider_then_finalize = (
+            slider_stealth.XianyuSliderStealth._recover_verification_url_with_auto_slider_then_finalize.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+
+        result = slider_stealth.XianyuSliderStealth._consume_browser_cookie_warmup_verification_hint(
+            slider_like,
+            fake_context,
+            fallback_page,
+            {
+                "unb": "u1",
+                "sgcookie": "sg1",
+                "cookie2": "c2",
+                "_m_h5_tk": "tk_1",
+                "_m_h5_tk_enc": "enc1",
+                "t": "t1",
+                "x5sec": "x5_old",
+            },
+            notification_callback=None,
+            notification_scene="账号密码登录",
+        )
+
+        self.assertEqual({"ok": True}, result)
+        self.assertIsNone(slider_like.last_browser_cookie_warmup_verification_hint)
+        self.assertFalse(slider_like.last_browser_cookie_warmup_session_unready)
+        slider_like._finalize_logged_in_cookies.assert_called_once_with(
+            fake_context,
+            fallback_page,
+            scene="浏览器业务预热验证页自动续解",
+            notification_callback=None,
+            notification_scene="账号密码登录",
+            extra_cookie_updates=refreshed_cookies,
+        )
+
+    def test_check_login_success_by_element_accepts_empty_im_conversation_state(self):
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        page = mock.Mock()
+        page.query_selector.return_value = None
+
+        slider_like = SimpleNamespace(
+            pure_user_id="3",
+            _collect_page_text_for_detection=mock.Mock(
+                return_value="暂无会话，先休息下吧 尚未选择任何联系人 快点左侧列表聊起来吧"
+            ),
+            _safe_page_url=mock.Mock(return_value="https://www.goofish.com/im"),
+            _is_logged_in_url=mock.Mock(return_value=True),
+            _page_has_login_form=mock.Mock(return_value=False),
+        )
+
+        result = slider_stealth.XianyuSliderStealth._check_login_success_by_element(
+            slider_like,
+            page,
+        )
+
+        self.assertTrue(result)
+        slider_like._collect_page_text_for_detection.assert_called_once_with(page)
+        slider_like._page_has_login_form.assert_called_once_with(page)
+
 
 class ReplyServerAccountDeletionCleanupTest(_ReplyServerModuleBindingMixin, unittest.TestCase):
     def test_purge_account_local_artifacts_removes_profile_and_face_verification_images(self):

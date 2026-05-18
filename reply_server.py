@@ -4457,6 +4457,35 @@ def _stabilize_password_login_cookies_after_login(
     }
 
 
+def _should_accept_password_login_business_ready_handoff(
+    merge_result: Dict[str, Any],
+    slider_instance: Any,
+) -> bool:
+    if not isinstance(merge_result, dict):
+        return False
+    if not bool(getattr(slider_instance, 'last_cookie_business_ready', False)):
+        return False
+
+    missing_required_fields = [
+        str(field).strip()
+        for field in (merge_result.get('missing_required_fields') or [])
+        if str(field).strip()
+    ]
+    incoming_cookies = merge_result.get('incoming_cookies_dict') or {}
+    helper = getattr(slider_instance, '_should_accept_business_ready_cookie_handoff', None)
+    if callable(helper):
+        try:
+            return bool(
+                helper(
+                    incoming_cookies,
+                    missing_required_fields=missing_required_fields,
+                )
+            )
+        except Exception:
+            return False
+
+    return False
+
 
 def _get_latest_password_login_session_for_account(
     account_id: str,
@@ -5192,7 +5221,16 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 )
                 cookies_str = '; '.join([f"{k}={v}" for k, v in merged_cookies_dict.items()])
 
-                if merge_result['missing_required_fields']:
+                if _should_accept_password_login_business_ready_handoff(merge_result, slider_instance):
+                    log_with_user(
+                        'warning',
+                        (
+                            "密码登录Cookie仅缺少 cna，但当前浏览器业务预热已证明会话可用；"
+                            "本次按业务就绪态交接，后续由正式实例继续补齐观测字段"
+                        ),
+                        current_user,
+                    )
+                elif merge_result['missing_required_fields']:
                     missing_fields_text = ', '.join(merge_result['missing_required_fields'])
                     error_message = f"登录成功但Cookie核心字段仍缺失，未覆盖旧Cookie: {missing_fields_text}"
                     log_with_user('error', f"{error_message}: {account_id}", current_user)
