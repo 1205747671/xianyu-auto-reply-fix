@@ -58,10 +58,9 @@ REQUIRED_SESSION_COOKIE_FIELDS = (
     '_m_h5_tk',
     '_m_h5_tk_enc',
     't',
-)
-OBSERVED_SESSION_COOKIE_FIELDS = (
     'cna',
 )
+OBSERVED_SESSION_COOKIE_FIELDS = ()
 
 
 class ConnectionState(Enum):

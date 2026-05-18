@@ -11793,7 +11793,8 @@ async function checkManualCookieImportStatus() {
                         data.screenshot_path,
                         data.verification_type,
                         data.message,
-                        manualImportVerificationPendingCompletion
+                        manualImportVerificationPendingCompletion,
+                        Boolean(data.show_verification_link_button)
                     );
                     break;
                 case 'success':
@@ -12102,7 +12103,8 @@ function startRefreshCookiePolling(sessionId, accountId) {
                         data.screenshot_path,
                         data.verification_type,
                         data.message,
-                        refreshVerificationPendingCompletion
+                        refreshVerificationPendingCompletion,
+                        Boolean(data.show_verification_link_button)
                     );
                     break;
                 case 'success':
@@ -12266,7 +12268,8 @@ async function checkPasswordLoginStatus() {
                         data.screenshot_path,
                         data.verification_type,
                         data.message,
-                        verificationPendingCompletion
+                        verificationPendingCompletion,
+                        Boolean(data.show_verification_link_button)
                     );
                     // 继续监控（人脸认证后需要继续等待登录完成）
                     break;
@@ -12411,7 +12414,14 @@ function bindPasswordLoginQRModalEvents(modalElement) {
 }
 
 // 显示账号密码登录验证
-function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationType, statusMessage = '', verificationPendingCompletion = false) {
+function showPasswordLoginQRCode(
+    verificationUrl,
+    screenshotPath,
+    verificationType,
+    statusMessage = '',
+    verificationPendingCompletion = false,
+    showVerificationLinkButton = null
+) {
     // 使用现有的二维码登录模态框
     let modal = document.getElementById('passwordLoginQRModal');
     if (!modal) {
@@ -12443,9 +12453,13 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationTy
     // 优先显示截图，如果没有截图则显示链接
     const screenshotImg = document.getElementById('passwordLoginScreenshotImg');
     const linkButton = document.getElementById('passwordLoginVerificationLink');
+    const passwordLoginLinkContainer = document.getElementById('passwordLoginLinkContainer');
     const statusText = document.getElementById('passwordLoginQRStatusText');
     const verificationTypeLabel = getPasswordLoginVerificationTypeLabel(verificationType);
     const fallbackWaitingMessage = statusMessage || '验证已提交，正在等待服务端完成登录，请勿关闭当前窗口';
+    if (showVerificationLinkButton === null) {
+        showVerificationLinkButton = !verificationPendingCompletion && !screenshotPath && Boolean(verificationUrl);
+    }
 
     if (verificationPendingCompletion) {
         if (screenshotImg) {
@@ -12456,6 +12470,9 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationTy
         if (linkButton) {
             linkButton.style.display = 'none';
             linkButton.removeAttribute('href');
+        }
+        if (passwordLoginLinkContainer) {
+            passwordLoginLinkContainer.style.display = 'none';
         }
         if (statusText) {
             statusText.textContent = fallbackWaitingMessage;
@@ -12473,6 +12490,9 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationTy
                 if (linkButton) {
                     linkButton.style.display = 'none';
                 }
+                if (passwordLoginLinkContainer) {
+                    passwordLoginLinkContainer.style.display = 'none';
+                }
                 if (statusText && !passwordLoginPollingState.completed) {
                     statusText.textContent = fallbackWaitingMessage;
                 }
@@ -12486,6 +12506,9 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationTy
         if (linkButton) {
             linkButton.style.display = 'none';
         }
+        if (passwordLoginLinkContainer) {
+            passwordLoginLinkContainer.style.display = 'none';
+        }
         
         // 更新状态文本
         if (statusText) {
@@ -12493,7 +12516,7 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationTy
                 ? '需要闲鱼二维码验证，请使用手机闲鱼APP扫描下方二维码完成验证'
                 : `需要闲鱼${verificationTypeLabel}，请根据下方验证信息在手机闲鱼APP中完成操作`);
         }
-    } else if (verificationUrl) {
+    } else if (verificationUrl && showVerificationLinkButton) {
         // 隐藏截图
         if (screenshotImg) {
             screenshotImg.src = '';
@@ -12505,10 +12528,13 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationTy
             linkButton.href = verificationUrl;
             linkButton.style.display = 'inline-block';
         }
+        if (passwordLoginLinkContainer) {
+            passwordLoginLinkContainer.style.display = showVerificationLinkButton ? 'block' : 'none';
+        }
         
         // 更新状态文本
         if (statusText) {
-            statusText.textContent = statusMessage || `服务端已保持原始会话；如${verificationTypeLabel}入口暂未显示，可使用下方兜底入口`;
+            statusText.textContent = statusMessage || `服务端已保持原始会话；如${verificationTypeLabel}入口暂未显示，可使用下方辅助验证链接`;
         }
     } else {
         // 都没有，显示等待
@@ -12519,6 +12545,9 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationTy
         if (linkButton) {
             linkButton.href = '#';
             linkButton.style.display = 'none';
+        }
+        if (passwordLoginLinkContainer) {
+            passwordLoginLinkContainer.style.display = showVerificationLinkButton ? 'block' : 'none';
         }
         if (statusText) {
             statusText.textContent = fallbackWaitingMessage;
@@ -12545,9 +12574,13 @@ function closePasswordLoginQRModal() {
     }
 
     const linkButton = document.getElementById('passwordLoginVerificationLink');
+    const passwordLoginLinkContainer = document.getElementById('passwordLoginLinkContainer');
     if (linkButton) {
         linkButton.href = '#';
         linkButton.style.display = 'none';
+    }
+    if (passwordLoginLinkContainer) {
+        passwordLoginLinkContainer.style.display = 'none';
     }
 
     const statusText = document.getElementById('passwordLoginQRStatusText');
@@ -12575,7 +12608,7 @@ function setPasswordLoginQRModalStatus(message) {
 function createPasswordLoginQRModal() {
     const modalHtml = `
         <div class="modal fade" id="passwordLoginQRModal" tabindex="-1" aria-labelledby="passwordLoginQRModalLabel" aria-hidden="true">
-            <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-dialog modal-lg modal-dialog-centered">
                 <div class="modal-content">
                     <div class="modal-header">
                         <h5 class="modal-title" id="passwordLoginQRModalLabel">
@@ -12591,15 +12624,15 @@ function createPasswordLoginQRModal() {
                         <!-- 截图显示区域 -->
                         <div id="passwordLoginScreenshotContainer" class="mb-3 d-flex justify-content-center">
                             <img id="passwordLoginScreenshotImg" src="" alt="验证截图" 
-                                 class="img-fluid" style="display: none; max-width: 400px; height: auto; border: 2px solid #ddd; border-radius: 8px;">
+                                 class="img-fluid" style="display: none; max-width: min(100%, 560px); width: 100%; max-height: 70vh; height: auto; object-fit: contain; border: 2px solid #ddd; border-radius: 8px;">
                         </div>
                         
-                        <!-- 验证链接按钮（回退方案） -->
-                        <div id="passwordLoginLinkContainer" class="mt-4">
+                        <!-- 验证链接按钮（辅助方案） -->
+                        <div id="passwordLoginLinkContainer" class="mt-4" style="display: none;">
                             <a id="passwordLoginVerificationLink" href="#" target="_blank" 
                                class="btn btn-warning btn-lg" style="display: none;">
                                 <i class="bi bi-shield-check me-2"></i>
-                                打开兜底验证页面
+                                打开辅助验证链接
                             </a>
                         </div>
                         

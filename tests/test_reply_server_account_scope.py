@@ -2266,6 +2266,57 @@ class ReplyServerVerificationMaterialStateTest(_ReplyServerModuleBindingMixin, u
             )
 
 
+    def test_build_verification_required_status_payload_hides_fallback_link_when_screenshot_exists(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            screenshot_path = Path(tmpdir) / "face_verify_1_latest.jpg"
+            screenshot_path.write_bytes(b"fake-image")
+
+            session = {
+                "verification_type": "face_verify",
+                "screenshot_path": str(screenshot_path),
+                "verification_url": "https://passport.example/fallback",
+                "qr_code_url": None,
+            }
+
+            payload = reply_server._build_verification_required_status_payload(session)
+
+            self.assertEqual("verification_required", payload["status"])
+            self.assertEqual(str(screenshot_path), payload["screenshot_path"])
+            self.assertFalse(payload["show_verification_link_button"])
+
+    def test_build_verification_required_status_payload_shows_fallback_link_only_without_screenshot(self):
+        session = {
+            "verification_type": "face_verify",
+            "screenshot_path": None,
+            "verification_url": "https://passport.example/fallback",
+            "qr_code_url": None,
+        }
+
+        payload = reply_server._build_verification_required_status_payload(session)
+
+        self.assertEqual("verification_required", payload["status"])
+        self.assertTrue(payload["show_verification_link_button"])
+        self.assertEqual("https://passport.example/fallback", payload["verification_url"])
+
+    def test_build_verification_required_status_payload_treats_auto_captcha_link_as_processing(self):
+        session = {
+            "verification_type": "unknown",
+            "screenshot_path": None,
+            "verification_url": (
+                "https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/"
+                "_____tmd_____/punish?x5step=2&action=captcha&pureCaptcha="
+            ),
+            "qr_code_url": None,
+        }
+
+        payload = reply_server._build_verification_required_status_payload(session)
+
+        self.assertEqual("verification_processing", payload["status"])
+        self.assertFalse(payload["show_verification_link_button"])
+        self.assertTrue(payload["verification_pending_completion"])
+        self.assertIn("自动处理", payload["message"])
+
+
 class ReplyServerVerificationUiContractTest(_ReplyServerModuleBindingMixin, unittest.TestCase):
     def test_password_login_modal_handles_verification_processing_without_fallback_button(self):
         app_js = (REPO_ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
@@ -2274,6 +2325,252 @@ class ReplyServerVerificationUiContractTest(_ReplyServerModuleBindingMixin, unit
         self.assertIn("showPasswordLoginQRCode(", app_js)
         self.assertIn("Boolean(data.verification_pending_completion)", app_js)
         self.assertIn("data.status === 'verification_processing'", app_js)
+        self.assertIn("showVerificationLinkButton", app_js)
+        self.assertIn("passwordLoginLinkContainer.style.display = showVerificationLinkButton ? 'block' : 'none';", app_js)
+
+    def test_password_login_modal_uses_large_modal_and_screenshot_preview(self):
+        app_js = (REPO_ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('modal-dialog modal-lg modal-dialog-centered', app_js)
+        self.assertIn('max-width: min(100%, 560px); width: 100%;', app_js)
+
+
+class ReplyServerPasswordLoginStabilizationTest(_ReplyServerModuleBindingMixin, unittest.TestCase):
+    def test_cna_is_restored_to_required_cookie_gate(self):
+        xianyu_async = (REPO_ROOT / "XianyuAutoAsync.py").read_text(encoding="utf-8")
+        slider_source = (REPO_ROOT / "utils" / "xianyu_slider_stealth.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "REQUIRED_SESSION_COOKIE_FIELDS = (\n"
+            "    'unb',\n"
+            "    'sgcookie',\n"
+            "    'cookie2',\n"
+            "    '_m_h5_tk',\n"
+            "    '_m_h5_tk_enc',\n"
+            "    't',\n"
+            "    'cna',\n"
+            ")",
+            xianyu_async,
+        )
+        self.assertIn(
+            "_REQUIRED_SESSION_COOKIE_FIELDS = (\n"
+            "        'unb',\n"
+            "        'sgcookie',\n"
+            "        'cookie2',\n"
+            "        '_m_h5_tk',\n"
+            "        '_m_h5_tk_enc',\n"
+            "        't',\n"
+            "        'cna',\n"
+            "    )",
+            slider_source,
+        )
+
+    def test_password_login_http_success_still_reuses_runtime_when_protected_fields_missing(self):
+        import XianyuAutoAsync
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        class FakeLive:
+            def __init__(self, cookies_str, account_id, user_id, register_instance=False):
+                self.cookies_str = cookies_str
+                self.account_id = account_id
+                self.user_id = user_id
+                self.register_instance = register_instance
+                self.current_token = None
+
+            async def preflight_token_after_password_login(self):
+                return "prewarmed-token"
+
+        def fake_run_coroutine_threadsafe(coro, loop):
+            coro.close()
+            return object()
+
+        slider_instance = SimpleNamespace(
+            context=object(),
+            page=object(),
+            _stabilize_logged_in_context_cookies=mock.Mock(
+                return_value={
+                    "unb": "u1",
+                    "sgcookie": "sg1",
+                    "cookie2": "c2",
+                    "_m_h5_tk": "tk_1",
+                    "_m_h5_tk_enc": "enc1",
+                    "t": "t1",
+                    "cna": "cna1",
+                    "havana_lgc2_77": "hv1",
+                }
+            ),
+        )
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "PROTECTED_SESSION_COOKIE_FIELDS",
+            ("unb", "sgcookie", "cookie2", "_m_h5_tk", "_m_h5_tk_enc", "t", "cna", "havana_lgc2_77"),
+        ), mock.patch.object(
+            XianyuAutoAsync,
+            "XianyuLive",
+            FakeLive,
+        ), mock.patch.object(
+            slider_stealth,
+            "probe_cookie_verification_from_cookie",
+            side_effect=[
+                {
+                    "status": "cookie_valid",
+                    "session_cookies": {
+                        "unb": "u1",
+                        "sgcookie": "sg1",
+                        "cookie2": "c2",
+                        "_m_h5_tk": "tk_1",
+                        "_m_h5_tk_enc": "enc1",
+                        "t": "t1",
+                    },
+                },
+                {
+                    "status": "cookie_valid",
+                    "session_cookies": {
+                        "unb": "u1",
+                        "sgcookie": "sg1",
+                        "cookie2": "c2",
+                        "_m_h5_tk": "tk_1",
+                        "_m_h5_tk_enc": "enc1",
+                        "t": "t1",
+                        "cna": "cna1",
+                        "havana_lgc2_77": "hv1",
+                    },
+                },
+            ],
+        ) as probe_mock, mock.patch.object(
+            reply_server.asyncio,
+            "run_coroutine_threadsafe",
+            side_effect=fake_run_coroutine_threadsafe,
+        ), mock.patch.object(
+            reply_server,
+            "_wait_threadsafe_future_result",
+            return_value="prewarmed-token",
+        ), mock.patch.object(reply_server, "log_with_user"):
+            cookies_str, meta = reply_server._stabilize_password_login_cookies_after_login(
+                cookies_str="unb=u1; sgcookie=sg1; cookie2=c2; _m_h5_tk=tk_1; _m_h5_tk_enc=enc1; t=t1",
+                account_id="1",
+                user_id=1,
+                current_user={"user_id": 1},
+                slider_instance=slider_instance,
+                proxy_config=None,
+                request_loop=mock.Mock(),
+                preflight_timeout=10.0,
+            )
+
+        slider_instance._stabilize_logged_in_context_cookies.assert_called_once()
+        self.assertEqual(2, probe_mock.call_count)
+        self.assertTrue(meta["token_prewarmed"])
+        self.assertTrue(meta["real_cookie_refreshed"])
+        self.assertIn("cna=cna1", cookies_str)
+        self.assertIn("havana_lgc2_77=hv1", cookies_str)
+
+    def test_password_login_http_success_skips_runtime_stabilization_when_protected_fields_complete(self):
+        import XianyuAutoAsync
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        class FakeLive:
+            def __init__(self, cookies_str, account_id, user_id, register_instance=False):
+                self.cookies_str = cookies_str
+                self.account_id = account_id
+                self.user_id = user_id
+                self.register_instance = register_instance
+                self.current_token = None
+
+            async def preflight_token_after_password_login(self):
+                return "prewarmed-token"
+
+        def fake_run_coroutine_threadsafe(coro, loop):
+            coro.close()
+            return object()
+
+        slider_instance = SimpleNamespace(
+            context=object(),
+            page=object(),
+            _stabilize_logged_in_context_cookies=mock.Mock(),
+        )
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "PROTECTED_SESSION_COOKIE_FIELDS",
+            ("unb", "sgcookie", "cookie2", "_m_h5_tk", "_m_h5_tk_enc", "t", "cna"),
+        ), mock.patch.object(
+            XianyuAutoAsync,
+            "XianyuLive",
+            FakeLive,
+        ), mock.patch.object(
+            slider_stealth,
+            "probe_cookie_verification_from_cookie",
+            return_value={
+                "status": "cookie_valid",
+                "session_cookies": {
+                    "unb": "u1",
+                    "sgcookie": "sg1",
+                    "cookie2": "c2",
+                    "_m_h5_tk": "tk_1",
+                    "_m_h5_tk_enc": "enc1",
+                    "t": "t1",
+                    "cna": "cna1",
+                },
+            },
+        ), mock.patch.object(
+            reply_server.asyncio,
+            "run_coroutine_threadsafe",
+            side_effect=fake_run_coroutine_threadsafe,
+        ), mock.patch.object(
+            reply_server,
+            "_wait_threadsafe_future_result",
+            return_value="prewarmed-token",
+        ), mock.patch.object(reply_server, "log_with_user"):
+            _, meta = reply_server._stabilize_password_login_cookies_after_login(
+                cookies_str="unb=u1; sgcookie=sg1; cookie2=c2; _m_h5_tk=tk_1; _m_h5_tk_enc=enc1; t=t1; cna=cna1",
+                account_id="1",
+                user_id=1,
+                current_user={"user_id": 1},
+                slider_instance=slider_instance,
+                proxy_config=None,
+                request_loop=mock.Mock(),
+                preflight_timeout=10.0,
+            )
+
+        slider_instance._stabilize_logged_in_context_cookies.assert_not_called()
+        self.assertTrue(meta["token_prewarmed"])
+        self.assertFalse(meta["real_cookie_refreshed"])
+
+    def test_wait_for_context_login_hands_off_when_verification_page_disappears_but_logged_in_ui_is_visible(self):
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        monitor_page = object()
+        slider_like = SimpleNamespace(
+            pure_user_id="2",
+            last_login_error=None,
+            _select_monitor_page=mock.Mock(return_value=monitor_page),
+            _ensure_active_verification_session=mock.Mock(return_value=None),
+            _attempt_solve_slider_on_page=mock.Mock(),
+            _detect_qr_code_verification=mock.Mock(return_value=(False, None)),
+            _check_login_success_by_element=mock.Mock(return_value=True),
+            _probe_context_login_success=mock.Mock(
+                side_effect=AssertionError("logged-in UI fast path should short-circuit before probe")
+            ),
+            _resolve_special_captcha_block_with_recovery=mock.Mock(return_value=None),
+            _safe_page_url=mock.Mock(return_value="https://www.goofish.com/im"),
+        )
+
+        login_success, success_page = slider_stealth.XianyuSliderStealth._wait_for_context_login(
+            slider_like,
+            context=object(),
+            fallback_page=monitor_page,
+            max_wait_time=10,
+            check_interval=1,
+            verification_type="face_verify",
+            verification_url="https://passport.goofish.com/iv/mini/identity_verify.htm",
+            verification_screenshot_path="static/uploads/images/face_verify_2_latest.jpg",
+        )
+
+        self.assertTrue(login_success)
+        self.assertIs(success_page, monitor_page)
+        slider_like._check_login_success_by_element.assert_called_once_with(monitor_page)
+        slider_like._probe_context_login_success.assert_not_called()
 
 
 class ReplyServerAccountDeletionCleanupTest(_ReplyServerModuleBindingMixin, unittest.TestCase):

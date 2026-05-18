@@ -4041,20 +4041,31 @@ def _build_verification_required_status_payload(
         screenshot_path = None
         session['screenshot_path'] = None
 
+    auto_verification_processing = bool(
+        verification_url and any(
+            token in str(verification_url or '').lower()
+            for token in ('punish?', 'x5step=2', 'action=captcha', 'purecaptcha')
+        )
+    )
     verification_pending_completion = bool(
         pending_completion_message
         and session_had_screenshot
         and not screenshot_path
-    )
+    ) or auto_verification_processing
     if verification_pending_completion:
         verification_url = None
         qr_code_url = None
 
+    show_verification_link_button = bool(
+        verification_url
+        and not screenshot_path
+        and not verification_pending_completion
+    )
     verification_material_ready = bool(screenshot_path or verification_url or qr_code_url)
     if screenshot_path:
         message = f'需要{verification_type}，请查看验证截图'
     elif verification_pending_completion:
-        message = pending_completion_message
+        message = pending_completion_message or '检测到服务端正在自动处理后续验证，请勿关闭当前页面'
     elif verification_url:
         message = f'需要{verification_type}，请点击验证链接'
     else:
@@ -4067,6 +4078,7 @@ def _build_verification_required_status_payload(
         'verification_type': verification_type,
         'verification_material_ready': verification_material_ready,
         'verification_pending_completion': verification_pending_completion,
+        'show_verification_link_button': show_verification_link_button,
         'message': message,
     }
     if include_qr_code_url:
@@ -4130,7 +4142,7 @@ def _stabilize_password_login_cookies_after_login(
 ) -> Tuple[str, Dict[str, Any]]:
     # 优先走纯 HTTP Token 探测 + 复用当前 managed runtime 的 Cookie 稳定化，
     # 避免“密码登录成功 -> Token 预检失败 -> 再次申请 runtime”导致的二次拉起浏览器。
-    from XianyuAutoAsync import XianyuLive
+    from XianyuAutoAsync import PROTECTED_SESSION_COOKIE_FIELDS, XianyuLive
     from utils.xianyu_slider_stealth import probe_cookie_verification_from_cookie
 
     def _to_cookie_str(cookie_dict: Dict[str, Any]) -> str:
@@ -4143,6 +4155,13 @@ def _stabilize_password_login_cookies_after_login(
 
     def _probe_cookie(cookie_text: str) -> Dict[str, Any]:
         return probe_cookie_verification_from_cookie(cookie_text, proxy=proxy_config)
+
+    def _get_missing_protected_fields(cookie_text: str) -> List[str]:
+        cookie_dict = trans_cookies(cookie_text)
+        return [
+            key for key in PROTECTED_SESSION_COOKIE_FIELDS
+            if not cookie_dict.get(key)
+        ]
 
     def _try_prewarm_password_login_token(
         cookie_text: str,
@@ -4168,6 +4187,77 @@ def _stabilize_password_login_cookies_after_login(
         token_ready = bool(getattr(temp_xianyu, 'current_token', None) or token_result)
         return updated_cookie_str, token_ready
 
+    def _try_stabilize_with_current_runtime(
+        cookie_text: str,
+        *,
+        scene: str,
+    ) -> Tuple[str, Optional[Dict[str, Any]], List[str], List[str]]:
+        missing_before = _get_missing_protected_fields(cookie_text)
+        if not missing_before:
+            return cookie_text, None, [], []
+
+        context = getattr(slider_instance, 'context', None) if slider_instance is not None else None
+        page = getattr(slider_instance, 'page', None) if slider_instance is not None else None
+        stabilizer = getattr(slider_instance, '_stabilize_logged_in_context_cookies', None) if slider_instance is not None else None
+        if not callable(stabilizer) or context is None:
+            log_with_user(
+                'warning',
+                (
+                    f"{scene}检测到当前Cookie仍缺少保护字段，但当前 managed runtime 不可复用，"
+                    f"将继续使用现有Cookie交接: {account_id}, missing={missing_before}"
+                ),
+                current_user,
+            )
+            return cookie_text, None, missing_before, missing_before
+
+        log_with_user(
+            'info',
+            (
+                f"{scene}检测到当前Cookie仍缺少保护字段，继续复用当前 managed runtime 做同会话稳定化: "
+                f"{account_id}, missing={missing_before}"
+            ),
+            current_user,
+        )
+
+        try:
+            stabilized_cookie_dict = stabilizer(
+                context,
+                page,
+                scene=scene,
+            )
+        except Exception as stabilize_err:
+            log_with_user(
+                'warning',
+                f"复用当前 runtime 稳定化Cookie失败，将继续沿用当前Cookie交接: {account_id}, 错误: {str(stabilize_err)}",
+                current_user,
+            )
+            return cookie_text, None, missing_before, missing_before
+
+        if not stabilized_cookie_dict:
+            return cookie_text, None, missing_before, missing_before
+
+        stabilized_cookie_str = _to_cookie_str(stabilized_cookie_dict)
+        missing_after = _get_missing_protected_fields(stabilized_cookie_str)
+        if len(missing_after) < len(missing_before):
+            log_with_user(
+                'info',
+                (
+                    f"{scene}同会话稳定化后保护字段缺失已减少: {account_id}, "
+                    f"before={missing_before}, after={missing_after}"
+                ),
+                current_user,
+            )
+        else:
+            log_with_user(
+                'warning',
+                (
+                    f"{scene}同会话稳定化未补齐更多保护字段，将继续沿用当前最佳Cookie: "
+                    f"{account_id}, missing={missing_after}"
+                ),
+                current_user,
+            )
+        return stabilized_cookie_str, stabilized_cookie_dict, missing_before, missing_after
+
     log_with_user(
         'info',
         f"密码登录成功后开始执行Token预检(HTTP)，优先确认新Cookie可直接交接: {account_id}",
@@ -4184,10 +4274,41 @@ def _stabilize_password_login_cookies_after_login(
             'session_cookies': trans_cookies(cookies_str),
         }
 
+    stabilized_cookie_dict = None
     if probe_result.get('status') == 'cookie_valid':
         merged = trans_cookies(cookies_str)
         merged.update(probe_result.get('session_cookies') or {})
         cookies_str = _to_cookie_str(merged)
+        missing_protected_fields = _get_missing_protected_fields(cookies_str)
+        if missing_protected_fields:
+            cookies_str, stabilized_cookie_dict, _, missing_after_stabilization = _try_stabilize_with_current_runtime(
+                cookies_str,
+                scene="密码登录后(HTTP预检通过，交接前)",
+            )
+            if stabilized_cookie_dict:
+                try:
+                    probe_result = _probe_cookie(cookies_str)
+                except Exception as probe_err:
+                    probe_result = {
+                        'status': 'unknown',
+                        'verification_url': None,
+                        'payload': {'error': str(probe_err)},
+                        'session_cookies': trans_cookies(cookies_str),
+                    }
+                if probe_result.get('status') == 'cookie_valid':
+                    merged = trans_cookies(cookies_str)
+                    merged.update(probe_result.get('session_cookies') or {})
+                    cookies_str = _to_cookie_str(merged)
+                else:
+                    log_with_user(
+                        'warning',
+                        (
+                            f"密码登录后(HTTP预检通过，交接前)稳定化后再次HTTP预检未直通，"
+                            f"将继续沿用当前最佳Cookie交接: {account_id}, "
+                            f"status={probe_result.get('status')}, missing={missing_after_stabilization}"
+                        ),
+                        current_user,
+                    )
         token_prewarmed = False
         try:
             cookies_str, token_prewarmed = _try_prewarm_password_login_token(
@@ -4213,7 +4334,7 @@ def _stabilize_password_login_cookies_after_login(
         )
         return cookies_str, {
             'token_prewarmed': token_prewarmed,
-            'real_cookie_refreshed': False,
+            'real_cookie_refreshed': bool(stabilized_cookie_dict),
             'fallback_reason': None,
         }
 
@@ -4231,7 +4352,6 @@ def _stabilize_password_login_cookies_after_login(
         current_user,
     )
 
-    stabilized_cookie_dict = None
     try:
         context = getattr(slider_instance, 'context', None) if slider_instance is not None else None
         page = getattr(slider_instance, 'page', None) if slider_instance is not None else None

@@ -3868,10 +3868,9 @@ class XianyuSliderStealth:
         '_m_h5_tk',
         '_m_h5_tk_enc',
         't',
-    )
-    _OBSERVED_SESSION_COOKIE_FIELDS = (
         'cna',
     )
+    _OBSERVED_SESSION_COOKIE_FIELDS = ()
     _IDENTITY_VERIFY_PENDING_COOKIE_FIELDS = (
         'ivActionType',
         'tmp0',
@@ -5914,6 +5913,21 @@ class XianyuSliderStealth:
                 return False, monitor_page
             self._attempt_solve_slider_on_page(monitor_page)
             has_verification, refreshed_frame = self._detect_qr_code_verification(monitor_page)
+
+            # 人脸/扫码验证页已经消失，且当前页已经明显进入已登录列表时，
+            # 不要继续被“待确认 Cookie 标记”卡死，交给后续 finalize 做稳定化补齐。
+            if not has_verification and monitor_page:
+                try:
+                    if self._check_login_success_by_element(monitor_page):
+                        logger.info(
+                            f"[{self.pure_user_id}] 验证页已退出且当前页已呈现登录态，"
+                            "提前结束验证等待并进入 Cookie 稳定化"
+                        )
+                        return True, monitor_page
+                except Exception as login_probe_err:
+                    logger.debug(
+                        f"[{self.pure_user_id}] 验证等待期间复核当前页登录态失败: {login_probe_err}"
+                    )
 
             hard_block = None
             hard_block_target = None
