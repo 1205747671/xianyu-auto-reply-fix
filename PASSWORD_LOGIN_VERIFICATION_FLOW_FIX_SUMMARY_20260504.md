@@ -1513,6 +1513,71 @@ python -m pytest tests/test_reply_server_account_scope.py -k "verification"
 
 ## 2026-05-18 补充：编辑账号资料后误触发账号重启的问题
 
+## 2026-05-18 补充：删除“显示浏览器窗口”开关，账密/扫码相关流程统一无头
+
+### 1. 本次调整目标
+
+把前后端残留的“显示浏览器窗口 / show_browser”彻底逻辑删除，避免：
+
+- 本机调试和正式 Docker 行为不一致
+- 账密登录、手动导入 Cookie、手动刷新 Cookie、自动恢复之间混用有头/无头
+- 前端还留着开关，实际上后端很多入口早就强制无头，造成误导
+
+### 2. 本次实际改动
+
+- 前端删除：
+  - 账号编辑中的“显示浏览器”
+  - 账密登录中的“显示浏览器窗口”
+  - 手动导入 Cookie 中的“显示浏览器窗口”
+  - 手动刷新 Cookie 中的“显示浏览器窗口”
+- 前端请求体删除：
+  - 不再向 `/password-login`
+  - `/manual-cookie-import`
+  - `/accounts/{account_id}/account-info`
+  传 `show_browser`
+- 后端删除：
+  - `ManualCookieImportRequest.show_browser`
+  - `CookieAccountInfo.show_browser`
+  - 账密登录 / 手动导入 Cookie / 会话状态 / 风控元数据里对 `show_browser` 的透传和记录
+- 运行态统一：
+  - 账密登录：固定 `headless=True`
+  - 手动 Cookie 导入验证：固定 `headless=True`
+  - Cookie 失效后的自动恢复 / token 刷新：固定 `headless=True`
+  - 二维码验证页：固定 `headless=True`
+
+### 3. 兼容策略
+
+本轮采用 **A 方案：逻辑删除，数据库字段保留**：
+
+- `cookies.show_browser` 字段暂时不做物理删列
+- 但已经不再：
+  - 读这个字段
+  - 写这个字段
+  - 返回给前端
+
+这样能避免为了删一个历史字段去做 SQLite 迁移，平白增加翻车面。
+
+### 4. 验证结果
+
+执行：
+
+```bash
+python -m py_compile reply_server.py db_manager.py XianyuAutoAsync.py utils/qr_login.py
+.venv\Scripts\python.exe -m pytest tests/test_db_manager_account_id_relations.py tests/test_reply_server_account_scope.py -q
+```
+
+结果：
+
+- `py_compile` 通过
+- `131 passed`
+- `19 subtests passed`
+
+### 5. 当前结论
+
+- 后续正式环境不再存在“勾错开关导致切到有头模式”的问题
+- 账密登录、Cookie 导入、自动恢复、二维码验证页的浏览器启动策略统一为无头
+- 如果后面还要排登录 / 滑块 / 人脸问题，就应该直接查无头链路本身，不要再怀疑这个已删除的前端开关
+
 ### 1. 现象
 
 - 前一轮 `account_id=1` 扫码登录已经成功，`Cookie -> Token -> WebSocket` 链路都正常；

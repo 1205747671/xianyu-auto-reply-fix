@@ -53,16 +53,6 @@ QR_CROSS_DOMAIN_COOKIE_NAMES = {
     "sca",
 }
 
-
-def _is_force_headless_enabled() -> bool:
-    """Headless hard constraint (for Docker deployment).
-
-    Default: enabled. Set XY_FORCE_HEADLESS=0 to allow headed mode locally.
-    """
-    override = str(os.getenv("XY_FORCE_HEADLESS", "1") or "").strip().lower()
-    return override not in {"0", "false", "no", "off"}
-
-
 def generate_headers():
     """生成请求头"""
     runtime_identity = get_runtime_browser_identity()
@@ -313,17 +303,7 @@ class QRLoginManager:
             '--window-size=1600,900',
         ]
 
-    def _should_show_verification_browser(self) -> bool:
-        if _is_force_headless_enabled():
-            return False
-        override = str(os.getenv("XY_QR_LOGIN_SHOW_BROWSER") or "").strip().lower()
-        if override:
-            return override in {"1", "true", "yes", "on"}
-        docker_env = str(os.getenv("DOCKER_ENV") or "").strip().lower() in {"1", "true", "yes", "on"}
-        return os.name == 'nt' and not docker_env
-
-    def _build_verification_context_options(self, show_browser: bool) -> Dict[str, Any]:
-        _ = show_browser
+    def _build_verification_context_options(self) -> Dict[str, Any]:
         # 验证页走的是 CloakBrowser managed runtime + persistent profile。
         # 这里不要再把 locale/timezone/viewport 之类的身份画像参数二次塞回 provider，
         # 避免和账号级固定指纹发生冲突。
@@ -339,9 +319,8 @@ class QRLoginManager:
         return account_browser_runtime_manager.resolve_profile_dir(account_id)
 
     async def _launch_verification_browser_context(self, session: QRLoginSession):
-        show_browser = self._should_show_verification_browser()
         launch_options = {
-            'headless': not show_browser,
+            'headless': True,
             'args': self._build_verification_browser_launch_args(),
             'humanize': True,
             'human_preset': 'careful',
@@ -349,7 +328,7 @@ class QRLoginManager:
         proxy_settings = self._resolve_verification_proxy_settings(session)
         if proxy_settings:
             launch_options['proxy'] = proxy_settings
-        context_options = self._build_verification_context_options(show_browser)
+        context_options = self._build_verification_context_options()
         profile_dir = self._resolve_verification_profile_dir(session)
         runtime_request = {
             'account_id': session.account_id,
@@ -378,9 +357,9 @@ class QRLoginManager:
                 raise RuntimeError(f"扫码登录验证页 runtime 缺少 context: {session.session_id}")
             logger.info(
                 f"扫码登录验证页复用 CloakBrowser 持久化画像: {session.session_id}, "
-                f"profile_dir: {profile_dir}, headless: {not show_browser}"
+                f"profile_dir: {profile_dir}, headless: True"
             )
-            return lease, browser, context, show_browser
+            return lease, browser, context
         except Exception as persistent_error:
             logger.error(
                 f"扫码登录持久化画像启动失败，拒绝降级到匿名上下文: {session.session_id}, "
@@ -843,7 +822,7 @@ class QRLoginManager:
         try:
 
             logger.info(f"开始打开扫码登录验证页面: {session_id}")
-            runtime_lease, browser, context, show_browser = await self._launch_verification_browser_context(session)
+            runtime_lease, browser, context = await self._launch_verification_browser_context(session)
             self._update_session_state(
                 session,
                 phase='verification_browser_ready',
@@ -861,7 +840,7 @@ class QRLoginManager:
             try:
                 logger.info(f"扫码登录验证页预热闲鱼首页: {session_id}")
                 await page.goto('https://www.goofish.com/', wait_until='domcontentloaded', timeout=15000)
-                await page.wait_for_timeout(1200 if show_browser else 800)
+                await page.wait_for_timeout(800)
             except Exception as warmup_error:
                 logger.warning(f"扫码登录验证页预热失败（继续主流程）: {session_id}, 错误: {warmup_error}")
             await page.goto(session.verification_url, wait_until='domcontentloaded', timeout=60000)

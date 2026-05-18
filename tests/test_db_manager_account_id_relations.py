@@ -1281,7 +1281,6 @@ class DBManagerAccountIdRelationsTest(unittest.TestCase):
                 account_id="acc-credential-1",
                 username="demo-user",
                 password="demo-pass",
-                show_browser=True,
             )
         )
         self.assertTrue(
@@ -1299,7 +1298,6 @@ class DBManagerAccountIdRelationsTest(unittest.TestCase):
         self.assertEqual(details["remark"], "remark-1")
         self.assertEqual(details["username"], "demo-user")
         self.assertEqual(details["password"], "demo-pass")
-        self.assertTrue(details["show_browser"])
 
         proxy_config = self.db.get_cookie_proxy_config(account_id="acc-credential-1")
         self.assertEqual(proxy_config["proxy_type"], "http")

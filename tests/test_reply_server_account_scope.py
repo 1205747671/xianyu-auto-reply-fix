@@ -206,7 +206,6 @@ class ReplyServerAccountScopeContractTest(_ReplyServerModuleBindingMixin, unitte
             "                cookies_dict = slider_instance.login_with_password_browser(\n"
             "                    account=account,\n"
             "                    password=password,\n"
-            "                    show_browser=show_browser,\n"
             "                    notification_callback=notification_callback,\n"
             "                    force_clean_context=is_refresh_mode,\n"
             "                    require_managed_runtime=True,\n"
@@ -238,7 +237,6 @@ class ReplyServerAccountScopeContractTest(_ReplyServerModuleBindingMixin, unitte
             "return slider.login_with_password_browser(\n"
             "                account=account,\n"
             "                password=password,\n"
-            "                show_browser=show_browser,\n"
             "                notification_callback=notification_callback,\n"
             "                force_clean_context=force_clean_context,\n"
             "                require_managed_runtime=True,\n"
@@ -559,7 +557,6 @@ class ReplyServerProxyUpdateBehaviorTest(_ReplyServerModuleBindingMixin, unittes
                 reply_server.ManualCookieImportRequest(
                     account_id="default",
                     cookie="unb=test_user; cookie2=test_cookie2",
-                    show_browser=False,
                 ),
                 current_user={"user_id": 1, "username": "admin"},
             )
@@ -1783,7 +1780,8 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
         self.assertIn("const accountsCheckResponse = await fetch('/accounts/check', {", app_js)
         self.assertIn("if (data.success && data.accounts) {", app_js)
         self.assertIn("data.accounts.forEach(account => {", app_js)
-        self.assertIn("body: JSON.stringify({\n                value: cookie,\n                username: username,\n                password: password,\n                show_browser: showBrowser", app_js)
+        self.assertIn("body: JSON.stringify({\n                value: cookie,\n                username: username,\n                password: password", app_js)
+        self.assertNotIn("show_browser: showBrowser", app_js)
         self.assertNotIn("async function loadCookies()", app_js)
         self.assertNotIn("async function loadCookieFilter(id)", app_js)
         self.assertNotIn("async function loadCookieFilterPlus(id)", app_js)

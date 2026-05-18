@@ -801,7 +801,7 @@ def get_ip_failure_count(client_ip: str) -> int:
 
 
 # 账号密码登录会话管理
-password_login_sessions = {}  # {session_id: {'account_id': str, 'account': str, 'show_browser': bool, 'status': str, 'verification_url': str, 'qr_code_url': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
+password_login_sessions = {}  # {session_id: {'account_id': str, 'account': str, 'status': str, 'verification_url': str, 'qr_code_url': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
 password_login_locks = defaultdict(lambda: asyncio.Lock())
 manual_cookie_import_sessions = {}  # {session_id: {'account_id': str, 'status': str, 'verification_url': str, 'screenshot_path': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
 manual_cookie_import_locks = defaultdict(lambda: asyncio.Lock())
@@ -2488,7 +2488,6 @@ class AccountCookieUpsertIn(BaseModel):
 class ManualCookieImportRequest(BaseModel):
     account_id: str
     cookie: str
-    show_browser: bool = False
 
 
 class RuntimeTokenRefreshRequest(BaseModel):
@@ -2578,16 +2577,6 @@ def _require_runtime_account_id(account_id: Any, *, action_text: str = "runtime 
     if not ACCOUNT_ID_PATTERN.fullmatch(normalized_account_id):
         raise ValueError(f"{action_text} requires account_id matching ^[A-Za-z0-9_-]+$")
     return normalized_account_id
-
-
-def _is_force_headless_enabled() -> bool:
-    """Headless hard constraint (for Docker deployment).
-
-    Default: enabled. Set XY_FORCE_HEADLESS=0 to allow headed mode locally.
-    """
-    override = str(os.getenv("XY_FORCE_HEADLESS", "1") or "").strip().lower()
-    return override not in {"0", "false", "no", "off"}
-
 
 def _prepare_manual_refresh_runtime_account_id(
     account_id: Any,
@@ -3367,12 +3356,11 @@ class CookieAccountInfo(BaseModel):
     value: Optional[str] = None
     username: Optional[str] = None
     password: Optional[str] = None
-    show_browser: Optional[bool] = None
 
 
 @app.post("/accounts/{account_id}/account-info")
 def update_cookie_account_info(account_id: str, info: CookieAccountInfo, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """更新账号信息（Cookie、用户名、密码、显示浏览器设置）"""
+    """更新账号信息（Cookie、用户名、密码）"""
     if cookie_manager.manager is None:
         raise HTTPException(status_code=500, detail='CookieManager 未就绪')
     try:
@@ -3388,7 +3376,6 @@ def update_cookie_account_info(account_id: str, info: CookieAccountInfo, current
             cookie_value=info.value,
             username=info.username,
             password=info.password,
-            show_browser=info.show_browser
         )
         
         if not success:
@@ -3838,7 +3825,6 @@ def _update_session_risk_log(
         merged_meta = _build_risk_event_meta(
             {
                 'account_id': session.get('account_id'),
-                'show_browser': session.get('show_browser'),
                 'refresh_mode': bool(session.get('refresh_mode')),
             },
             **(event_meta or {}),
@@ -3916,7 +3902,6 @@ def _close_password_login_pending_verification_risk_logs(
         merged_meta = _build_risk_event_meta(
             {
                 'account_id': session.get('account_id'),
-                'show_browser': session.get('show_browser'),
                 'refresh_mode': bool(session.get('refresh_mode')),
             },
             **(event_meta or {}),
@@ -4725,7 +4710,6 @@ def _persist_password_login_success(
     account_id: str,
     account: str,
     password: str,
-    show_browser: bool,
     user_id: int,
     cookies_str: str,
     merged_cookies_dict: Dict[str, Any],
@@ -4742,7 +4726,6 @@ def _persist_password_login_success(
         cookie_value=cookies_str,
         username=account,
         password=password,
-        show_browser=show_browser if not is_refresh_mode else None,
         user_id=user_id,
     )
     if not update_success:
@@ -4792,7 +4775,7 @@ def _persist_manual_cookie_import_success(
     return is_new_account
 
 
-async def _execute_password_login(session_id: str, account_id: str, account: str, password: str, show_browser: bool, user_id: int, current_user: Dict[str, Any]):
+async def _execute_password_login(session_id: str, account_id: str, account: str, password: str, user_id: int, current_user: Dict[str, Any]):
     """后台执行账号密码登录任务"""
     manual_refresh_acquired = False
     manual_refresh_owner = f"password_login:{session_id}"
@@ -4828,7 +4811,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
         slider_instance = XianyuSliderStealth(
             user_id=account_id,
             enable_learning=True,
-            headless=not show_browser,
+            headless=True,
             initial_cookies=existing_cookie_info.get('value', ''),
             proxy=proxy_config,
             slider_max_retries=4,
@@ -5003,7 +4986,6 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 cookies_dict = slider_instance.login_with_password_browser(
                     account=account,
                     password=password,
-                    show_browser=show_browser,
                     notification_callback=notification_callback,
                     force_clean_context=is_refresh_mode,
                     require_managed_runtime=True,
@@ -5267,7 +5249,6 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     account_id=account_id,
                     account=account,
                     password=password,
-                    show_browser=show_browser,
                     user_id=user_id,
                     cookies_str=cookies_str,
                     merged_cookies_dict=merged_cookies_dict,
@@ -5401,7 +5382,6 @@ async def _execute_manual_cookie_import(
     session_id: str,
     account_id: str,
     cookie_value: str,
-    show_browser: bool,
     user_id: int,
     current_user: Dict[str, Any],
 ):
@@ -5423,7 +5403,7 @@ async def _execute_manual_cookie_import(
         slider_instance = XianyuSliderStealth(
             user_id=account_id,
             enable_learning=True,
-            headless=not show_browser,
+            headless=True,
             initial_cookies=cookie_value,
             proxy=proxy_config,
             slider_max_retries=4,
@@ -5673,13 +5653,7 @@ async def manual_cookie_import(
     try:
         account_id = str(request.account_id or '').strip()
         cookie_value = str(request.cookie or '').replace('\ufeff', '').strip()
-        show_browser = bool(request.show_browser)
         user_id = current_user['user_id']
-
-        if _is_force_headless_enabled():
-            if show_browser:
-                log_with_user('info', f"XY_FORCE_HEADLESS=1，忽略 show_browser 请求，强制无头模式: {account_id}", current_user)
-            show_browser = False
 
         try:
             account_id = _require_runtime_account_id(
@@ -5701,7 +5675,6 @@ async def manual_cookie_import(
         session_id = secrets.token_urlsafe(16)
         manual_cookie_import_sessions[session_id] = {
             'account_id': account_id,
-            'show_browser': show_browser,
             'status': 'processing',
             'verification_url': None,
             'screenshot_path': None,
@@ -5717,7 +5690,6 @@ async def manual_cookie_import(
             session_id,
             account_id,
             cookie_value,
-            show_browser,
             user_id,
             current_user,
         ))
@@ -5816,9 +5788,6 @@ async def password_login(
         account_id = str(request.get('account_id') or '').strip()
         account = request.get('account')
         password = request.get('password')
-        # 检查前端是否明确指定了 show_browser 参数
-        show_browser_specified = 'show_browser' in request
-        show_browser = request.get('show_browser', False)
         refresh_mode = request.get('refresh_mode', False)  # 刷新模式：从数据库读取账密
         risk_log_id = None
 
@@ -5832,12 +5801,6 @@ async def password_login(
                 )
             except ValueError as account_scope_error:
                 return {'success': False, 'message': str(account_scope_error)}
-
-        if _is_force_headless_enabled():
-            # Docker 部署不允许有头；统一在 API 层强制无头，避免任意入口“偷偷开窗”。
-            if show_browser:
-                log_with_user('info', f"XY_FORCE_HEADLESS=1，忽略 show_browser 请求，强制无头模式: {account_id}", current_user)
-            show_browser = False
 
         # 刷新模式：从数据库读取已保存的账号密码
         if refresh_mode and account_id:
@@ -5856,16 +5819,7 @@ async def password_login(
             if not account or not password:
                 return {'success': False, 'message': '该账号未配置用户名和密码，无法刷新Cookie'}
 
-            # 获取 show_browser 设置（只有当前端没有明确指定时，才使用数据库配置）
-            if not show_browser_specified:
-                show_browser = cookie_info.get('show_browser', False)
-
-            if _is_force_headless_enabled():
-                if show_browser:
-                    log_with_user('info', f"XY_FORCE_HEADLESS=1，忽略数据库 show_browser 配置，强制无头模式: {account_id}", current_user)
-                show_browser = False
-
-            log_with_user('info', f"刷新Cookie模式: {account_id}, 用户名: {account}, show_browser: {show_browser}", current_user)
+            log_with_user('info', f"刷新Cookie模式: {account_id}, 用户名: {account}, headless: True", current_user)
 
             if XianyuLive.is_manual_refresh_active(account_id):
                 return {'success': False, 'message': f'账号 {account_id} 正在执行手动刷新，请稍候再试'}
@@ -5893,7 +5847,6 @@ async def password_login(
                     processing_status='processing',
                     event_meta=_build_risk_event_meta({
                         'account_id': account_id,
-                        'show_browser': bool(show_browser),
                         'refresh_mode': True,
                     })
                 )
@@ -5907,7 +5860,6 @@ async def password_login(
         password_login_sessions[session_id] = {
             'account_id': account_id,
             'account': account,
-            'show_browser': show_browser,
             'refresh_mode': refresh_mode,  # 保存刷新模式标志
             'risk_control_log_id': risk_log_id if refresh_mode else None,  # 风控日志ID
             'risk_session_id': risk_session_id,
@@ -5925,7 +5877,7 @@ async def password_login(
         
         # 启动后台登录任务
         task = asyncio.create_task(_execute_password_login(
-            session_id, account_id, account, password, show_browser, user_id, current_user
+            session_id, account_id, account, password, user_id, current_user
         ))
         password_login_sessions[session_id]['task'] = task
         

@@ -8747,7 +8747,6 @@ Cookie数量: {cookie_count}
                     "pause_duration": result[7] if result[7] is not None else 10,
                     "username": result[8] or "",
                     "password": password,
-                    "show_browser": bool(result[10]) if result[10] is not None else False,
                     "created_at": result[11],
                     "proxy_type": result[12] or "none",
                     "proxy_host": result[13] or "",
@@ -8782,7 +8781,6 @@ Cookie数量: {cookie_count}
         cookie_value: str = None,
         username: str = None,
         password: str = None,
-        show_browser: bool = None,
         user_id: int = None,
     ) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -8819,11 +8817,6 @@ Cookie数量: {cookie_count}
                         insert_values.append(self._encrypt_secret(password))
                         placeholders.append("?")
 
-                    if show_browser is not None:
-                        insert_fields.append("show_browser")
-                        insert_values.append(1 if show_browser else 0)
-                        placeholders.append("?")
-
                     cursor.execute(
                         f"INSERT INTO cookies ({', '.join(insert_fields)}) VALUES ({', '.join(placeholders)})",
                         tuple(insert_values),
@@ -8852,10 +8845,6 @@ Cookie数量: {cookie_count}
                 if password is not None:
                     update_fields.append("password = ?")
                     params.append(self._encrypt_secret(password))
-
-                if show_browser is not None:
-                    update_fields.append("show_browser = ?")
-                    params.append(1 if show_browser else 0)
 
                 if not update_fields:
                     logger.warning(f"更新账号 {normalized_account_id} 信息时没有提供任何更新字段")

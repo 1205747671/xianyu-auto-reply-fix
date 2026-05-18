@@ -4626,7 +4626,6 @@ async function openAccountEditModal(accountData) {
     document.getElementById('editAccountCookie').value = accountData.value || '';
     document.getElementById('editAccountUsername').value = accountData.username || '';
     document.getElementById('editAccountPassword').value = accountData.password || '';
-    document.getElementById('editAccountShowBrowser').checked = accountData.show_browser || false;
     
     // 显示账号ID
     document.getElementById('accountEditIdDisplay').textContent = accountId;
@@ -4683,8 +4682,6 @@ async function saveAccountEdit() {
     const cookie = document.getElementById('editAccountCookie').value.trim();
     const username = document.getElementById('editAccountUsername').value.trim();
     const password = document.getElementById('editAccountPassword').value.trim();
-    const showBrowser = document.getElementById('editAccountShowBrowser').checked;
-    
     // 代理配置
     const proxyType = document.getElementById('editProxyType').value;
     const proxyHost = document.getElementById('editProxyHost').value.trim();
@@ -4719,8 +4716,7 @@ async function saveAccountEdit() {
             body: JSON.stringify({
                 value: cookie,
                 username: username,
-                password: password,
-                show_browser: showBrowser
+                password: password
             })
         });
         
@@ -11662,9 +11658,6 @@ async function handleManualCookieImport(event) {
     const selectedAccountId = document.getElementById('accountId').value.trim();
     const accountId = selectedAccountId;
     const cookieValue = document.getElementById('cookieValue').value.trim();
-    const showBrowserCheckbox = document.getElementById('manualCookieShowBrowser');
-    const showBrowser = showBrowserCheckbox ? showBrowserCheckbox.checked : false;
-
     if (!accountId || !cookieValue) {
         showToast('请填写完整的账号ID和Cookie', 'warning');
         return;
@@ -11684,8 +11677,7 @@ async function handleManualCookieImport(event) {
             },
             body: JSON.stringify({
                 account_id: selectedAccountId,
-                cookie: cookieValue,
-                show_browser: showBrowser
+                cookie: cookieValue
             })
         });
 
@@ -11969,7 +11961,6 @@ async function handleRefreshCookie(event) {
     const select = document.getElementById('refreshCookieAccountSelect');
     const accountId = select.value;
     const selectedOption = select.options[select.selectedIndex];
-    const showBrowser = document.getElementById('refreshCookieShowBrowser').checked;
 
     if (!accountId) {
         showToast('请选择要刷新的账号', 'warning');
@@ -11995,8 +11986,7 @@ async function handleRefreshCookie(event) {
             },
             body: JSON.stringify({
                 account_id: accountId,
-                refresh_mode: true,  // 标记为刷新模式
-                show_browser: showBrowser
+                refresh_mode: true  // 标记为刷新模式
             })
         });
 
@@ -12180,7 +12170,6 @@ async function handlePasswordLogin(event) {
     const accountId = document.getElementById('passwordLoginAccountId').value.trim();
     const account = document.getElementById('passwordLoginAccount').value.trim();
     const password = document.getElementById('passwordLoginPassword').value;
-    const showBrowser = document.getElementById('passwordLoginShowBrowser').checked;
     
     if (!accountId || !account || !password) {
         showToast('请填写完整的登录信息', 'warning');
@@ -12203,8 +12192,7 @@ async function handlePasswordLogin(event) {
             body: JSON.stringify({
                 account_id: accountId,
                 account: account,
-                password: password,
-                show_browser: showBrowser
+                password: password
             })
         });
         

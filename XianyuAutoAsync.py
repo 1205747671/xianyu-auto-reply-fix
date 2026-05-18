@@ -6674,18 +6674,15 @@ class XianyuLive:
                 logger.info(f"【{current_account_id}】XianyuSliderStealth导入成功，使用滑块验证")
 
                 account_info = db_manager.get_cookie_details(current_account_id) or {}
-                force_headful = os.environ.get("XY_SLIDER_FORCE_HEADFUL", "").strip().lower() in {"1", "true", "yes", "on"}
-                show_browser = bool(account_info.get('show_browser', False) or force_headful)
                 logger.info(
                     f"【{current_account_id}】自动滑块验证准备启动："
-                    f"show_browser={show_browser}, force_headful={force_headful}, "
-                    f"proxy_type={self.proxy_config.get('proxy_type', 'none')}"
+                    f"headless=True, proxy_type={self.proxy_config.get('proxy_type', 'none')}"
                 )
 
                 slider_stealth = XianyuSliderStealth(
                     user_id=f"{current_account_id}",
                     enable_learning=True,
-                    headless=not show_browser,
+                    headless=True,
                     initial_cookies=self.cookies_str,
                     proxy=self.proxy_config,
                     use_account_persistent_profile=True,
@@ -7168,9 +7165,6 @@ class XianyuLive:
 
             username = account_info.get('username', '')
             password = account_info.get('password', '')
-            force_headful = os.environ.get("XY_SLIDER_FORCE_HEADFUL", "").strip().lower() in {"1", "true", "yes", "on"}
-            show_browser = bool(account_info.get('show_browser', False) or force_headful)
-
             if not username or not password:
                 logger.warning(f"【{log_account_id}】未配置用户名或密码，跳过密码登录刷新")
                 self.last_token_refresh_status = "no_credentials"
@@ -7192,8 +7186,7 @@ class XianyuLive:
                     )
                 return False
 
-            browser_mode = "有头" if show_browser else "无头"
-            logger.info(f"【{log_account_id}】开始使用{browser_mode}浏览器进行密码登录刷新Cookie...")
+            logger.info(f"【{log_account_id}】开始使用无头浏览器进行密码登录刷新Cookie...")
             logger.info(f"【{log_account_id}】使用账号 {username}")
 
             async def notification_callback_wrapper(message: str, screenshot_path: str = None, verification_url: str = None):
@@ -7215,7 +7208,7 @@ class XianyuLive:
             slider = XianyuSliderStealth(
                 user_id=resolved_account_id,
                 enable_learning=True,
-                headless=not show_browser,
+                headless=True,
                 initial_cookies=self.cookies_str,
                 proxy=self.proxy_config,
                 use_account_persistent_profile=reuse_account_persistent_profile,
@@ -7250,7 +7243,6 @@ class XianyuLive:
                 resolved_account_id=resolved_account_id,
                 account=username,
                 password=password,
-                show_browser=show_browser,
                 notification_callback=notification_callback_wrapper,
                 force_clean_context=not reuse_account_persistent_profile,
             )
@@ -7448,7 +7440,6 @@ class XianyuLive:
         resolved_account_id: str,
         account: str,
         password: str,
-        show_browser: bool,
         notification_callback,
         force_clean_context: bool,
     ):
@@ -7502,7 +7493,6 @@ class XianyuLive:
             return slider.login_with_password_browser(
                 account=account,
                 password=password,
-                show_browser=show_browser,
                 notification_callback=notification_callback,
                 force_clean_context=force_clean_context,
                 require_managed_runtime=True,
