@@ -1,8 +1,8 @@
-# 闲鱼账号验证 / Cookie / 保活链路修复总结（更新至 2026-05-17）
+# 闲鱼账号验证 / Cookie / 保活链路修复总结（更新至 2026-05-20）
 
 ## 当前结论
 
-截至 **2026-05-17**，这条链路现在要分两层看：
+截至 **2026-05-20**，这条链路现在要分三层看：
 
 1. **浏览器运行时已经统一**
    - 项目活跃浏览器链路已经统一到 `CloakBrowser` provider。
@@ -20,9 +20,203 @@
    - 更常见的是账号进入风险验证页，或者保活链路命中了处罚页 / 验证页。
    - 重点要看风控日志、验证截图、会话状态，不要一上来就把锅甩给滑块。
 
+4. **人脸后再命中 `punish`，也不等于“滑块真失败”**
+   - 这次继续深挖确认了两个很容易把人带沟里的假象：
+     - 调试探针自己持有同账号独占 runtime，后续 `token_refresh_slider` 根本申请不进来；
+     - `punish` 页经常先出处罚壳子，过一拍才把真滑块 DOM 挂出来，过早打 `hard_block` 日志会误导排障。
+
 一句话说透：
 
 > 现在主要问题不再是“浏览器链路根本跑不起来”，而是“滑块之后账号是否还要继续做人机验证，以及保活恢复能不能正确承接这个状态”。
+
+---
+
+## 2026-05-20 本次继续深挖（`token_refresh -> punish -> slider -> ws`）
+
+这轮不是继续猜，是按用户要求：
+
+- 先清空 `data/ logs/ browser_data/ update_backup/ static/uploads/images/ trajectory_history/`
+- 指定 `account_id=10`
+- 账密：`15614318625 / qq1205747671`
+- 真实再跑一遍
+- 人脸扫完后，直接顺着 `token_refresh -> punish -> slider -> ws` 往里抠
+
+### A. 这次真实链路结论
+
+这次已经确认：
+
+1. **账号密码登录 + 人脸验证本身没问题**
+   - 人脸完成后成功回到 `https://www.goofish.com/im`
+   - 登录态 Cookie 已经满足核心 required fields
+
+2. **首次 `Token预检` 会真实命中 `punish`**
+   - `ret=['FAIL_SYS_USER_VALIDATE', 'RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试']`
+   - 同时返回真实 `punish` URL
+
+3. **`punish` 页里的滑块最终可以自动通过**
+   - 第 1 次尝试就成功
+   - 成功拿到并写回：
+     - `x5sec`
+     - `x5secdata`
+
+4. **滑块成功后，第二次 Token 重试成功，后续保活 / WebSocket 都成功**
+   - `last_token_refresh_status=success`
+   - `keep_session_alive=true`
+   - `websocket.connected=true`
+   - `websocket.init_sent=true`
+
+一句话：**这次不是“滑块真的过不去”，而是“前面有 runtime 自锁，外加处罚页早期 DOM 误判成 hard block”。两刀都已经收了。**
+
+### B. 这次确认的两个真实根因
+
+#### 1. 调试探针自己把自己锁死
+
+涉及文件：
+
+- `tmp_password_face_probe.py`
+
+真实问题：
+
+- 探针在 `login_success` 后，仍持有 `account_id=10` 的 `exclusive runtime lease`
+- 紧接着 `postflight -> preflight_token_after_password_login() -> refresh_token()`
+- 又要为同账号申请 `token_refresh_slider` runtime
+- 结果不是滑块失败，而是**同账号独占 runtime 没释放，后续滑块恢复链路被卡在门口**
+
+本次处理：
+
+- 探针在拿到登录成功 Cookie 后：
+  - 先 `release_runtime_sync(...)`
+  - 再 `_detach_managed_runtime()`
+  - 然后才进入 `run_postflight(...)`
+
+这样后续 `token_refresh_slider` 才能正常申请到同账号 runtime。
+
+#### 2. `punish` 页先像硬拦截，过一拍才出真滑块
+
+涉及文件：
+
+- `utils/xianyu_slider_stealth.py`
+- `tests/test_reply_server_account_scope.py`
+
+真实问题：
+
+- 进入 `punish?x5step=2&action=captcha&pureCaptcha=` 后
+- 页面早期会先呈现处罚壳子 / 反馈页特征
+- 旧逻辑在 `run()` 里会过早：
+  - 设置 `last_verification_feedback = hard_block`
+  - 打 error 日志
+  - 保存 `hard_block_page` 快照
+- 但真实现场里，下一拍页面就把真滑块 DOM 挂出来了，随后 `_detect_qr_code_verification()` 又能把滑块过掉
+
+结果就是：
+
+- **日志先吼“无可操作滑块 / 指纹被风控拦截”**
+- 但后面实际又自己过了
+- 排障时非常容易被这条假告警带歪
+
+本次处理：
+
+- `run()` 中命中 `_is_hard_block_page(self.page)` 时
+- 先尝试：
+  - `_detect_qr_code_verification(...)`
+  - `_consume_inline_slider_success_after_verification_probe(...)`
+- 只有这些都失败了，才真正落 `hard_block` 反馈 / error 日志 / 调试快照
+
+这样就不会再把“可恢复的处罚页滑块”过早判成彻底失败。
+
+### C. 这次真实时间线证据
+
+关键日志文件：
+
+- `logs/account_10_face_probe_stderr_live2.log`
+- `logs/account_10_face_probe_state.json`
+- `logs/account_10_face_probe_events.jsonl`
+
+关键时间点（**2026-05-20**）：
+
+- `01:39:27`
+  - `login_success`
+  - `runtime_released_before_postflight`
+  - `密码登录后的Token预检` 开始
+- `01:39:27`
+  - 首次 Token 返回 `FAIL_SYS_USER_VALIDATE`
+  - 命中 `punish` URL
+- `01:39:33`
+  - 页面标题：`验证码拦截`
+- `01:39:37`
+  - 旧逻辑会把这里当成“硬拦截页”
+- `01:39:38`
+  - 真实找到可操作滑块：
+    - 按钮：`#nc_1_n1z`
+    - 轨道：`#nc_1_n1t`
+- `01:39:46`
+  - `x5sec` 已变化
+  - 滑块成功
+- `01:39:56`
+  - Cookie 合并并写库成功
+- `01:39:59`
+  - 第二次 Token 刷新返回 `SUCCESS::调用成功`
+- `01:40:07`
+  - WebSocket `init` 注册完成
+- `01:40:12`
+  - `postflight_complete`
+
+### D. 这次代码调整
+
+涉及文件：
+
+- `utils/xianyu_slider_stealth.py`
+- `tests/test_reply_server_account_scope.py`
+- `tmp_password_face_probe.py`（调试探针）
+
+本次调整：
+
+1. `tmp_password_face_probe.py`
+   - 登录成功后，先释放账号独占 runtime，再进入 postflight
+   - 解决探针自锁问题
+
+2. `utils/xianyu_slider_stealth.py`
+   - `run()` 中延后 `hard_block` 反馈落地时机
+   - 优先允许验证探测阶段内联滑块恢复链路接管
+
+3. `tests/test_reply_server_account_scope.py`
+   - 新增回归：
+     - `test_run_defers_hard_block_feedback_until_inline_slider_recovery_fails`
+   - 同时补齐已有 warmup 用例缺失的 helper 绑定：
+     - `_should_defer_havana_cookie_chase`
+
+### E. 本次最小验证
+
+- `python -m py_compile utils/xianyu_slider_stealth.py tmp_password_face_probe.py tests/test_reply_server_account_scope.py`
+- `python -m unittest tests.test_reply_server_account_scope.ReplyServerPasswordLoginStabilizationTest.test_password_login_http_success_skips_runtime_stabilization_when_protected_fields_complete`
+- `python -m unittest tests.test_reply_server_account_scope.ReplyServerPasswordLoginStabilizationTest.test_password_login_http_success_skips_runtime_stabilization_when_only_havana_missing`
+- `python -m unittest tests.test_reply_server_account_scope.ReplyServerPasswordLoginStabilizationTest.test_stabilize_and_warmup_logged_in_cookies_skips_heavy_steps_when_only_havana_missing`
+- `python -m unittest tests.test_reply_server_account_scope.ReplyServerPasswordLoginStabilizationTest.test_browser_cookie_warmup_hint_auto_slider_success_can_handoff_back_to_finalize`
+- `python -m unittest tests.test_reply_server_account_scope.ReplyServerPasswordLoginStabilizationTest.test_browser_cookie_warmup_hint_skips_punish_recovery_when_only_havana_missing`
+- `python -m unittest tests.test_reply_server_account_scope.ReplyServerPasswordLoginStabilizationTest.test_run_defers_hard_block_feedback_until_inline_slider_recovery_fails`
+
+结果：
+
+- 语法校验通过
+- 相关 6 个回归用例通过
+
+### F. 一个看起来吓人、但这次不算故障的噪音
+
+日志里会出现：
+
+- `CookieManager不可用，无法重启实例`
+
+这次不把它当故障，原因是：
+
+- 当前跑的是 `tmp_password_face_probe.py`
+- `XianyuLive(..., register_instance=False)`
+- 属于**脱离正式服务的独立 postflight 探针**
+
+所以这句的意思只是：
+
+- 这个 standalone probe 没挂正式实例管理器
+- 不能像服务内那样走“重启实例”路径
+- 但它后面仍然在**同进程内继续重试 Token，并最终成功**
 
 ---
 

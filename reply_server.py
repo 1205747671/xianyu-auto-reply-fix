@@ -4144,7 +4144,7 @@ def _stabilize_password_login_cookies_after_login(
 ) -> Tuple[str, Dict[str, Any]]:
     # 优先走纯 HTTP Token 探测 + 复用当前 managed runtime 的 Cookie 稳定化，
     # 避免“密码登录成功 -> Token 预检失败 -> 再次申请 runtime”导致的二次拉起浏览器。
-    from XianyuAutoAsync import PROTECTED_SESSION_COOKIE_FIELDS, XianyuLive
+    from XianyuAutoAsync import PROTECTED_SESSION_COOKIE_FIELDS, REQUIRED_SESSION_COOKIE_FIELDS, XianyuLive
     from utils.xianyu_slider_stealth import probe_cookie_verification_from_cookie
 
     def _to_cookie_str(cookie_dict: Dict[str, Any]) -> str:
@@ -4164,6 +4164,23 @@ def _stabilize_password_login_cookies_after_login(
             key for key in PROTECTED_SESSION_COOKIE_FIELDS
             if not cookie_dict.get(key)
         ]
+
+    def _should_defer_havana_cookie_stabilization(cookie_text: str) -> bool:
+        cookie_dict = trans_cookies(cookie_text)
+        missing_protected_fields = [
+            key for key in PROTECTED_SESSION_COOKIE_FIELDS
+            if not cookie_dict.get(key)
+        ]
+        if missing_protected_fields != ['havana_lgc2_77']:
+            return False
+
+        missing_required_fields = [
+            key for key in REQUIRED_SESSION_COOKIE_FIELDS
+            if not cookie_dict.get(key)
+        ]
+        if missing_required_fields:
+            return False
+        return True
 
     def _try_prewarm_password_login_token(
         cookie_text: str,
@@ -4197,6 +4214,16 @@ def _stabilize_password_login_cookies_after_login(
         missing_before = _get_missing_protected_fields(cookie_text)
         if not missing_before:
             return cookie_text, None, [], []
+        if _should_defer_havana_cookie_stabilization(cookie_text):
+            log_with_user(
+                'info',
+                (
+                    f"{scene}当前仅缺少 havana_lgc2_77，且Cookie已具备业务可用形态；"
+                    f"跳过重型 runtime 稳定化，直接进入Token预热交接: {account_id}"
+                ),
+                current_user,
+            )
+            return cookie_text, None, missing_before, missing_before
 
         context = getattr(slider_instance, 'context', None) if slider_instance is not None else None
         page = getattr(slider_instance, 'page', None) if slider_instance is not None else None

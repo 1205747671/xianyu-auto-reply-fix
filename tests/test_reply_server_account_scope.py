@@ -2560,6 +2560,85 @@ class ReplyServerPasswordLoginStabilizationTest(_ReplyServerModuleBindingMixin, 
         self.assertTrue(meta["token_prewarmed"])
         self.assertFalse(meta["real_cookie_refreshed"])
 
+    def test_password_login_http_success_skips_runtime_stabilization_when_only_havana_missing(self):
+        import XianyuAutoAsync
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        class FakeLive:
+            def __init__(self, cookies_str, account_id, user_id, register_instance=False):
+                self.cookies_str = cookies_str
+                self.account_id = account_id
+                self.user_id = user_id
+                self.register_instance = register_instance
+                self.current_token = None
+
+            async def preflight_token_after_password_login(self):
+                return "prewarmed-token"
+
+        def fake_run_coroutine_threadsafe(coro, loop):
+            coro.close()
+            return object()
+
+        slider_instance = SimpleNamespace(
+            context=object(),
+            page=object(),
+            _stabilize_logged_in_context_cookies=mock.Mock(),
+        )
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "PROTECTED_SESSION_COOKIE_FIELDS",
+            ("unb", "sgcookie", "cookie2", "_m_h5_tk", "_m_h5_tk_enc", "t", "cna", "havana_lgc2_77"),
+        ), mock.patch.object(
+            XianyuAutoAsync,
+            "REQUIRED_SESSION_COOKIE_FIELDS",
+            ("unb", "sgcookie", "cookie2", "_m_h5_tk", "_m_h5_tk_enc", "t", "cna"),
+        ), mock.patch.object(
+            XianyuAutoAsync,
+            "XianyuLive",
+            FakeLive,
+        ), mock.patch.object(
+            slider_stealth,
+            "probe_cookie_verification_from_cookie",
+            return_value={
+                "status": "cookie_valid",
+                "session_cookies": {
+                    "unb": "u1",
+                    "sgcookie": "sg1",
+                    "cookie2": "c2",
+                    "_m_h5_tk": "tk_1",
+                    "_m_h5_tk_enc": "enc1",
+                    "t": "t1",
+                    "cna": "cna1",
+                    "_tb_token_": "tb1",
+                    "x5sec": "x5_1",
+                },
+            },
+        ), mock.patch.object(
+            reply_server.asyncio,
+            "run_coroutine_threadsafe",
+            side_effect=fake_run_coroutine_threadsafe,
+        ), mock.patch.object(
+            reply_server,
+            "_wait_threadsafe_future_result",
+            return_value="prewarmed-token",
+        ), mock.patch.object(reply_server, "log_with_user"):
+            cookies_str, meta = reply_server._stabilize_password_login_cookies_after_login(
+                cookies_str="unb=u1; sgcookie=sg1; cookie2=c2; _m_h5_tk=tk_1; _m_h5_tk_enc=enc1; t=t1; cna=cna1; _tb_token_=tb1; x5sec=x5_1",
+                account_id="1",
+                user_id=1,
+                current_user={"user_id": 1},
+                slider_instance=slider_instance,
+                proxy_config=None,
+                request_loop=mock.Mock(),
+                preflight_timeout=10.0,
+            )
+
+        slider_instance._stabilize_logged_in_context_cookies.assert_not_called()
+        self.assertTrue(meta["token_prewarmed"])
+        self.assertFalse(meta["real_cookie_refreshed"])
+        self.assertIn("x5sec=x5_1", cookies_str)
+
     def test_wait_for_context_login_hands_off_when_verification_page_disappears_but_logged_in_ui_is_visible(self):
         import utils.xianyu_slider_stealth as slider_stealth
 
@@ -2779,6 +2858,11 @@ class ReplyServerPasswordLoginStabilizationTest(_ReplyServerModuleBindingMixin, 
                 slider_like, SimpleNamespace
             )
         )
+        slider_like._should_defer_havana_cookie_chase = (
+            slider_stealth.XianyuSliderStealth._should_defer_havana_cookie_chase.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
         slider_like._should_skip_redundant_browser_cookie_warmup = (
             slider_stealth.XianyuSliderStealth._should_skip_redundant_browser_cookie_warmup.__get__(
                 slider_like, SimpleNamespace
@@ -2809,6 +2893,76 @@ class ReplyServerPasswordLoginStabilizationTest(_ReplyServerModuleBindingMixin, 
 
         self.assertEqual({"status": "handled"}, result)
         slider_like._perform_browser_cookie_warmup_probes.assert_not_called()
+
+    def test_stabilize_and_warmup_logged_in_cookies_skips_heavy_steps_when_only_havana_missing(self):
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        cookies_dict = {
+            "unb": "u1",
+            "sgcookie": "sg1",
+            "cookie2": "c2",
+            "_m_h5_tk": "tk_1",
+            "_m_h5_tk_enc": "enc1",
+            "t": "t1",
+            "cna": "cna1",
+            "_tb_token_": "tb1",
+            "x5sec": "x5_1",
+        }
+        slider_like = SimpleNamespace(
+            pure_user_id="3",
+            last_cookie_business_ready=False,
+            _PROTECTED_SESSION_COOKIE_FIELDS=(
+                "unb",
+                "sgcookie",
+                "cookie2",
+                "_m_h5_tk",
+                "_m_h5_tk_enc",
+                "t",
+                "cna",
+                "havana_lgc2_77",
+                "_tb_token_",
+            ),
+            _REQUIRED_SESSION_COOKIE_FIELDS=(
+                "unb",
+                "sgcookie",
+                "cookie2",
+                "_m_h5_tk",
+                "_m_h5_tk_enc",
+                "t",
+                "cna",
+            ),
+            _stabilize_logged_in_context_cookies=mock.Mock(
+                side_effect=AssertionError("should not run heavy stabilization when only havana_lgc2_77 is missing")
+            ),
+            _perform_browser_cookie_warmup_probes=mock.Mock(
+                side_effect=AssertionError("should not run browser warmup when only havana_lgc2_77 is missing")
+            ),
+        )
+        slider_like._has_business_ready_cookie_shape = (
+            slider_stealth.XianyuSliderStealth._has_business_ready_cookie_shape.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+        slider_like._should_defer_havana_cookie_chase = (
+            slider_stealth.XianyuSliderStealth._should_defer_havana_cookie_chase.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+        slider_like._stabilize_and_warmup_logged_in_cookies = (
+            slider_stealth.XianyuSliderStealth._stabilize_and_warmup_logged_in_cookies.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+
+        result = slider_like._stabilize_and_warmup_logged_in_cookies(
+            context=object(),
+            target_page=object(),
+            cookies_dict=cookies_dict,
+            scene="账号密码登录",
+        )
+
+        self.assertEqual(cookies_dict, result)
+        self.assertTrue(slider_like.last_cookie_business_ready)
 
     def test_finalize_cookie_handoff_or_fail_accepts_business_ready_cookie_when_only_cna_missing(self):
         import utils.xianyu_slider_stealth as slider_stealth
@@ -2990,6 +3144,11 @@ class ReplyServerPasswordLoginStabilizationTest(_ReplyServerModuleBindingMixin, 
                 slider_like, SimpleNamespace
             )
         )
+        slider_like._should_defer_havana_cookie_chase = (
+            slider_stealth.XianyuSliderStealth._should_defer_havana_cookie_chase.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
 
         result = slider_stealth.XianyuSliderStealth._consume_browser_cookie_warmup_verification_hint(
             slider_like,
@@ -3020,6 +3179,76 @@ class ReplyServerPasswordLoginStabilizationTest(_ReplyServerModuleBindingMixin, 
             extra_cookie_updates=refreshed_cookies,
         )
 
+    def test_browser_cookie_warmup_hint_skips_punish_recovery_when_only_havana_missing(self):
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        slider_like = SimpleNamespace(
+            pure_user_id="3",
+            last_browser_cookie_warmup_verification_hint={
+                "verification_url": "https://example.invalid/punish?x5step=2",
+                "verification_type": "unknown",
+            },
+            last_browser_cookie_warmup_session_unready=True,
+            last_cookie_business_ready=False,
+            _PROTECTED_SESSION_COOKIE_FIELDS=(
+                "unb",
+                "sgcookie",
+                "cookie2",
+                "_m_h5_tk",
+                "_m_h5_tk_enc",
+                "t",
+                "cna",
+                "havana_lgc2_77",
+                "_tb_token_",
+            ),
+            _REQUIRED_SESSION_COOKIE_FIELDS=(
+                "unb",
+                "sgcookie",
+                "cookie2",
+                "_m_h5_tk",
+                "_m_h5_tk_enc",
+                "t",
+                "cna",
+            ),
+            _recover_verification_url_with_auto_slider_then_finalize=mock.Mock(
+                side_effect=AssertionError("should not reopen punish recovery when only havana_lgc2_77 is missing")
+            ),
+        )
+        slider_like._has_business_ready_cookie_shape = (
+            slider_stealth.XianyuSliderStealth._has_business_ready_cookie_shape.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+        slider_like._should_defer_havana_cookie_chase = (
+            slider_stealth.XianyuSliderStealth._should_defer_havana_cookie_chase.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+
+        result = slider_stealth.XianyuSliderStealth._consume_browser_cookie_warmup_verification_hint(
+            slider_like,
+            context=object(),
+            fallback_page=object(),
+            cookies_dict={
+                "unb": "u1",
+                "sgcookie": "sg1",
+                "cookie2": "c2",
+                "_m_h5_tk": "tk_1",
+                "_m_h5_tk_enc": "enc1",
+                "t": "t1",
+                "cna": "cna1",
+                "_tb_token_": "tb1",
+                "x5sec": "x5_1",
+            },
+            notification_callback=None,
+            notification_scene="账号密码登录",
+        )
+
+        self.assertIsNone(result)
+        self.assertIsNone(slider_like.last_browser_cookie_warmup_verification_hint)
+        self.assertFalse(slider_like.last_browser_cookie_warmup_session_unready)
+        self.assertTrue(slider_like.last_cookie_business_ready)
+
     def test_check_login_success_by_element_accepts_empty_im_conversation_state(self):
         import utils.xianyu_slider_stealth as slider_stealth
 
@@ -3043,6 +3272,51 @@ class ReplyServerPasswordLoginStabilizationTest(_ReplyServerModuleBindingMixin, 
 
         self.assertTrue(result)
         slider_like._collect_page_text_for_detection.assert_called_once_with(page)
+
+    def test_run_defers_hard_block_feedback_until_inline_slider_recovery_fails(self):
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        monitor_page = object()
+        page = mock.Mock()
+        page.title.return_value = "验证码拦截"
+        page.content.return_value = "验证码拦截"
+        page.mouse = SimpleNamespace(move=mock.Mock())
+
+        slider_like = SimpleNamespace(
+            pure_user_id="3",
+            headless=True,
+            disable_headless_warmup=True,
+            context=object(),
+            page=page,
+            _managed_runtime_binding=object(),
+            last_verification_feedback={},
+            last_login_error=None,
+            _check_date_validity=mock.Mock(return_value=True),
+            _is_hard_block_page=mock.Mock(return_value=True),
+            _select_monitor_page=mock.Mock(return_value=monitor_page),
+            _detect_qr_code_verification=mock.Mock(return_value=(False, None)),
+            _consume_inline_slider_success_after_verification_probe=mock.Mock(
+                return_value=(True, {"x5sec": "ok"})
+            ),
+            _process_verification_requirement=mock.Mock(),
+            _save_debug_snapshot=mock.Mock(),
+            close_browser=mock.Mock(),
+        )
+
+        with mock.patch.object(slider_stealth.random, "uniform", return_value=0.3), \
+             mock.patch.object(slider_stealth.time, "sleep", return_value=None):
+            success, cookies = slider_stealth.XianyuSliderStealth.run(
+                slider_like,
+                "https://example.invalid/punish?x5step=2",
+                require_managed_runtime=True,
+            )
+
+        self.assertTrue(success)
+        self.assertEqual({"x5sec": "ok"}, cookies)
+        self.assertEqual({}, slider_like.last_verification_feedback)
+        slider_like._save_debug_snapshot.assert_not_called()
+        slider_like._process_verification_requirement.assert_not_called()
+        slider_like.close_browser.assert_called_once()
 
     def test_wait_for_context_login_marks_processing_when_verification_ui_exits(self):
         import utils.xianyu_slider_stealth as slider_stealth

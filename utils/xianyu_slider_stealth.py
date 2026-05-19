@@ -4798,6 +4798,35 @@ class XianyuSliderStealth:
             or cookies_dict.get('x5secdata')
         )
 
+    def _should_defer_havana_cookie_chase(
+        self,
+        cookies_dict: Dict[str, str],
+        *,
+        missing_protected_fields: Optional[List[str]] = None,
+    ) -> bool:
+        cookies_dict = cookies_dict or {}
+        normalized_missing_protected_fields = [
+            str(field).strip()
+            for field in (missing_protected_fields or [])
+            if str(field).strip()
+        ]
+        if not normalized_missing_protected_fields:
+            normalized_missing_protected_fields = [
+                key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
+                if not cookies_dict.get(key)
+            ]
+
+        if normalized_missing_protected_fields != ['havana_lgc2_77']:
+            return False
+
+        missing_required_fields = [
+            key for key in self._REQUIRED_SESSION_COOKIE_FIELDS
+            if not cookies_dict.get(key)
+        ]
+        if missing_required_fields:
+            return False
+        return True
+
     def _has_browser_cookie_warmup_probe_business_ready(self) -> bool:
         if getattr(self, 'last_browser_cookie_warmup_session_unready', False):
             return False
@@ -5100,6 +5129,15 @@ class XianyuSliderStealth:
         def _clear_warmup_verification_handoff_state():
             self.last_browser_cookie_warmup_verification_hint = None
             self.last_browser_cookie_warmup_session_unready = False
+
+        if self._should_defer_havana_cookie_chase(cookies_dict):
+            _clear_warmup_verification_handoff_state()
+            self.last_cookie_business_ready = True
+            logger.warning(
+                f"[{self.pure_user_id}] browser warmup verification hint only blocks havana_lgc2_77, "
+                "but current cookie shape is already business-ready; skip punish recovery and hand off directly"
+            )
+            return None
 
         logger.warning(
             f"[{self.pure_user_id}] browser warmup returned verification handoff while havana_lgc2_77 is still missing: {verification_url}"
@@ -6108,6 +6146,17 @@ class XianyuSliderStealth:
             key for key in self._PROTECTED_SESSION_COOKIE_FIELDS
             if not cookies_dict.get(key)
         ]
+        if self._should_defer_havana_cookie_chase(
+            cookies_dict,
+            missing_protected_fields=missing_protected_fields,
+        ):
+            self.last_cookie_business_ready = True
+            logger.info(
+                f"[{self.pure_user_id}] {scene} only misses havana_lgc2_77, but current cookie shape is already "
+                "business-ready; skip heavy stabilization and browser warmup"
+            )
+            return cookies_dict
+
         if missing_protected_fields:
             logger.warning(
                 f"[{self.pure_user_id}] {scene} is still missing protected cookie fields, run standard stabilization first: "
@@ -12705,16 +12754,6 @@ class XianyuSliderStealth:
                 logger.info(f"【{self.pure_user_id}】页面内容包含验证码相关关键词")
 
                 if self._is_hard_block_page(self.page):
-                    self.last_verification_feedback = {
-                        "status": "hard_block",
-                        "source": "deny_page",
-                        "message": "当前页面是阿里处罚页/反馈二维码页，不是真正可拖动的滑块",
-                    }
-                    logger.error(
-                        f"【{self.pure_user_id}】当前命中的是处罚页/反馈二维码页，"
-                        f"{'无头' if self.headless else '有头'}环境指纹已被风控拦截，当前页面不存在可操作滑块"
-                    )
-                    self._save_debug_snapshot("hard_block_page", self.page)
                     monitor_page = self._select_monitor_page(self.context, self.page) or self.page
                     has_qr, qr_frame = self._detect_qr_code_verification(monitor_page)
                     if has_qr:
@@ -12737,6 +12776,16 @@ class XianyuSliderStealth:
                         )
                         if inline_slider_result is not None:
                             return inline_slider_result
+                    self.last_verification_feedback = {
+                        "status": "hard_block",
+                        "source": "deny_page",
+                        "message": "当前页面是阿里处罚页/反馈二维码页，不是真正可拖动的滑块",
+                    }
+                    logger.error(
+                        f"【{self.pure_user_id}】当前命中的是处罚页/反馈二维码页，"
+                        f"{'无头' if self.headless else '有头'}环境指纹已被风控拦截，当前页面不存在可操作滑块"
+                    )
+                    self._save_debug_snapshot("hard_block_page", self.page)
                     return False, None
 
                 self._simulate_human_page_behavior()
