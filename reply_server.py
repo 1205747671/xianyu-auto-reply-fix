@@ -31,7 +31,11 @@ import cookie_manager
 from db_manager import db_manager
 from file_log_collector import setup_file_logging, get_file_log_collector
 from ai_reply_engine import ai_reply_engine
-from utils.account_browser_runtime import ACCOUNT_ID_PATTERN, account_browser_runtime_manager
+from utils.account_browser_runtime import (
+    ACCOUNT_ID_PATTERN,
+    account_browser_runtime_manager,
+    resolve_runtime_attach_metadata,
+)
 from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
@@ -1143,15 +1147,26 @@ async def stop_account_browser_runtime_janitor():
     task = getattr(app.state, "account_browser_runtime_janitor_task", None)
     if not isinstance(task, asyncio.Task):
         app.state.account_browser_runtime_janitor_task = None
-        return
-    task.cancel()
+    else:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            app.state.account_browser_runtime_janitor_task = None
+        logger.info("账号浏览器 runtime janitor 已停止")
     try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    finally:
-        app.state.account_browser_runtime_janitor_task = None
-    logger.info("账号浏览器 runtime janitor 已停止")
+        closed_counts = await account_browser_runtime_manager.close_all_runtimes(
+            reason="app_shutdown",
+        )
+        if closed_counts.get("async") or closed_counts.get("sync"):
+            logger.info(
+                f"应用关闭时已回收账号浏览器 runtime: "
+                f"async={closed_counts.get('async', 0)}, sync={closed_counts.get('sync', 0)}"
+            )
+    except Exception as cleanup_error:
+        logger.warning(f"应用关闭时回收账号浏览器 runtime 失败: {cleanup_error}")
 
 
 # 添加请求日志中间件
@@ -4769,6 +4784,10 @@ def _acquire_slider_managed_runtime_sync(account_id: str, purpose: str, slider_i
     try:
         page, context = account_browser_runtime_manager.get_fresh_page_sync(lease)
         runtime = lease.runtime
+        runtime_browser_features, runtime_profile_id = resolve_runtime_attach_metadata(
+            runtime,
+            runtime_request,
+        )
         attach_managed_runtime = getattr(slider_instance, 'attach_managed_runtime', None)
         attach_payload = {
             'lease': lease,
@@ -4777,8 +4796,8 @@ def _acquire_slider_managed_runtime_sync(account_id: str, purpose: str, slider_i
             'context': context,
             'page': page,
             'playwright': getattr(runtime, 'playwright', None),
-            'browser_features': dict(runtime_request.get('browser_features') or {}),
-            'profile_id': runtime_request.get('profile_id'),
+            'browser_features': runtime_browser_features,
+            'profile_id': runtime_profile_id,
         }
         if callable(attach_managed_runtime):
             attach_managed_runtime(**attach_payload)
@@ -5563,8 +5582,20 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     except Exception as manual_cleanup_e:
                         log_with_user('warning', f"结束手动刷新保护失败: {account_id}, 错误: {str(manual_cleanup_e)}", current_user)
         
-        # 在后台线程中执行登录
-        login_thread = threading.Thread(target=run_login, daemon=True)
+        def run_login_via_account_worker():
+            try:
+                account_browser_runtime_manager.run_sync_task_on_account_thread(
+                    account_id,
+                    run_login,
+                )
+            except Exception as worker_err:
+                _finalize_password_login_session_failure(session_id, str(worker_err))
+                log_with_user('error', f"账号浏览器 worker 执行登录任务异常: {str(worker_err)}", current_user)
+                import traceback
+                logger.error(traceback.format_exc())
+
+        # 在后台线程中调度到账号级浏览器 worker，确保同账号浏览器操作固定落在同一线程。
+        login_thread = threading.Thread(target=run_login_via_account_worker, daemon=True)
         login_thread.start()
         login_thread_started = True
         
@@ -5837,8 +5868,20 @@ async def _execute_manual_cookie_import(
                 except Exception:
                     pass
 
+        def run_import_via_account_worker():
+            try:
+                account_browser_runtime_manager.run_sync_task_on_account_thread(
+                    account_id,
+                    run_import,
+                )
+            except Exception as worker_err:
+                _finalize_manual_cookie_import_session_failure(session_id, str(worker_err))
+                log_with_user('error', f"账号浏览器 worker 执行手动导入 Cookie 任务异常: {str(worker_err)}", current_user)
+                import traceback
+                logger.error(traceback.format_exc())
+
         import threading
-        login_thread = threading.Thread(target=run_import, daemon=True)
+        login_thread = threading.Thread(target=run_import_via_account_worker, daemon=True)
         login_thread.start()
     except Exception as exc:
         _finalize_manual_cookie_import_session_failure(session_id, str(exc))

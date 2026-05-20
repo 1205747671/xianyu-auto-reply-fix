@@ -37,6 +37,13 @@ class BrowserProviderTestMixin:
         fake_module.launch_persistent_context_async = mock.AsyncMock(
             return_value="persistent-context-async"
         )
+        fake_module.ensure_binary = mock.Mock(return_value="C:/cloakbrowser/chrome.exe")
+        fake_module.build_args = mock.Mock(
+            side_effect=lambda stealth_args, extra_args, timezone=None, locale=None, headless=True: list(extra_args or [])
+        )
+        fake_module.maybe_resolve_geoip = mock.Mock(
+            side_effect=lambda geoip, proxy, timezone, locale: (timezone, locale, None)
+        )
         return fake_module
 
     def _load_provider_with_fake_cloakbrowser(self):

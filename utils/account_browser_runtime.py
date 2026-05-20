@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import os
+import queue
 import re
 import threading
 import time
@@ -118,6 +119,25 @@ class _SyncRuntimeState:
 
 
 @dataclass
+class _SyncAccountTaskCall:
+    func: Callable[..., Any]
+    args: tuple[Any, ...]
+    kwargs: Dict[str, Any]
+    done: threading.Event = field(default_factory=threading.Event)
+    result: Any = None
+    exception: Optional[BaseException] = None
+
+
+@dataclass
+class _SyncAccountWorkerState:
+    thread: Optional[threading.Thread] = None
+    thread_id: Optional[int] = None
+    last_used_at: float = 0.0
+    task_queue: Any = field(default_factory=queue.Queue)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+@dataclass
 class _ProfileClaimState:
     owner: Optional[Tuple[int, str, str]] = None
 
@@ -126,6 +146,7 @@ _PROFILE_CLAIMS_GUARD = threading.Lock()
 _PROFILE_CLAIMS: Dict[str, _ProfileClaimState] = {}
 _MANAGER_INSTANCE_ID_GUARD = threading.Lock()
 _NEXT_MANAGER_INSTANCE_ID = 1
+_SYNC_ACCOUNT_WORKER_STOP = object()
 
 
 def _safe_bool_call(target: Any, method_name: str) -> Optional[bool]:
@@ -147,27 +168,43 @@ async def _maybe_await(value: Any) -> Any:
 def _runtime_is_alive(runtime: Any) -> bool:
     if runtime is None:
         return False
+    is_managed_cdp_runtime = bool(getattr(runtime, "cdp_endpoint", None))
     is_alive = getattr(runtime, "is_alive", None)
+    runtime_is_alive = None
     if callable(is_alive):
         try:
-            return bool(is_alive())
+            runtime_is_alive = bool(is_alive())
         except Exception:
-            return False
+            runtime_is_alive = False
     browser = getattr(runtime, "browser", None)
+    browser_connected = None
     if browser is not None:
-        connected = _safe_bool_call(browser, "is_connected")
-        if connected is False:
+        browser_connected = _safe_bool_call(browser, "is_connected")
+        if browser_connected is False:
             return False
     context = getattr(runtime, "context", None)
+    context_closed = None
     if context is not None:
-        closed = _safe_bool_call(context, "is_closed")
-        if closed is True:
+        context_closed = _safe_bool_call(context, "is_closed")
+        if context_closed is True:
             return False
     page = getattr(runtime, "page", None)
     if page is not None:
         closed = _safe_bool_call(page, "is_closed")
         if closed is True:
             runtime.page = None
+    if is_managed_cdp_runtime:
+        # CloakBrowser's launcher process may exit after handing off the real
+        # Chromium instance. For managed CDP runtimes, prefer live Playwright
+        # connectivity signals over launcher process liveness.
+        if browser_connected is True:
+            return True
+        if context is not None and context_closed is False and browser_connected is not False:
+            return True
+        if runtime_is_alive is True:
+            return True
+    elif runtime_is_alive is not None:
+        return runtime_is_alive
     process = getattr(runtime, "process", None)
     if process is None:
         return True
@@ -178,6 +215,17 @@ def _runtime_is_alive(runtime: Any) -> bool:
         except Exception:
             return False
     return True
+
+
+def resolve_runtime_attach_metadata(
+    runtime: Any,
+    runtime_request: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    request = dict(runtime_request or {})
+    runtime_browser_features = getattr(runtime, "browser_features", None) or {}
+    browser_features = dict(runtime_browser_features or request.get("browser_features") or {})
+    profile_id = getattr(runtime, "profile_id", None) or request.get("profile_id")
+    return browser_features, profile_id
 
 
 def _call_runtime_factory(factory: Callable[..., Any], *args, runtime_request: Optional[Dict[str, Any]] = None) -> Any:
@@ -276,6 +324,22 @@ def _reuse_runtime_page_if_available(runtime: Any, context: Any, lease_pages: li
     if isinstance(context_pages, (list, tuple)) and context_pages and page not in context_pages:
         return None
     return page
+
+
+def _should_preserve_managed_runtime_page(runtime: Any, page: Any) -> bool:
+    if runtime is None or page is None:
+        return False
+    if page is not getattr(runtime, "page", None):
+        return False
+    if not getattr(runtime, "cdp_endpoint", None):
+        return False
+    if _safe_bool_call(page, "is_closed") is True:
+        return False
+    context = getattr(runtime, "context", None)
+    context_pages = getattr(context, "pages", None)
+    if isinstance(context_pages, (list, tuple)) and len(context_pages) > 1:
+        return False
+    return True
 
 
 def _pop_locale_and_timezone(options: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
@@ -394,6 +458,7 @@ async def _default_async_runtime_factory(
     runtime.page = page
     runtime.profile_dir = profile_dir
     runtime.browser_features = browser_features
+    runtime.profile_id = request.get("profile_id")
     return runtime
 
 
@@ -484,6 +549,7 @@ def _default_sync_runtime_factory(
     runtime.page = page
     runtime.profile_dir = profile_dir
     runtime.browser_features = browser_features
+    runtime.profile_id = request.get("profile_id")
     return runtime
 
 
@@ -572,6 +638,8 @@ class AccountBrowserRuntimeManager:
         self._states: Dict[str, _RuntimeState] = {}
         self._sync_states: Dict[str, _SyncRuntimeState] = {}
         self._sync_states_guard = threading.Lock()
+        self._sync_account_workers: Dict[str, _SyncAccountWorkerState] = {}
+        self._sync_account_workers_guard = threading.Lock()
 
     def _normalize_account_id(self, account_id: str) -> str:
         normalized = str(account_id or "").strip()
@@ -612,6 +680,100 @@ class AccountBrowserRuntimeManager:
         _release_profile_dir(getattr(state, "claimed_profile_dir", None), getattr(state, "claim_owner", None))
         state.claimed_profile_dir = None
         state.claim_owner = None
+
+    def _account_worker_loop(self, account_id: str, state: _SyncAccountWorkerState) -> None:
+        current_thread_id = threading.get_ident()
+        with state.lock:
+            state.thread_id = current_thread_id
+            state.last_used_at = self.time_fn()
+        try:
+            while True:
+                task = state.task_queue.get()
+                if task is _SYNC_ACCOUNT_WORKER_STOP:
+                    return
+                if not isinstance(task, _SyncAccountTaskCall):
+                    continue
+                try:
+                    with state.lock:
+                        state.last_used_at = self.time_fn()
+                    task.result = task.func(*task.args, **task.kwargs)
+                except BaseException as exc:
+                    task.exception = exc
+                finally:
+                    with state.lock:
+                        state.last_used_at = self.time_fn()
+                    task.done.set()
+        finally:
+            with state.lock:
+                state.thread_id = None
+                state.thread = None
+                state.last_used_at = self.time_fn()
+
+    def _get_sync_account_worker_state(self, account_id: str) -> _SyncAccountWorkerState:
+        with self._sync_account_workers_guard:
+            return self._sync_account_workers.setdefault(account_id, _SyncAccountWorkerState())
+
+    def _ensure_sync_account_worker_thread(
+        self,
+        account_id: str,
+        state: _SyncAccountWorkerState,
+    ) -> None:
+        with state.lock:
+            if state.thread is not None and state.thread.is_alive():
+                return
+            state.thread = threading.Thread(
+                target=self._account_worker_loop,
+                args=(account_id, state),
+                name=f"account-browser-{account_id}",
+                daemon=True,
+            )
+            state.thread.start()
+
+    def run_sync_task_on_account_thread(
+        self,
+        account_id: str,
+        func: Callable[..., Any],
+        *args,
+        timeout: Optional[float] = None,
+        **kwargs,
+    ) -> Any:
+        account_id = self._normalize_account_id(account_id)
+        state = self._get_sync_account_worker_state(account_id)
+        current_thread_id = threading.get_ident()
+        with state.lock:
+            if state.thread_id == current_thread_id:
+                state.last_used_at = self.time_fn()
+                return func(*args, **kwargs)
+        self._ensure_sync_account_worker_thread(account_id, state)
+        call = _SyncAccountTaskCall(
+            func=func,
+            args=tuple(args),
+            kwargs=dict(kwargs),
+        )
+        state.task_queue.put(call)
+        completed = call.done.wait(timeout=timeout)
+        if not completed:
+            raise TimeoutError(f"account browser worker task timed out: account_id={account_id}")
+        if call.exception is not None:
+            raise call.exception
+        return call.result
+
+    async def run_sync_task_on_account_thread_async(
+        self,
+        account_id: str,
+        func: Callable[..., Any],
+        *args,
+        timeout: Optional[float] = None,
+        **kwargs,
+    ) -> Any:
+        return await asyncio.to_thread(
+            self.run_sync_task_on_account_thread,
+            account_id,
+            func,
+            *args,
+            timeout=timeout,
+            **kwargs,
+        )
 
     def resolve_profile_dir(self, account_id: str) -> str:
         account_id = self._normalize_account_id(account_id)
@@ -663,6 +825,20 @@ class AccountBrowserRuntimeManager:
         if runtime is None:
             return []
         if owner_thread_id is None or owner_thread_id == current_thread_id:
+            return [(runtime, reason)]
+        if getattr(runtime, "cdp_endpoint", None):
+            # Managed CDP runtimes can be force-closed across threads: even if
+            # Browser.close()/playwright.stop() reject cross-thread access, the
+            # closer still falls back to terminating the underlying process.
+            #
+            # This is important for flows like:
+            # - main thread: password login managed runtime
+            # - worker thread: token_refresh_slider managed runtime
+            #
+            # If we defer closure until the original owner thread cleans up, we
+            # may launch a second Chromium against the same profile first, and
+            # headless CloakBrowser can then fail with
+            # "DevToolsActivePort was ready" / startup collisions.
             return [(runtime, reason)]
         state.pending_closures.append((runtime, reason, owner_thread_id))
         return []
@@ -770,7 +946,11 @@ class AccountBrowserRuntimeManager:
         if state is None:
             lease.released = True
             return
-        pages_to_close = list(lease.pages)
+        runtime = lease.runtime
+        pages_to_close = [
+            page for page in list(lease.pages)
+            if not _should_preserve_managed_runtime_page(runtime, page)
+        ]
         lease.pages.clear()
         for page in pages_to_close:
             try:
@@ -988,7 +1168,11 @@ class AccountBrowserRuntimeManager:
         if state is None:
             lease.released = True
             return
-        pages_to_close = list(lease.pages)
+        runtime = lease.runtime
+        pages_to_close = [
+            page for page in list(lease.pages)
+            if not _should_preserve_managed_runtime_page(runtime, page)
+        ]
         lease.pages.clear()
         for page in pages_to_close:
             try:
@@ -1068,6 +1252,53 @@ class AccountBrowserRuntimeManager:
             self._release_profile_claim(state)
         return True
 
+    async def close_all_runtimes(self, *, reason: str = "shutdown") -> Dict[str, int]:
+        async_runtimes_to_close = []
+        async_states_snapshot = list(self._states.items())
+
+        for _account_id, state in async_states_snapshot:
+            should_release_claim = False
+            async with state.condition:
+                runtime = state.runtime
+                pending_closures = list(state.pending_closures)
+                if runtime is None and not pending_closures:
+                    continue
+                state.runtime = None
+                state.runtime_identity = None
+                state.active_leases = 0
+                state.active_exclusive = False
+                state.pending_closures.clear()
+                state.generation += 1
+                state.last_released_at = self.time_fn()
+                state.condition.notify_all()
+                async_runtimes_to_close.extend(
+                    [runtime] if runtime is not None else []
+                )
+                async_runtimes_to_close.extend(
+                    pending_runtime
+                    for pending_runtime, _close_reason in pending_closures
+                    if pending_runtime is not None
+                )
+                should_release_claim = True
+            if should_release_claim:
+                self._release_profile_claim(state)
+
+        closed_async = 0
+        seen_async_runtime_ids = set()
+        for runtime in async_runtimes_to_close:
+            runtime_id = id(runtime)
+            if runtime is None or runtime_id in seen_async_runtime_ids:
+                continue
+            seen_async_runtime_ids.add(runtime_id)
+            await self._close_async_runtime(runtime, reason=reason)
+            closed_async += 1
+
+        closed_sync = self.close_all_runtimes_sync(reason=reason)
+        return {
+            "async": closed_async,
+            "sync": closed_sync,
+        }
+
     def cleanup_idle_runtimes_sync(self) -> int:
         closed_count = 0
         current_thread_id = threading.get_ident()
@@ -1107,6 +1338,79 @@ class AccountBrowserRuntimeManager:
                 closed_count += 1
             if should_release_claim:
                 self._release_profile_claim(state)
+        closed_count += self.cleanup_idle_account_workers_sync()
+        return closed_count
+
+    def cleanup_idle_account_workers_sync(self) -> int:
+        stopped_count = 0
+        with self._sync_account_workers_guard:
+            workers = list(self._sync_account_workers.items())
+        for account_id, state in workers:
+            thread_to_join = None
+            with state.lock:
+                thread = state.thread
+                if thread is None or not thread.is_alive():
+                    continue
+                is_idle = (
+                    state.thread_id is not None
+                    and state.task_queue.empty()
+                    and (self.time_fn() - state.last_used_at) >= self.idle_timeout_seconds
+                )
+                if not is_idle:
+                    continue
+                state.task_queue.put(_SYNC_ACCOUNT_WORKER_STOP)
+                thread_to_join = thread
+            if thread_to_join is not None:
+                thread_to_join.join(timeout=1.0)
+                if not thread_to_join.is_alive():
+                    stopped_count += 1
+                    with self._sync_account_workers_guard:
+                        existing_state = self._sync_account_workers.get(account_id)
+                        if existing_state is state:
+                            self._sync_account_workers.pop(account_id, None)
+        return stopped_count
+
+    def close_all_runtimes_sync(self, *, reason: str = "shutdown") -> int:
+        runtimes_to_close = []
+        with self._sync_states_guard:
+            states_snapshot = list(self._sync_states.items())
+
+        for _account_id, state in states_snapshot:
+            should_release_claim = False
+            with state.condition:
+                runtime = state.runtime
+                pending_closures = list(state.pending_closures)
+                if runtime is None and not pending_closures:
+                    continue
+                state.runtime = None
+                state.runtime_identity = None
+                state.owner_thread_id = None
+                state.active_leases = 0
+                state.active_exclusive = False
+                state.pending_closures.clear()
+                state.generation += 1
+                state.last_released_at = self.time_fn()
+                state.condition.notify_all()
+                if runtime is not None:
+                    runtimes_to_close.append(runtime)
+                runtimes_to_close.extend(
+                    pending_runtime
+                    for pending_runtime, _close_reason, _owner_thread_id in pending_closures
+                    if pending_runtime is not None
+                )
+                should_release_claim = True
+            if should_release_claim:
+                self._release_profile_claim(state)
+
+        closed_count = 0
+        seen_runtime_ids = set()
+        for runtime in runtimes_to_close:
+            runtime_id = id(runtime)
+            if runtime_id in seen_runtime_ids:
+                continue
+            seen_runtime_ids.add(runtime_id)
+            self._close_sync_runtime(runtime, reason=reason)
+            closed_count += 1
         return closed_count
 
 

@@ -2102,6 +2102,13 @@ class XianyuSliderStealth:
         if not self._provider_owns_browser_identity():
             return False
         override = str(os.environ.get("XY_SLIDER_USE_PROVIDER_HUMANIZE_DRAG", "") or "").strip().lower()
+        if override in {"0", "false", "no", "off"} and self._is_high_risk_browser_scene():
+            log_user_id = getattr(self, "pure_user_id", None) or getattr(self, "user_id", None) or "unknown"
+            logger.warning(
+                f"【{log_user_id}】高风险滑块场景强制使用指纹浏览器自带 humanize 拖拽，"
+                "忽略 XY_SLIDER_USE_PROVIDER_HUMANIZE_DRAG=off"
+            )
+            return True
         if override in {"0", "false", "no", "off"}:
             return False
         return True
@@ -4805,6 +4812,8 @@ class XianyuSliderStealth:
         missing_protected_fields: Optional[List[str]] = None,
     ) -> bool:
         cookies_dict = cookies_dict or {}
+        if getattr(self, 'risk_trigger_scene', None) == 'token_refresh':
+            return False
         normalized_missing_protected_fields = [
             str(field).strip()
             for field in (missing_protected_fields or [])
@@ -4834,6 +4843,13 @@ class XianyuSliderStealth:
         probe_status = getattr(self, 'last_browser_cookie_warmup_probe_status', {}) or {}
         return bool(probe_status.get('login_token_fetch') and probe_status.get('login_user_fetch'))
 
+    def _has_live_browser_business_probe_ready(self) -> bool:
+        if getattr(self, 'last_browser_cookie_warmup_session_unready', False):
+            return False
+
+        probe_status = getattr(self, 'last_live_browser_business_probe_status', {}) or {}
+        return bool(probe_status.get('login_token_native') and probe_status.get('login_user_native'))
+
     def _should_accept_business_ready_cookie_handoff(
         self,
         cookies_dict: Dict[str, str],
@@ -4848,7 +4864,10 @@ class XianyuSliderStealth:
             return False
 
         return (
-            self._has_browser_cookie_warmup_probe_business_ready()
+            (
+                self._has_browser_cookie_warmup_probe_business_ready()
+                or self._has_live_browser_business_probe_ready()
+            )
             and self._has_business_ready_cookie_shape(cookies_dict)
         )
 
@@ -4895,6 +4914,46 @@ class XianyuSliderStealth:
 
     def _has_browser_cookie_warmup_business_ready_signal(self, cookies_dict: Dict[str, str]) -> bool:
         return self._should_accept_business_ready_cookie_handoff(cookies_dict)
+
+    def _update_live_browser_business_probe_status_from_response(self, response) -> None:
+        response_url = str(getattr(response, 'url', '') or '').lower()
+        probe_name = None
+        if 'mtop.taobao.idlemessage.pc.login.token' in response_url:
+            probe_name = 'login_token_native'
+        elif 'mtop.taobao.idlemessage.pc.loginuser.get' in response_url:
+            probe_name = 'login_user_native'
+        elif 'mtop.taobao.idlemessage.pc.accs.token' in response_url:
+            probe_name = 'accs_token_native'
+        elif 'mtop.taobao.idlemessage.pc.session.sync' in response_url:
+            probe_name = 'session_sync_native'
+        if not probe_name:
+            return
+
+        try:
+            response_text = str(response.text() or '')
+        except Exception as response_body_err:
+            logger.debug(
+                f"【{self.pure_user_id}】读取浏览器原生业务响应失败，跳过业务就绪判定: {response_body_err}"
+            )
+            return
+
+        if 'SUCCESS::调用成功' not in response_text:
+            return
+
+        if probe_name == 'login_token_native' and '"accessToken"' not in response_text:
+            return
+        if probe_name == 'login_user_native' and '"userId"' not in response_text:
+            return
+
+        live_status = dict(getattr(self, 'last_live_browser_business_probe_status', {}) or {})
+        if live_status.get(probe_name):
+            return
+        live_status[probe_name] = True
+        self.last_live_browser_business_probe_status = live_status
+        logger.info(
+            f"【{self.pure_user_id}】浏览器原生业务探测成功: {probe_name}, "
+            f"status={getattr(response, 'status', None)}"
+        )
 
     def _extract_browser_cookie_warmup_verification_hint(
         self,
@@ -5730,11 +5789,30 @@ class XianyuSliderStealth:
                 return False
 
             page_url = self._safe_page_url(page)
+            page_has_logged_in_surface = False
+            try:
+                page_has_logged_in_surface = (
+                    self._is_logged_in_url(page_url)
+                    and self._check_login_success_by_element(page)
+                    and not self._page_has_slider(page)
+                )
+            except Exception:
+                page_has_logged_in_surface = False
+
+            if page_has_logged_in_surface:
+                return False
+
             if self._looks_like_verification_url(page_url):
                 return True
 
             try:
                 iframe = page.query_selector('iframe#alibaba-login-box')
+                if iframe:
+                    try:
+                        if hasattr(iframe, 'is_visible') and not iframe.is_visible():
+                            iframe = None
+                    except Exception:
+                        pass
                 if iframe:
                     return True
             except Exception:
@@ -9774,7 +9852,7 @@ class XianyuSliderStealth:
         except Exception:
             pass
 
-        if self.context:
+        if getattr(self, "context", None):
             try:
                 context_login_success, _, _ = self._probe_context_login_success(
                     self.context,
@@ -10773,6 +10851,17 @@ class XianyuSliderStealth:
         """
         try:
             logger.info(f"【{self.pure_user_id}】检测二维码/人脸验证...")
+            page_url = self._safe_page_url(page)
+            page_has_logged_in_surface = False
+            page_has_hidden_alibaba_login_box = False
+            try:
+                page_has_logged_in_surface = (
+                    self._is_logged_in_url(page_url)
+                    and self._check_login_success_by_element(page)
+                    and not self._page_has_slider(page)
+                )
+            except Exception:
+                page_has_logged_in_surface = False
             
             # 先检查是否是滑块验证，如果是滑块验证，立即处理并返回
             slider_selectors = [
@@ -10872,7 +10961,6 @@ class XianyuSliderStealth:
                     continue
 
             # 检测所有frames中的二维码/人脸验证
-            page_url = self._safe_page_url(page)
             page_verification_type = self._detect_verification_type(page)
             page_has_login_form = self._page_has_login_form(page)
             if self._looks_like_verification_url(page_url) or (
@@ -10898,6 +10986,18 @@ class XianyuSliderStealth:
                     try:
                         iframe_id = iframe.get_attribute('id')
                         if iframe_id == 'alibaba-login-box':
+                            iframe_visible = True
+                            try:
+                                if hasattr(iframe, 'is_visible'):
+                                    iframe_visible = bool(iframe.is_visible())
+                            except Exception:
+                                iframe_visible = True
+                            if page_has_logged_in_surface and not iframe_visible:
+                                page_has_hidden_alibaba_login_box = True
+                                logger.info(
+                                    f"【{self.pure_user_id}】页面已回到业务登录态，忽略隐藏的 alibaba-login-box iframe"
+                                )
+                                continue
                             logger.info(f"【{self.pure_user_id}】✅ 检测到 alibaba-login-box iframe")
                             frame = iframe.content_frame()
                             if frame:
@@ -11007,6 +11107,25 @@ class XianyuSliderStealth:
                 try:
                     frame_url = frame.url
                     logger.debug(f"【{self.pure_user_id}】检查Frame {idx} 是否有二维码: {frame_url}")
+                    if (
+                        page_has_logged_in_surface and
+                        page_has_hidden_alibaba_login_box and
+                        self._looks_like_verification_url(frame_url)
+                    ):
+                        try:
+                            frame_element = frame.frame_element()
+                            if frame_element and hasattr(frame_element, 'is_visible') and frame_element.is_visible():
+                                pass
+                            else:
+                                logger.info(
+                                    f"【{self.pure_user_id}】页面已回到业务登录态，忽略隐藏验证 Frame: {frame_url}"
+                                )
+                                continue
+                        except Exception:
+                            logger.info(
+                                f"【{self.pure_user_id}】页面已回到业务登录态，忽略残留验证 Frame: {frame_url}"
+                            )
+                            continue
                     
                     # 检查frame URL是否包含 mini_login（人脸验证或短信验证页面）
                     if 'mini_login' in frame_url:
@@ -11651,9 +11770,16 @@ class XianyuSliderStealth:
             self._refresh_browser_features_from_page_metrics(page)
             self._apply_headless_network_fingerprint(page, browser_features)
             observed_set_cookie_updates: Dict[str, str] = {}
+            self.last_live_browser_business_probe_status = {}
 
             def _capture_response_set_cookie(response):
                 try:
+                    try:
+                        self._update_live_browser_business_probe_status_from_response(response)
+                    except Exception as live_probe_err:
+                        logger.debug(
+                            f"【{self.pure_user_id}】更新浏览器原生业务成功信号失败: {live_probe_err}"
+                        )
                     updates = self._extract_set_cookie_updates_from_playwright_response(response)
                     if not updates:
                         return
@@ -12685,6 +12811,50 @@ class XianyuSliderStealth:
                 notification_scene=notification_scene,
             )
 
+        refreshed_cookies = {}
+        try:
+            refreshed_cookies = self._snapshot_context_cookies(
+                context,
+                page=refreshed_monitor_page,
+            )
+        except Exception as cookie_snapshot_err:
+            logger.debug(
+                f"【{self.pure_user_id}】内联滑块通过后抓取上下文 Cookie 失败: {cookie_snapshot_err}"
+            )
+
+        if refreshed_cookies:
+            missing_required_fields = [
+                key for key in self._REQUIRED_SESSION_COOKIE_FIELDS
+                if not refreshed_cookies.get(key)
+            ]
+            accept_business_ready_handoff = False
+            try:
+                accept_business_ready_handoff = bool(
+                    self._should_accept_business_ready_cookie_handoff(
+                        refreshed_cookies,
+                        missing_required_fields=missing_required_fields,
+                    )
+                )
+            except Exception as business_ready_err:
+                logger.warning(
+                    f"【{self.pure_user_id}】内联滑块通过后评估 business-ready Cookie 失败: "
+                    f"{business_ready_err}"
+                )
+
+            if accept_business_ready_handoff:
+                logger.warning(
+                    f"【{self.pure_user_id}】内联滑块通过后虽未立即确认登录元素，"
+                    "但当前 Cookie 已呈现 business-ready，会话继续交给 Cookie finalize 收口"
+                )
+                return True, self._finalize_logged_in_cookies(
+                    context,
+                    refreshed_monitor_page,
+                    scene=success_scene,
+                    notification_callback=notification_callback,
+                    notification_scene=notification_scene,
+                    extra_cookie_updates=refreshed_cookies,
+                )
+
         logger.warning(f"【{self.pure_user_id}】内联滑块通过后仍未确认登录态，也未发现身份验证页")
         return False, None
 
@@ -12934,6 +13104,21 @@ class XianyuSliderStealth:
     async def _run_sync_method_on_fresh_thread(self, func, *args, **kwargs):
         import asyncio
         import threading
+
+        account_scope = str(
+            getattr(self, "pure_user_id", None)
+            or getattr(self, "user_id", None)
+            or ""
+        ).strip()
+        if account_scope:
+            from utils.account_browser_runtime import account_browser_runtime_manager
+
+            return await account_browser_runtime_manager.run_sync_task_on_account_thread_async(
+                account_scope,
+                func,
+                *args,
+                **kwargs,
+            )
 
         loop = asyncio.get_running_loop()
         result_future = loop.create_future()

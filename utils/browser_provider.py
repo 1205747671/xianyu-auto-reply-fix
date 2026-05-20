@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence
 from urllib.parse import quote, urlparse, urlunparse
+
+import psutil
 
 from cloakbrowser import (
     build_args,
@@ -220,6 +223,145 @@ def _ensure_managed_launch_args(
     return managed_args
 
 
+def _normalize_fs_path(path_text: Optional[str]) -> str:
+    text = str(path_text or "").strip().strip('"')
+    if not text:
+        return ""
+    try:
+        return os.path.normcase(str(Path(text).resolve()))
+    except Exception:
+        return os.path.normcase(os.path.abspath(text))
+
+
+def _extract_process_user_data_dir(process: Any) -> str:
+    try:
+        cmdline = process.cmdline()
+    except Exception:
+        return ""
+    if not isinstance(cmdline, (list, tuple)):
+        return ""
+    for index, arg in enumerate(cmdline):
+        text = str(arg or "").strip().strip('"')
+        if not text:
+            continue
+        if text.startswith("--user-data-dir="):
+            return _normalize_fs_path(text.split("=", 1)[1])
+        if text == "--user-data-dir" and (index + 1) < len(cmdline):
+            return _normalize_fs_path(cmdline[index + 1])
+    return ""
+
+
+def _process_matches_executable(process: Any, normalized_executable_path: str) -> bool:
+    if not normalized_executable_path:
+        return True
+    try:
+        process_executable = _normalize_fs_path(process.exe())
+    except Exception:
+        process_executable = ""
+    if process_executable and process_executable == normalized_executable_path:
+        return True
+    try:
+        cmdline = process.cmdline()
+    except Exception:
+        return False
+    if not isinstance(cmdline, (list, tuple)) or not cmdline:
+        return False
+    return _normalize_fs_path(cmdline[0]) == normalized_executable_path
+
+
+def _iter_profile_processes(
+    user_data_dir: str,
+    *,
+    executable_path: Optional[str] = None,
+) -> list[Any]:
+    normalized_user_data_dir = _normalize_fs_path(user_data_dir)
+    if not normalized_user_data_dir:
+        return []
+    normalized_executable_path = _normalize_fs_path(executable_path)
+    matched_processes = []
+    for process in psutil.process_iter():
+        try:
+            if _extract_process_user_data_dir(process) != normalized_user_data_dir:
+                continue
+            if not _process_matches_executable(process, normalized_executable_path):
+                continue
+            matched_processes.append(process)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return matched_processes
+
+
+def _cleanup_profile_lock_artifacts(user_data_dir: str) -> None:
+    for stale_name in (
+        DEVTOOLS_ACTIVE_PORT,
+        "lockfile",
+        "SingletonLock",
+        "SingletonCookie",
+        "SingletonSocket",
+    ):
+        try:
+            (Path(user_data_dir) / stale_name).unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            # Best-effort cleanup; the launcher will retry or fail with a clearer error.
+            pass
+
+
+def _cleanup_residual_profile_processes(
+    user_data_dir: str,
+    *,
+    executable_path: Optional[str] = None,
+    close_timeout: float = DEFAULT_CLOSE_TIMEOUT,
+) -> None:
+    matched_processes = _iter_profile_processes(
+        user_data_dir,
+        executable_path=executable_path,
+    )
+    if not matched_processes:
+        return
+
+    process_by_pid = {process.pid: process for process in matched_processes}
+    root_processes = [
+        process
+        for process in matched_processes
+        if getattr(process, "ppid", lambda: None)() not in process_by_pid
+    ] or matched_processes
+
+    if os.name == "nt":
+        for process in root_processes:
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    check=False,
+                    timeout=close_timeout,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                continue
+        return
+
+    terminate_targets = sorted(
+        matched_processes,
+        key=lambda process: len(process.parents()),
+        reverse=True,
+    )
+    for process in terminate_targets:
+        try:
+            process.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    _gone, alive = psutil.wait_procs(terminate_targets, timeout=close_timeout)
+    for process in alive:
+        try:
+            process.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    if alive:
+        psutil.wait_procs(alive, timeout=close_timeout)
+
+
 def _read_devtools_active_port(
     user_data_dir: str,
     startup_timeout: float,
@@ -228,9 +370,10 @@ def _read_devtools_active_port(
 ) -> int:
     port_file = Path(user_data_dir) / DEVTOOLS_ACTIVE_PORT
     deadline = time.monotonic() + startup_timeout
+    process_exited = False
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise RuntimeError("CloakBrowser process exited before DevToolsActivePort was ready")
+            process_exited = True
         if port_file.exists():
             try:
                 lines = port_file.read_text(encoding="utf-8").splitlines()
@@ -241,6 +384,8 @@ def _read_devtools_active_port(
                 # 可能短暂持有独占锁，继续轮询即可。
                 pass
         sleep(0.1)
+    if process_exited:
+        raise RuntimeError("CloakBrowser process exited before DevToolsActivePort was ready")
     raise TimeoutError(f"Timed out waiting for {DEVTOOLS_ACTIVE_PORT}")
 
 
@@ -251,9 +396,10 @@ async def _read_devtools_active_port_async(
 ) -> int:
     port_file = Path(user_data_dir) / DEVTOOLS_ACTIVE_PORT
     deadline = time.monotonic() + startup_timeout
+    process_exited = False
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise RuntimeError("CloakBrowser process exited before DevToolsActivePort was ready")
+            process_exited = True
         if port_file.exists():
             try:
                 lines = port_file.read_text(encoding="utf-8").splitlines()
@@ -264,6 +410,8 @@ async def _read_devtools_active_port_async(
                 # 可能短暂持有独占锁，继续轮询即可。
                 pass
         await asyncio.sleep(0.1)
+    if process_exited:
+        raise RuntimeError("CloakBrowser process exited before DevToolsActivePort was ready")
     raise TimeoutError(f"Timed out waiting for {DEVTOOLS_ACTIVE_PORT}")
 
 
@@ -298,6 +446,101 @@ async def _wait_for_process_exit_async(process: Any, close_timeout: float) -> No
         await asyncio.to_thread(wait)
 
 
+def _terminate_process_tree(process: Any, close_timeout: float) -> None:
+    if process is None or process.poll() is not None:
+        return
+
+    if os.name == "nt":
+        taskkill_attempted = False
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                check=False,
+                timeout=close_timeout,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            taskkill_attempted = True
+        except Exception:
+            pass
+        try:
+            process.terminate()
+        except Exception:
+            pass
+        try:
+            process.wait(timeout=close_timeout)
+            return
+        except Exception:
+            if not taskkill_attempted:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                try:
+                    process.wait(timeout=close_timeout)
+                except Exception:
+                    pass
+            return
+
+    process.terminate()
+    try:
+        process.wait(timeout=close_timeout)
+    except Exception:
+        process.kill()
+        try:
+            process.wait(timeout=close_timeout)
+        except Exception:
+            pass
+
+
+async def _terminate_process_tree_async(process: Any, close_timeout: float) -> None:
+    if process is None or process.poll() is not None:
+        return
+
+    if os.name == "nt":
+        taskkill_attempted = False
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                check=False,
+                timeout=close_timeout,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            taskkill_attempted = True
+        except Exception:
+            pass
+        try:
+            process.terminate()
+        except Exception:
+            pass
+        try:
+            await _wait_for_process_exit_async(process, close_timeout)
+            return
+        except Exception:
+            if not taskkill_attempted:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                try:
+                    await _wait_for_process_exit_async(process, close_timeout)
+                except Exception:
+                    pass
+            return
+
+    process.terminate()
+    try:
+        await _wait_for_process_exit_async(process, close_timeout)
+    except Exception:
+        process.kill()
+        try:
+            await _wait_for_process_exit_async(process, close_timeout)
+        except Exception:
+            pass
+
+
 def launch_managed_browser_runtime(
     user_data_dir: str,
     *,
@@ -321,29 +564,12 @@ def launch_managed_browser_runtime(
     _port_reader: Optional[Callable[[str, float, Any, Callable[[float], None]], int]] = None,
     _sleep: Callable[[float], None] = time.sleep,
 ) -> ManagedBrowserRuntime:
-    # Best-effort cleanup of stale profile lock artifacts.
-    #
-    # - Chrome will write DevToolsActivePort into the profile dir. If the previous
-    #   run was killed abruptly, the file may remain and point to a stale port,
-    #   causing connect_over_cdp() to ECONNREFUSED.
-    # - Some environments may leave lock markers like "lockfile" or Chromium
-    #   singleton files behind, which can make the next launch exit early.
-    for stale_name in (
-        DEVTOOLS_ACTIVE_PORT,
-        "lockfile",
-        "SingletonLock",
-        "SingletonCookie",
-        "SingletonSocket",
-    ):
-        try:
-            (Path(user_data_dir) / stale_name).unlink()
-        except FileNotFoundError:
-            pass
-        except Exception:
-            # Best-effort cleanup; the launcher will retry or fail with a clearer error.
-            pass
-
     resolved_executable_path = executable_path or ensure_binary()
+    _cleanup_residual_profile_processes(
+        user_data_dir,
+        executable_path=resolved_executable_path,
+    )
+    _cleanup_profile_lock_artifacts(user_data_dir)
     chrome_args = _build_managed_browser_launch_args(
         args=args,
         headless=headless,
@@ -411,22 +637,12 @@ async def launch_managed_browser_runtime_async(
     _connect_over_cdp: Optional[Callable[[str], Any]] = None,
     _port_reader: Optional[Callable[[str, float, Any], Any]] = None,
 ) -> AsyncManagedBrowserRuntime:
-    # See sync variant above: clear stale profile lock artifacts before launching.
-    for stale_name in (
-        DEVTOOLS_ACTIVE_PORT,
-        "lockfile",
-        "SingletonLock",
-        "SingletonCookie",
-        "SingletonSocket",
-    ):
-        try:
-            (Path(user_data_dir) / stale_name).unlink()
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
-
     resolved_executable_path = executable_path or ensure_binary()
+    _cleanup_residual_profile_processes(
+        user_data_dir,
+        executable_path=resolved_executable_path,
+    )
+    _cleanup_profile_lock_artifacts(user_data_dir)
     chrome_args = _build_managed_browser_launch_args(
         args=args,
         headless=headless,
@@ -496,16 +712,12 @@ def close_managed_browser_runtime(
         runtime.playwright = None
 
     process = runtime.process
-    if process is not None and process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=close_timeout)
-        except Exception:
-            process.kill()
-            try:
-                process.wait(timeout=close_timeout)
-            except Exception:
-                pass
+    _terminate_process_tree(process, close_timeout)
+    if runtime.user_data_dir:
+        _cleanup_residual_profile_processes(
+            runtime.user_data_dir,
+            executable_path=None,
+        )
 
     return runtime
 
@@ -537,16 +749,12 @@ async def close_managed_browser_runtime_async(
         runtime.playwright = None
 
     process = runtime.process
-    if process is not None and process.poll() is None:
-        process.terminate()
-        try:
-            await _wait_for_process_exit_async(process, close_timeout)
-        except Exception:
-            process.kill()
-            try:
-                await _wait_for_process_exit_async(process, close_timeout)
-            except Exception:
-                pass
+    await _terminate_process_tree_async(process, close_timeout)
+    if runtime.user_data_dir:
+        _cleanup_residual_profile_processes(
+            runtime.user_data_dir,
+            executable_path=None,
+        )
 
     return runtime
 

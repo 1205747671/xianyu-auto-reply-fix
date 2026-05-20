@@ -243,6 +243,67 @@ class _GenericTaobaoHomepagePage(_FakePage):
         return []
 
 
+class _FakeVerificationFramePage(_FakePage):
+    def __init__(self, url):
+        super().__init__(title="身份验证", url=url)
+
+    def inner_text(self, selector, timeout=None):
+        if selector != "body":
+            raise AssertionError(f"unexpected selector: {selector}")
+        return "请进行人脸验证"
+
+    def content(self):
+        return self.inner_text("body")
+
+
+class _FakeIframeElement:
+    def __init__(self, *, iframe_id="alibaba-login-box", visible=False, frame=None):
+        self._iframe_id = iframe_id
+        self._visible = visible
+        self._frame = frame
+
+    def get_attribute(self, name):
+        if name == "id":
+            return self._iframe_id
+        return None
+
+    def is_visible(self):
+        return self._visible
+
+    def content_frame(self):
+        return self._frame
+
+
+class _LoggedInImPageWithHiddenAlibabaIframe(_FakePage):
+    def __init__(self):
+        self.hidden_frame = _FakeVerificationFramePage(
+            "https://passport.goofish.com/iv/mini/identity_verify.htm?htoken=unit"
+        )
+        hidden_iframe = _FakeIframeElement(visible=False, frame=self.hidden_frame)
+        super().__init__(
+            title="聊天_闲鱼",
+            url="https://www.goofish.com/im",
+            selectors={
+                'iframe#alibaba-login-box': hidden_iframe,
+            },
+        )
+        self.frames = [self.hidden_frame]
+        self._iframes = [hidden_iframe]
+
+    def inner_text(self, selector, timeout=None):
+        if selector != "body":
+            raise AssertionError(f"unexpected selector: {selector}")
+        return "订单 消息 尚未选择任何联系人 快点左侧列表聊起来吧~"
+
+    def content(self):
+        return self.inner_text("body")
+
+    def query_selector_all(self, selector):
+        if selector == "iframe":
+            return list(self._iframes)
+        return []
+
+
 class SliderVerificationGuardsTest(unittest.TestCase):
     def _make_slider(self, page):
         slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
@@ -599,6 +660,7 @@ class SliderVerificationGuardsTest(unittest.TestCase):
             "_m_h5_tk": "tk",
             "_m_h5_tk_enc": "tk_enc",
             "t": "t_cookie",
+            "cna": "cna_cookie",
             "_tb_token_": "tb_token",
         }
         slider = self._make_slider(page)
@@ -766,6 +828,35 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         self.assertIsNone(verification_target)
         slider._capture_verification_screenshot.assert_not_called()
 
+    def test_page_looks_like_verification_ignores_hidden_alibaba_iframe_when_im_already_logged_in(self):
+        page = _LoggedInImPageWithHiddenAlibabaIframe()
+        slider = self._make_slider(page)
+        slider._page_has_login_form = lambda _page: False
+        slider._check_login_success_by_element = lambda _page: True
+        slider._page_has_slider = lambda _page: False
+
+        self.assertFalse(slider._page_looks_like_verification(page))
+
+    def test_detect_qr_code_verification_ignores_hidden_alibaba_iframe_when_im_already_logged_in(self):
+        page = _LoggedInImPageWithHiddenAlibabaIframe()
+        slider = self._make_slider(page)
+        slider._page_has_login_form = lambda _page: False
+        slider._check_login_success_by_element = lambda _page: True
+        slider._capture_verification_screenshot = mock.Mock(return_value="unexpected-face.jpg")
+        slider._get_face_verification_url = lambda frame: frame.url
+        slider._detect_verification_type = (
+            lambda target: "face_verify"
+            if getattr(target, "url", "").startswith("https://passport.goofish.com/iv/")
+            else "unknown"
+        )
+        slider._read_frame_text_for_detection = lambda frame: "请进行人脸验证"
+
+        has_verification, verification_target = slider._detect_qr_code_verification(page)
+
+        self.assertFalse(has_verification)
+        self.assertIsNone(verification_target)
+        slider._capture_verification_screenshot.assert_not_called()
+
     @mock.patch("utils.xianyu_slider_stealth.time.sleep", return_value=None)
     def test_capture_verification_screenshot_replaces_old_file_and_reuses_last_on_timeout(self, _mock_sleep):
         page = _FakePage(title="人脸验证", url="https://passport.goofish.com/iv/test")
@@ -866,6 +957,7 @@ class SliderVerificationGuardsTest(unittest.TestCase):
             "_m_h5_tk": "tk",
             "_m_h5_tk_enc": "tk_enc",
             "t": "t_cookie",
+            "cna": "cna_cookie",
         }
         slider = self._make_slider(page)
         slider.last_login_error = ""
@@ -1646,6 +1738,61 @@ class SliderRunInlineVerificationProbeTest(unittest.TestCase):
         result = slider.run("https://passport.goofish.com/verify")
 
         self.assertEqual(result, (True, {"cookie2": "browser_cookie2"}))
+        slider._finalize_logged_in_cookies.assert_called_once()
+        slider.close_browser.assert_called_once_with()
+
+    def test_run_consumes_inline_slider_success_when_business_ready_cookies_exist_even_without_login_element(self):
+        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
+        page = _FakePage(
+            title="验证码拦截",
+            url="https://passport.goofish.com/verify",
+        )
+        business_ready_cookies = {
+            "unb": "user1",
+            "sgcookie": "sg",
+            "cookie2": "c2",
+            "_m_h5_tk": "tk",
+            "_m_h5_tk_enc": "tk_enc",
+            "t": "t_value",
+            "_tb_token_": "tb_token",
+            "x5sec": "x5_token",
+        }
+        slider.pure_user_id = "inline_probe_business_ready"
+        slider.page = page
+        slider.context = object()
+        slider.headless = True
+        slider.disable_headless_warmup = True
+        slider.slider_max_retries = 4
+        slider.last_login_error = ""
+        slider.last_verification_feedback = {}
+        slider._managed_runtime_binding = object()
+        slider._check_date_validity = mock.Mock(return_value=True)
+        slider._warmup_slider_context = mock.Mock()
+        slider._is_hard_block_page = mock.Mock(return_value=False)
+        slider._simulate_human_page_behavior = mock.Mock()
+        slider.solve_slider = mock.Mock(return_value=False)
+        slider._should_abort_token_refresh_slider_flow_after_failure = mock.Mock(return_value=(False, ""))
+        slider._select_monitor_page = mock.Mock(side_effect=lambda _context, fallback=None: fallback or page)
+        slider._probe_context_login_success = mock.Mock(return_value=(False, page, dict(business_ready_cookies)))
+        slider._snapshot_context_cookies = mock.Mock(return_value=dict(business_ready_cookies))
+        slider._should_accept_business_ready_cookie_handoff = mock.Mock(return_value=True)
+        slider._finalize_logged_in_cookies = mock.Mock(return_value={"cookie2": "browser_cookie2"})
+        slider.close_browser = mock.Mock()
+
+        def detect_side_effect(_monitor_page):
+            slider.last_verification_feedback = {
+                "status": "success",
+                "source": "container_missing",
+                "message": "滑块容器已消失",
+            }
+            return False, None
+
+        slider._detect_qr_code_verification = mock.Mock(side_effect=detect_side_effect)
+
+        result = slider.run("https://passport.goofish.com/verify")
+
+        self.assertEqual(result, (True, {"cookie2": "browser_cookie2"}))
+        slider._should_accept_business_ready_cookie_handoff.assert_called_once()
         slider._finalize_logged_in_cookies.assert_called_once()
         slider.close_browser.assert_called_once_with()
 

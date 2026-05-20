@@ -35,7 +35,10 @@ from utils.notification_dispatcher import (
     guess_verification_type,
     render_notification_template,
 )
-from utils.account_browser_runtime import account_browser_runtime_manager
+from utils.account_browser_runtime import (
+    account_browser_runtime_manager,
+    resolve_runtime_attach_metadata,
+)
 
 
 DELIVERY_BATCH_MAX_UNITS = 10
@@ -6657,6 +6660,10 @@ class XianyuLive:
             runtime = getattr(lease, "runtime", None)
             browser = getattr(runtime, "browser", None) or getattr(context, "browser", None)
             playwright = getattr(runtime, "playwright", None)
+            runtime_browser_features, runtime_profile_id = resolve_runtime_attach_metadata(
+                runtime,
+                runtime_request,
+            )
             attach_managed_runtime(
                 lease=lease,
                 runtime=runtime,
@@ -6664,8 +6671,8 @@ class XianyuLive:
                 context=context,
                 page=page,
                 playwright=playwright,
-                browser_features=runtime_request.get("browser_features"),
-                profile_id=runtime_request.get("profile_id"),
+                browser_features=runtime_browser_features,
+                profile_id=runtime_profile_id,
             )
             attach_succeeded = True
             current_release_reason = release_reason
@@ -6736,15 +6743,29 @@ class XianyuLive:
                     use_account_persistent_profile=True,
                 )
                 slider_stealth.risk_trigger_scene = 'token_refresh'
-
-                success, cookies = await slider_stealth._run_sync_method_on_fresh_thread(
-                    self._run_slider_verification_with_managed_runtime_sync,
-                    slider=slider_stealth,
-                    verification_url=verification_url,
-                    purpose="token_refresh_slider",
-                    release_reason="token_refresh_slider_completed",
-                    attach_failure_reason="token_refresh_slider_attach_failed",
-                )
+                try:
+                    success, cookies = await slider_stealth._run_sync_method_on_fresh_thread(
+                        self._run_slider_verification_with_managed_runtime_sync,
+                        slider=slider_stealth,
+                        verification_url=verification_url,
+                        purpose="token_refresh_slider",
+                        release_reason="token_refresh_slider_completed",
+                        attach_failure_reason="token_refresh_slider_attach_failed",
+                    )
+                finally:
+                    try:
+                        if (
+                            getattr(slider_stealth, "_concurrency_slot_registered", False)
+                            or getattr(slider_stealth, "browser", None)
+                            or getattr(slider_stealth, "context", None)
+                            or getattr(slider_stealth, "page", None)
+                            or getattr(slider_stealth, "playwright", None)
+                        ):
+                            slider_stealth.close_browser()
+                    except Exception as slider_cleanup_error:
+                        logger.warning(
+                            f"【{current_account_id}】滑块验证收尾清理失败: {self._safe_str(slider_cleanup_error)}"
+                        )
 
                 if success and cookies:
                     logger.info(f"【{self.account_id}】滑块验证成功，获取到新的cookies")
@@ -6834,6 +6855,37 @@ class XianyuLive:
                         self._mark_pending_slider_success_notice("token_refresh")
                         XianyuLive.clear_password_login_failure_backoff(current_account_id)
                         logger.info(f"【{current_account_id}】滑块验证成功后，已清理密码登录失败回避状态")
+
+                        if (
+                            getattr(slider_stealth, "risk_trigger_scene", None) == "token_refresh"
+                            and missing_protected_fields == ["havana_lgc2_77"]
+                        ):
+                            logger.warning(
+                                f"【{current_account_id}】滑块验证成功后仍缺 havana_lgc2_77，"
+                                "追加执行浏览器真实 Cookie 稳定化"
+                            )
+                            try:
+                                stabilization_success = await self._refresh_cookies_via_browser_page(
+                                    cookies_str,
+                                    restart_on_success=False,
+                                )
+                            except Exception as stabilization_error:
+                                stabilization_success = False
+                                logger.warning(
+                                    f"【{current_account_id}】滑块成功后的浏览器真实 Cookie 稳定化异常: "
+                                    f"{self._safe_str(stabilization_error)}"
+                                )
+                            if stabilization_success:
+                                cookies_str = self.cookies_str
+                                updated_cookies = dict(getattr(self, "cookies", {}) or updated_cookies)
+                                logger.info(
+                                    f"【{current_account_id}】滑块成功后的浏览器真实 Cookie 稳定化完成，"
+                                    "已刷新当前实例 Cookie 视图"
+                                )
+                            else:
+                                logger.warning(
+                                    f"【{current_account_id}】滑块成功后的浏览器真实 Cookie 稳定化未补齐 havana_lgc2_77"
+                                )
 
                         x5sec_cookies_str = "; ".join([f"{k}={v}" for k, v in x5sec_cookies.items()]) if x5sec_cookies else "?"
                         log_captcha_event(current_account_id, "滑块验证成功并自动更新数据库", True,
@@ -7547,6 +7599,10 @@ class XianyuLive:
             runtime = getattr(lease, "runtime", None)
             browser = getattr(runtime, "browser", None) or getattr(context, "browser", None)
             playwright = getattr(runtime, "playwright", None)
+            runtime_browser_features, runtime_profile_id = resolve_runtime_attach_metadata(
+                runtime,
+                runtime_request,
+            )
             attach_managed_runtime(
                 lease=lease,
                 runtime=runtime,
@@ -7554,8 +7610,8 @@ class XianyuLive:
                 context=context,
                 page=page,
                 playwright=playwright,
-                browser_features=runtime_request.get("browser_features"),
-                profile_id=runtime_request.get("profile_id"),
+                browser_features=runtime_browser_features,
+                profile_id=runtime_profile_id,
             )
             attach_succeeded = True
             release_reason = "password_login_refresh_completed"

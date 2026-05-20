@@ -284,6 +284,164 @@ class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(created_sliders), 1)
         self.assertTrue(created_sliders[0].kwargs.get("use_account_persistent_profile"))
 
+    async def test_handle_captcha_verification_closes_slider_resources_when_runtime_attach_fails(self):
+        created_sliders = []
+
+        class _FakeSlider:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+                self.risk_trigger_scene = None
+                self._concurrency_slot_registered = True
+                self.browser = None
+                self.context = None
+                self.page = None
+                self.playwright = None
+                self.close_browser = mock.Mock()
+                created_sliders.append(self)
+
+            async def _run_sync_method_on_fresh_thread(self, *_args, **_kwargs):
+                raise RuntimeError("attach failed before run")
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "token_refresh_cleanup_test"
+        live.cookies_str = "_m_h5_tk=test_token_12345; cookie2=dummy_cookie2"
+        live.proxy_config = {}
+        live.connection_state = ConnectionState.DISCONNECTED
+        live.ws = None
+        live._safe_str = lambda exc: str(exc)
+        live._canonical_account_id = lambda: "token_refresh_cleanup_test"
+        live.is_manual_refresh_active = lambda *_args, **_kwargs: False
+
+        async def fake_send_notification(*_args, **_kwargs):
+            return None
+
+        live.send_token_refresh_notification = fake_send_notification
+
+        with mock.patch("XianyuAutoAsync.db_manager.get_cookie_details", return_value={}), \
+             mock.patch("XianyuAutoAsync.log_captcha_event"), \
+             mock.patch("utils.xianyu_slider_stealth.XianyuSliderStealth", _FakeSlider):
+            result = await live._handle_captcha_verification(
+                {"data": {"url": "https://example.com/punish?action=captcha"}}
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(len(created_sliders), 1)
+        created_sliders[0].close_browser.assert_called_once_with()
+
+    async def test_handle_captcha_verification_runs_browser_stabilization_when_only_havana_missing(self):
+        created_sliders = []
+
+        slider_cookies = {
+            "unb": "u1",
+            "sgcookie": "sg1",
+            "cookie2": "c2_new",
+            "_m_h5_tk": "tk_new",
+            "_m_h5_tk_enc": "enc_new",
+            "t": "t_new",
+            "cna": "cna_new",
+            "_tb_token_": "tb_new",
+            "x5sec": "x5_new",
+            "x5secdata": "x5data_new",
+        }
+
+        class _FakeSlider:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+                self.risk_trigger_scene = None
+                self._concurrency_slot_registered = False
+                self.browser = None
+                self.context = None
+                self.page = None
+                self.playwright = None
+                self.close_browser = mock.Mock()
+                created_sliders.append(self)
+
+            async def _run_sync_method_on_fresh_thread(self, *_args, **_kwargs):
+                return True, dict(slider_cookies)
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "token_refresh_havana_stabilize_test"
+        live.cookies_str = "unb=u1; sgcookie=sg_old; cookie2=c2_old; _m_h5_tk=tk_old; _m_h5_tk_enc=enc_old; t=t_old; cna=cna_old; _tb_token_=tb_old"
+        live.cookies = {
+            "unb": "u1",
+            "sgcookie": "sg_old",
+            "cookie2": "c2_old",
+            "_m_h5_tk": "tk_old",
+            "_m_h5_tk_enc": "enc_old",
+            "t": "t_old",
+            "cna": "cna_old",
+            "_tb_token_": "tb_old",
+        }
+        live.proxy_config = {}
+        live.connection_state = ConnectionState.DISCONNECTED
+        live.ws = None
+        live._safe_str = lambda exc: str(exc)
+        live._canonical_account_id = lambda: "token_refresh_havana_stabilize_test"
+        live.is_manual_refresh_active = lambda *_args, **_kwargs: False
+        live.get_qr_login_grace = lambda *_args, **_kwargs: None
+        live._log_protected_merge_event = lambda *_args, **_kwargs: None
+        live._log_cookie_merge_summary = lambda *_args, **_kwargs: None
+        live._mark_slider_success_recovery = lambda *_args, **_kwargs: None
+        live._mark_pending_slider_success_notice = lambda *_args, **_kwargs: None
+
+        def _set_runtime_cookie_state(*, cookies_str, cookies_dict, source):
+            live.cookies_str = cookies_str
+            live.cookies = dict(cookies_dict)
+            live.last_cookie_source = source
+
+        live._set_runtime_cookie_state = _set_runtime_cookie_state
+        live.update_config_cookies = mock.AsyncMock()
+
+        merged_cookies = dict(slider_cookies)
+        merge_result = {
+            "merged_cookies_dict": merged_cookies,
+            "updated_fields": list(merged_cookies.keys()),
+            "changed_fields": ["cookie2", "_m_h5_tk", "_m_h5_tk_enc", "t", "cna", "_tb_token_"],
+            "new_fields": ["x5sec", "x5secdata"],
+            "removed_fields": [],
+            "preserved_fields": [],
+            "preserved_protected_fields": [],
+            "would_remove_fields": [],
+            "missing_protected_fields": ["havana_lgc2_77"],
+            "missing_required_fields": [],
+            "incoming_missing_protected_fields": ["havana_lgc2_77"],
+            "account_switched": False,
+        }
+        live.protected_merge_cookie_dicts = mock.Mock(return_value=merge_result)
+
+        async def fake_browser_stabilization(cookie_string, restart_on_success=True):
+            self = live
+            self.cookies["havana_lgc2_77"] = "hv1"
+            self.cookies_str = cookie_string + "; havana_lgc2_77=hv1"
+            return True
+
+        live._refresh_cookies_via_browser_page = mock.AsyncMock(side_effect=fake_browser_stabilization)
+
+        async def fake_send_notification(*_args, **_kwargs):
+            return None
+
+        live.send_token_refresh_notification = fake_send_notification
+
+        with mock.patch("XianyuAutoAsync.db_manager.get_cookie_details", return_value={}), \
+             mock.patch("XianyuAutoAsync.log_captcha_event"), \
+             mock.patch("utils.xianyu_slider_stealth.XianyuSliderStealth", _FakeSlider), \
+             mock.patch.object(XianyuLive, "clear_password_login_failure_backoff"), \
+             mock.patch(
+                 "XianyuAutoAsync.account_browser_runtime_manager.run_sync_task_on_account_thread_async",
+                 new=mock.AsyncMock(return_value=True),
+             ) as invalidate_runtime_mock:
+            result = await live._handle_captcha_verification(
+                {"data": {"url": "https://example.com/punish?action=captcha"}}
+            )
+
+        self.assertIsNotNone(result)
+        invalidate_runtime_mock.assert_awaited_once()
+        live._refresh_cookies_via_browser_page.assert_awaited_once()
+        self.assertIn("havana_lgc2_77=hv1", live.cookies_str)
+        self.assertEqual(len(created_sliders), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

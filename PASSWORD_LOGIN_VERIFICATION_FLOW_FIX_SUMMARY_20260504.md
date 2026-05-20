@@ -218,6 +218,127 @@
 - 不能像服务内那样走“重启实例”路径
 - 但它后面仍然在**同进程内继续重试 Token，并最终成功**
 
+### G. 2026-05-20 最新无头重跑实证：`cna / havana_lgc2_77` 不再当硬门槛
+
+这轮又追加做了**真正的无头重跑**，并且多次在人脸页反复验证，最后拿到了一次完整跑通证据。
+
+关键产物：
+
+- `logs/account_10_face_probe_state.json`
+- `logs/account_10_face_probe_events.jsonl`
+
+最终成功态（**2026-05-20 16:46:29**）：
+
+- `status=postflight_complete`
+- `preflight_token` 成功
+- `keep_session_alive=true`
+- `websocket.connected=true`
+- `websocket.init_sent=true`
+- 已收到首条 websocket 消息
+
+更关键的是：这次成功不是靠把 Cookie 补“完美”。
+
+最终状态文件里两份 Cookie 视图分别是：
+
+1. `cookie_summary`
+   - `missing_required_fields=['cna']`
+   - `missing_protected_fields=['cna', 'havana_lgc2_77']`
+   - `pending_identity_markers=[]`
+
+2. `settled_cookie_summary / live_im_diag.best_cookie_summary`
+   - 同样仍缺：
+     - `cna`
+     - `havana_lgc2_77`
+   - 而且还保留：
+     - `ivActionType`
+     - `tmp0`
+     - `siv20`
+     - `last_u_xianyu_web`
+
+但与此同时，浏览器真实业务请求已经成功跑通：
+
+- `mtop.taobao.idlemessage.pc.loginuser.get` → `SUCCESS`
+- `mtop.taobao.idlemessage.pc.login.token` → `SUCCESS`
+- `mtop.taobao.idlemessage.pc.accs.token` → `SUCCESS`
+- `mtop.taobao.idlemessage.pc.session.sync` → `SUCCESS`
+
+这次把结论钉死了：
+
+> **对“password -> token_refresh -> websocket”这条真实链路来说，活浏览器业务成功信号比单个 Cookie 名字更权威。**
+
+换句话说：
+
+- `havana_lgc2_77` 不是这条链路的绝对硬门槛
+- `cna` 也不是这条链路的绝对硬门槛
+- `ivActionType/tmp0/siv20` 这些半登录标记，在浏览器真实业务已成功时，更多是**观察噪音**，不能继续硬拦截
+
+### H. 基于这次实证，正式逻辑继续收口
+
+这轮又补了两类正式逻辑：
+
+#### 1. 已回 IM 时，忽略隐藏/残留验证 iframe
+
+涉及文件：
+
+- `utils/xianyu_slider_stealth.py`
+- `tests/test_slider_verification_guards.py`
+
+新增回归：
+
+- `test_page_looks_like_verification_ignores_hidden_alibaba_iframe_when_im_already_logged_in`
+- `test_detect_qr_code_verification_ignores_hidden_alibaba_iframe_when_im_already_logged_in`
+
+目的：
+
+- 页面已经回 `https://www.goofish.com/im`
+- 登录列表元素也已经出现
+- 但 `alibaba-login-box` 还残留一个隐藏 iframe / 旧 frame
+- 这种情况不能再当“还在验证中”
+
+#### 2. 把“浏览器原生业务成功信号”纳入 business-ready 判定
+
+涉及文件：
+
+- `utils/xianyu_slider_stealth.py`
+- `tests/test_reply_server_account_scope.py`
+
+本次新增：
+
+- `last_live_browser_business_probe_status`
+- `_update_live_browser_business_probe_status_from_response(...)`
+- `_has_live_browser_business_probe_ready()`
+
+当前正式判定里，以下原生成功信号会被记录：
+
+- `login_token_native`
+- `login_user_native`
+- 额外观测：
+  - `accs_token_native`
+  - `session_sync_native`
+
+只要满足：
+
+- 浏览器真实业务请求已成功
+- Cookie 形态已经达到 `_has_business_ready_cookie_shape(...)`
+- 且缺失 required fields 至多是 `cna`
+
+就允许按 **business-ready handoff** 继续往后交接，
+不再因为：
+
+- `havana_lgc2_77`
+- `cna`
+- `ivActionType/tmp0/siv20`
+
+这些字段反复回到 punish / 验证等待。
+
+新增回归：
+
+- `test_pending_identity_verification_state_accepts_native_browser_success_signal`
+
+一句话总结这轮正式逻辑收口：
+
+> **以后优先信浏览器真实业务是否已经跑成，再决定要不要继续纠缠 `havana_lgc2_77 / cna / ivActionType`。**
+
 ---
 
 ## 2026-05-17 本次代码级收口（指纹 / 滑块 / 账号级画像继续收紧）
@@ -2313,3 +2434,208 @@ python -m pytest tests/test_reply_server_proxy_restart_guard_contract.py -q
 - token 预检成功
 - ws 成功
 - heartbeat / keepalive 成功
+
+---
+
+## 2026-05-20 补充：同账号浏览器残留清理 + 滑块 business-ready 收口后，扫码链路连续复跑稳定
+
+### 1. 这轮真正修掉的两个坑
+
+这次不是再去怀疑扫码本身，而是把两个老坑钉死：
+
+1. **同一个 `account_id` 的账号级浏览器 profile 被残留 CloakBrowser 进程占住**
+   - 旧现象：
+     - 扫码成功后，进入“真实 Cookie 恢复浏览器”
+     - 直接报：
+       - `CloakBrowser process exited before DevToolsActivePort was ready`
+   - 根因：
+     - managed runtime 关闭时，只断了 launcher / CDP 连接
+     - 真实 `chrome.exe` 进程树没按 `profile_dir` 杀干净
+     - 下一轮同账号继续复用 `browser_data/user_<account_id>` 时直接撞残留
+
+2. **`token_refresh -> punish -> slider` 里滑块明明过了，但后续代码不认账**
+   - 旧现象：
+     - `x5sec` 已变化
+     - 日志里明确有“滑块验证成功”
+     - 但因为 IM 列表元素没立刻出现，后面仍被打成：
+       - `captcha_verification_failed`
+   - 根因：
+     - `_consume_inline_slider_success_after_verification_probe(...)`
+     - 在 `container_missing` 这类“内联滑块已成功”场景下
+     - 只认“页面元素立即确认登录”
+     - 不认“Cookie 已经 business-ready”
+
+### 2. 本次正式修复
+
+涉及文件：
+
+- `utils/browser_provider.py`
+- `utils/xianyu_slider_stealth.py`
+- `tests/test_browser_provider.py`
+- `tests/test_browser_provider_cdp_runtime.py`
+- `tests/test_slider_verification_guards.py`
+
+#### A. 按 `profile_dir` 精确清理残留 CloakBrowser 进程
+
+位置：
+
+- `utils/browser_provider.py`
+
+新增逻辑：
+
+- 启动前：
+  - `_cleanup_residual_profile_processes(user_data_dir, executable_path=...)`
+  - 按 `--user-data-dir=<profile_dir>` 精确匹配同账号浏览器树
+  - 再清 `DevToolsActivePort / lockfile / Singleton*`
+- 关闭后：
+  - 先走原有 `browser.close()/playwright.stop()/taskkill`
+  - 再按同一个 `user_data_dir` 做一次兜底残留清理
+
+兼容策略：
+
+- **Windows**
+  - 用 `taskkill /PID ... /T /F`
+- **Docker / Linux**
+  - 用 `psutil` 做按进程树 `terminate -> kill` 清理
+
+这个修法保持了原来的边界：
+
+- **同一个 `account_id` 继续复用同一个浏览器环境 / 同一个 worker**
+- **不同账号不会互相误伤**
+- 不走“全局杀所有 CloakBrowser”这种脏招
+
+#### B. 滑块成功后，允许 business-ready Cookie 直接收口
+
+位置：
+
+- `utils/xianyu_slider_stealth.py`
+
+修复点：
+
+- 在 `_consume_inline_slider_success_after_verification_probe(...)` 里补了新分支
+- 当满足：
+  - `last_verification_feedback.status == success`
+  - 来源属于：
+    - `container_missing`
+    - `frame_detached`
+    - `page_changed`
+    - `context_login_confirmed`
+    - 等内联滑块成功信号
+  - 当前页已不再落回验证页
+  - 上下文 Cookie 已满足 `business-ready`
+- 则直接：
+  - `return True, self._finalize_logged_in_cookies(...)`
+
+不再死等：
+
+- `.rc-virtual-list-holder-inner`
+
+这一步本质上是：
+
+> **把“滑块通过后的 Cookie 业务完成态”提升为一级成功信号。**
+
+### 3. 真实复跑结果
+
+这轮连续做了两次真实扫码复跑，账号固定：
+
+- `account_id=10`
+
+#### 第 1 次复跑
+
+会话：
+
+- `session_id=9ef671ad-0e8f-4180-8260-f1aec7bbe48e`
+
+关键结果：
+
+- `real_cookie_refreshed=true`
+- `cookie_persisted_in_db=True`
+- `preflight_token_received=True`
+- `ws_connected=True`
+- `ws_connection_state=connected`
+- `session_keepalive_ok=True`
+
+这次已经能确认：
+
+- 旧的 `DevToolsActivePort was ready` 启动失败**没有再出现**
+- 旧的“滑块过了但后面不认账”**没有再出现**
+
+#### 第 2 次复跑（长观察窗口）
+
+会话：
+
+- `session_id=ab7f9501-ffc4-4f4c-8dcb-ff66b69408b4`
+
+这次把 `observe_seconds` 拉到 **30 秒**，确认不是“刚连上就掉”的假通。
+
+最终结果：
+
+- `real_cookie_refreshed=true`
+- `cookie_persisted_in_db=True`
+- `preflight_token_received=True`
+- `ws_connected=True`
+- `ws_connection_state=connected`
+- `session_keepalive_ok=True`
+
+关键时间点（**2026-05-20**）：
+
+- `18:13:07`
+  - 真实 Cookie 恢复完成
+  - 字段数到 `34`
+  - 核心字段明确齐全：
+    - `cna`
+    - `x5sec`
+    - `x5secdata`
+    - `_m_h5_tk`
+    - `_m_h5_tk_enc`
+    - `cookie2`
+    - `sgcookie`
+    - `t`
+    - `unb`
+- `18:13:10`
+  - token 预检成功：
+    - `ret=['SUCCESS::调用成功']`
+- `18:13:18`
+  - WebSocket 进入 `connected`
+- `18:13:22`
+  - 已收到业务消息
+- `18:13:33`
+  - 再次发 heartbeat
+- `18:13:37`
+  - 收到 heartbeat response
+
+stdout 最终摘要：
+
+- `ws_probe_snapshot.current_token_present=true`
+- `ws_probe_snapshot.last_session_keepalive_status=success`
+- `ws_probe_snapshot.last_token_refresh_status=success`
+- `ws_probe_snapshot.heartbeat_task_running=true`
+- `ws_probe_snapshot.keepalive_ok=true`
+
+### 4. 本轮结论
+
+这次可以把结论说死：
+
+1. **同账号浏览器残留占用问题已修掉**
+   - 旧的 `DevToolsActivePort` 启动失败不再复现
+
+2. **滑块成功后的 business-ready 收口问题已修掉**
+   - 旧的“滑块过了但后续误判失败”不再复现
+
+3. **扫码主链路已连续复跑通过**
+   - `扫码成功 -> 真实 Cookie 恢复 -> token 预检 -> websocket -> keepalive`
+   - 这条链路现在是稳定的
+
+### 5. 本轮回归验证
+
+执行：
+
+```bash
+.\.venv\Scripts\python.exe -m unittest tests.test_slider_verification_guards tests.test_browser_provider_cdp_runtime tests.test_browser_provider tests.test_account_browser_runtime tests.test_xianyu_async_browser_runtime.XianyuAsyncBrowserRuntimeTest.test_handle_captcha_verification_prefers_account_id_alias_for_recovery_state_success_branch tests.test_xianyu_async_browser_runtime.XianyuAsyncBrowserRuntimeTest.test_open_browser_recovery_context_returns_failure_when_persistent_profile_launch_fails tests.test_xianyu_async_browser_runtime.XianyuAsyncBrowserRuntimeTest.test_release_browser_recovery_runtime_invalidates_cached_runtime_when_requested tests.test_xianyu_async_browser_runtime.XianyuAsyncBrowserRuntimeTest.test_refresh_cookies_via_browser_reuses_persistent_profile_after_recent_slider_success
+.\.venv\Scripts\python.exe -m py_compile .\utils\xianyu_slider_stealth.py .\utils\browser_provider.py .\utils\account_browser_runtime.py .\XianyuAutoAsync.py .\reply_server.py .\tmp_manual_qr_login_ws_probe.py
+```
+
+结果：
+
+- `116 tests OK`
+- `py_compile OK`
