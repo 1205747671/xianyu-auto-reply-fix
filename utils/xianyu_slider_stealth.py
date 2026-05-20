@@ -4693,6 +4693,17 @@ class XianyuSliderStealth:
                         f"【{self.pure_user_id}】{scene}浏览器业务预热结果[{probe_name}]: "
                         f"status={probe_result.get('status')} ok={probe_result.get('ok')} summary={summary}"
                     )
+                    try:
+                        self._cache_auth_prewarmed_token_from_probe_result(
+                            probe_name,
+                            probe_result,
+                            request_body=probe.get('body'),
+                        )
+                    except Exception as cache_probe_token_err:
+                        logger.debug(
+                            f"【{self.pure_user_id}】缓存浏览器业务预热token失败，继续使用现有会话: "
+                            f"{cache_probe_token_err}"
+                        )
                     response_cookie_updates = probe_result.get('set_cookie_updates') or {}
                     if response_cookie_updates:
                         logger.info(
@@ -4915,6 +4926,90 @@ class XianyuSliderStealth:
     def _has_browser_cookie_warmup_business_ready_signal(self, cookies_dict: Dict[str, str]) -> bool:
         return self._should_accept_business_ready_cookie_handoff(cookies_dict)
 
+    def _extract_login_token_device_id_from_payload_text(self, payload_text: Any) -> Optional[str]:
+        raw_text = str(payload_text or '').strip()
+        if not raw_text:
+            return None
+
+        candidate_json_text = raw_text
+        if not raw_text.startswith('{'):
+            try:
+                parsed_form = parse_qs(raw_text, keep_blank_values=True)
+            except Exception:
+                parsed_form = {}
+            data_values = parsed_form.get('data') or []
+            if data_values:
+                candidate_json_text = str(data_values[0] or '').strip()
+
+        if not candidate_json_text:
+            return None
+
+        try:
+            payload = json.loads(candidate_json_text)
+        except Exception:
+            return None
+
+        return str((payload or {}).get('deviceId') or '').strip() or None
+
+    def _cache_auth_prewarmed_token_from_probe_result(
+        self,
+        probe_name: str,
+        probe_result: Dict[str, Any],
+        request_body: Any = None,
+    ) -> None:
+        if not isinstance(probe_result, dict):
+            return
+        if str(probe_name or '').strip().lower() != 'login_token_fetch':
+            return
+
+        raw_text = str(probe_result.get('text') or '').strip()
+        if not raw_text:
+            return
+
+        try:
+            payload = json.loads(raw_text)
+        except Exception:
+            return
+
+        ret_items = payload.get('ret')
+        if isinstance(ret_items, list):
+            ret_values = [str(item) for item in ret_items if item is not None]
+        elif ret_items is None:
+            ret_values = []
+        else:
+            ret_values = [str(ret_items)]
+        ret_summary = " ".join(ret_values)
+        if 'SUCCESS::调用成功' not in ret_summary:
+            return
+
+        data_payload = payload.get('data')
+        if not isinstance(data_payload, dict):
+            return
+
+        access_token = str(data_payload.get('accessToken') or '').strip()
+        if not access_token:
+            return
+
+        self.last_browser_warmup_auth_token = access_token
+        self.last_browser_warmup_auth_token_source = 'browser_warmup_login_token'
+        self.last_browser_warmup_auth_token_at = time.time()
+        extracted_device_id = self._extract_login_token_device_id_from_payload_text(request_body)
+        if extracted_device_id:
+            self.last_browser_warmup_auth_device_id = extracted_device_id
+        try:
+            from XianyuAutoAsync import XianyuLive
+
+            XianyuLive.cache_auth_prewarmed_token(
+                self.pure_user_id,
+                access_token,
+                source='browser_warmup_login_token',
+                device_id=extracted_device_id,
+            )
+        except Exception as cache_err:
+            logger.debug(
+                f"【{self.pure_user_id}】缓存浏览器业务预热token失败，继续沿用本地成功信号: {cache_err}"
+            )
+
     def _update_live_browser_business_probe_status_from_response(self, response) -> None:
         response_url = str(getattr(response, 'url', '') or '').lower()
         probe_name = None
@@ -4965,9 +5060,24 @@ class XianyuSliderStealth:
                 data_payload = {}
             access_token = str(data_payload.get('accessToken') or '').strip()
             if access_token:
+                request_obj = getattr(response, 'request', None)
+                request_post_data = None
+                if request_obj is not None:
+                    try:
+                        request_post_data_attr = getattr(request_obj, 'post_data', None)
+                        request_post_data = (
+                            request_post_data_attr()
+                            if callable(request_post_data_attr)
+                            else request_post_data_attr
+                        )
+                    except Exception:
+                        request_post_data = None
+                extracted_device_id = self._extract_login_token_device_id_from_payload_text(request_post_data)
                 self.last_live_browser_auth_token = access_token
                 self.last_live_browser_auth_token_source = 'browser_live_login_token'
                 self.last_live_browser_auth_token_at = time.time()
+                if extracted_device_id:
+                    self.last_live_browser_auth_device_id = extracted_device_id
                 try:
                     from XianyuAutoAsync import XianyuLive
 
@@ -4975,6 +5085,7 @@ class XianyuSliderStealth:
                         self.pure_user_id,
                         access_token,
                         source='browser_live_login_token',
+                        device_id=extracted_device_id,
                     )
                 except Exception as cache_err:
                     logger.debug(

@@ -1,8 +1,8 @@
-# 闲鱼账号验证 / Cookie / 保活链路修复总结（更新至 2026-05-20）
+# 闲鱼账号验证 / Cookie / 保活链路修复总结（更新至 2026-05-21）
 
 ## 当前结论
 
-截至 **2026-05-20**，这条链路现在要分三层看：
+截至 **2026-05-21**，这条链路现在要分三层看：
 
 1. **浏览器运行时已经统一**
    - 项目活跃浏览器链路已经统一到 `CloakBrowser` provider。
@@ -28,6 +28,123 @@
 一句话说透：
 
 > 现在主要问题不再是“浏览器链路根本跑不起来”，而是“滑块之后账号是否还要继续做人机验证，以及保活恢复能不能正确承接这个状态”。
+
+---
+
+## 2026-05-21 补充：预热 token + device_id 一起交接后，两轮完整无头复跑通过
+
+这轮不是继续猜，而是把“**浏览器真实业务已成功**”再往前推进一步：
+
+- 不只交接浏览器里拿到的 `accessToken`
+- 还把同一条浏览器成功链路里的 `deviceId` 一起交给后续 `XianyuLive`
+
+涉及文件：
+
+- `XianyuAutoAsync.py`
+- `utils/xianyu_slider_stealth.py`
+- `tests/test_xianyu_token_refresh_request.py`
+
+### A. `account_id=10` 无头复跑：`ws 401` 已消失
+
+这轮关键时间点（**2026-05-21**）：
+
+- `01:50:58`
+  - 第二段人脸页切到：
+    - `passport.goofish.com/newlogin/safe/ivCheckLogin.htm`
+- `01:52:25`
+  - `runtime_released_before_postflight`
+- `01:52:35`
+  - `postflight_complete`
+
+最终 `postflight` 结果：
+
+- `preflight_token`：成功
+- `last_token_refresh_status=prewarmed_token_reused`
+- `keep_session_alive=true`
+- `last_session_keepalive_status=success`
+- `websocket.connected=true`
+- `websocket.init_sent=true`
+- 首条 websocket 注册响应：`code=200`
+
+这次最关键的变化是：
+
+- 旧问题里的
+  - `device id or appkey is not equal`
+- **这轮没有再出现**
+
+说明：
+
+> **只交接 token 不够，token + 同源 device_id 一起交接后，ws 注册才能稳定对齐。**
+
+### B. `account_id=3` 无头复跑：完整链路跑通
+
+这轮实际发生了两段验证和一段 punish 滑块：
+
+- 第一段人脸：
+  - `passport.goofish.com/iv/mini/identity_verify.htm`
+- 第二段人脸：
+  - `passport.goofish.com/newlogin/safe/ivCheckLogin.htm`
+- 之后命中：
+  - `mtop.taobao.idlemessage.pc.login.token/.../_____tmd_____/punish`
+
+关键时间点（**2026-05-21**）：
+
+- `02:11:16`
+  - `punish` 滑块验证成功
+- `02:11:20`
+  - 页面元素确认登录成功
+  - `✅ 验证成功，登录状态已确认`
+- `02:12:01`
+  - `已复用认证预热device_id`
+  - `已复用认证预热token，来源: browser_warmup_login_token`
+- `02:12:11`
+  - `连接状态: connecting → connected`
+  - `轻量会话保活成功`
+
+最终 stdout 结果：
+
+- `success=True`
+- `cookie_count=21`
+- `cookie_persisted_in_db=True`
+- `preflight_token_received=True`
+- `ws_connected=True`
+- `ws_connection_state=connected`
+- `session_keepalive_ok=True`
+
+最终 `ws_probe_snapshot` 关键字段：
+
+- `preflight_token_received=true`
+- `ws_connected=true`
+- `connection_state=connected`
+- `current_token_present=true`
+- `last_session_keepalive_status=success`
+- `last_token_refresh_status=prewarmed_token_reused`
+- `keepalive_ok=true`
+
+### C. 这轮可以先钉死的结论
+
+1. **`session_expired_preflight` 在成功账号复跑里已不再复现**
+   - `account_id=10`：不复现
+   - `account_id=3`：不复现
+
+2. **旧的 ws 注册 401 已经被打穿**
+   - 旧报错：
+     - `device id or appkey is not equal`
+   - 现在 `account_id=10` / `3` 都能进入：
+     - `websocket.connected=true`
+
+3. **当前更可信的交接模型是：浏览器成功业务态 → 交接 token + device_id**
+   - 而不是再退回“浏览器外纯 HTTP 预检必须自己重新拿到一份独立成功”那条老路
+
+### D. 本轮最小验证
+
+- `python -m py_compile XianyuAutoAsync.py utils/xianyu_slider_stealth.py tests/test_xianyu_token_refresh_request.py`
+- `python -m unittest tests.test_reply_server_account_scope tests.test_slider_verification_guards tests.test_xianyu_token_refresh_request`
+
+结果：
+
+- `Ran 183 tests`
+- `OK`
 
 ---
 

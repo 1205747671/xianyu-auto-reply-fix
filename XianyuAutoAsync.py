@@ -298,16 +298,25 @@ class XianyuLive:
         account_id: str = None,
         token: str = None,
         source: str = 'generic_auth',
+        device_id: str = None,
+        app_key: str = None,
     ):
         resolved_account_id = cls._normalize_account_scope(account_id)
         if not resolved_account_id or not token:
             return
         cls._cleanup_auth_prewarmed_tokens()
-        cls._auth_prewarmed_tokens[resolved_account_id] = {
+        token_info = {
             'token': token,
             'timestamp': time.time(),
             'source': source,
         }
+        normalized_device_id = str(device_id or '').strip()
+        if normalized_device_id:
+            token_info['device_id'] = normalized_device_id
+        normalized_app_key = str(app_key or '').strip()
+        if normalized_app_key:
+            token_info['app_key'] = normalized_app_key
+        cls._auth_prewarmed_tokens[resolved_account_id] = token_info
 
     @classmethod
     def pop_auth_prewarmed_token(
@@ -334,6 +343,35 @@ class XianyuLive:
         if not resolved_account_id:
             return
         cls._auth_prewarmed_tokens.pop(resolved_account_id, None)
+
+    def _apply_auth_prewarmed_token_info(
+        self,
+        token_info: Optional[Dict[str, Any]],
+        *,
+        init_log_account_id: str = None,
+    ) -> bool:
+        if not isinstance(token_info, dict):
+            return False
+
+        token = str(token_info.get('token') or '').strip()
+        if not token:
+            return False
+
+        self.current_token = token
+        self.last_token_refresh_time = float(token_info.get('timestamp') or time.time())
+
+        normalized_device_id = str(token_info.get('device_id') or '').strip()
+        if normalized_device_id:
+            self.device_id = normalized_device_id
+            logger.info(
+                f"【{init_log_account_id or self.account_id}】已复用认证预热device_id: {normalized_device_id}"
+            )
+
+        normalized_app_key = str(token_info.get('app_key') or '').strip()
+        if normalized_app_key:
+            self.auth_prewarmed_app_key = normalized_app_key
+
+        return True
 
     @classmethod
     def _cleanup_qr_prewarmed_tokens(cls):
@@ -1579,6 +1617,7 @@ class XianyuLive:
         self.myid = self.cookies['unb']
         logger.info(f"【{init_log_account_id}】用户ID: {self.myid}")
         self.device_id = generate_device_id(self.myid)
+        self.auth_prewarmed_app_key = None
 
         self.heartbeat_interval = HEARTBEAT_INTERVAL
         self.heartbeat_timeout = HEARTBEAT_TIMEOUT
@@ -1621,9 +1660,10 @@ class XianyuLive:
 
         canonical_account_id = self._canonical_account_id()
         prewarmed_token_info = self.pop_auth_prewarmed_token(canonical_account_id)
-        if prewarmed_token_info:
-            self.current_token = prewarmed_token_info.get('token')
-            self.last_token_refresh_time = prewarmed_token_info.get('timestamp', time.time())
+        if self._apply_auth_prewarmed_token_info(
+            prewarmed_token_info,
+            init_log_account_id=init_log_account_id,
+        ):
             logger.info(
                 f"【{init_log_account_id}】已复用认证预热token，来源: {prewarmed_token_info.get('source') or 'unknown'}"
             )
@@ -5689,7 +5729,13 @@ class XianyuLive:
             if existing_token:
                 self.last_token_refresh_status = "prewarmed_token_reused"
                 self.last_token_refresh_error_message = None
-                self.cache_auth_prewarmed_token(current_account_id, existing_token, source=token_source)
+                self.cache_auth_prewarmed_token(
+                    current_account_id,
+                    existing_token,
+                    source=token_source,
+                    device_id=getattr(self, 'device_id', None),
+                    app_key=getattr(self, 'auth_prewarmed_app_key', None) or APP_CONFIG.get('app_key'),
+                )
                 logger.info(
                     f"【{log_account_id}】{label}检测到实例已持有新鲜token，"
                     "跳过额外HTTP预检并回填认证预热缓存"
@@ -5700,7 +5746,13 @@ class XianyuLive:
             for attempt in range(1, max_preflight_retries + 1):
                 token = await self.refresh_token(allow_password_login_recovery=False)
                 if token:
-                    self.cache_auth_prewarmed_token(current_account_id, token, source=token_source)
+                    self.cache_auth_prewarmed_token(
+                        current_account_id,
+                        token,
+                        source=token_source,
+                        device_id=getattr(self, 'device_id', None),
+                        app_key=getattr(self, 'auth_prewarmed_app_key', None) or APP_CONFIG.get('app_key'),
+                    )
                     logger.info(f"【{log_account_id}】{label}成功（第{attempt}次），已缓存预热token供新实例复用")
                     return token
 
@@ -11520,7 +11572,7 @@ class XianyuLive:
             "lwp": "/reg",
             "headers": {
                 "cache-header": "app-key token ua wv",
-                "app-key": APP_CONFIG.get('app_key'),
+                "app-key": str(getattr(self, 'auth_prewarmed_app_key', None) or APP_CONFIG.get('app_key') or ''),
                 "token": self.current_token,
                 "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 DingTalk(2.1.5) OS(Windows/10) Browser(Chrome/133.0.0.0) DingWeb/2.1.5 IMPaaS DingWeb/2.1.5",
                 "dt": "j",

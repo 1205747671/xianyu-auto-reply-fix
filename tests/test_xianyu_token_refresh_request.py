@@ -49,6 +49,7 @@ class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
         live.account_id = "prewarmed_token_account"
         live.current_token = "oauth_browser_native_token"
         live.last_token_refresh_time = time.time()
+        live.device_id = "browser-device-id"
         live.last_message_received_time = 0
         live.last_token_refresh_status = None
         live.last_token_refresh_error_message = None
@@ -63,11 +64,11 @@ class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("oauth_browser_native_token", token)
         live.refresh_token.assert_not_awaited()
-        cache_token.assert_called_once_with(
-            "prewarmed_token_account",
-            "oauth_browser_native_token",
-            source="password_login_refresh",
-        )
+        cache_token.assert_called_once()
+        self.assertEqual("prewarmed_token_account", cache_token.call_args.args[0])
+        self.assertEqual("oauth_browser_native_token", cache_token.call_args.args[1])
+        self.assertEqual("password_login_refresh", cache_token.call_args.kwargs["source"])
+        self.assertEqual("browser-device-id", cache_token.call_args.kwargs["device_id"])
 
     def test_live_browser_login_token_success_caches_auth_prewarmed_token(self):
         import utils.xianyu_slider_stealth as slider_stealth
@@ -75,6 +76,9 @@ class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
         class _FakeResponse:
             url = "https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/"
             status = 200
+            request = SimpleNamespace(
+                post_data="data=%7B%22appKey%22%3A%22444e9908a51d1cb236a27862abc769c9%22%2C%22deviceId%22%3A%22browser-native-device-id%22%7D"
+            )
 
             def text(self):
                 return (
@@ -85,6 +89,11 @@ class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
         slider_like = SimpleNamespace(
             pure_user_id="10",
             last_live_browser_business_probe_status={},
+        )
+        slider_like._extract_login_token_device_id_from_payload_text = (
+            slider_stealth.XianyuSliderStealth._extract_login_token_device_id_from_payload_text.__get__(
+                slider_like, SimpleNamespace
+            )
         )
 
         with mock.patch.object(XianyuLive, "cache_auth_prewarmed_token") as cache_token:
@@ -99,11 +108,67 @@ class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
             },
             slider_like.last_live_browser_business_probe_status,
         )
-        cache_token.assert_called_once_with(
-            "10",
-            "oauth_browser_live_token",
-            source="browser_live_login_token",
+        cache_token.assert_called_once()
+        self.assertEqual("10", cache_token.call_args.args[0])
+        self.assertEqual("oauth_browser_live_token", cache_token.call_args.args[1])
+        self.assertEqual("browser_live_login_token", cache_token.call_args.kwargs["source"])
+        self.assertEqual("browser-native-device-id", cache_token.call_args.kwargs["device_id"])
+
+    def test_browser_cookie_warmup_login_token_success_caches_auth_prewarmed_token(self):
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        slider_like = SimpleNamespace(
+            pure_user_id="10",
         )
+        slider_like._extract_login_token_device_id_from_payload_text = (
+            slider_stealth.XianyuSliderStealth._extract_login_token_device_id_from_payload_text.__get__(
+                slider_like, SimpleNamespace
+            )
+        )
+        probe_result = {
+            "ok": True,
+            "text": (
+                '{"api":"mtop.taobao.idlemessage.pc.login.token","data":{"accessToken":"oauth_browser_warmup_token"},'
+                '"ret":["SUCCESS::调用成功"],"v":"1.0"}'
+            ),
+        }
+
+        with mock.patch.object(XianyuLive, "cache_auth_prewarmed_token") as cache_token:
+            slider_stealth.XianyuSliderStealth._cache_auth_prewarmed_token_from_probe_result(
+                slider_like,
+                "login_token_fetch",
+                probe_result,
+                request_body="data=%7B%22appKey%22%3A%22444e9908a51d1cb236a27862abc769c9%22%2C%22deviceId%22%3A%22browser-warmup-device-id%22%7D",
+            )
+
+        self.assertEqual("oauth_browser_warmup_token", slider_like.last_browser_warmup_auth_token)
+        self.assertEqual("browser-warmup-device-id", slider_like.last_browser_warmup_auth_device_id)
+        cache_token.assert_called_once()
+        self.assertEqual("10", cache_token.call_args.args[0])
+        self.assertEqual("oauth_browser_warmup_token", cache_token.call_args.args[1])
+        self.assertEqual("browser_warmup_login_token", cache_token.call_args.kwargs["source"])
+        self.assertEqual("browser-warmup-device-id", cache_token.call_args.kwargs["device_id"])
+
+    def test_apply_auth_prewarmed_token_info_reuses_browser_device_id(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "10"
+        live.current_token = None
+        live.last_token_refresh_time = 0
+        live.device_id = "python-generated-device-id"
+
+        live._apply_auth_prewarmed_token_info(
+            {
+                "token": "oauth_browser_bundle_token",
+                "timestamp": 123.0,
+                "source": "browser_live_login_token",
+                "device_id": "browser-bundle-device-id",
+            },
+            init_log_account_id="10",
+        )
+
+        self.assertEqual("oauth_browser_bundle_token", live.current_token)
+        self.assertEqual(123.0, live.last_token_refresh_time)
+        self.assertEqual("browser-bundle-device-id", live.device_id)
 
     async def test_init_disables_password_login_recovery_during_handoff_recovery(self):
         live = XianyuLive.__new__(XianyuLive)
