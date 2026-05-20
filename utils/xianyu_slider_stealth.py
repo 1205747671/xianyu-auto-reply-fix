@@ -4945,11 +4945,44 @@ class XianyuSliderStealth:
         if probe_name == 'login_user_native' and '"userId"' not in response_text:
             return
 
+        payload = None
+        try:
+            payload = json.loads(response_text)
+        except Exception:
+            payload = None
+
         live_status = dict(getattr(self, 'last_live_browser_business_probe_status', {}) or {})
         if live_status.get(probe_name):
+            already_marked = True
+        else:
+            live_status[probe_name] = True
+            self.last_live_browser_business_probe_status = live_status
+            already_marked = False
+
+        if probe_name == 'login_token_native' and isinstance(payload, dict):
+            data_payload = payload.get('data')
+            if not isinstance(data_payload, dict):
+                data_payload = {}
+            access_token = str(data_payload.get('accessToken') or '').strip()
+            if access_token:
+                self.last_live_browser_auth_token = access_token
+                self.last_live_browser_auth_token_source = 'browser_live_login_token'
+                self.last_live_browser_auth_token_at = time.time()
+                try:
+                    from XianyuAutoAsync import XianyuLive
+
+                    XianyuLive.cache_auth_prewarmed_token(
+                        self.pure_user_id,
+                        access_token,
+                        source='browser_live_login_token',
+                    )
+                except Exception as cache_err:
+                    logger.debug(
+                        f"【{self.pure_user_id}】缓存浏览器原生预热token失败，继续沿用本地成功信号: {cache_err}"
+                    )
+
+        if already_marked:
             return
-        live_status[probe_name] = True
-        self.last_live_browser_business_probe_status = live_status
         logger.info(
             f"【{self.pure_user_id}】浏览器原生业务探测成功: {probe_name}, "
             f"status={getattr(response, 'status', None)}"

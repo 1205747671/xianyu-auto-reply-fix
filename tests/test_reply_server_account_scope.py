@@ -1,8 +1,11 @@
 import asyncio
+import concurrent.futures
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
+import threading
 from types import SimpleNamespace
 import types
 import unittest
@@ -120,6 +123,52 @@ class ReplyServerAccountScopeContractTest(_ReplyServerModuleBindingMixin, unitte
         self.assertIn("def __init__(self, cookie_string: str = None, headless: bool = True, account_id: str = None):", order_detail_fetcher)
         self.assertNotIn("account_id_for_log", order_detail_fetcher)
         self.assertNotIn("account_id_for_log=self.cookie_id", xianyu_async)
+
+
+class ReplyServerAccountWorkerFutureWaitTest(_ReplyServerModuleBindingMixin, unittest.TestCase):
+    def test_wait_threadsafe_future_result_services_same_account_worker_queue(self):
+        from utils.account_browser_runtime import AccountBrowserRuntimeManager
+
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(temp_dir, ignore_errors=True))
+        manager = AccountBrowserRuntimeManager(base_dir=temp_dir)
+        original_manager = reply_server.account_browser_runtime_manager
+        reply_server.account_browser_runtime_manager = manager
+        self.addCleanup(lambda: setattr(reply_server, "account_browser_runtime_manager", original_manager))
+
+        thread_future = concurrent.futures.Future()
+
+        def nested_worker_task():
+            thread_future.set_result("nested-ok")
+            return "nested-ok"
+
+        def wait_inside_account_worker():
+            def enqueue_nested_task():
+                manager.run_sync_task_on_account_thread(
+                    "account-42",
+                    nested_worker_task,
+                    timeout=0.5,
+                )
+
+            enqueue_thread = threading.Thread(target=enqueue_nested_task, daemon=True)
+            enqueue_thread.start()
+            try:
+                return reply_server._wait_threadsafe_future_result(
+                    thread_future,
+                    0.5,
+                    "future wait timed out",
+                    account_id="account-42",
+                )
+            finally:
+                enqueue_thread.join(timeout=0.5)
+
+        result = manager.run_sync_task_on_account_thread(
+            "account-42",
+            wait_inside_account_worker,
+            timeout=1.0,
+        )
+
+        self.assertEqual("nested-ok", result)
 
     def test_item_sync_endpoints_accept_account_id_request_field(self):
         source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")

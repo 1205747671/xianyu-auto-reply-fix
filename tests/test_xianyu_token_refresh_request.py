@@ -1,5 +1,7 @@
+import time
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 from XianyuAutoAsync import ConnectionState, XianyuLive
 
@@ -42,6 +44,67 @@ class _FakeSession:
 
 
 class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
+    async def test_preflight_token_after_password_login_reuses_existing_current_token(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "prewarmed_token_account"
+        live.current_token = "oauth_browser_native_token"
+        live.last_token_refresh_time = time.time()
+        live.last_message_received_time = 0
+        live.last_token_refresh_status = None
+        live.last_token_refresh_error_message = None
+        live._skip_db_cookie_reload_for_token_refresh = False
+        live._canonical_account_id = lambda: "prewarmed_token_account"
+        live.refresh_token = mock.AsyncMock(
+            side_effect=AssertionError("should not refresh token when current_token is already available")
+        )
+
+        with mock.patch.object(XianyuLive, "cache_auth_prewarmed_token") as cache_token:
+            token = await live.preflight_token_after_password_login()
+
+        self.assertEqual("oauth_browser_native_token", token)
+        live.refresh_token.assert_not_awaited()
+        cache_token.assert_called_once_with(
+            "prewarmed_token_account",
+            "oauth_browser_native_token",
+            source="password_login_refresh",
+        )
+
+    def test_live_browser_login_token_success_caches_auth_prewarmed_token(self):
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        class _FakeResponse:
+            url = "https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/"
+            status = 200
+
+            def text(self):
+                return (
+                    '{"api":"mtop.taobao.idlemessage.pc.login.token","data":{"accessToken":"oauth_browser_live_token"},'
+                    '"ret":["SUCCESS::调用成功"],"v":"1.0"}'
+                )
+
+        slider_like = SimpleNamespace(
+            pure_user_id="10",
+            last_live_browser_business_probe_status={},
+        )
+
+        with mock.patch.object(XianyuLive, "cache_auth_prewarmed_token") as cache_token:
+            slider_stealth.XianyuSliderStealth._update_live_browser_business_probe_status_from_response(
+                slider_like,
+                _FakeResponse(),
+            )
+
+        self.assertEqual(
+            {
+                "login_token_native": True,
+            },
+            slider_like.last_live_browser_business_probe_status,
+        )
+        cache_token.assert_called_once_with(
+            "10",
+            "oauth_browser_live_token",
+            source="browser_live_login_token",
+        )
+
     async def test_init_disables_password_login_recovery_during_handoff_recovery(self):
         live = XianyuLive.__new__(XianyuLive)
         live.account_id = "handoff_init_account"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
 import inspect
 import os
@@ -135,6 +136,7 @@ class _SyncAccountWorkerState:
     last_used_at: float = 0.0
     task_queue: Any = field(default_factory=queue.Queue)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    stop_requested: bool = False
 
 
 @dataclass
@@ -146,7 +148,6 @@ _PROFILE_CLAIMS_GUARD = threading.Lock()
 _PROFILE_CLAIMS: Dict[str, _ProfileClaimState] = {}
 _MANAGER_INSTANCE_ID_GUARD = threading.Lock()
 _NEXT_MANAGER_INSTANCE_ID = 1
-_SYNC_ACCOUNT_WORKER_STOP = object()
 
 
 def _safe_bool_call(target: Any, method_name: str) -> Optional[bool]:
@@ -686,28 +687,42 @@ class AccountBrowserRuntimeManager:
         with state.lock:
             state.thread_id = current_thread_id
             state.last_used_at = self.time_fn()
+            state.stop_requested = False
         try:
             while True:
-                task = state.task_queue.get()
-                if task is _SYNC_ACCOUNT_WORKER_STOP:
-                    return
+                try:
+                    task = state.task_queue.get(timeout=0.1)
+                except queue.Empty:
+                    with state.lock:
+                        if state.stop_requested and state.task_queue.empty():
+                            return
+                    continue
                 if not isinstance(task, _SyncAccountTaskCall):
                     continue
-                try:
-                    with state.lock:
-                        state.last_used_at = self.time_fn()
-                    task.result = task.func(*task.args, **task.kwargs)
-                except BaseException as exc:
-                    task.exception = exc
-                finally:
-                    with state.lock:
-                        state.last_used_at = self.time_fn()
-                    task.done.set()
+                self._execute_sync_account_task_call(state, task)
         finally:
             with state.lock:
                 state.thread_id = None
                 state.thread = None
                 state.last_used_at = self.time_fn()
+                state.stop_requested = False
+
+    def _execute_sync_account_task_call(
+        self,
+        state: _SyncAccountWorkerState,
+        task: _SyncAccountTaskCall,
+    ) -> None:
+        try:
+            with state.lock:
+                state.last_used_at = self.time_fn()
+                state.stop_requested = False
+            task.result = task.func(*task.args, **task.kwargs)
+        except BaseException as exc:
+            task.exception = exc
+        finally:
+            with state.lock:
+                state.last_used_at = self.time_fn()
+            task.done.set()
 
     def _get_sync_account_worker_state(self, account_id: str) -> _SyncAccountWorkerState:
         with self._sync_account_workers_guard:
@@ -720,7 +735,9 @@ class AccountBrowserRuntimeManager:
     ) -> None:
         with state.lock:
             if state.thread is not None and state.thread.is_alive():
+                state.stop_requested = False
                 return
+            state.stop_requested = False
             state.thread = threading.Thread(
                 target=self._account_worker_loop,
                 args=(account_id, state),
@@ -728,6 +745,51 @@ class AccountBrowserRuntimeManager:
                 daemon=True,
             )
             state.thread.start()
+
+    def is_sync_account_worker_thread(
+        self,
+        account_id: str,
+        *,
+        thread_id: Optional[int] = None,
+    ) -> bool:
+        account_id = self._normalize_account_id(account_id)
+        state = self._get_sync_account_worker_state(account_id)
+        current_thread_id = thread_id or threading.get_ident()
+        with state.lock:
+            return bool(
+                state.thread is not None
+                and state.thread.is_alive()
+                and state.thread_id == current_thread_id
+            )
+
+    def wait_for_threadsafe_future_result_on_account_thread(
+        self,
+        account_id: str,
+        thread_future: concurrent.futures.Future,
+        *,
+        timeout: float,
+        poll_interval: float = 0.05,
+    ) -> Any:
+        account_id = self._normalize_account_id(account_id)
+        if not self.is_sync_account_worker_thread(account_id):
+            return thread_future.result(timeout=timeout)
+
+        state = self._get_sync_account_worker_state(account_id)
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                return thread_future.result(timeout=0)
+            except concurrent.futures.TimeoutError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                try:
+                    task = state.task_queue.get(timeout=min(max(0.01, poll_interval), remaining))
+                except queue.Empty:
+                    continue
+                if not isinstance(task, _SyncAccountTaskCall):
+                    continue
+                self._execute_sync_account_task_call(state, task)
 
     def run_sync_task_on_account_thread(
         self,
@@ -743,6 +805,7 @@ class AccountBrowserRuntimeManager:
         with state.lock:
             if state.thread_id == current_thread_id:
                 state.last_used_at = self.time_fn()
+                state.stop_requested = False
                 return func(*args, **kwargs)
         self._ensure_sync_account_worker_thread(account_id, state)
         call = _SyncAccountTaskCall(
@@ -750,10 +813,27 @@ class AccountBrowserRuntimeManager:
             args=tuple(args),
             kwargs=dict(kwargs),
         )
+        with state.lock:
+            state.stop_requested = False
         state.task_queue.put(call)
-        completed = call.done.wait(timeout=timeout)
-        if not completed:
-            raise TimeoutError(f"account browser worker task timed out: account_id={account_id}")
+        deadline = None if timeout is None else (time.monotonic() + max(0.0, float(timeout)))
+        while True:
+            if call.done.is_set():
+                break
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"account browser worker task timed out: account_id={account_id}")
+                wait_slice = min(0.05, remaining)
+            else:
+                wait_slice = 0.05
+            if call.done.wait(timeout=wait_slice):
+                break
+            with state.lock:
+                worker_thread = state.thread
+                worker_alive = bool(worker_thread is not None and worker_thread.is_alive())
+            if not worker_alive:
+                self._ensure_sync_account_worker_thread(account_id, state)
         if call.exception is not None:
             raise call.exception
         return call.result
@@ -1126,12 +1206,24 @@ class AccountBrowserRuntimeManager:
                 account_id=account_id,
                 mode="sync",
             )
+            can_reenter_current_runtime = bool(
+                state.active_leases
+                and state.owner_thread_id == current_thread_id
+                and _runtime_is_alive(state.runtime)
+            )
             while state.active_leases and (exclusive or state.active_exclusive):
+                if can_reenter_current_runtime:
+                    break
                 state.condition.wait()
                 self._raise_if_runtime_draining_pending_closures(
                     state,
                     account_id=account_id,
                     mode="sync",
+                )
+                can_reenter_current_runtime = bool(
+                    state.active_leases
+                    and state.owner_thread_id == current_thread_id
+                    and _runtime_is_alive(state.runtime)
                 )
             closures_to_run = self._take_sync_closures_for_thread(state, current_thread_id)
             runtime = self._ensure_sync_runtime(
@@ -1358,7 +1450,7 @@ class AccountBrowserRuntimeManager:
                 )
                 if not is_idle:
                     continue
-                state.task_queue.put(_SYNC_ACCOUNT_WORKER_STOP)
+                state.stop_requested = True
                 thread_to_join = thread
             if thread_to_join is not None:
                 thread_to_join.join(timeout=1.0)

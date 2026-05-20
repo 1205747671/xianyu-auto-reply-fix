@@ -4033,8 +4033,17 @@ def _wait_threadsafe_future_result(
     thread_future: concurrent.futures.Future,
     timeout: float,
     timeout_message: str,
+    *,
+    account_id: Optional[str] = None,
 ):
     try:
+        normalized_account_id = str(account_id or "").strip()
+        if normalized_account_id:
+            return account_browser_runtime_manager.wait_for_threadsafe_future_result_on_account_thread(
+                normalized_account_id,
+                thread_future,
+                timeout=timeout,
+            )
         return thread_future.result(timeout=timeout)
     except concurrent.futures.TimeoutError as timeout_err:
         thread_future.cancel()
@@ -4216,6 +4225,7 @@ def _stabilize_password_login_cookies_after_login(
             preflight_future,
             preflight_timeout,
             f"{stage_label}在 {preflight_timeout:.0f} 秒内未完成",
+            account_id=account_id,
         )
         updated_cookie_str = temp_xianyu.cookies_str or cookie_text
         token_ready = bool(getattr(temp_xianyu, 'current_token', None) or token_result)
@@ -5337,6 +5347,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                             preflight_future,
                             manual_refresh_preflight_timeout,
                             f"手动刷新后的Token预检在 {manual_refresh_preflight_timeout:.0f} 秒内未完成",
+                            account_id=account_id,
                         )
                         cookies_str = temp_xianyu.cookies_str
                         merged_cookies_dict = trans_cookies(cookies_str)

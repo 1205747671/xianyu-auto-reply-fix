@@ -5685,6 +5685,17 @@ class XianyuLive:
         previous_skip_reload_flag = bool(getattr(self, '_skip_db_cookie_reload_for_token_refresh', False))
         self._skip_db_cookie_reload_for_token_refresh = True
         try:
+            existing_token = str(getattr(self, 'current_token', '') or '').strip()
+            if existing_token:
+                self.last_token_refresh_status = "prewarmed_token_reused"
+                self.last_token_refresh_error_message = None
+                self.cache_auth_prewarmed_token(current_account_id, existing_token, source=token_source)
+                logger.info(
+                    f"【{log_account_id}】{label}检测到实例已持有新鲜token，"
+                    "跳过额外HTTP预检并回填认证预热缓存"
+                )
+                return existing_token
+
             max_preflight_retries = 3
             for attempt in range(1, max_preflight_retries + 1):
                 token = await self.refresh_token(allow_password_login_recovery=False)
@@ -6728,7 +6739,6 @@ class XianyuLive:
 
                 logger.info(f"【{current_account_id}】XianyuSliderStealth导入成功，使用滑块验证")
 
-                account_info = db_manager.get_cookie_details(current_account_id) or {}
                 logger.info(
                     f"【{current_account_id}】自动滑块验证准备启动："
                     f"headless=True, proxy_type={self.proxy_config.get('proxy_type', 'none')}"
@@ -6864,6 +6874,18 @@ class XianyuLive:
                                 f"【{current_account_id}】滑块验证成功后仍缺 havana_lgc2_77，"
                                 "追加执行浏览器真实 Cookie 稳定化"
                             )
+                            try:
+                                await account_browser_runtime_manager.run_sync_task_on_account_thread_async(
+                                    current_account_id,
+                                    account_browser_runtime_manager.invalidate_runtime_sync,
+                                    current_account_id,
+                                    reason="token_refresh_post_slider_browser_stabilization_prepare",
+                                )
+                            except Exception as invalidate_error:
+                                logger.warning(
+                                    f"【{current_account_id}】滑块成功后准备浏览器稳定化时失效旧账号 runtime 失败: "
+                                    f"{self._safe_str(invalidate_error)}"
+                                )
                             try:
                                 stabilization_success = await self._refresh_cookies_via_browser_page(
                                     cookies_str,
