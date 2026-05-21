@@ -1050,10 +1050,22 @@ class AccountBrowserRuntimeManager:
                 should_release_claim = state.runtime is None
             lease.released = True
             state.condition.notify_all()
-        for runtime, close_reason in closures_to_run:
-            await self._close_async_runtime(runtime, reason=close_reason)
-        if should_release_claim:
-            self._release_profile_claim(state)
+        close_errors = []
+        try:
+            for runtime, close_reason in closures_to_run:
+                try:
+                    await self._close_async_runtime(runtime, reason=close_reason)
+                except Exception as close_error:
+                    close_errors.append(close_error)
+        finally:
+            if should_release_claim:
+                self._release_profile_claim(state)
+        if close_errors:
+            first_error = close_errors[0]
+            process_lookup_errors = [err for err in close_errors if isinstance(err, ProcessLookupError)]
+            if len(process_lookup_errors) == len(close_errors):
+                return
+            raise first_error
 
     async def get_fresh_page(self, lease: AccountBrowserRuntimeLease) -> Tuple[Any, Any]:
         if lease.released:

@@ -1618,6 +1618,8 @@ class XianyuLive:
         logger.info(f"【{init_log_account_id}】用户ID: {self.myid}")
         self.device_id = generate_device_id(self.myid)
         self.auth_prewarmed_app_key = None
+        self.last_qr_handoff_token_prewarmed = False
+        self.last_qr_handoff_token_source = None
 
         self.heartbeat_interval = HEARTBEAT_INTERVAL
         self.heartbeat_timeout = HEARTBEAT_TIMEOUT
@@ -12092,12 +12094,15 @@ class XianyuLive:
         page = managed_page
         runtime_lease = managed_runtime_lease
         owns_runtime_lease = False
+        runtime_invalidated_during_auth_prewarm = False
         close_browser = False
         close_context = False
         close_page = False
         explicit_account_id = self._normalize_account_scope(account_id)
         canonical_account_id = self._canonical_account_id()
         target_account_id = explicit_account_id or canonical_account_id
+        self.last_qr_handoff_token_prewarmed = False
+        self.last_qr_handoff_token_source = None
         if not target_account_id:
             logger.error("【default】扫码登录Cookie刷新缺少 account_id，无法继续申请账号级浏览器 runtime")
             return False
@@ -12303,6 +12308,43 @@ class XianyuLive:
                 scene="浏览器稳定化Cookie",
                 initial_cookies_dict=qr_cookies_dict,
             )
+            prewarm_missing_required_fields = [
+                key for key in REQUIRED_SESSION_COOKIE_FIELDS
+                if not real_cookies_dict.get(key)
+            ]
+            should_attempt_handoff_prewarm = (
+                not prewarm_missing_required_fields
+                or self._should_accept_business_ready_cookie_handoff(
+                    real_cookies_dict,
+                    missing_required_fields=prewarm_missing_required_fields,
+                )
+            )
+            if should_attempt_handoff_prewarm:
+                auth_prewarm_meta = await self._prewarm_auth_token_in_browser_context_async(
+                    context,
+                    page,
+                    scene="扫码登录交接前",
+                    initial_cookies_dict=real_cookies_dict,
+                )
+                prewarmed_cookies_dict = auth_prewarm_meta.get('cookies_dict') or {}
+                if prewarmed_cookies_dict:
+                    real_cookies_dict = prewarmed_cookies_dict
+                self.last_qr_handoff_token_prewarmed = bool(auth_prewarm_meta.get('token_prewarmed'))
+                self.last_qr_handoff_token_source = (
+                    str(auth_prewarm_meta.get('token_source') or '').strip() or None
+                )
+                if self.last_qr_handoff_token_prewarmed:
+                    logger.info(
+                        f"【{target_account_id}】扫码登录已在同账号浏览器环境完成Token预热: "
+                        f"source={self.last_qr_handoff_token_source or 'unknown'}"
+                    )
+                else:
+                    logger.info(f"【{target_account_id}】扫码登录同账号浏览器环境Token预热未直通，继续沿用真实Cookie交接")
+            else:
+                logger.info(
+                    f"【{target_account_id}】扫码登录真实Cookie仍缺失核心字段，跳过同账号浏览器Token预热: "
+                    f"missing_required_fields={prewarm_missing_required_fields}"
+                )
 
             existing_cookie = db_manager.get_cookie_details(target_account_id)
             existing_cookie_value = self._extract_cookie_value(existing_cookie)
@@ -12450,6 +12492,48 @@ class XianyuLive:
                 self.last_qr_cookie_refresh_time = time.time()
                 logger.info(f"【{target_account_id}】已更新扫码登录Cookie刷新时间标志，_refresh_cookies_via_browser将等待{self.qr_cookie_refresh_cooldown//60}分钟后执行")
 
+                verification_url = str(auth_prewarm_meta.get('verification_url') or '').strip() if should_attempt_handoff_prewarm else ''
+                if verification_url and owns_runtime_lease and runtime_lease is not None:
+                    logger.warning(
+                        f"【{target_account_id}】扫码登录交接前浏览器内Token预热已提前返回验证URL，"
+                        "为避免后续 sync slider 与当前 async runtime 抢同一 profile，"
+                        f"先失效当前账号 runtime: {verification_url}"
+                    )
+                    try:
+                        runtime_invalidated_during_auth_prewarm = bool(
+                            await account_browser_runtime_manager.invalidate_runtime(
+                                target_account_id,
+                                reason="qr_cookie_refresh_auth_prewarm_verification",
+                            )
+                        )
+                    except Exception as invalidate_error:
+                        logger.warning(
+                            f"【{target_account_id}】扫码登录交接前失效当前账号 runtime 失败，"
+                            f"后续将继续依赖 finally 路径释放: {self._safe_str(invalidate_error)}"
+                        )
+                    else:
+                        logger.info(f"【{target_account_id}】扫码登录交接前已标记当前账号 runtime 失效，立即释放当前 lease")
+                    try:
+                        await self._release_browser_recovery_runtime(
+                            runtime_lease,
+                            browser=browser,
+                            context=context,
+                            page=page,
+                            reason="qr_cookie_refresh_auth_prewarm_handoff_release",
+                            invalidate_after_release=False,
+                        )
+                    except Exception as early_release_error:
+                        logger.warning(
+                            f"【{target_account_id}】扫码登录交接前提前释放当前 runtime 失败，"
+                            f"将退回 finally 路径兜底: {self._safe_str(early_release_error)}"
+                        )
+                    else:
+                        runtime_lease = None
+                        browser = None
+                        context = None
+                        page = None
+                        owns_runtime_lease = False
+
                 return True
             else:
                 logger.error(f"【{target_account_id}】保存真实Cookie到数据库失败")
@@ -12462,13 +12546,13 @@ class XianyuLive:
             try:
                 if runtime_lease is not None:
                     await self._release_browser_recovery_runtime(
-                        runtime_lease,
-                        browser=browser,
-                        context=context,
-                        page=page,
-                        reason="qr_cookie_refresh_completed",
-                        invalidate_after_release=owns_runtime_lease,
-                    )
+                    runtime_lease,
+                    browser=browser,
+                    context=context,
+                    page=page,
+                    reason="qr_cookie_refresh_completed",
+                    invalidate_after_release=owns_runtime_lease and not runtime_invalidated_during_auth_prewarm,
+                )
                 elif browser or context:
                     await self._async_close_browser(
                         browser=browser,
@@ -12810,6 +12894,446 @@ class XianyuLive:
         if not callable(cookie_reader):
             return {}
         return self._normalize_browser_cookie_items(await cookie_reader())
+
+    def _build_browser_auth_warmup_probe_requests(
+        self,
+        cookies_dict: Optional[Dict[str, str]],
+    ) -> List[Dict[str, str]]:
+        from urllib.parse import urlencode, quote_plus
+
+        cookies_dict = dict(cookies_dict or {})
+        raw_m_h5_tk = str(cookies_dict.get('_m_h5_tk') or '').strip()
+        token = raw_m_h5_tk.split('_')[0] if raw_m_h5_tk else ''
+        if not token:
+            return []
+
+        device_id = str(getattr(self, 'device_id', '') or '').strip()
+        if not device_id:
+            current_user_id = str(getattr(self, 'myid', '') or cookies_dict.get('unb') or '').strip()
+            if not current_user_id:
+                return []
+            device_id = generate_device_id(current_user_id)
+            self.device_id = device_id
+
+        common_params = {
+            'jsv': '2.7.2',
+            'appKey': '34839810',
+            'v': '1.0',
+            'type': 'originaljson',
+            'accountSite': 'xianyu',
+            'dataType': 'json',
+            'timeout': '20000',
+            'sessionOption': 'AutoLoginOnly',
+            'spm_cnt': 'a21ybx.im.0.0',
+        }
+
+        probes: List[Dict[str, str]] = []
+
+        token_ts = str(int(time.time() * 1000))
+        token_data = json.dumps(
+            {
+                "appKey": "444e9908a51d1cb236a27862abc769c9",
+                "deviceId": device_id,
+            },
+            separators=(',', ':'),
+            ensure_ascii=False,
+        )
+        token_params = dict(common_params)
+        token_params.update({
+            't': token_ts,
+            'api': 'mtop.taobao.idlemessage.pc.login.token',
+            'dangerouslySetWindvaneParams': '%5Bobject%20Object%5D',
+            'smToken': 'token',
+            'queryToken': 'sm',
+            'sm': 'sm',
+            'sign': generate_sign(token_ts, token, token_data),
+        })
+        probes.append({
+            'name': 'login_token_fetch',
+            'url': (
+                "https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/?"
+                + urlencode(token_params)
+            ),
+            'body': f"data={quote_plus(token_data)}",
+            'token_source': 'qr_login_browser_handoff_login_token',
+        })
+
+        user_ts = str(int(time.time() * 1000))
+        user_data = '{}'
+        user_params = dict(common_params)
+        user_params.update({
+            't': user_ts,
+            'api': 'mtop.taobao.idlemessage.pc.loginuser.get',
+            'sign': generate_sign(user_ts, token, user_data),
+        })
+        probes.append({
+            'name': 'login_user_fetch',
+            'url': (
+                "https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.loginuser.get/1.0/?"
+                + urlencode(user_params)
+            ),
+            'body': f"data={quote_plus(user_data)}",
+        })
+
+        return probes
+
+    async def _execute_browser_auth_warmup_probe_async(
+        self,
+        context,
+        page,
+        probe: Dict[str, str],
+        *,
+        timeout_ms: int = 5000,
+    ) -> Dict[str, Any]:
+        effective_timeout_ms = max(1000, int(timeout_ms or 5000))
+        request_headers = {
+            'accept': 'application/json, text/plain, */*',
+            'content-type': 'application/x-www-form-urlencoded',
+        }
+
+        request_context = getattr(context, 'request', None) if context else None
+        request_post = getattr(request_context, 'post', None) if request_context else None
+        if callable(request_post):
+            try:
+                response = await request_post(
+                    probe['url'],
+                    data=probe.get('body') or '',
+                    headers=request_headers,
+                    timeout=effective_timeout_ms,
+                )
+                response_text = ''
+                try:
+                    response_text = str(await response.text() or '')
+                except Exception as body_err:
+                    logger.debug(
+                        f"【{self.account_id}】浏览器认证预热读取响应失败，继续沿用Cookie快照: "
+                        f"{self._safe_str(body_err)}"
+                    )
+                return {
+                    'ok': bool(getattr(response, 'ok', False)),
+                    'status': int(getattr(response, 'status', 0) or 0),
+                    'text': response_text[:600],
+                    'timed_out': False,
+                    'timeout_ms': effective_timeout_ms,
+                }
+            except Exception as request_err:
+                error_text = str(request_err)
+                error_name = type(request_err).__name__
+                timed_out = (
+                    'Timeout' in error_name or
+                    'timed out' in error_text.lower() or
+                    'timeout' in error_text.lower()
+                )
+                if timed_out or page is None:
+                    return {
+                        'ok': False,
+                        'status': 0,
+                        'error': error_text,
+                        'timed_out': timed_out,
+                        'timeout_ms': effective_timeout_ms,
+                    }
+                logger.debug(
+                    f"【{self.account_id}】浏览器认证预热 request.post 失败，回退到页面内 fetch: "
+                    f"{self._safe_str(request_err)}"
+                )
+
+        if page is None:
+            return {}
+
+        try:
+            return await page.evaluate(
+                """
+                async ({ url, body, timeoutMs }) => {
+                    let didTimeout = false;
+                    const controller = new AbortController();
+                    const timer = setTimeout(() => {
+                        didTimeout = true;
+                        controller.abort();
+                    }, timeoutMs);
+                    try {
+                        const resp = await fetch(url, {
+                            method: 'POST',
+                            credentials: 'include',
+                            cache: 'no-store',
+                            headers: {
+                                'accept': 'application/json, text/plain, */*',
+                                'content-type': 'application/x-www-form-urlencoded',
+                            },
+                            body,
+                            signal: controller.signal,
+                        });
+                        const text = await resp.text();
+                        return {
+                            ok: resp.ok,
+                            status: resp.status,
+                            text: text.slice(0, 600),
+                            timed_out: false,
+                            timeout_ms: timeoutMs,
+                        };
+                    } catch (error) {
+                        return {
+                            ok: false,
+                            status: 0,
+                            error: String((error && error.message) || error || ''),
+                            timed_out: didTimeout || String((error && error.name) || '') === 'AbortError',
+                            timeout_ms: timeoutMs,
+                        };
+                    } finally {
+                        clearTimeout(timer);
+                    }
+                }
+                """,
+                {
+                    "url": probe['url'],
+                    "body": probe.get('body') or '',
+                    "timeoutMs": effective_timeout_ms,
+                },
+            )
+        except Exception as page_eval_err:
+            return {
+                'ok': False,
+                'status': 0,
+                'error': self._safe_str(page_eval_err),
+                'timed_out': 'timeout' in str(page_eval_err).lower(),
+                'timeout_ms': effective_timeout_ms,
+            }
+
+    def _is_browser_auth_warmup_probe_success(
+        self,
+        probe_name: str,
+        probe_result: Dict[str, Any],
+    ) -> bool:
+        if not isinstance(probe_result, dict):
+            return False
+        if not probe_result.get('ok'):
+            return False
+
+        raw_text = str(probe_result.get('text') or '').strip()
+        if not raw_text:
+            return False
+
+        try:
+            payload = json.loads(raw_text)
+        except Exception:
+            return False
+
+        ret_items = payload.get('ret')
+        if isinstance(ret_items, list):
+            ret_values = [str(item) for item in ret_items if item is not None]
+        elif ret_items is None:
+            ret_values = []
+        else:
+            ret_values = [str(ret_items)]
+
+        if 'SUCCESS::调用成功' not in ' '.join(ret_values):
+            return False
+
+        data_payload = payload.get('data')
+        if not isinstance(data_payload, dict):
+            data_payload = {}
+
+        normalized_probe_name = str(probe_name or '').strip().lower()
+        if normalized_probe_name == 'login_token_fetch':
+            return bool(data_payload.get('accessToken'))
+        if normalized_probe_name == 'login_user_fetch':
+            return bool(data_payload.get('userId'))
+        return False
+
+    def _cache_auth_prewarmed_token_from_browser_probe_result(
+        self,
+        *,
+        account_id: str,
+        probe_name: str,
+        probe_result: Dict[str, Any],
+        token_source: Optional[str] = None,
+    ) -> Optional[str]:
+        if str(probe_name or '').strip().lower() != 'login_token_fetch':
+            return None
+        if not isinstance(probe_result, dict):
+            return None
+
+        raw_text = str(probe_result.get('text') or '').strip()
+        if not raw_text:
+            return None
+
+        try:
+            payload = json.loads(raw_text)
+        except Exception:
+            return None
+
+        data_payload = payload.get('data')
+        if not isinstance(data_payload, dict):
+            return None
+
+        access_token = str(data_payload.get('accessToken') or '').strip()
+        if not access_token:
+            return None
+
+        resolved_account_id = str(account_id or self._canonical_account_id() or '').strip()
+        if not resolved_account_id:
+            return None
+
+        resolved_source = str(token_source or 'qr_login_browser_handoff_login_token').strip()
+        resolved_app_key = str(
+            getattr(self, 'auth_prewarmed_app_key', None) or APP_CONFIG.get('app_key') or ''
+        ).strip() or None
+        resolved_device_id = str(getattr(self, 'device_id', None) or '').strip() or None
+
+        self.current_token = access_token
+        self.last_token_refresh_time = time.time()
+        if resolved_app_key:
+            self.auth_prewarmed_app_key = resolved_app_key
+
+        self.cache_auth_prewarmed_token(
+            resolved_account_id,
+            access_token,
+            source=resolved_source,
+            device_id=resolved_device_id,
+            app_key=resolved_app_key,
+        )
+        return access_token
+
+    def _extract_browser_auth_warmup_verification_url(
+        self,
+        probe_name: str,
+        probe_result: Dict[str, Any],
+    ) -> Optional[str]:
+        if str(probe_name or '').strip().lower() != 'login_token_fetch':
+            return None
+        if not isinstance(probe_result, dict):
+            return None
+
+        raw_text = str(probe_result.get('text') or '').strip()
+        if not raw_text:
+            return None
+
+        try:
+            payload = json.loads(raw_text)
+        except Exception:
+            return None
+
+        data_payload = payload.get('data')
+        if not isinstance(data_payload, dict):
+            return None
+
+        ret_items = payload.get('ret')
+        if isinstance(ret_items, list):
+            ret_values = [str(item) for item in ret_items if item is not None]
+        elif ret_items is None:
+            ret_values = []
+        else:
+            ret_values = [str(ret_items)]
+        ret_summary = " ".join(ret_values)
+        if 'FAIL_SYS_USER_VALIDATE' not in ret_summary and 'FAIL_SYS_SESSION_EXPIRED' not in ret_summary:
+            return None
+
+        verification_url = str(data_payload.get('url') or '').strip()
+        return verification_url or None
+
+    async def _prewarm_auth_token_in_browser_context_async(
+        self,
+        context,
+        page,
+        *,
+        scene: str,
+        initial_cookies_dict: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        best_cookies = dict(initial_cookies_dict or {})
+        if not best_cookies:
+            try:
+                best_cookies = await self._snapshot_browser_context_cookies_async(context)
+            except Exception as snapshot_err:
+                logger.warning(
+                    f"【{self.account_id}】{scene} 初始Cookie快照失败，跳过浏览器内Token预热: "
+                    f"{self._safe_str(snapshot_err)}"
+                )
+                best_cookies = {}
+
+        probe_requests = self._build_browser_auth_warmup_probe_requests(best_cookies)
+        if not probe_requests or context is None or page is None:
+            return {
+                'token_prewarmed': False,
+                'token_source': None,
+                'probe_status': {},
+                'cookies_dict': best_cookies,
+            }
+
+        probe_status: Dict[str, bool] = {}
+        token_prewarmed = False
+        token_source = None
+        verification_url = None
+
+        for probe in probe_requests:
+            probe_name = str(probe.get('name') or 'unknown_probe')
+            try:
+                logger.info(f"【{self.account_id}】{scene} 浏览器内认证预热探测: {probe_name}")
+                probe_result = await self._execute_browser_auth_warmup_probe_async(
+                    context,
+                    page,
+                    probe,
+                )
+                summary = str(
+                    probe_result.get('error')
+                    or probe_result.get('text')
+                    or ''
+                ).replace('\n', ' ')[:220]
+                logger.info(
+                    f"【{self.account_id}】{scene} 浏览器内认证预热结果[{probe_name}]: "
+                    f"status={probe_result.get('status')} ok={probe_result.get('ok')} summary={summary}"
+                )
+
+                if not verification_url:
+                    verification_url = self._extract_browser_auth_warmup_verification_url(
+                        probe_name,
+                        probe_result,
+                    )
+
+                if self._is_browser_auth_warmup_probe_success(probe_name, probe_result):
+                    probe_status[probe_name] = True
+
+                cached_token = self._cache_auth_prewarmed_token_from_browser_probe_result(
+                    account_id=self._canonical_account_id(),
+                    probe_name=probe_name,
+                    probe_result=probe_result,
+                    token_source=probe.get('token_source'),
+                )
+                if cached_token:
+                    token_prewarmed = True
+                    token_source = str(probe.get('token_source') or '').strip() or None
+            except Exception as probe_err:
+                logger.warning(
+                    f"【{self.account_id}】{scene} 浏览器内认证预热[{probe_name}]失败: "
+                    f"{self._safe_str(probe_err)}"
+                )
+                continue
+
+            await asyncio.sleep(1.0)
+            wait_for_load_state = getattr(page, "wait_for_load_state", None)
+            if callable(wait_for_load_state):
+                try:
+                    await wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+            await asyncio.sleep(0.5)
+
+            try:
+                current_cookies = await self._snapshot_browser_context_cookies_async(context)
+            except Exception as snapshot_err:
+                logger.warning(
+                    f"【{self.account_id}】{scene} 浏览器内认证预热[{probe_name}]后Cookie快照失败: "
+                    f"{self._safe_str(snapshot_err)}"
+                )
+                current_cookies = {}
+            if current_cookies and len(current_cookies) >= len(best_cookies):
+                best_cookies = current_cookies
+
+        return {
+            'token_prewarmed': token_prewarmed,
+            'token_source': token_source,
+            'probe_status': probe_status,
+            'cookies_dict': best_cookies,
+            'verification_url': verification_url,
+        }
 
     async def _run_browser_cookie_stabilization_action_async(
         self,

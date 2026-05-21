@@ -685,6 +685,31 @@ class _FakeQrRefreshPrewarmSuccessLive(_FakeQrRefreshSuccessLive):
         return "prewarmed_token"
 
 
+class _FakeQrRefreshAuthPrewarmSuccessLive(_FakeQrRefreshSuccessLive):
+    @staticmethod
+    def mark_qr_login_grace(*_args, **_kwargs):
+        return None
+
+    @staticmethod
+    def clear_qr_login_grace(*_args, **_kwargs):
+        return None
+
+    @staticmethod
+    def clear_qr_prewarmed_token(*_args, **_kwargs):
+        return None
+
+    @staticmethod
+    def clear_auth_prewarmed_token(*_args, **_kwargs):
+        return None
+
+    async def refresh_cookies_from_qr_login(self, **kwargs):
+        _ = kwargs
+        self.cookies_str = "unb=test_user; cookie2=real_cookie2"
+        self.last_qr_handoff_token_prewarmed = True
+        self.last_qr_handoff_token_source = "qr_login_browser_handoff_login_token"
+        return True
+
+
 class ReplyServerProcessQrLoginCookiesTest(unittest.TestCase):
     def test_process_qr_login_cookies_raises_and_never_saves_raw_cookie_when_real_cookie_flow_fails(self):
         current_user = {"user_id": 1, "username": "admin"}
@@ -865,6 +890,59 @@ class ReplyServerProcessQrLoginCookiesTest(unittest.TestCase):
         fake_manager.update_cookie.assert_not_called()
         delete_cookie_mock.assert_not_called()
         update_cookie_mock.assert_not_called()
+
+    def test_process_qr_login_cookies_marks_token_prewarmed_when_qr_handoff_already_prewarms_in_same_runtime(self):
+        current_user = {"user_id": 1, "username": "admin"}
+        fake_loop = SimpleNamespace(
+            is_closed=mock.Mock(return_value=False),
+            is_running=mock.Mock(return_value=True),
+        )
+        add_cookie_async = mock.AsyncMock(return_value=None)
+        fake_manager = SimpleNamespace(
+            cookies={},
+            add_cookie=mock.Mock(),
+            update_cookie=mock.Mock(),
+            _add_cookie_async=add_cookie_async,
+            loop=fake_loop,
+        )
+
+        async def run_on_manager_loop(account_id, coroutine_factory, timeout=None, cancel_on_timeout=True):
+            _ = account_id, timeout, cancel_on_timeout
+            return await coroutine_factory()
+
+        with mock.patch("XianyuAutoAsync.XianyuLive", _FakeQrRefreshAuthPrewarmSuccessLive), \
+             mock.patch.object(reply_server.db_manager, "get_all_cookies", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_binding_info", return_value={"bound_unb": "", "bind_status": "pending_bind"}), \
+             mock.patch.object(reply_server.db_manager, "assert_cookie_belongs_to_user", return_value=True), \
+             mock.patch.object(reply_server.db_manager, "bind_cookie_account_unb", return_value=True), \
+             mock.patch.object(
+                 reply_server.db_manager,
+                 "get_cookie_by_id",
+                 return_value={"cookies_str": "unb=test_user; cookie2=real_cookie2"},
+             ), \
+             mock.patch.object(reply_server.db_manager, "add_risk_control_log", return_value=None), \
+             mock.patch.object(reply_server.db_manager, "update_risk_control_log"), \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "_run_live_instance_on_manager_loop", side_effect=run_on_manager_loop), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(
+                reply_server.process_qr_login_cookies(
+                    "test_user",
+                    "unb=test_user; cookie2=test_cookie2",
+                    "test_user",
+                    current_user,
+                )
+            )
+
+        self.assertEqual(result["account_id"], "test_user")
+        self.assertTrue(result["task_restarted"])
+        self.assertTrue(result["token_prewarmed"])
+        self.assertIsNone(result["warning_message"])
+        add_cookie_async.assert_awaited_once_with(
+            "test_user",
+            "unb=test_user; cookie2=real_cookie2",
+            user_id=1,
+        )
 
 
 class _FakePasswordLoginSlider:

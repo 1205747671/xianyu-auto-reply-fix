@@ -6,8 +6,6 @@ from pydantic import BaseModel
 from typing import List, Tuple, Optional, Dict, Any, Callable, Awaitable
 from pathlib import Path
 from urllib.parse import unquote
-from urllib import request as urllib_request, error as urllib_error
-import hashlib
 import inspect
 import secrets
 import time
@@ -152,283 +150,6 @@ ORDER_SALES_TIME_SQL = "COALESCE(NULLIF(platform_paid_at, ''), NULLIF(platform_c
 ORDER_HISTORY_SYNC_JOB_RETENTION_SECONDS = 3600
 order_history_sync_jobs: Dict[str, Dict[str, Any]] = {}
 order_history_sync_tasks: Dict[str, asyncio.Task] = {}
-ANNOUNCEMENT_CACHE_TTL_SECONDS = 300
-announcement_cache: Dict[str, Any] = {
-    'expires_at': 0.0,
-    'current': None,
-    'history': [],
-    'last_success_current': None,
-    'last_success_history': [],
-    'has_remote_success': False,
-}
-
-
-def _get_announcement_remote_url() -> str:
-    configured_url = str(os.getenv('DASHBOARD_ANNOUNCEMENT_URL') or '').strip()
-    if configured_url:
-        return configured_url
-
-    owner = str(os.getenv('UPDATE_GITHUB_OWNER') or 'GuDong2003').strip() or 'GuDong2003'
-    repo = str(os.getenv('UPDATE_GITHUB_REPO') or 'xianyu-auto-reply-fix').strip() or 'xianyu-auto-reply-fix'
-    branch = str(os.getenv('DASHBOARD_ANNOUNCEMENT_BRANCH') or 'main').strip() or 'main'
-    file_path = str(os.getenv('DASHBOARD_ANNOUNCEMENT_FILE') or 'announcement.json').strip().lstrip('/')
-    return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file_path}"
-
-
-def _get_announcement_local_path() -> Path:
-    file_path = str(os.getenv('DASHBOARD_ANNOUNCEMENT_FILE') or 'announcement.json').strip().lstrip('/')
-    return Path(__file__).parent / file_path
-
-
-def _parse_announcement_datetime(value: Any) -> Optional[datetime]:
-    raw_value = str(value or '').strip()
-    if not raw_value:
-        return None
-
-    normalized_value = raw_value.replace('Z', '+00:00') if raw_value.endswith('Z') else raw_value
-    try:
-        parsed = datetime.fromisoformat(normalized_value)
-    except ValueError:
-        return None
-
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=LOCAL_TIMEZONE)
-    return parsed.astimezone(LOCAL_TIMEZONE)
-
-
-def _build_announcement_id(payload: Dict[str, Any]) -> str:
-    raw_id = str(payload.get('id') or '').strip()
-    if raw_id:
-        return raw_id
-
-    stable_source = json.dumps(
-        {
-            'level': str(payload.get('level') or '').strip(),
-            'title': str(payload.get('title') or '').strip(),
-            'message': str(payload.get('message') or '').strip(),
-            'action_text': str(payload.get('action_text') or '').strip(),
-            'action_type': str(payload.get('action_type') or '').strip(),
-            'action_url': str(payload.get('action_url') or '').strip(),
-            'dismissible': payload.get('dismissible', True),
-            'start_at': str(payload.get('start_at') or '').strip(),
-            'end_at': str(payload.get('end_at') or '').strip(),
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-    return f"announcement-{hashlib.sha1(stable_source.encode('utf-8')).hexdigest()[:12]}"
-
-
-def _coerce_announcement_bool(value: Any, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-
-    normalized = str(value).strip().lower()
-    if normalized in {'1', 'true', 'yes', 'y', 'on', 'enabled'}:
-        return True
-    if normalized in {'0', 'false', 'no', 'n', 'off', 'disabled', ''}:
-        return False
-    return default
-
-
-def _empty_dashboard_announcement_snapshot() -> Dict[str, Any]:
-    return {
-        'current': None,
-        'history': [],
-    }
-
-
-def _normalize_dashboard_announcement_entry(payload: Any) -> Optional[Dict[str, Any]]:
-    if not isinstance(payload, dict):
-        return None
-
-    enabled = _coerce_announcement_bool(payload.get('enabled'), default=False)
-    start_at = _parse_announcement_datetime(payload.get('start_at'))
-    end_at = _parse_announcement_datetime(payload.get('end_at'))
-    title = str(payload.get('title') or '').strip()
-    message = str(payload.get('message') or '').strip()
-    if not title and not message:
-        return None
-
-    level = str(payload.get('level') or 'info').strip().lower()
-    if level not in {'info', 'success', 'warning', 'danger'}:
-        level = 'info'
-
-    action_type = str(payload.get('action_type') or '').strip().lower()
-    if action_type not in {'', 'url', 'changelog', 'update'}:
-        action_type = ''
-
-    action_url = str(payload.get('action_url') or '').strip()
-    if action_type == 'url' and not action_url:
-        action_type = ''
-
-    action_text = str(payload.get('action_text') or '').strip()
-    if action_type and not action_text:
-        action_text = '查看详情' if action_type == 'url' else '立即查看'
-    if not action_type:
-        action_text = ''
-
-    published_at = _parse_announcement_datetime(payload.get('published_at'))
-    now = get_local_now()
-    if not enabled:
-        status = 'disabled'
-    elif start_at and now < start_at:
-        status = 'scheduled'
-    elif end_at and now > end_at:
-        status = 'expired'
-    else:
-        status = 'active'
-
-    return {
-        'id': _build_announcement_id(payload),
-        'enabled': enabled,
-        'status': status,
-        'level': level,
-        'title': title,
-        'message': message,
-        'action_text': action_text,
-        'action_type': action_type,
-        'action_url': action_url,
-        'dismissible': _coerce_announcement_bool(payload.get('dismissible'), default=True),
-        'published_at': published_at.isoformat() if published_at else '',
-        'start_at': start_at.isoformat() if start_at else '',
-        'end_at': end_at.isoformat() if end_at else '',
-    }
-
-
-def _normalize_dashboard_announcement_snapshot(payload: Any) -> Optional[Dict[str, Any]]:
-    announcements_payload = payload if isinstance(payload, list) else payload.get('announcements') if isinstance(payload, dict) else None
-    if not isinstance(announcements_payload, list):
-        return None
-
-    history: List[Dict[str, Any]] = []
-    for item in announcements_payload:
-        normalized_item = _normalize_dashboard_announcement_entry(item)
-        if normalized_item:
-            history.append(normalized_item)
-
-    history.sort(
-        key=lambda item: item.get('published_at') or item.get('start_at') or item.get('end_at') or '',
-        reverse=True,
-    )
-
-    current_id = ''
-    for item in history:
-        if item.get('status') == 'active':
-            current_id = str(item.get('id') or '').strip()
-            break
-
-    normalized_history: List[Dict[str, Any]] = []
-    current_announcement: Optional[Dict[str, Any]] = None
-    for item in history:
-        normalized_item = dict(item)
-        normalized_item['is_current'] = bool(current_id and normalized_item.get('id') == current_id)
-        normalized_history.append(normalized_item)
-        if normalized_item['is_current'] and current_announcement is None:
-            current_announcement = dict(normalized_item)
-
-    return {
-        'current': current_announcement,
-        'history': normalized_history,
-    }
-
-
-def _try_load_dashboard_announcement_snapshot_from_remote() -> Tuple[bool, Optional[Dict[str, Any]]]:
-    remote_url = _get_announcement_remote_url()
-    try:
-        request = urllib_request.Request(
-            remote_url,
-            headers={
-                'User-Agent': 'XianyuDashboardAnnouncement/1.0',
-                'Accept': 'application/json',
-            }
-        )
-        with urllib_request.urlopen(request, timeout=8) as response:
-            status_code = getattr(response, 'status', 200)
-            if status_code != 200:
-                logger.warning(f"获取远端公告失败: http_status={status_code}, url={remote_url}")
-                return False, None
-            raw_content = response.read().decode('utf-8')
-    except urllib_error.HTTPError as exc:
-        logger.warning(f"获取远端公告失败: http_status={exc.code}, url={remote_url}")
-        return False, None
-    except Exception as exc:
-        logger.warning(f"获取远端公告异常: url={remote_url}, error={mask_sensitive_text(exc)}")
-        return False, None
-
-    try:
-        payload = json.loads(raw_content)
-    except json.JSONDecodeError as exc:
-        logger.warning(f"解析远端公告失败: url={remote_url}, error={exc}")
-        return False, None
-
-    snapshot = _normalize_dashboard_announcement_snapshot(payload)
-    if snapshot is None:
-        logger.warning(f"远端公告格式无效: url={remote_url}")
-        return False, None
-
-    return True, snapshot
-
-
-def _try_load_dashboard_announcement_snapshot_from_local() -> Optional[Dict[str, Any]]:
-    local_path = _get_announcement_local_path()
-    if not local_path.exists():
-        return None
-
-    try:
-        payload = json.loads(local_path.read_text(encoding='utf-8'))
-    except Exception as exc:
-        logger.warning(f"读取本地公告文件失败: path={local_path}, error={mask_sensitive_text(exc)}")
-        return None
-
-    snapshot = _normalize_dashboard_announcement_snapshot(payload)
-    if snapshot is None:
-        logger.warning(f"本地公告格式无效: path={local_path}")
-        return None
-
-    return snapshot
-
-
-def _get_dashboard_announcement_payload(force_refresh: bool = False) -> Dict[str, Any]:
-    now_ts = time.time()
-    if not force_refresh and announcement_cache.get('expires_at', 0) > now_ts:
-        return {
-            'current': announcement_cache.get('current'),
-            'history': list(announcement_cache.get('history') or []),
-        }
-
-    loaded_remote, remote_snapshot = _try_load_dashboard_announcement_snapshot_from_remote()
-    if loaded_remote and remote_snapshot is not None:
-        announcement_cache.update({
-            'expires_at': now_ts + ANNOUNCEMENT_CACHE_TTL_SECONDS,
-            'current': remote_snapshot.get('current'),
-            'history': list(remote_snapshot.get('history') or []),
-            'last_success_current': remote_snapshot.get('current'),
-            'last_success_history': list(remote_snapshot.get('history') or []),
-            'has_remote_success': True,
-        })
-        return remote_snapshot
-
-    if announcement_cache.get('has_remote_success'):
-        snapshot = {
-            'current': announcement_cache.get('last_success_current'),
-            'history': list(announcement_cache.get('last_success_history') or []),
-        }
-    else:
-        snapshot = _try_load_dashboard_announcement_snapshot_from_local() or _empty_dashboard_announcement_snapshot()
-
-    announcement_cache.update({
-        'expires_at': now_ts + ANNOUNCEMENT_CACHE_TTL_SECONDS,
-        'current': snapshot.get('current'),
-        'history': list(snapshot.get('history') or []),
-    })
-    return snapshot
-
-
 def mask_sensitive_text(text: Any) -> str:
     raw_text = str(text or '')
     masked_text = raw_text
@@ -3262,31 +2983,6 @@ async def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current
             'runtime_status': await _build_live_runtime_status(account_id),
         })
     return result
-
-
-@app.get("/api/announcement")
-def get_dashboard_announcement(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """获取仪表盘公告，优先读取 GitHub 公告文件，本地文件兜底。"""
-    try:
-        _ = current_user['user_id']
-        snapshot = _get_dashboard_announcement_payload()
-        return {
-            'success': True,
-            'announcement': snapshot.get('current'),
-            'current': snapshot.get('current'),
-            'history': snapshot.get('history') or [],
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"获取仪表盘公告失败: {mask_sensitive_text(e)}")
-        return {
-            'success': False,
-            'announcement': None,
-            'current': None,
-            'history': [],
-            'message': safe_client_error("获取公告失败，请稍后重试"),
-        }
 
 
 @app.post("/accounts")
@@ -6950,24 +6646,30 @@ async def process_qr_login_cookies(
 
                     XianyuLive.mark_qr_login_grace(account_id, stage='real_cookie_ready')
 
-                    token_prewarmed = False
+                    token_prewarmed = bool(getattr(temp_instance, 'last_qr_handoff_token_prewarmed', False))
+                    token_prewarm_source = str(
+                        getattr(temp_instance, 'last_qr_handoff_token_source', '') or ''
+                    ).strip() or None
                     task_restarted = False
                     task_switch_in_progress = False
                     warning_message = None
                     final_cookies = temp_instance.cookies_str or real_cookies
 
-                    # 不在扫码 handoff 阶段同步 refresh_token：
-                    # 1. 这会让临时实例和正式账号实例并发抢同一个 account_id 的验证码/滑块槽位；
-                    # 2. asyncio.wait_for() 超时取消时，Playwright/滑块资源容易残留；
-                    # 3. API check 接口会在 confirmed -> success 之间被这段同步预热拖慢。
-                    #
-                    # 真实 Cookie 已经落库，后续直接交给 CookieManager 拉起的正式实例按 account_id
-                    # 复用同一 persistent profile 继续做首次 token 初始化更稳。
-                    log_with_user(
-                        'info',
-                        f"跳过扫码登录阶段的同步Token预热，直接进入账号任务接管: {account_id}",
-                        current_user,
-                    )
+                    if token_prewarmed:
+                        log_with_user(
+                            'info',
+                            (
+                                f"扫码登录已在同账号浏览器环境完成Token预热，将直接交接预热Token给正式实例: "
+                                f"{account_id}, source={token_prewarm_source or 'unknown'}"
+                            ),
+                            current_user,
+                        )
+                    else:
+                        log_with_user(
+                            'info',
+                            f"扫码登录阶段未拿到可复用预热Token，直接进入账号任务接管: {account_id}",
+                            current_user,
+                        )
 
                     try:
                         manager_runtime_issue = _get_cookie_manager_runtime_issue()
@@ -7026,7 +6728,7 @@ async def process_qr_login_cookies(
                             )
                         else:
                             if token_prewarmed:
-                                XianyuLive.clear_qr_prewarmed_token(account_id)
+                                XianyuLive.clear_auth_prewarmed_token(account_id)
                             XianyuLive.clear_qr_login_grace(account_id)
                             warning_message = f"真实Cookie已获取，但切换账号任务失败: {str(task_switch_e)}"
                         log_with_user('warning', f"{warning_message}: {account_id}", current_user)
@@ -7034,7 +6736,7 @@ async def process_qr_login_cookies(
                     if not task_restarted:
                         if not task_switch_in_progress:
                             if token_prewarmed:
-                                XianyuLive.clear_qr_prewarmed_token(account_id)
+                                XianyuLive.clear_auth_prewarmed_token(account_id)
                             XianyuLive.clear_qr_login_grace(account_id)
                         if not warning_message:
                             warning_message = _build_task_restart_warning(_get_cookie_manager_runtime_issue())
@@ -12709,391 +12411,13 @@ async def refresh_order_status(
         return {"success": False, "updated": False, "message": f"刷新失败: {str(e)}"}
 
 
-# ==================== 自动更新接口 ====================
-
-from auto_updater import get_updater, UpdateStatus, init_updater
-from pydantic import BaseModel as PydanticBaseModel
-
-class UpdateCheckResponse(PydanticBaseModel):
-    """更新检查响应"""
-    has_update: bool
-    current_version: str
-    new_version: str = ""
-    description: str = ""
-    changelog: list = []
-    files_count: int = 0
-    total_size: int = 0
-    release_date: str = ""
-
-
-class UpdateProgressResponse(PydanticBaseModel):
-    """更新进度响应"""
-    status: str
-    current_file: str = ""
-    current_index: int = 0
-    total_files: int = 0
-    downloaded_bytes: int = 0
-    total_bytes: int = 0
-    message: str = ""
-    error: str = ""
-
-
-class UpdateResultResponse(PydanticBaseModel):
-    """更新结果响应"""
-    success: bool
-    message: str
-    updated_files: list = []
-    deleted_files: list = []
-    needs_restart: bool = False
-    new_version: str = ""
-
-
-def _is_auto_update_enabled() -> bool:
-    """热更新功能已移除，始终保持关闭。"""
-    return False
-
-
-def _ensure_auto_update_enabled():
-    """统一拦截历史热更新接口，兼容旧前端缓存页面。"""
-    raise HTTPException(status_code=403, detail="热更新功能已移除，请改为手动部署更新代码")
-
-
-@app.get('/api/update/check')
-async def check_for_updates(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """
-    检查是否有可用更新
-    
-    返回更新信息，包括新版本号、更新内容等
-    """
-    try:
-        _ensure_auto_update_enabled()
-        updater = get_updater()
-        manifest = await updater.check_for_updates()
-        
-        if manifest is None:
-            return {
-                "success": True,
-                "data": {
-                    "has_update": False,
-                    "current_version": updater.current_version,
-                    "message": "已是最新版本"
-                }
-            }
-        
-        # 获取需要更新的文件
-        files_to_update = await updater.get_files_to_update(manifest)
-        files_to_delete = await updater.get_files_to_delete(manifest)
-        total_size = sum(f.size for f in files_to_update)
-
-        if not files_to_update and not files_to_delete:
-            return {
-                "success": True,
-                "data": {
-                    "has_update": False,
-                    "current_version": updater.current_version,
-                    "message": "已是最新版本"
-                }
-            }
-        
-        return {
-            "success": True,
-            "data": {
-                "has_update": True,
-                "current_version": updater.current_version,
-                "new_version": manifest.version,
-                "description": manifest.description,
-                "changelog": manifest.changelog or [],
-                "files_count": len(files_to_update),
-                "deleted_files_count": len(files_to_delete),
-                "total_size": total_size,
-                "release_date": manifest.release_date,
-                "files": [
-                    {
-                        "path": f.path,
-                        "size": f.size,
-                        "requires_restart": f.requires_restart,
-                        "description": f.description
-                    }
-                    for f in files_to_update
-                ],
-                "deleted_files": [
-                    {
-                        "path": f.path,
-                        "requires_restart": f.requires_restart,
-                        "description": f.description
-                    }
-                    for f in files_to_delete
-                ]
-            }
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"检查更新失败: {e}")
-        return {
-            "success": False,
-            "message": f"检查更新失败: {str(e)}"
-        }
-
-
-@app.post('/api/update/apply')
-async def apply_updates(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """
-    应用更新
-    
-    下载并安装所有可用更新
-    """
-    try:
-        _ensure_auto_update_enabled()
-        # 只允许管理员执行更新，兼容历史 admin 用户名判断
-        if not current_user.get('is_admin') and current_user.get('username') != 'admin':
-            raise HTTPException(status_code=403, detail="只有管理员可以执行更新")
-        
-        updater = get_updater()
-        
-        log_with_user('info', "开始执行自动更新", current_user)
-        
-        result = await updater.perform_update()
-        
-        if result["success"]:
-            log_with_user('info', f"更新完成: {result['message']}", current_user)
-        else:
-            log_with_user('error', f"更新失败: {result['message']}", current_user)
-        
-        return {
-            "success": result["success"],
-            "data": result
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"应用更新失败: {e}")
-        return {
-            "success": False,
-            "message": f"应用更新失败: {str(e)}"
-        }
-
-
-@app.get('/api/update/progress')
-async def get_update_progress(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """
-    获取更新进度
-    
-    返回当前更新状态和进度信息
-    """
-    try:
-        _ensure_auto_update_enabled()
-        updater = get_updater()
-        progress = updater.progress
-        
-        return {
-            "success": True,
-            "data": {
-                "status": progress.status.value,
-                "current_file": progress.current_file,
-                "current_index": progress.current_index,
-                "total_files": progress.total_files,
-                "downloaded_bytes": progress.downloaded_bytes,
-                "total_bytes": progress.total_bytes,
-                "message": progress.message,
-                "error": progress.error
-            }
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"获取更新进度失败: {e}")
-        return {
-            "success": False,
-            "message": f"获取更新进度失败: {str(e)}"
-        }
-
-
-@app.get('/api/update/local-hashes')
-async def get_local_file_hashes(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """
-    获取本地文件哈希值
-    
-    用于服务端比对哪些文件需要更新
-    """
-    try:
-        _ensure_auto_update_enabled()
-        # 只允许管理员查看（检查username是否为admin）
-        if current_user.get('username') != 'admin':
-            raise HTTPException(status_code=403, detail="只有管理员可以查看文件哈希")
-        
-        updater = get_updater()
-        hashes = updater.get_local_file_hashes()
-        
-        return {
-            "success": True,
-            "data": {
-                "version": updater.current_version,
-                "files": hashes,
-                "count": len(hashes)
-            }
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"获取文件哈希失败: {e}")
-        return {
-            "success": False,
-            "message": f"获取文件哈希失败: {str(e)}"
-        }
-
-
-@app.post('/api/update/cleanup-backups')
-async def cleanup_old_backups(days: int = 7, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """
-    清理旧的备份文件
-    
-    Args:
-        days: 保留天数，默认7天
-    """
-    try:
-        _ensure_auto_update_enabled()
-        # 只允许管理员执行（检查username是否为admin）
-        if current_user.get('username') != 'admin':
-            raise HTTPException(status_code=403, detail="只有管理员可以清理备份")
-        
-        updater = get_updater()
-        updater.cleanup_old_backups(keep_days=days)
-        
-        log_with_user('info', f"清理了 {days} 天前的备份文件", current_user)
-        
-        return {
-            "success": True,
-            "message": f"已清理 {days} 天前的备份文件"
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"清理备份失败: {e}")
-        return {
-            "success": False,
-            "message": f"清理备份失败: {str(e)}"
-        }
-
-
-@app.get('/api/update/file-changes')
-async def get_file_changes(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """
-    比较当前文件与上次更新后的哈希清单
-    
-    用于检测哪些文件在更新后被本地修改过
-    """
-    try:
-        _ensure_auto_update_enabled()
-        # 只允许管理员查看
-        if current_user.get('username') != 'admin':
-            raise HTTPException(status_code=403, detail="只有管理员可以查看文件变化")
-        
-        updater = get_updater()
-        result = updater.compare_file_hashes()
-        
-        return {
-            "success": True,
-            "data": result
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"比较文件变化失败: {e}")
-        return {
-            "success": False,
-            "message": f"比较文件变化失败: {str(e)}"
-        }
-
-
-@app.post('/api/update/save-hashes')
-async def save_current_hashes(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """
-    手动保存当前文件的哈希清单
-    
-    用于记录当前状态，以便以后比较
-    """
-    try:
-        _ensure_auto_update_enabled()
-        # 只允许管理员执行
-        if current_user.get('username') != 'admin':
-            raise HTTPException(status_code=403, detail="只有管理员可以保存哈希清单")
-        
-        updater = get_updater()
-        updater.save_file_hashes(updater.current_version)
-        
-        log_with_user('info', "手动保存文件哈希清单", current_user)
-        
-        return {
-            "success": True,
-            "message": "文件哈希清单已保存"
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"保存哈希清单失败: {e}")
-        return {
-            "success": False,
-            "message": f"保存哈希清单失败: {str(e)}"
-        }
-
-
-@app.get('/api/update/saved-hashes')
-async def get_saved_hashes(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """
-    获取上次保存的文件哈希清单
-    """
-    try:
-        _ensure_auto_update_enabled()
-        # 只允许管理员查看
-        if current_user.get('username') != 'admin':
-            raise HTTPException(status_code=403, detail="只有管理员可以查看哈希清单")
-        
-        updater = get_updater()
-        saved_hashes = updater.load_file_hashes()
-        
-        if saved_hashes is None:
-            return {
-                "success": True,
-                "data": None,
-                "message": "没有保存的哈希清单"
-            }
-        
-        return {
-            "success": True,
-            "data": {
-                "version": saved_hashes.get("version"),
-                "updated_at": saved_hashes.get("updated_at"),
-                "total_files": saved_hashes.get("total_files"),
-                "last_updated_files": saved_hashes.get("last_updated_files", []),
-                "last_updated_count": saved_hashes.get("last_updated_count", 0)
-            }
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"获取哈希清单失败: {e}")
-        return {
-            "success": False,
-            "message": f"获取哈希清单失败: {str(e)}"
-        }
-
-
 @app.post('/api/update/restart')
 async def restart_application(current_user: Dict[str, Any] = Depends(get_current_user)):
     """
     重启应用
 
     注意：历史上复用了 /api/update/restart 路径，
-    但这里保留的是管理员手动重启能力，不属于热更新。
+    但这里保留的是管理员手动重启能力。
     """
     try:
         # 只允许管理员执行

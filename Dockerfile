@@ -12,12 +12,9 @@ ARG https_proxy
 ARG no_proxy
 
 # 设置标签信息
-LABEL maintainer="GuDong2003"
 LABEL version="2.1.0"
-LABEL description="闲鱼管理系统 - GuDong2003 维护版本，支持多用户、多账号与自动化管理"
-LABEL repository="https://github.com/GuDong2003/xianyu-auto-reply-fix"
+LABEL description="闲鱼管理系统正式版，支持多用户、多账号与自动化管理"
 LABEL license="仅供学习与研究使用，禁止商业用途"
-LABEL author="GuDong2003"
 LABEL build-date=""
 LABEL vcs-ref=""
 

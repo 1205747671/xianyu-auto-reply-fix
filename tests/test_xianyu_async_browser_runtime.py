@@ -4206,6 +4206,284 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             "missing canonical account_id for token preflight",
         )
 
+    async def test_prewarm_auth_token_in_browser_context_async_caches_token_and_updates_cookie_snapshot(self):
+        class _FakeApiResponse:
+            def __init__(self, ok, status, text):
+                self.ok = ok
+                self.status = status
+                self._text = text
+
+            async def text(self):
+                return self._text
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "qr-browser-prewarm-account"
+        live._legacy_cookie_id = "qr-browser-prewarm-account"
+        live.device_id = "browser-runtime-device-id"
+        live.current_token = None
+        live.last_token_refresh_time = 0
+        live.auth_prewarmed_app_key = None
+        live._safe_str = str
+        live._snapshot_browser_context_cookies_async = mock.AsyncMock(
+            side_effect=[
+                {
+                    "unb": "user-1",
+                    "cookie2": "cookie2-1",
+                    "sgcookie": "sg-1",
+                    "_m_h5_tk": "token-1_123",
+                    "_m_h5_tk_enc": "enc-1",
+                    "t": "t-1",
+                    "x5sec": "x5-1",
+                    "_tb_token_": "tb-token-1",
+                },
+                {
+                    "unb": "user-1",
+                    "cookie2": "cookie2-1",
+                    "sgcookie": "sg-1",
+                    "_m_h5_tk": "token-1_123",
+                    "_m_h5_tk_enc": "enc-1",
+                    "t": "t-1",
+                    "x5sec": "x5-1",
+                    "_tb_token_": "tb-token-1",
+                    "cna": "cna-1",
+                },
+            ]
+        )
+
+        request_context = types.SimpleNamespace(
+            post=mock.AsyncMock(
+                side_effect=[
+                    _FakeApiResponse(
+                        True,
+                        200,
+                        json.dumps(
+                            {
+                                "ret": ["SUCCESS::调用成功"],
+                                "data": {"accessToken": "oauth_qr_browser_token"},
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ),
+                    _FakeApiResponse(
+                        True,
+                        200,
+                        json.dumps(
+                            {
+                                "ret": ["SUCCESS::调用成功"],
+                                "data": {"userId": "user-1"},
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ),
+                ]
+            )
+        )
+        context = types.SimpleNamespace(request=request_context)
+        page = types.SimpleNamespace(
+            wait_for_load_state=mock.AsyncMock(return_value=None),
+            evaluate=mock.AsyncMock(
+                side_effect=AssertionError("should use context.request.post before page.evaluate fallback")
+            ),
+        )
+
+        with mock.patch.object(XianyuLive, "cache_auth_prewarmed_token") as cache_token, \
+             mock.patch("XianyuAutoAsync.asyncio.sleep", new=mock.AsyncMock()):
+            result = await live._prewarm_auth_token_in_browser_context_async(
+                context,
+                page,
+                scene="扫码登录交接前",
+                initial_cookies_dict={
+                    "unb": "user-1",
+                    "cookie2": "cookie2-1",
+                    "sgcookie": "sg-1",
+                    "_m_h5_tk": "token-1_123",
+                    "_m_h5_tk_enc": "enc-1",
+                    "t": "t-1",
+                    "x5sec": "x5-1",
+                },
+            )
+
+        self.assertTrue(result["token_prewarmed"])
+        self.assertEqual(result["token_source"], "qr_login_browser_handoff_login_token")
+        self.assertEqual(result["probe_status"]["login_token_fetch"], True)
+        self.assertEqual(result["probe_status"]["login_user_fetch"], True)
+        self.assertEqual(result["cookies_dict"]["cna"], "cna-1")
+        self.assertEqual(live.current_token, "oauth_qr_browser_token")
+        cache_token.assert_called_once_with(
+            "qr-browser-prewarm-account",
+            "oauth_qr_browser_token",
+            source="qr_login_browser_handoff_login_token",
+            device_id="browser-runtime-device-id",
+            app_key=XianyuAutoAsync.APP_CONFIG.get("app_key"),
+        )
+
+    async def test_prewarm_auth_token_in_browser_context_async_returns_without_token_when_browser_probe_fails(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "qr-browser-prewarm-fail"
+        live._legacy_cookie_id = "qr-browser-prewarm-fail"
+        live.device_id = "browser-runtime-device-id"
+        live.current_token = None
+        live.last_token_refresh_time = 0
+        live.auth_prewarmed_app_key = None
+        live._safe_str = str
+        live._snapshot_browser_context_cookies_async = mock.AsyncMock(
+            side_effect=[
+                {
+                    "unb": "user-1",
+                    "cookie2": "cookie2-1",
+                    "sgcookie": "sg-1",
+                    "_m_h5_tk": "token-1_123",
+                    "_m_h5_tk_enc": "enc-1",
+                    "t": "t-1",
+                    "x5sec": "x5-1",
+                },
+                {
+                    "unb": "user-1",
+                    "cookie2": "cookie2-1",
+                    "sgcookie": "sg-1",
+                    "_m_h5_tk": "token-1_123",
+                    "_m_h5_tk_enc": "enc-1",
+                    "t": "t-1",
+                    "x5sec": "x5-1",
+                },
+            ]
+        )
+
+        request_context = types.SimpleNamespace(
+            post=mock.AsyncMock(
+                side_effect=[
+                    RuntimeError("probe timeout"),
+                    RuntimeError("probe timeout"),
+                ]
+            )
+        )
+        context = types.SimpleNamespace(request=request_context)
+        page = types.SimpleNamespace(
+            wait_for_load_state=mock.AsyncMock(return_value=None),
+            evaluate=mock.AsyncMock(return_value={"ok": False, "status": 0, "error": "fallback failed"}),
+        )
+
+        with mock.patch.object(XianyuLive, "cache_auth_prewarmed_token") as cache_token, \
+             mock.patch("XianyuAutoAsync.asyncio.sleep", new=mock.AsyncMock()):
+            result = await live._prewarm_auth_token_in_browser_context_async(
+                context,
+                page,
+                scene="扫码登录交接前",
+                initial_cookies_dict={
+                    "unb": "user-1",
+                    "cookie2": "cookie2-1",
+                    "sgcookie": "sg-1",
+                    "_m_h5_tk": "token-1_123",
+                    "_m_h5_tk_enc": "enc-1",
+                    "t": "t-1",
+                    "x5sec": "x5-1",
+                },
+            )
+
+        self.assertFalse(result["token_prewarmed"])
+        self.assertEqual(result["cookies_dict"]["x5sec"], "x5-1")
+        self.assertEqual(result["probe_status"], {})
+        self.assertIsNone(live.current_token)
+        cache_token.assert_not_called()
+
+    async def test_prewarm_auth_token_in_browser_context_async_surfaces_verification_url(self):
+        class _FakeApiResponse:
+            def __init__(self, ok, status, text):
+                self.ok = ok
+                self.status = status
+                self._text = text
+
+            async def text(self):
+                return self._text
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "qr-browser-punish-account"
+        live._legacy_cookie_id = "qr-browser-punish-account"
+        live.device_id = "browser-runtime-device-id"
+        live.current_token = None
+        live.last_token_refresh_time = 0
+        live.auth_prewarmed_app_key = None
+        live._safe_str = str
+        live._snapshot_browser_context_cookies_async = mock.AsyncMock(
+            side_effect=[
+                {
+                    "unb": "user-1",
+                    "cookie2": "cookie2-1",
+                    "sgcookie": "sg-1",
+                    "_m_h5_tk": "token-1_123",
+                    "_m_h5_tk_enc": "enc-1",
+                    "t": "t-1",
+                    "x5sec": "x5-1",
+                },
+                {
+                    "unb": "user-1",
+                    "cookie2": "cookie2-1",
+                    "sgcookie": "sg-1",
+                    "_m_h5_tk": "token-1_123",
+                    "_m_h5_tk_enc": "enc-1",
+                    "t": "t-1",
+                    "x5sec": "x5-1",
+                },
+            ]
+        )
+        punish_url = "https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/_____tmd_____/punish"
+        request_context = types.SimpleNamespace(
+            post=mock.AsyncMock(
+                side_effect=[
+                    _FakeApiResponse(
+                        True,
+                        200,
+                        json.dumps(
+                            {
+                                "ret": ["FAIL_SYS_USER_VALIDATE"],
+                                "data": {"url": punish_url},
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ),
+                    _FakeApiResponse(
+                        True,
+                        200,
+                        json.dumps(
+                            {
+                                "ret": ["SUCCESS::调用成功"],
+                                "data": {"userId": "user-1"},
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ),
+                ]
+            )
+        )
+        context = types.SimpleNamespace(request=request_context)
+        page = types.SimpleNamespace(
+            wait_for_load_state=mock.AsyncMock(return_value=None),
+            evaluate=mock.AsyncMock(
+                side_effect=AssertionError("should use context.request.post before page.evaluate fallback")
+            ),
+        )
+
+        with mock.patch.object(XianyuLive, "cache_auth_prewarmed_token") as cache_token, \
+             mock.patch("XianyuAutoAsync.asyncio.sleep", new=mock.AsyncMock()):
+            result = await live._prewarm_auth_token_in_browser_context_async(
+                context,
+                page,
+                scene="扫码登录交接前",
+                initial_cookies_dict={
+                    "unb": "user-1",
+                    "cookie2": "cookie2-1",
+                    "sgcookie": "sg-1",
+                    "_m_h5_tk": "token-1_123",
+                    "_m_h5_tk_enc": "enc-1",
+                    "t": "t-1",
+                    "x5sec": "x5-1",
+                },
+            )
+
+        self.assertFalse(result["token_prewarmed"])
+        self.assertEqual(result["verification_url"], punish_url)
+        cache_token.assert_not_called()
+
     async def test_init_prefers_account_id_alias_when_clearing_init_auth_failure_state(self):
         live = XianyuLive.__new__(XianyuLive)
         live._legacy_cookie_id = "legacy-cookie-name"
@@ -9084,6 +9362,115 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         )
         launch_browser_safe.assert_not_awaited()
 
+    async def test_refresh_cookies_from_qr_login_invalidates_async_runtime_when_handoff_prewarm_hits_verification(self):
+        page = mock.Mock()
+        page.goto = mock.AsyncMock()
+        page.reload = mock.AsyncMock()
+        page.close = mock.AsyncMock()
+
+        context = mock.Mock()
+        context.browser = mock.Mock()
+        context.browser.close = mock.AsyncMock()
+        context.add_cookies = mock.AsyncMock()
+        context.new_page = mock.AsyncMock(return_value=page)
+        context.cookies = mock.AsyncMock(
+            return_value=[
+                {"name": "unb", "value": "new-unb"},
+                {"name": "sgcookie", "value": "new-sg"},
+                {"name": "cookie2", "value": "new-cookie2"},
+                {"name": "_m_h5_tk", "value": "new-token_123"},
+                {"name": "_m_h5_tk_enc", "value": "new-enc"},
+                {"name": "t", "value": "new-t"},
+                {"name": "x5sec", "value": "x5-1"},
+                {"name": "_tb_token_", "value": "tb-token-1"},
+            ]
+        )
+        context.close = mock.AsyncMock()
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "qr-handoff-invalidate"
+        live._legacy_cookie_id = "qr-handoff-invalidate"
+        live.user_id = 7
+        live.qr_cookie_refresh_cooldown = 180
+        live.last_qr_cookie_refresh_time = 0
+        live._safe_str = str
+        live._extract_cookie_value = lambda cookie_record: (cookie_record or {}).get("cookie")
+        live._mask_secret_value = lambda value, head=8, tail=6: value
+        live._summarize_cookie_string = lambda cookie_string: cookie_string
+        live._set_runtime_cookie_state = mock.Mock()
+        live.protected_merge_cookie_dicts = lambda existing, incoming: self._build_merge_result(incoming)
+        live._prewarm_auth_token_in_browser_context_async = mock.AsyncMock(
+            return_value={
+                "token_prewarmed": False,
+                "token_source": None,
+                "probe_status": {"login_user_fetch": True},
+                "cookies_dict": {
+                    "unb": "new-unb",
+                    "sgcookie": "new-sg",
+                    "cookie2": "new-cookie2",
+                    "_m_h5_tk": "new-token_123",
+                    "_m_h5_tk_enc": "new-enc",
+                    "t": "new-t",
+                    "x5sec": "x5-1",
+                    "_tb_token_": "tb-token-1",
+                },
+                "verification_url": "https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/_____tmd_____/punish",
+            }
+        )
+
+        qr_cookies_str = (
+            "unb=qr-unb; sgcookie=qr-sg; cookie2=qr-cookie2; "
+            "_m_h5_tk=qr-token_123; _m_h5_tk_enc=qr-enc; t=qr-t"
+        )
+        lease = self._build_runtime_lease(live.account_id, browser=context.browser, context=context)
+        runtime_manager = types.SimpleNamespace(
+            acquire_runtime=mock.AsyncMock(return_value=lease),
+            get_fresh_page=mock.AsyncMock(return_value=(page, context)),
+            release_runtime=mock.AsyncMock(return_value=None),
+            invalidate_runtime=mock.AsyncMock(return_value=True),
+            resolve_profile_dir=mock.Mock(
+                return_value=os.path.join(os.getcwd(), "browser_data", "user_qr-handoff-invalidate")
+            ),
+        )
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "account_browser_runtime_manager",
+            new=runtime_manager,
+        ), \
+             mock.patch.object(
+                 XianyuAutoAsync,
+                 "_launch_browser_safe",
+                 new=mock.AsyncMock(side_effect=AssertionError("should not launch clean browser")),
+                 create=True,
+             ) as launch_browser_safe, \
+             mock.patch("XianyuAutoAsync.asyncio.sleep", new=mock.AsyncMock()), \
+             mock.patch.object(
+                 XianyuAutoAsync.os,
+                 "getenv",
+                 side_effect=lambda key: "1" if key == "DOCKER_ENV" else None,
+             ), \
+             mock.patch("XianyuAutoAsync.db_manager.get_cookie_details", return_value={"cookie": qr_cookies_str}), \
+             mock.patch("XianyuAutoAsync.db_manager.update_cookie_account_info", return_value=True):
+            result = await live.refresh_cookies_from_qr_login(qr_cookies_str)
+
+        self.assertTrue(result)
+        runtime_manager.acquire_runtime.assert_awaited_once_with(
+            "qr-handoff-invalidate",
+            "verification_recovery",
+            exclusive=True,
+            runtime_request=mock.ANY,
+        )
+        runtime_manager.invalidate_runtime.assert_awaited_once_with(
+            "qr-handoff-invalidate",
+            reason="qr_cookie_refresh_auth_prewarm_verification",
+        )
+        runtime_manager.release_runtime.assert_awaited_once_with(
+            lease,
+            reason="qr_cookie_refresh_auth_prewarm_handoff_release",
+        )
+        launch_browser_safe.assert_not_awaited()
+
     async def test_refresh_cookies_from_qr_login_rejects_missing_required_fields_without_persisting(self):
         page = mock.Mock()
         page.goto = mock.AsyncMock()
@@ -9286,7 +9673,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             ],
         )
         fresh_page.close.assert_awaited_once_with()
-        self.assertEqual(context.cookies.await_count, 5)
+        self.assertEqual(context.cookies.await_count, 7)
         get_cookie_details.assert_called()
         update_cookie_account_info.assert_called_once()
         save_cookie.assert_not_called()

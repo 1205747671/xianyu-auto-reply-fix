@@ -31,6 +31,115 @@
 
 ---
 
+## 2026-05-21 补充：清空所有数据后，`account_id=5` 全新环境扫码复跑通过
+
+### 1. 本轮前提
+
+这次不是沿用旧数据硬跑，而是先把本地运行态彻底清空后再测：
+
+- `data/`
+- `browser_data/`
+- `logs/`
+- `trajectory_history/`
+- `static/uploads/images/`
+- `realtime.log`
+- `update_backup/`
+- `tmp_qr_*.png`
+
+同时把残留的 **CloakBrowser / Chromium** 账号画像占用进程也收掉，确保：
+
+> **`account_id=5` 这轮扫码登录使用的是全新账号级浏览器环境。**
+
+### 2. 真实链路
+
+本轮会话：
+
+- `session_id=41a179b7-9e5e-48d2-81d3-ea758448707d`
+
+实际过程：
+
+1. **扫码 API 成功**
+   - `scan_success=True`
+   - 初始扫码 Cookie 只有 `9` 个字段
+
+2. **浏览器接管同账号环境，补真实 Cookie**
+   - `real_cookie_refreshed=true`
+   - 真实 Cookie 长度到 `1388`
+   - 真实 Cookie 字段数到 `17`
+
+3. **handoff 前浏览器内 token 预热没有直通**
+   - `login.token` 首轮返回：
+     - `FAIL_SYS_USER_VALIDATE`
+   - 因此：
+     - `token_prewarmed=false`
+
+4. **随后进入正式恢复链**
+   - `token_refresh -> punish -> slider`
+   - 指纹浏览器自己的滑块 **第 1 轮直接通过**
+
+5. **滑块通过后继续做 Cookie 稳定化和登录态确认**
+   - 日志明确确认：
+     - `✅ 滑块验证成功`
+     - `✅ 通过探测页面URL和Cookie确认登录成功`
+     - `captured 21 cookies`
+
+6. **最终业务链路收口成功**
+   - `preflight_token_received=True`
+   - `ws_connected=True`
+   - `ws_connection_state=connected`
+   - `session_keepalive_ok=True`
+   - `last_token_refresh_status=success`
+
+### 3. 本轮没有发生的事
+
+这次**没有再触发人脸验证**。
+
+也就是说，这轮全新环境扫码登录只需要：
+
+- 扫码确认
+- 后续由同账号浏览器环境自己处理 `punish -> slider`
+
+### 4. 这轮说明了什么
+
+这轮能进一步确认：
+
+1. **扫码链路在全新环境下可以独立跑通**
+   - 不是借前面账密登录残留态混过去的
+
+2. **`token_prewarmed=false` 不等于失败**
+   - 它只代表：
+     - handoff 前那次浏览器内 token 预热先命中了 `punish`
+   - 后面仍然可以靠：
+     - **同一个 `account_id=5` 的浏览器环境**
+     - **同一个账号级画像**
+     - 顺着 `punish -> slider -> token -> ws`
+     - 把整条链路收回来
+
+3. **扫码正式逻辑和账密正式逻辑在核心恢复模式上已经对齐**
+   - 都是优先复用同账号浏览器环境
+   - 都是把风控恢复放在账号级 runtime 里处理
+   - 当前没有观察到新的阻塞型分叉问题
+
+### 5. 本轮顺手 review 结论
+
+对照当前正式逻辑再看一遍，这轮没有发现新的阻塞问题，重点结论是：
+
+1. **扫码链路的 `token_prewarmed=false` 目前是可接受状态**
+   - 只要后续同账号 `punish -> slider` 恢复链能打通
+   - 最终 `token/ws/keepalive` 成功即可
+
+2. **当前 warning_message 属于探针上下文，不是正式链路 bug**
+   - 本轮 `handoff_account_info.warning_message` 提示：
+     - “真实Cookie已获取，但账号任务未启动”
+   - 这是因为这次用的是**独立探针脚本**
+   - 不是正式服务里“账号已受管运行中”的那条路径
+
+3. **同账号浏览器复用策略这轮符合预期**
+   - 没有出现跨账号串 profile
+   - 也没有出现因为旧 runtime 没放掉而导致 sync slider 抢不进来的新问题
+
+---
+
 ## 2026-05-21 补充：预热 token + device_id 一起交接后，两轮完整无头复跑通过
 
 这轮不是继续猜，而是把“**浏览器真实业务已成功**”再往前推进一步：
@@ -145,6 +254,133 @@
 
 - `Ran 183 tests`
 - `OK`
+
+---
+
+## 2026-05-21 补充：全新浏览器环境下扫码登录回归（`account_id=10`）通过
+
+### 1. 本轮前提
+
+这次不是复用前面账密登录后留下的浏览器环境。
+
+回归前已清空：
+
+- `data/`
+- `browser_data/`
+- `logs/`
+- `trajectory_history/`
+- `static/uploads/images/`
+- `realtime.log`
+
+因此这轮扫码登录使用的是**全新账号级浏览器环境**：
+
+- `browser_data/user_10`
+
+也就是说，本次验证的是：
+
+> **清空数据后，新建 `account_id=10` 的同账号持久化画像，直接走扫码登录，看能不能完整打通 `扫码 -> 真实 Cookie -> token_refresh -> punish -> slider -> ws`。**
+
+### 2. 本轮真实链路
+
+扫码会话：
+
+- `session_id=b42ca1d0-0a2f-4f95-ac08-ee42886f58f1`
+
+实际过程：
+
+1. **扫码 API 侧先成功**
+   - `scan_success=True`
+   - 初始扫码 Cookie 只有 `9` 个字段
+
+2. **进入同账号浏览器环境补真实 Cookie**
+   - 真实 Cookie 最终扩到 `21` 个字段
+   - 其中业务关键字段已齐
+   - 仍然缺：
+     - `cna`
+     - `havana_lgc2_77`
+
+3. **首次浏览器外 `login.token` 预检仍命中 `punish`**
+   - 返回：
+     - `FAIL_SYS_USER_VALIDATE`
+   - 说明：
+     - **扫码 API 成功 != 浏览器外首轮 token_refresh 一定直通**
+
+4. **同账号指纹浏览器接管 `punish` 页面**
+   - 第 1 轮滑块失败
+   - 但仍在**同一个 `account_id=10` 持久化画像 / 同一个 context** 里继续处理
+   - `fresh-tab` 重试后第 2 轮滑块成功
+
+5. **滑块成功后继续做浏览器内业务预热**
+   - `login_token_fetch` 返回 `status=200 ok=True`
+   - 证明当前浏览器会话已经达到业务可用态
+
+6. **随后再次 token_refresh 成功，WS / keepalive 打通**
+
+### 3. 最终结果
+
+本轮 `tmp_manual_qr_login_ws_probe.py --account-id 10 --qr-wait-timeout 1200 --observe-seconds 20` 最终输出：
+
+- `cookie_persisted_in_db=True`
+- `preflight_token_received=True`
+- `ws_connected=True`
+- `ws_connection_state=connected`
+- `session_keepalive_ok=True`
+
+最终 `ws_probe_snapshot` 关键字段：
+
+- `current_token_present=true`
+- `last_token_refresh_status=success`
+- `heartbeat_task_running=true`
+- `keepalive_ok=true`
+
+### 4. 这轮说明了什么
+
+这轮可以确认两件事：
+
+1. **扫码登录现在可以在“全新浏览器环境”下独立跑通**
+   - 不是借用了之前账密登录残留的浏览器态
+
+2. **同一个 `account_id` 的浏览器环境复用逻辑在扫码链路里是成立的**
+   - 从真实 Cookie 恢复
+   - 到 `punish -> slider`
+   - 到 `fresh-tab` 重试
+   - 到后续 `token_refresh -> websocket`
+   - 全程都在同一个 `account_id=10` 的账号级持久化画像里完成
+
+### 5. 对扫码正式逻辑的顺手 review 结论
+
+这轮对照账密链路再看一遍，当前没有发现新的阻塞型不一致问题。
+
+但有一个**仍然存在、且是当前有意保留的差异点**：
+
+- **账密登录**
+  - 在交接前会尽量做同步 `token` 预热 / 认证交接
+- **扫码登录**
+  - 仍然**跳过 handoff 阶段的同步 token 预热**
+  - 先把真实 Cookie 落库并切给正式实例
+  - 首次 `token_refresh` 如果命中 `punish`
+  - 再由同账号浏览器环境继续恢复
+
+这次实测表明，这个差异目前**不会阻断最终链路**，只是意味着：
+
+- 扫码链路首轮 `token_refresh`
+- 仍然**有机会先吃一次 `punish`**
+
+但现在这条恢复链已经能靠：
+
+- 同账号持久化画像
+- 指纹浏览器滑块接管
+- 浏览器内业务预热
+- 再次 `token_refresh`
+
+把整条链收回来。
+
+所以当前口径是：
+
+> **扫码正式逻辑和账密逻辑已经在“最终可恢复到 WS / keepalive 可用”这个目标上对齐；**
+> **剩下的差异主要是“是否在 handoff 前尽量把首轮 token_refresh 打直”。**
+
+这个差异现在属于**优化项**，不再是阻塞项。
 
 ---
 
@@ -2551,6 +2787,239 @@ python -m pytest tests/test_reply_server_proxy_restart_guard_contract.py -q
 - token 预检成功
 - ws 成功
 - heartbeat / keepalive 成功
+
+---
+
+## 2026-05-21 补充：扫码 handoff 前浏览器内 token 预热继续收口后，重新真实扫码回归通过
+
+### 1. 这轮真正想收什么
+
+这次不是再修账密，而是专门继续收口扫码链路里和账密不一致的那一小段：
+
+- **账密登录**
+  - 交接前尽量做同步 `token` 预热
+- **扫码登录**
+  - 之前是直接跳过 handoff 前 `token` 预热
+  - 把真实 Cookie 落库后，交给正式实例自己再走首次 `token_refresh`
+
+这次目标就是：
+
+> **尽量在扫码登录拿到真实 Cookie 后、同一个 `account_id` / 同一个浏览器环境里，先把 `login.token` 预热掉。**
+
+### 2. 先遇到的新坑
+
+第一次按这个方向改完后，真实扫码回归没有直接过，暴露出一个更底层的问题：
+
+1. 扫码真实 Cookie 恢复成功
+2. handoff 前浏览器内 `login_token_fetch` 的确开始执行
+3. 但它仍然先命中：
+   - `FAIL_SYS_USER_VALIDATE`
+   - 返回 `punish` URL
+4. 正式实例随后继续进入：
+   - `token_refresh -> punish -> slider`
+5. 结果 sync slider 抢同账号 profile 时直接报：
+   - `账号级 browser profile 已被其他 runtime 持有`
+   - `owner=manager=1, account_id=10, mode=async`
+
+也就是说：
+
+> **问题已经不是业务层忘了 release，而是 async runtime 的 profile claim 没有在异常 close 后真正释放。**
+
+### 3. 最终根因
+
+继续顺着日志往下抠，真正的卡点是：
+
+- 浏览器内 handoff 预热命中 `punish`
+- 业务层已经做了：
+  - `invalidate_runtime(account_id=10, reason=qr_cookie_refresh_auth_prewarm_verification)`
+  - 并提前释放当前 async lease
+- 但 `account_browser_runtime.release_runtime()` 在关闭 pending async runtime 时命中：
+  - `process no longer exists (pid=...)`
+- 这个异常把后面的 **profile claim 释放链**打断了
+
+所以后续 sync slider 看起来像是“还在抢旧 runtime”，本质上是：
+
+- **claim 没放干净**
+
+### 4. 这轮正式修复
+
+涉及文件：
+
+- `XianyuAutoAsync.py`
+- `reply_server.py`
+- `utils/account_browser_runtime.py`
+- `tests/test_account_browser_runtime.py`
+- `tests/test_xianyu_async_browser_runtime.py`
+- `tests/test_reply_server_manual_cookie_import_flow.py`
+
+#### A. 扫码真实 Cookie 恢复后，补上同 runtime 的浏览器内认证预热
+
+位置：
+
+- `XianyuAutoAsync.py`
+
+新增：
+
+- `_build_browser_auth_warmup_probe_requests(...)`
+- `_execute_browser_auth_warmup_probe_async(...)`
+- `_is_browser_auth_warmup_probe_success(...)`
+- `_cache_auth_prewarmed_token_from_browser_probe_result(...)`
+- `_extract_browser_auth_warmup_verification_url(...)`
+- `_prewarm_auth_token_in_browser_context_async(...)`
+
+作用：
+
+- 在 `refresh_cookies_from_qr_login()` 里
+- 真实 Cookie 稳定化后、释放 runtime 前
+- 直接复用当前 `context/page`
+- 主动打：
+  - `mtop.taobao.idlemessage.pc.login.token`
+  - `mtop.taobao.idlemessage.pc.loginuser.get`
+
+#### B. 只在“可交接 Cookie 形态”下才做这步预热
+
+不是所有扫码场景都硬做。
+
+当前策略是：
+
+- 真实 Cookie 已满足 required fields
+  - 或者
+- 只差 `cna`，但已经是 `business-ready`
+
+才尝试 handoff 前浏览器内 token 预热。
+
+#### C. 预热命中 `punish` 时，提前失效并释放当前 async runtime
+
+位置：
+
+- `XianyuAutoAsync.py`
+
+如果 handoff 前浏览器内预热已经拿到验证 URL：
+
+- 先：
+  - `invalidate_runtime(account_id, reason="qr_cookie_refresh_auth_prewarm_verification")`
+- 再：
+  - 提前走
+    - `qr_cookie_refresh_auth_prewarm_handoff_release`
+
+不再把 release 完全留给 finally 尾巴去碰运气。
+
+#### D. manager 层修复：即使 close pending async runtime 报 `process no longer exists`，也必须释放 claim
+
+位置：
+
+- `utils/account_browser_runtime.py`
+
+修复点：
+
+- `release_runtime(...)`
+
+现在逻辑变成：
+
+- 关闭 pending async runtime 时，即便 `_close_async_runtime(...)` 抛异常
+- 也会先执行：
+  - `_release_profile_claim(state)`
+- 如果异常全是 `ProcessLookupError`
+  - 直接吞掉
+  - 不再把 claim 残留在 manager 里
+
+这一步就是这轮真正把坑填死的地方。
+
+### 5. 真实回归结果
+
+清空：
+
+- `data/`
+- `browser_data/`
+- `logs/`
+- `trajectory_history/`
+- `static/uploads/images/`
+- `realtime.log`
+
+后，再用：
+
+- `account_id=10`
+
+重新走扫码登录。
+
+最终成功会话：
+
+- `session_id=22d65115-29dd-47d1-9175-18848686d7e7`
+
+关键时间点（**2026-05-21**）：
+
+- `11:00:10`
+  - handoff 前浏览器内 `login_token_fetch`
+  - 仍先命中 `FAIL_SYS_USER_VALIDATE`
+- `11:00:13`
+  - 真实 Cookie 落库
+  - 识别到预热阶段已经拿到 `punish` URL
+  - 提前失效并释放当前 async runtime
+- `11:00:14`
+  - 正式实例开始 `preflight token`
+- `11:00:25`
+  - 找到滑块元素
+- `11:00:34`
+  - `滑块验证成功`
+- `11:01:26`
+  - WebSocket 开始连接
+- `11:01:28`
+  - `connected`
+
+最终 stdout：
+
+- `cookie_persisted_in_db=True`
+- `preflight_token_received=True`
+- `ws_connected=True`
+- `ws_connection_state=connected`
+- `session_keepalive_ok=True`
+
+最终 `ws_probe_snapshot`：
+
+- `preflight_token_received=true`
+- `ws_connected=true`
+- `connection_state=connected`
+- `current_token_present=true`
+- `last_session_keepalive_status=success`
+- `last_token_refresh_status=success`
+- `heartbeat_task_running=true`
+- `keepalive_ok=true`
+
+### 6. 这轮结论
+
+这轮可以明确说：
+
+1. **扫码 handoff 前浏览器内 token 预热已经接进正式链路**
+   - 只是它当前仍有概率先命中 `punish`
+
+2. **真正卡死 sync slider 的 async claim 残留问题已经修掉**
+   - 根因是：
+     - async runtime close 命中 `process no longer exists`
+     - claim 释放被异常打断
+   - 现在 manager 层已补容错
+
+3. **修完后，真实扫码链路重新跑通**
+   - `扫码 -> 真实 Cookie -> handoff 前预热 -> punish -> slider -> token_refresh -> ws -> keepalive`
+
+4. **当前剩余问题已经降级为优化项**
+   - 现在不是“能不能通”
+   - 而是：
+     - **能不能进一步提高 handoff 前 `token_prewarmed=true` 的命中率**
+
+### 7. 本轮定向验证
+
+执行：
+
+```bash
+python -m py_compile .\utils\account_browser_runtime.py .\XianyuAutoAsync.py .\reply_server.py .\tests\test_account_browser_runtime.py .\tests\test_xianyu_async_browser_runtime.py .\tests\test_reply_server_manual_cookie_import_flow.py
+python -m unittest tests.test_account_browser_runtime.AccountBrowserRuntimeManagerTest.test_invalidate_runtime_with_active_lease_releases_profile_claim_even_when_async_close_fails tests.test_xianyu_async_browser_runtime.XianyuAsyncBrowserRuntimeTest.test_refresh_cookies_from_qr_login_invalidates_async_runtime_when_handoff_prewarm_hits_verification tests.test_xianyu_async_browser_runtime.XianyuAsyncBrowserRuntimeTest.test_refresh_cookies_from_qr_login_uses_account_persistent_profile_without_clean_browser_fallback tests.test_xianyu_async_browser_runtime.XianyuAsyncBrowserRuntimeTest.test_refresh_cookies_from_qr_login_uses_home_and_fresh_tab_to_fill_missing_required_fields tests.test_xianyu_async_browser_runtime.XianyuAsyncBrowserRuntimeTest.test_refresh_cookies_from_qr_login_reuses_managed_page_without_creating_or_closing_extra_tabs tests.test_reply_server_manual_cookie_import_flow.ReplyServerProcessQrLoginCookiesTest.test_process_qr_login_cookies_marks_token_prewarmed_when_qr_handoff_already_prewarms_in_same_runtime tests.test_xianyu_token_refresh_request.XianyuTokenRefreshRequestTest.test_init_disables_password_login_recovery_during_qr_real_cookie_handoff
+```
+
+结果：
+
+- `py_compile OK`
+- 定向 `7` 项测试通过
+- 真实扫码回归通过
 
 ---
 
