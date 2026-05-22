@@ -2103,6 +2103,49 @@ Cookie数量: {cookie_count}
                 self.conn.rollback()
                 return False
 
+    def delete_pending_cookie_placeholder(self, account_id: str, user_id: int = None) -> bool:
+        """仅删除仍处于 pending_bind 且尚未写入 Cookie 的账号占位记录。"""
+        normalized_account_id = self._require_account_id(account_id)
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    """
+                    SELECT user_id, bind_status, value
+                    FROM cookies
+                    WHERE id = ?
+                    """,
+                    (normalized_account_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return False
+
+                existing_user_id, bind_status, encrypted_cookie_value = row
+                if user_id is not None and existing_user_id != user_id:
+                    logger.warning(
+                        f"账号 {normalized_account_id} 占位归属用户 {existing_user_id}，拒绝按用户 {user_id} 删除"
+                    )
+                    return False
+
+                if str(bind_status or '').strip() != 'pending_bind':
+                    return False
+
+                cookie_value = self._decrypt_secret(encrypted_cookie_value)
+                if str(cookie_value or '').strip():
+                    return False
+
+                self._execute_sql(cursor, "DELETE FROM cookies WHERE id = ?", (normalized_account_id,))
+                self.conn.commit()
+                logger.info(f"已删除待绑定账号占位记录: {normalized_account_id}")
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"删除待绑定账号占位记录失败: account_id={account_id}, error={e}")
+                self.conn.rollback()
+                return False
+
     def get_cookie_binding_info(self, account_id: str) -> Optional[Dict[str, Any]]:
         """获取账号绑定信息。"""
         normalized_account_id = self._require_account_id(account_id)
@@ -8739,6 +8782,7 @@ Cookie数量: {cookie_count}
                     "id": result[0],
                     "account_id": result[0],
                     "value": cookie_value,
+                    "cookie_value": cookie_value,
                     "user_id": result[2],
                     "auto_confirm": bool(result[3]),
                     "bound_unb": result[4] or "",
@@ -8747,6 +8791,7 @@ Cookie数量: {cookie_count}
                     "pause_duration": result[7] if result[7] is not None else 10,
                     "username": result[8] or "",
                     "password": password,
+                    "show_browser": bool(result[10]) if result[10] is not None else False,
                     "created_at": result[11],
                     "proxy_type": result[12] or "none",
                     "proxy_host": result[13] or "",

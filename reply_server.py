@@ -526,7 +526,7 @@ def get_ip_failure_count(client_ip: str) -> int:
 
 
 # 账号密码登录会话管理
-password_login_sessions = {}  # {session_id: {'account_id': str, 'account': str, 'status': str, 'verification_url': str, 'qr_code_url': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
+password_login_sessions = {}  # {session_id: {'account_id': str, 'account': str, 'show_browser': bool, 'status': str, 'verification_url': str, 'qr_code_url': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
 password_login_locks = defaultdict(lambda: asyncio.Lock())
 manual_cookie_import_sessions = {}  # {session_id: {'account_id': str, 'status': str, 'verification_url': str, 'screenshot_path': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
 manual_cookie_import_locks = defaultdict(lambda: asyncio.Lock())
@@ -2224,6 +2224,7 @@ class AccountCookieUpsertIn(BaseModel):
 class ManualCookieImportRequest(BaseModel):
     account_id: str
     cookie: str
+    show_browser: bool = False
 
 
 class RuntimeTokenRefreshRequest(BaseModel):
@@ -2330,6 +2331,85 @@ def _prepare_manual_refresh_runtime_account_id(
         source=manual_refresh_owner,
     )
     return runtime_account_id
+
+
+def _has_active_qr_binding_session(account_id: str) -> bool:
+    normalized_account_id = str(account_id or '').strip()
+    if not normalized_account_id:
+        return False
+
+    terminal_statuses = {'failed', 'cancelled', 'expired'}
+    for session in list(getattr(qr_login_manager, 'sessions', {}).values()):
+        if session is None:
+            continue
+        if str(getattr(session, 'account_id', '') or '').strip() != normalized_account_id:
+            continue
+
+        session_status = str(getattr(session, 'status', '') or '').strip().lower()
+        handoff_status = str(getattr(session, 'handoff_status', '') or '').strip().lower()
+        if session_status in terminal_statuses:
+            continue
+        if session_status == 'success' and handoff_status == 'success':
+            continue
+        return True
+
+    return False
+
+
+def _cleanup_stale_foreign_pending_placeholder(
+    account_id: str,
+    user_id: int,
+    *,
+    action_text: str,
+) -> bool:
+    initial_binding_info = db_manager.get_cookie_binding_info(account_id)
+    if not initial_binding_info:
+        return False
+
+    expected_owner_id = int(initial_binding_info.get('user_id') or 0)
+    if expected_owner_id == int(user_id):
+        return False
+
+    if str(initial_binding_info.get('bind_status') or '').strip() != 'pending_bind':
+        return False
+
+    try:
+        qr_login_manager.cleanup_expired_sessions()
+    except Exception as cleanup_error:
+        logger.warning(
+            f"{action_text} 清理过期扫码会话失败，跳过 stale placeholder 自愈: "
+            f"account_id={account_id}, error={cleanup_error}"
+        )
+        return False
+
+    if _has_active_qr_binding_session(account_id):
+        logger.info(
+            f"{action_text} 检测到账号仍存在活动中的扫码绑定会话，保留 pending_bind 占位: {account_id}"
+        )
+        return False
+
+    latest_binding_info = db_manager.get_cookie_binding_info(account_id)
+    if not latest_binding_info:
+        return False
+
+    if int(latest_binding_info.get('user_id') or 0) != expected_owner_id:
+        logger.info(
+            f"{action_text} 检测到 pending_bind 占位归属已变化，跳过自愈删除: "
+            f"account_id={account_id}, expected_owner_id={expected_owner_id}, "
+            f"latest_owner_id={latest_binding_info.get('user_id')}"
+        )
+        return False
+
+    if str(latest_binding_info.get('bind_status') or '').strip() != 'pending_bind':
+        return False
+
+    deleted = db_manager.delete_pending_cookie_placeholder(
+        account_id,
+        user_id=expected_owner_id,
+    )
+    if deleted:
+        logger.info(f"{action_text} 已清理陈旧 foreign pending_bind 占位: {account_id}")
+    return deleted
 
 
 _MANAGED_LIVE_INSTANCE_ACCESS = contextvars.ContextVar(
@@ -4678,7 +4758,15 @@ def _persist_manual_cookie_import_success(
     return is_new_account
 
 
-async def _execute_password_login(session_id: str, account_id: str, account: str, password: str, user_id: int, current_user: Dict[str, Any]):
+async def _execute_password_login(
+    session_id: str,
+    account_id: str,
+    account: str,
+    password: str,
+    show_browser: bool,
+    user_id: int,
+    current_user: Dict[str, Any],
+):
     """后台执行账号密码登录任务"""
     manual_refresh_acquired = False
     manual_refresh_owner = f"password_login:{session_id}"
@@ -4714,7 +4802,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
         slider_instance = XianyuSliderStealth(
             user_id=account_id,
             enable_learning=True,
-            headless=True,
+            headless=not show_browser,
             initial_cookies=existing_cookie_info.get('value', ''),
             proxy=proxy_config,
             slider_max_retries=4,
@@ -5323,6 +5411,7 @@ async def _execute_manual_cookie_import(
     session_id: str,
     account_id: str,
     cookie_value: str,
+    show_browser: bool,
     user_id: int,
     current_user: Dict[str, Any],
 ):
@@ -5344,7 +5433,7 @@ async def _execute_manual_cookie_import(
         slider_instance = XianyuSliderStealth(
             user_id=account_id,
             enable_learning=True,
-            headless=True,
+            headless=not show_browser,
             initial_cookies=cookie_value,
             proxy=proxy_config,
             slider_max_retries=4,
@@ -5606,6 +5695,7 @@ async def manual_cookie_import(
     try:
         account_id = str(request.account_id or '').strip()
         cookie_value = str(request.cookie or '').replace('\ufeff', '').strip()
+        show_browser = bool(request.show_browser)
         user_id = current_user['user_id']
 
         try:
@@ -5619,15 +5709,24 @@ async def manual_cookie_import(
         if not account_id or not cookie_value:
             return {'success': False, 'message': '账号ID和Cookie不能为空'}
 
-        existing_cookies = db_manager.get_all_cookies()
-        if account_id in existing_cookies:
-            user_cookies = db_manager.get_all_cookies(user_id)
-            if account_id not in user_cookies:
-                return {'success': False, 'message': '该账号ID已被其他用户使用'}
+        _cleanup_stale_foreign_pending_placeholder(
+            account_id,
+            user_id,
+            action_text="manual cookie import",
+        )
+        binding_info = db_manager.get_cookie_binding_info(account_id)
+        binding_owner_id = binding_info.get('user_id') if binding_info else None
+        has_binding_owner = binding_owner_id is not None and str(binding_owner_id).strip() != ''
+        if binding_info and has_binding_owner:
+            try:
+                db_manager.assert_cookie_belongs_to_user(account_id, user_id)
+            except PermissionError as ownership_error:
+                return {'success': False, 'message': str(ownership_error)}
 
         session_id = secrets.token_urlsafe(16)
         manual_cookie_import_sessions[session_id] = {
             'account_id': account_id,
+            'show_browser': show_browser,
             'status': 'processing',
             'verification_url': None,
             'screenshot_path': None,
@@ -5643,6 +5742,7 @@ async def manual_cookie_import(
             session_id,
             account_id,
             cookie_value,
+            show_browser,
             user_id,
             current_user,
         ))
@@ -5741,6 +5841,8 @@ async def password_login(
         account_id = str(request.get('account_id') or '').strip()
         account = request.get('account')
         password = request.get('password')
+        show_browser_specified = 'show_browser' in request
+        show_browser = bool(request.get('show_browser', False))
         refresh_mode = request.get('refresh_mode', False)  # 刷新模式：从数据库读取账密
         risk_log_id = None
 
@@ -5754,6 +5856,25 @@ async def password_login(
                 )
             except ValueError as account_scope_error:
                 return {'success': False, 'message': str(account_scope_error)}
+
+        if account_id and not refresh_mode:
+            binding_info = db_manager.get_cookie_binding_info(account_id)
+            binding_owner_id = binding_info.get('user_id') if binding_info else None
+            has_binding_owner = binding_owner_id is not None and str(binding_owner_id).strip() != ''
+            if binding_info and has_binding_owner and int(binding_owner_id) != int(user_id):
+                _cleanup_stale_foreign_pending_placeholder(
+                    account_id,
+                    user_id,
+                    action_text="password login",
+                )
+                binding_info = db_manager.get_cookie_binding_info(account_id)
+                binding_owner_id = binding_info.get('user_id') if binding_info else None
+                has_binding_owner = binding_owner_id is not None and str(binding_owner_id).strip() != ''
+            if binding_info and has_binding_owner:
+                try:
+                    db_manager.assert_cookie_belongs_to_user(account_id, user_id)
+                except PermissionError as ownership_error:
+                    return {'success': False, 'message': str(ownership_error)}
 
         # 刷新模式：从数据库读取已保存的账号密码
         if refresh_mode and account_id:
@@ -5772,7 +5893,10 @@ async def password_login(
             if not account or not password:
                 return {'success': False, 'message': '该账号未配置用户名和密码，无法刷新Cookie'}
 
-            log_with_user('info', f"刷新Cookie模式: {account_id}, 用户名: {account}, headless: True", current_user)
+            if not show_browser_specified:
+                show_browser = bool(cookie_info.get('show_browser', False))
+
+            log_with_user('info', f"刷新Cookie模式: {account_id}, 用户名: {account}, headless: {not show_browser}", current_user)
 
             if XianyuLive.is_manual_refresh_active(account_id):
                 return {'success': False, 'message': f'账号 {account_id} 正在执行手动刷新，请稍候再试'}
@@ -5813,6 +5937,7 @@ async def password_login(
         password_login_sessions[session_id] = {
             'account_id': account_id,
             'account': account,
+            'show_browser': show_browser,
             'refresh_mode': refresh_mode,  # 保存刷新模式标志
             'risk_control_log_id': risk_log_id if refresh_mode else None,  # 风控日志ID
             'risk_session_id': risk_session_id,
@@ -5830,7 +5955,7 @@ async def password_login(
         
         # 启动后台登录任务
         task = asyncio.create_task(_execute_password_login(
-            session_id, account_id, account, password, user_id, current_user
+            session_id, account_id, account, password, show_browser, user_id, current_user
         ))
         password_login_sessions[session_id]['task'] = task
         
@@ -6157,6 +6282,25 @@ async def generate_qr_code(
             raise HTTPException(status_code=400, detail='account_id只能包含英文字母、数字、下划线和短横线')
 
         user_id = current_user.get('user_id')
+        qr_login_manager.cleanup_expired_sessions()
+        replaced_session_ids = qr_login_manager.invalidate_account_sessions(
+            account_id=account_id,
+            user_id=user_id,
+            reason='qr_login_regenerated_same_account',
+        )
+        if replaced_session_ids:
+            clear_qr_check_records_for_sessions(replaced_session_ids)
+            log_with_user(
+                'info',
+                f"二维码登录已清理同账号旧会话 {len(replaced_session_ids)} 个: {', '.join(replaced_session_ids)}",
+                current_user,
+            )
+
+        _cleanup_stale_foreign_pending_placeholder(
+            account_id,
+            user_id,
+            action_text="qr login generate",
+        )
         binding_info = db_manager.get_cookie_binding_info(account_id)
         if binding_info:
             try:
@@ -6171,20 +6315,6 @@ async def generate_qr_code(
             )
             if not created:
                 raise HTTPException(status_code=403, detail='账号不属于当前用户或占位创建失败')
-
-        qr_login_manager.cleanup_expired_sessions()
-        replaced_session_ids = qr_login_manager.invalidate_account_sessions(
-            account_id=account_id,
-            user_id=user_id,
-            reason='qr_login_regenerated_same_account',
-        )
-        if replaced_session_ids:
-            clear_qr_check_records_for_sessions(replaced_session_ids)
-            log_with_user(
-                'info',
-                f"二维码登录已清理同账号旧会话 {len(replaced_session_ids)} 个: {', '.join(replaced_session_ids)}",
-                current_user,
-            )
 
         log_with_user('info', f"请求生成扫码登录二维码: {account_id}", current_user)
 

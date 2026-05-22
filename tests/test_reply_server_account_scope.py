@@ -286,6 +286,7 @@ class ReplyServerAccountWorkerFutureWaitTest(_ReplyServerModuleBindingMixin, uni
             "return slider.login_with_password_browser(\n"
             "                account=account,\n"
             "                password=password,\n"
+            "                show_browser=show_browser,\n"
             "                notification_callback=notification_callback,\n"
             "                force_clean_context=force_clean_context,\n"
             "                require_managed_runtime=True,\n"
@@ -600,6 +601,47 @@ class ReplyServerProxyUpdateBehaviorTest(_ReplyServerModuleBindingMixin, unittes
         self.assertFalse(result["success"])
         self.assertIn("non-empty, non-default account_id", result["message"])
 
+    def test_password_login_rejects_foreign_account_id_before_creating_session(self):
+        current_user = {"user_id": 1, "username": "admin"}
+        original_sessions = dict(reply_server.password_login_sessions)
+        reply_server.password_login_sessions.clear()
+
+        def restore_sessions():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        async def invoke():
+            return await reply_server.password_login(
+                {
+                    "account_id": "acc-foreign-1",
+                    "account": "unit-user",
+                    "password": "unit-password",
+                    "refresh_mode": False,
+                },
+                current_user=current_user,
+            )
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_binding_info",
+            return_value={"account_id": "acc-foreign-1", "user_id": 2, "bind_status": "active"},
+        ), mock.patch.object(
+            reply_server.db_manager,
+            "assert_cookie_belongs_to_user",
+            side_effect=PermissionError("无权操作此账号"),
+        ), mock.patch(
+            "asyncio.create_task",
+            return_value=mock.Mock(),
+        ) as create_task, mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertFalse(result["success"])
+        self.assertEqual("无权操作此账号", result["message"])
+        self.assertEqual({}, reply_server.password_login_sessions)
+        create_task.assert_not_called()
+
     def test_manual_cookie_import_rejects_default_account_id_before_db_access(self):
         async def invoke():
             return await reply_server.manual_cookie_import(
@@ -619,6 +661,139 @@ class ReplyServerProxyUpdateBehaviorTest(_ReplyServerModuleBindingMixin, unittes
 
         self.assertFalse(result["success"])
         self.assertIn("non-empty, non-default account_id", result["message"])
+
+    def test_password_login_cleans_stale_foreign_pending_placeholder_before_creating_session(self):
+        current_user = {"user_id": 1, "username": "admin"}
+        original_sessions = dict(reply_server.password_login_sessions)
+        original_qr_sessions = dict(reply_server.qr_login_manager.sessions)
+        reply_server.password_login_sessions.clear()
+        reply_server.qr_login_manager.sessions.clear()
+        stale_placeholder = {"present": True}
+
+        def restore_state():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_sessions)
+            reply_server.qr_login_manager.sessions.clear()
+            reply_server.qr_login_manager.sessions.update(original_qr_sessions)
+
+        self.addCleanup(restore_state)
+
+        def fake_get_cookie_binding_info(_account_id):
+            if stale_placeholder["present"]:
+                return {"account_id": "acc-stale-login-1", "user_id": 2, "bind_status": "pending_bind"}
+            return None
+
+        def fake_delete_placeholder(_account_id, user_id=None):
+            self.assertEqual(user_id, 2)
+            stale_placeholder["present"] = False
+            return True
+
+        def fake_create_task(coro):
+            coro.close()
+            return mock.Mock()
+
+        async def invoke():
+            return await reply_server.password_login(
+                {
+                    "account_id": "acc-stale-login-1",
+                    "account": "unit-user",
+                    "password": "unit-password",
+                    "refresh_mode": False,
+                },
+                current_user=current_user,
+            )
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_binding_info",
+            side_effect=fake_get_cookie_binding_info,
+        ), mock.patch.object(
+            reply_server.db_manager,
+            "delete_pending_cookie_placeholder",
+            side_effect=fake_delete_placeholder,
+        ) as delete_placeholder, mock.patch.object(
+            reply_server.db_manager,
+            "assert_cookie_belongs_to_user",
+            side_effect=PermissionError("stale placeholder should have been cleaned first"),
+        ) as assert_ownership, mock.patch.object(
+            reply_server.qr_login_manager,
+            "cleanup_expired_sessions",
+        ) as cleanup_expired_sessions, mock.patch(
+            "asyncio.create_task",
+            side_effect=fake_create_task,
+        ) as create_task, mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertTrue(result["success"])
+        delete_placeholder.assert_called_once_with("acc-stale-login-1", user_id=2)
+        cleanup_expired_sessions.assert_called_once()
+        assert_ownership.assert_not_called()
+        create_task.assert_called_once()
+
+    def test_manual_cookie_import_cleans_stale_foreign_pending_placeholder_before_start(self):
+        current_user = {"user_id": 1, "username": "admin"}
+        original_sessions = dict(reply_server.manual_cookie_import_sessions)
+        original_qr_sessions = dict(reply_server.qr_login_manager.sessions)
+        reply_server.manual_cookie_import_sessions.clear()
+        reply_server.qr_login_manager.sessions.clear()
+        stale_placeholder = {"present": True}
+
+        def restore_state():
+            reply_server.manual_cookie_import_sessions.clear()
+            reply_server.manual_cookie_import_sessions.update(original_sessions)
+            reply_server.qr_login_manager.sessions.clear()
+            reply_server.qr_login_manager.sessions.update(original_qr_sessions)
+
+        self.addCleanup(restore_state)
+
+        def fake_get_cookie_binding_info(_account_id):
+            if stale_placeholder["present"]:
+                return {"account_id": "acc-stale-import-1", "user_id": 2, "bind_status": "pending_bind"}
+            return None
+
+        def fake_delete_placeholder(_account_id, user_id=None):
+            self.assertEqual(user_id, 2)
+            stale_placeholder["present"] = False
+            return True
+
+        def fake_create_task(coro):
+            coro.close()
+            return mock.Mock()
+
+        async def invoke():
+            return await reply_server.manual_cookie_import(
+                reply_server.ManualCookieImportRequest(
+                    account_id="acc-stale-import-1",
+                    cookie="unb=test_user; cookie2=test_cookie2",
+                ),
+                current_user=current_user,
+            )
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_binding_info",
+            side_effect=fake_get_cookie_binding_info,
+        ), mock.patch.object(
+            reply_server.db_manager,
+            "delete_pending_cookie_placeholder",
+            side_effect=fake_delete_placeholder,
+        ) as delete_placeholder, mock.patch.object(
+            reply_server.qr_login_manager,
+            "cleanup_expired_sessions",
+        ) as cleanup_expired_sessions, mock.patch.object(
+            reply_server.db_manager,
+            "get_all_cookies",
+            return_value={"acc-stale-import-1": ""},
+        ), mock.patch(
+            "asyncio.create_task",
+            side_effect=fake_create_task,
+        ) as create_task, mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertTrue(result["success"])
+        delete_placeholder.assert_called_once_with("acc-stale-import-1", user_id=2)
+        cleanup_expired_sessions.assert_called_once()
+        create_task.assert_called_once()
 
     def test_account_management_routes_use_account_id_placeholders(self):
         source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
@@ -2182,6 +2357,17 @@ class ReplyServerRestartApplicationTest(_ReplyServerModuleBindingMixin, unittest
 
 
 class ReplyServerQrLoginSessionIsolationTest(_ReplyServerModuleBindingMixin, unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        super().setUp()
+        self._original_qr_sessions = dict(reply_server.qr_login_manager.sessions)
+        reply_server.qr_login_manager.sessions.clear()
+
+        def restore_sessions():
+            reply_server.qr_login_manager.sessions.clear()
+            reply_server.qr_login_manager.sessions.update(self._original_qr_sessions)
+
+        self.addCleanup(restore_sessions)
+
     async def test_generate_qr_code_clears_previous_same_account_session_tracking_before_regeneration(self):
         old_session_id = "old-qr-session"
         reply_server.qr_check_processed.clear()
@@ -2242,6 +2428,144 @@ class ReplyServerQrLoginSessionIsolationTest(_ReplyServerModuleBindingMixin, uni
         self.assertTrue(response["success"])
         self.assertEqual("1", response["account_id"])
         self.assertEqual("new-qr-session", response["session_id"])
+
+    async def test_generate_qr_code_cleans_stale_pending_placeholder_before_ownership_check(self):
+        stale_placeholder = {"present": True}
+        current_user = {
+            "user_id": 1,
+            "username": "admin",
+            "is_admin": True,
+        }
+
+        def fake_get_cookie_binding_info(_account_id):
+            if stale_placeholder["present"]:
+                return {"account_id": "acc-stale-1", "user_id": 2, "bind_status": "pending_bind"}
+            return None
+
+        def fake_delete_placeholder(_account_id, user_id=None):
+            self.assertEqual("acc-stale-1", _account_id)
+            self.assertEqual(2, user_id)
+            stale_placeholder["present"] = False
+            return True
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_binding_info",
+            side_effect=fake_get_cookie_binding_info,
+        ), mock.patch.object(
+            reply_server.db_manager,
+            "assert_cookie_belongs_to_user",
+            side_effect=PermissionError("stale placeholder should have been cleaned first"),
+        ) as assert_ownership, mock.patch.object(
+            reply_server.db_manager,
+            "delete_pending_cookie_placeholder",
+            side_effect=fake_delete_placeholder,
+        ) as delete_placeholder, mock.patch.object(
+            reply_server,
+            "_has_active_qr_binding_session",
+            return_value=False,
+        ), mock.patch.object(
+            reply_server.db_manager,
+            "create_cookie_account_placeholder",
+        return_value=True,
+        ) as create_placeholder, mock.patch.object(
+            reply_server.qr_login_manager,
+            "cleanup_expired_sessions",
+        ), mock.patch.object(
+            reply_server.qr_login_manager,
+            "invalidate_account_sessions",
+            return_value=[],
+        ), mock.patch.object(
+            reply_server.qr_login_manager,
+            "generate_qr_code",
+            new=mock.AsyncMock(
+                return_value={
+                    "success": True,
+                    "session_id": "new-stale-session",
+                    "qr_code_url": "data:image/png;base64,ZmFrZQ==",
+                }
+            ),
+        ), mock.patch.object(reply_server, "log_with_user"):
+            response = await reply_server.generate_qr_code(
+                request=reply_server.QRLoginGenerateRequest(account_id="acc-stale-1"),
+                current_user=current_user,
+            )
+
+        self.assertTrue(response["success"])
+        delete_placeholder.assert_called_once_with("acc-stale-1", user_id=2)
+        assert_ownership.assert_not_called()
+        create_placeholder.assert_called_once_with(
+            "acc-stale-1",
+            1,
+            bind_status="pending_bind",
+        )
+
+    async def test_cancelled_qr_session_releases_pending_placeholder(self):
+        from utils.qr_login import QRLoginSession
+
+        session = QRLoginSession("qr-cancel-1", user_id=7, account_id="acc-cancel-1")
+        reply_server.qr_login_manager.sessions[session.session_id] = session
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "delete_pending_cookie_placeholder",
+            return_value=True,
+            create=True,
+        ) as delete_placeholder:
+            updated = reply_server.qr_login_manager.update_session_fields(
+                session.session_id,
+                status="cancelled",
+                error_message="用户取消登录",
+            )
+
+        self.assertEqual("cancelled", updated.status)
+        delete_placeholder.assert_called_once_with("acc-cancel-1", user_id=7)
+
+    async def test_cleanup_expired_sessions_releases_pending_placeholder_before_drop(self):
+        from utils.qr_login import QRLoginSession
+
+        session = QRLoginSession("qr-expired-1", user_id=8, account_id="acc-expired-1")
+        session.created_time -= session.expire_time + 1
+        reply_server.qr_login_manager.sessions[session.session_id] = session
+
+        with mock.patch.object(
+            reply_server.qr_login_manager,
+            "_cleanup_session_assets",
+        ), mock.patch.object(
+            reply_server.db_manager,
+            "delete_pending_cookie_placeholder",
+            return_value=True,
+            create=True,
+        ) as delete_placeholder:
+            reply_server.qr_login_manager.cleanup_expired_sessions()
+
+        self.assertNotIn(session.session_id, reply_server.qr_login_manager.sessions)
+        delete_placeholder.assert_called_once_with("acc-expired-1", user_id=8)
+
+    async def test_invalidate_account_sessions_releases_pending_placeholder_for_replaced_session(self):
+        from utils.qr_login import QRLoginSession
+
+        session = QRLoginSession("qr-old-1", user_id=9, account_id="acc-replaced-1")
+        reply_server.qr_login_manager.sessions[session.session_id] = session
+
+        with mock.patch.object(
+            reply_server.qr_login_manager,
+            "_cleanup_session_assets",
+        ), mock.patch.object(
+            reply_server.db_manager,
+            "delete_pending_cookie_placeholder",
+            return_value=True,
+            create=True,
+        ) as delete_placeholder:
+            replaced_session_ids = reply_server.qr_login_manager.invalidate_account_sessions(
+                account_id="acc-replaced-1",
+                user_id=9,
+                reason="unit-test-replaced",
+            )
+
+        self.assertEqual(["qr-old-1"], replaced_session_ids)
+        self.assertNotIn(session.session_id, reply_server.qr_login_manager.sessions)
+        delete_placeholder.assert_called_once_with("acc-replaced-1", user_id=9)
 
 
 class ReplyServerVerificationMaterialStateTest(_ReplyServerModuleBindingMixin, unittest.TestCase):

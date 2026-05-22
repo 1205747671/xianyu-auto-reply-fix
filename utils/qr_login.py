@@ -303,7 +303,15 @@ class QRLoginManager:
             '--window-size=1600,900',
         ]
 
-    def _build_verification_context_options(self) -> Dict[str, Any]:
+    def _should_show_verification_browser(self) -> bool:
+        override = str(os.getenv("XY_QR_LOGIN_SHOW_BROWSER") or "").strip().lower()
+        if override:
+            return override in {"1", "true", "yes", "on"}
+        docker_env = str(os.getenv("DOCKER_ENV") or "").strip().lower() in {"1", "true", "yes", "on"}
+        return os.name == 'nt' and not docker_env
+
+    def _build_verification_context_options(self, show_browser: bool = False) -> Dict[str, Any]:
+        _ = show_browser
         # 验证页走的是 CloakBrowser managed runtime + persistent profile。
         # 这里不要再把 locale/timezone/viewport 之类的身份画像参数二次塞回 provider，
         # 避免和账号级固定指纹发生冲突。
@@ -319,8 +327,9 @@ class QRLoginManager:
         return account_browser_runtime_manager.resolve_profile_dir(account_id)
 
     async def _launch_verification_browser_context(self, session: QRLoginSession):
+        show_browser = self._should_show_verification_browser()
         launch_options = {
-            'headless': True,
+            'headless': not show_browser,
             'args': self._build_verification_browser_launch_args(),
             'humanize': True,
             'human_preset': 'careful',
@@ -328,7 +337,7 @@ class QRLoginManager:
         proxy_settings = self._resolve_verification_proxy_settings(session)
         if proxy_settings:
             launch_options['proxy'] = proxy_settings
-        context_options = self._build_verification_context_options()
+        context_options = self._build_verification_context_options(show_browser=show_browser)
         profile_dir = self._resolve_verification_profile_dir(session)
         runtime_request = {
             'account_id': session.account_id,
@@ -357,9 +366,9 @@ class QRLoginManager:
                 raise RuntimeError(f"扫码登录验证页 runtime 缺少 context: {session.session_id}")
             logger.info(
                 f"扫码登录验证页复用 CloakBrowser 持久化画像: {session.session_id}, "
-                f"profile_dir: {profile_dir}, headless: True"
+                f"profile_dir: {profile_dir}, headless: {not show_browser}"
             )
-            return lease, browser, context
+            return lease, browser, context, show_browser
         except Exception as persistent_error:
             logger.error(
                 f"扫码登录持久化画像启动失败，拒绝降级到匿名上下文: {session.session_id}, "
@@ -448,6 +457,7 @@ class QRLoginManager:
         if not session:
             return None
 
+        previous_status = str(getattr(session, 'status', '') or '').strip()
         if status is not None:
             session.status = status
         if phase is not None:
@@ -470,7 +480,44 @@ class QRLoginManager:
             session.browser_alive = bool(browser_alive)
         if verification_url is not None:
             session.verification_url = verification_url
+
+        current_status = str(getattr(session, 'status', '') or '').strip()
+        if current_status in {'expired', 'cancelled'} and current_status != previous_status:
+            self._cleanup_pending_account_placeholder(
+                session,
+                reason=f"qr_login_session_{current_status}",
+            )
         return session
+
+    def _cleanup_pending_account_placeholder(
+        self,
+        session: Optional[QRLoginSession],
+        *,
+        reason: str = 'qr_login_session_cleanup',
+    ) -> bool:
+        if not session:
+            return False
+
+        account_id = str(getattr(session, 'account_id', '') or '').strip()
+        if not account_id:
+            return False
+
+        user_id = getattr(session, 'user_id', None)
+        try:
+            from db_manager import db_manager
+
+            deleted = db_manager.delete_pending_cookie_placeholder(account_id, user_id=user_id)
+            if deleted:
+                logger.info(
+                    f"扫码登录会话已清理待绑定账号占位: account_id={account_id}, user_id={user_id}, reason={reason}"
+                )
+            return deleted
+        except Exception as cleanup_error:
+            logger.warning(
+                f"扫码登录清理待绑定账号占位失败: account_id={account_id}, user_id={user_id}, "
+                f"reason={reason}, error={cleanup_error}"
+            )
+            return False
 
     def update_session_fields(self, session_id: str, **fields) -> Optional[QRLoginSession]:
         return self._update_session_state(self.sessions.get(session_id), **fields)
@@ -818,11 +865,12 @@ class QRLoginManager:
         page = None
         runtime_lease = None
         launch_error_message = None
+        show_browser = False
 
         try:
 
             logger.info(f"开始打开扫码登录验证页面: {session_id}")
-            runtime_lease, browser, context = await self._launch_verification_browser_context(session)
+            runtime_lease, browser, context, show_browser = await self._launch_verification_browser_context(session)
             self._update_session_state(
                 session,
                 phase='verification_browser_ready',
@@ -840,7 +888,7 @@ class QRLoginManager:
             try:
                 logger.info(f"扫码登录验证页预热闲鱼首页: {session_id}")
                 await page.goto('https://www.goofish.com/', wait_until='domcontentloaded', timeout=15000)
-                await page.wait_for_timeout(800)
+                await page.wait_for_timeout(1200 if show_browser else 800)
             except Exception as warmup_error:
                 logger.warning(f"扫码登录验证页预热失败（继续主流程）: {session_id}, 错误: {warmup_error}")
             await page.goto(session.verification_url, wait_until='domcontentloaded', timeout=60000)
@@ -1056,6 +1104,10 @@ class QRLoginManager:
             if session_status == 'success' and handoff_status == 'success':
                 continue
 
+            self._cleanup_pending_account_placeholder(
+                session,
+                reason=reason,
+            )
             self._cleanup_session_assets(session, reason=reason)
             self.sessions.pop(session_id, None)
             replaced_session_ids.append(session_id)
@@ -1485,6 +1537,10 @@ class QRLoginManager:
                 expired_sessions.append(session_id)
 
         for session_id in expired_sessions:
+            self._cleanup_pending_account_placeholder(
+                self.sessions[session_id],
+                reason='qr_login_session_expired_cleanup',
+            )
             self._cleanup_session_assets(self.sessions[session_id])
             del self.sessions[session_id]
             logger.info(f"清理过期会话: {session_id}")

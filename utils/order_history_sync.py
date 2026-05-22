@@ -20,6 +20,13 @@ ORDER_HISTORY_ANCHOR_FIELDS = (
     'platform_created_at',
     'platform_completed_at',
 )
+SELLER_WORKBENCH_DENIED_KEYWORDS = (
+    '当前账号没有访问权限',
+    '请切换账号重试',
+    '联系对接人员确认',
+    'permission_exception',
+    '无权限访问',
+)
 
 ORDER_STATUS_ALIASES = {
     'processing': 'processing',
@@ -229,6 +236,11 @@ class OrderHistoryPageFetcher:
             ),
         }
 
+    def _build_browser_request_headers(self) -> Dict[str, str]:
+        request_headers = dict(self._build_request_headers())
+        request_headers.pop('cookie', None)
+        return request_headers
+
     def _build_request_params(self, data_val: str) -> Dict[str, str]:
         token = self.cookies.get('_m_h5_tk', '').split('_')[0]
         if not token:
@@ -251,6 +263,130 @@ class OrderHistoryPageFetcher:
         }
         params['sign'] = generate_sign(params['t'], token, data_val)
         return params
+
+    async def _read_seller_workbench_body_text(self, page) -> str:
+        if page is None:
+            return ''
+        try:
+            body_text = await page.evaluate(
+                '() => document.body ? (document.body.innerText || document.body.textContent || "") : ""'
+            )
+        except Exception:
+            return ''
+        return str(body_text or '').strip()
+
+    def _is_seller_workbench_access_denied_text(self, text: Any) -> bool:
+        normalized_text = str(text or '').strip().lower()
+        if not normalized_text:
+            return False
+        return any(keyword in normalized_text for keyword in SELLER_WORKBENCH_DENIED_KEYWORDS)
+
+    async def _raise_if_seller_workbench_access_denied(self, page, response_text: Any = None) -> None:
+        body_text = await self._read_seller_workbench_body_text(page)
+        if self._is_seller_workbench_access_denied_text(body_text) or self._is_seller_workbench_access_denied_text(response_text):
+            page_title = ''
+            if page is not None:
+                try:
+                    title_getter = getattr(page, 'title', None)
+                    page_title = await title_getter() if callable(title_getter) else str(title_getter or '')
+                except Exception:
+                    page_title = ''
+            raise RuntimeError(
+                f'【{self.account_id}】卖家工作台当前账号无访问权限，请切换账号或联系对接人员确认: '
+                f'title={page_title or "unknown"}'
+            )
+
+    async def _sync_browser_context_cookies(self, context, *, persist: bool = False) -> bool:
+        if context is None:
+            return False
+        cookie_reader = getattr(context, 'cookies', None)
+        if not callable(cookie_reader):
+            return False
+        try:
+            cookie_items = await cookie_reader()
+        except Exception:
+            return False
+        merged_cookies: Dict[str, str] = dict(self.cookies)
+        changed = False
+        for cookie in cookie_items or []:
+            if not isinstance(cookie, dict):
+                continue
+            name = str(cookie.get('name') or '').strip()
+            if not name:
+                continue
+            value = cookie.get('value')
+            if value is None:
+                continue
+            normalized_value = str(value)
+            if merged_cookies.get(name) != normalized_value:
+                merged_cookies[name] = normalized_value
+                changed = True
+        if changed:
+            self._set_runtime_cookie_state(merged_cookies)
+            if persist:
+                await self._persist_cookie_update()
+        return changed
+
+    async def _request_order_page_via_browser(self, page, context, page_number: int) -> Dict[str, Any]:
+        await self._raise_if_seller_workbench_access_denied(page)
+        pre_request_cookie_changed = await self._sync_browser_context_cookies(context, persist=False)
+
+        payload = {
+            'pageNumber': page_number,
+            'rowsPerPage': DEFAULT_PAGE_SIZE,
+            'orderIds': '',
+            'queryCode': ORDER_LIST_QUERY_CODE,
+            'orderSearchParam': '{}',
+        }
+        data_val = json.dumps(payload, separators=(',', ':'))
+        params = self._build_request_params(data_val)
+        request_headers = self._build_browser_request_headers()
+        request_url = f"{ORDER_LIST_API_URL}?{'&'.join([f'{key}={value}' for key, value in params.items()])}"
+
+        fetch_result = await page.evaluate(
+            """
+            async (payload) => {
+                const { url, headers, body } = payload;
+                const response = await fetch(url, {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers,
+                    body
+                });
+                return {
+                    status: response.status,
+                    text: await response.text()
+                };
+            }
+            """,
+            {
+                'url': request_url,
+                'headers': request_headers,
+                'body': f"data={data_val}",
+            },
+        )
+        if not isinstance(fetch_result, dict):
+            raise RuntimeError(f'【{self.account_id}】卖家工作台历史订单列表返回异常响应: {fetch_result!r}')
+
+        response_text = str(fetch_result.get('text') or '').strip()
+        await self._raise_if_seller_workbench_access_denied(page, response_text=response_text)
+
+        try:
+            response_json = json.loads(response_text)
+        except Exception as exc:
+            raise RuntimeError(
+                f'【{self.account_id}】卖家工作台历史订单列表返回非 JSON: status={fetch_result.get("status")}, '
+                f'body={response_text[:300]}'
+            ) from exc
+
+        ret_value = response_json.get('ret', [])
+        if any('SUCCESS::调用成功' in str(ret) for ret in ret_value):
+            post_request_cookie_changed = await self._sync_browser_context_cookies(context, persist=False)
+            if pre_request_cookie_changed or post_request_cookie_changed:
+                await self._persist_cookie_update()
+            return response_json
+
+        raise RuntimeError(f'【{self.account_id}】卖家工作台历史订单列表 API 调用失败: {ret_value or response_json}')
 
     async def _request_order_page(self, page_number: int, allow_retry: bool = True) -> Dict[str, Any]:
         await self._ensure_session()
@@ -432,6 +568,102 @@ class OrderHistoryPageFetcher:
                 logger.info(
                     f"【{self.account_id}】历史订单列表在第 {page_number} 页已全部早于开始时间，停止继续翻页"
                 )
+                break
+
+            page_number += 1
+
+        matched_orders = captured_orders[:max_orders]
+        return {
+            'orders': matched_orders,
+            'scanned_count': scanned_count,
+            'matched_count': len(matched_orders),
+            'out_of_range_count': out_of_range_count,
+            'pages_scanned': pages_scanned,
+            'stopped_by_range': stopped_by_range,
+        }
+
+    async def fetch_recent_orders_via_browser(
+        self,
+        page,
+        context=None,
+        max_orders: int = 100,
+        utc_start: Optional[str] = None,
+        utc_end_exclusive: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if max_orders <= 0:
+            return {
+                'orders': [],
+                'scanned_count': 0,
+                'matched_count': 0,
+                'out_of_range_count': 0,
+                'pages_scanned': 0,
+                'stopped_by_range': False,
+            }
+
+        await self._raise_if_seller_workbench_access_denied(page)
+
+        captured_orders: List[Dict[str, Any]] = []
+        seen_order_ids = set()
+        page_number = 1
+        scanned_count = 0
+        out_of_range_count = 0
+        pages_scanned = 0
+        stopped_by_range = False
+
+        while len(captured_orders) < max_orders:
+            response_json = await self._request_order_page_via_browser(page, context, page_number)
+            pages_scanned += 1
+            module = ((response_json.get('data') or {}).get('module') or {})
+            items = module.get('items') or []
+            next_page = str(module.get('nextPage') or '').lower() == 'true'
+
+            if not isinstance(items, list):
+                items = []
+
+            page_scanned_count = 0
+            page_in_range_count = 0
+            page_before_count = 0
+            page_unknown_count = 0
+
+            for raw_item in items:
+                candidate = self._normalize_order_candidate(raw_item)
+                if not candidate:
+                    continue
+
+                order_id = candidate.get('order_id')
+                if not order_id or order_id in seen_order_ids:
+                    continue
+
+                seen_order_ids.add(order_id)
+                scanned_count += 1
+                page_scanned_count += 1
+
+                anchor_time = resolve_order_history_anchor_time(candidate)
+                range_status = classify_order_history_range(anchor_time, utc_start=utc_start, utc_end_exclusive=utc_end_exclusive)
+                if range_status == 'in_range':
+                    captured_orders.append(candidate)
+                    page_in_range_count += 1
+                else:
+                    out_of_range_count += 1
+                    if range_status == 'before':
+                        page_before_count += 1
+                    elif range_status != 'after':
+                        page_unknown_count += 1
+
+                if len(captured_orders) >= max_orders:
+                    break
+
+            if len(captured_orders) >= max_orders or not next_page or not items:
+                break
+
+            if (
+                utc_start and utc_end_exclusive
+                and page_scanned_count > 0
+                and page_in_range_count == 0
+                and page_unknown_count == 0
+                and page_before_count == page_scanned_count
+            ):
+                stopped_by_range = True
                 break
 
             page_number += 1

@@ -324,15 +324,11 @@ class BrowserSidecarsProviderMigrationTest(unittest.IsolatedAsyncioTestCase):
             runtime_request["launch_options"]["proxy"],
             {"server": "http://127.0.0.1:1081"},
         )
-        self.assertEqual(runtime_request["persistent_context_options"]["locale"], "zh-CN")
-        self.assertEqual(runtime_request["persistent_context_options"]["timezone"], "Asia/Shanghai")
-        self.assertEqual(runtime_request["persistent_context_options"]["color_scheme"], "light")
+        self.assertNotIn("locale", runtime_request["persistent_context_options"])
+        self.assertNotIn("timezone", runtime_request["persistent_context_options"])
+        self.assertNotIn("viewport", runtime_request["persistent_context_options"])
         self.assertTrue(runtime_request["persistent_context_options"]["accept_downloads"])
         self.assertTrue(runtime_request["persistent_context_options"]["ignore_https_errors"])
-        self.assertEqual(
-            runtime_request["persistent_context_options"]["viewport"],
-            {"width": 1600, "height": 900},
-        )
         self.assertIs(session.managed_runtime_lease, lease)
         injected_cookie_keys = {
             (cookie["name"], cookie["domain"]): cookie["value"]

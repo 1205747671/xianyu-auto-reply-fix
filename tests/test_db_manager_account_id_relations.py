@@ -1309,6 +1309,44 @@ class DBManagerAccountIdRelationsTest(unittest.TestCase):
         self.assertTrue(self.db.delete_cookie(account_id="acc-credential-1"))
         self.assertIsNone(self.db.get_cookie_by_id(account_id="acc-credential-1"))
 
+    def test_delete_pending_cookie_placeholder_only_removes_empty_pending_records(self):
+        self.assertTrue(
+            self.db.create_cookie_account_placeholder(
+                account_id="acc-placeholder-empty-1",
+                user_id=1,
+                bind_status="pending_bind",
+            )
+        )
+        self.assertTrue(
+            self.db.delete_pending_cookie_placeholder(
+                account_id="acc-placeholder-empty-1",
+                user_id=1,
+            )
+        )
+        self.assertIsNone(self.db.get_cookie_binding_info("acc-placeholder-empty-1"))
+
+        self.assertTrue(
+            self.db.create_cookie_account_placeholder(
+                account_id="acc-placeholder-live-1",
+                user_id=1,
+                bind_status="pending_bind",
+            )
+        )
+        self.assertTrue(
+            self.db.save_cookie(
+                account_id="acc-placeholder-live-1",
+                cookie_value="a=1; b=2",
+                user_id=1,
+            )
+        )
+        self.assertFalse(
+            self.db.delete_pending_cookie_placeholder(
+                account_id="acc-placeholder-live-1",
+                user_id=1,
+            )
+        )
+        self.assertIsNotNone(self.db.get_cookie_binding_info("acc-placeholder-live-1"))
+
     def test_risk_control_logs_use_account_id_boundary(self):
         self._save_account("acc-risk-1")
 

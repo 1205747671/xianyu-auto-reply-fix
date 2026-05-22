@@ -1,8 +1,10 @@
 import time
+import sys
 import unittest
 from unittest import mock
 from types import SimpleNamespace
 
+import XianyuAutoAsync
 from XianyuAutoAsync import ConnectionState, XianyuLive
 
 
@@ -44,6 +46,20 @@ class _FakeSession:
 
 
 class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        super().setUp()
+        original_xianyu_module = sys.modules.get("XianyuAutoAsync")
+        sys.modules["XianyuAutoAsync"] = XianyuAutoAsync
+
+        def _restore_module_binding():
+            if original_xianyu_module is None:
+                if sys.modules.get("XianyuAutoAsync") is XianyuAutoAsync:
+                    sys.modules.pop("XianyuAutoAsync", None)
+            else:
+                sys.modules["XianyuAutoAsync"] = original_xianyu_module
+
+        self.addCleanup(_restore_module_binding)
+
     async def test_preflight_token_after_password_login_reuses_existing_current_token(self):
         live = XianyuLive.__new__(XianyuLive)
         live.account_id = "prewarmed_token_account"

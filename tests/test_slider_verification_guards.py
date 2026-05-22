@@ -1817,9 +1817,17 @@ class CloakBrowserProviderContractTest(unittest.TestCase):
             context_options=context_options,
         )
 
-        self.assertEqual(context_options, {})
-        self.assertNotIn("locale", persistent_options)
-        self.assertNotIn("timezone", persistent_options)
+        self.assertEqual(
+            context_options,
+            {
+                "color_scheme": "dark",
+                "viewport": {"width": 1600, "height": 900},
+            },
+        )
+        self.assertEqual(persistent_options["locale"], "zh-CN")
+        self.assertEqual(persistent_options["timezone"], "Asia/Shanghai")
+        self.assertEqual(persistent_options["color_scheme"], "dark")
+        self.assertEqual(persistent_options["viewport"], {"width": 1600, "height": 900})
         self.assertTrue(persistent_options["accept_downloads"])
         self.assertTrue(persistent_options["ignore_https_errors"])
 
@@ -1856,9 +1864,10 @@ class PasswordLoginNavigationContractTest(unittest.TestCase):
     def test_password_login_im_navigation_does_not_wait_for_networkidle(self):
         source = (Path(PROJECT_ROOT) / "utils" / "xianyu_slider_stealth.py").read_text(encoding="utf-8")
 
+        self.assertIn("self._goto_login_page_with_ready_state_fallback(", source)
+        self.assertIn("allow_networkidle_fallback=bool(effective_clean_context)", source)
         self.assertIn("page.goto(login_url, wait_until='domcontentloaded', timeout=30000)", source)
         self.assertIn("page.wait_for_load_state('load', timeout=10000)", source)
-        self.assertNotIn("page.goto(login_url, wait_until='networkidle', timeout=60000)", source)
 
 if __name__ == "__main__":
     unittest.main()

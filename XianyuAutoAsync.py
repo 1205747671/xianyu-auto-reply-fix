@@ -788,6 +788,37 @@ class XianyuLive:
         return text
 
     @staticmethod
+    def _safe_console_print(*parts, sep: str = " ", end: str = "\n") -> None:
+        try:
+            print(*parts, sep=sep, end=end)
+            return
+        except UnicodeEncodeError:
+            pass
+        except Exception:
+            return
+
+        text = sep.join(str(part) for part in parts)
+        tried_encodings = set()
+        for encoding in (
+            getattr(sys.stdout, "encoding", None),
+            "utf-8",
+            "ascii",
+        ):
+            normalized_encoding = str(encoding or "").strip().lower()
+            if not normalized_encoding or normalized_encoding in tried_encodings:
+                continue
+            tried_encodings.add(normalized_encoding)
+            try:
+                sanitized_text = text.encode(normalized_encoding, errors="replace").decode(
+                    normalized_encoding,
+                    errors="replace",
+                )
+                print(sanitized_text, end=end)
+                return
+            except Exception:
+                continue
+
+    @staticmethod
     def classify_password_login_failure(error_message: str) -> Tuple[str, int]:
         message = (error_message or "").lower()
         if any(keyword in message for keyword in ["账号密码错误", "账密错误", "用户名或密码错误", "密码错误"]):
@@ -5727,6 +5758,14 @@ class XianyuLive:
         previous_skip_reload_flag = bool(getattr(self, '_skip_db_cookie_reload_for_token_refresh', False))
         self._skip_db_cookie_reload_for_token_refresh = True
         try:
+            cache_extra_kwargs = {}
+            resolved_device_id = str(getattr(self, 'device_id', None) or '').strip()
+            if resolved_device_id:
+                cache_extra_kwargs['device_id'] = resolved_device_id
+            resolved_app_key = str(getattr(self, 'auth_prewarmed_app_key', None) or '').strip()
+            if resolved_app_key:
+                cache_extra_kwargs['app_key'] = resolved_app_key
+
             existing_token = str(getattr(self, 'current_token', '') or '').strip()
             if existing_token:
                 self.last_token_refresh_status = "prewarmed_token_reused"
@@ -5735,8 +5774,7 @@ class XianyuLive:
                     current_account_id,
                     existing_token,
                     source=token_source,
-                    device_id=getattr(self, 'device_id', None),
-                    app_key=getattr(self, 'auth_prewarmed_app_key', None) or APP_CONFIG.get('app_key'),
+                    **cache_extra_kwargs,
                 )
                 logger.info(
                     f"【{log_account_id}】{label}检测到实例已持有新鲜token，"
@@ -5752,8 +5790,7 @@ class XianyuLive:
                         current_account_id,
                         token,
                         source=token_source,
-                        device_id=getattr(self, 'device_id', None),
-                        app_key=getattr(self, 'auth_prewarmed_app_key', None) or APP_CONFIG.get('app_key'),
+                        **cache_extra_kwargs,
                     )
                     logger.info(f"【{log_account_id}】{label}成功（第{attempt}次），已缓存预热token供新实例复用")
                     return token
@@ -6793,15 +6830,17 @@ class XianyuLive:
 
                 logger.info(f"【{current_account_id}】XianyuSliderStealth导入成功，使用滑块验证")
 
+                account_info = db_manager.get_cookie_details(current_account_id) or {}
+                show_browser = bool(account_info.get('show_browser', False))
                 logger.info(
                     f"【{current_account_id}】自动滑块验证准备启动："
-                    f"headless=True, proxy_type={self.proxy_config.get('proxy_type', 'none')}"
+                    f"headless={not show_browser}, proxy_type={self.proxy_config.get('proxy_type', 'none')}"
                 )
 
                 slider_stealth = XianyuSliderStealth(
                     user_id=f"{current_account_id}",
                     enable_learning=True,
-                    headless=True,
+                    headless=not show_browser,
                     initial_cookies=self.cookies_str,
                     proxy=self.proxy_config,
                     use_account_persistent_profile=True,
@@ -7362,6 +7401,7 @@ class XianyuLive:
 
             username = account_info.get('username', '')
             password = account_info.get('password', '')
+            show_browser = bool(account_info.get('show_browser', False))
             if not username or not password:
                 logger.warning(f"【{log_account_id}】未配置用户名或密码，跳过密码登录刷新")
                 self.last_token_refresh_status = "no_credentials"
@@ -7383,7 +7423,7 @@ class XianyuLive:
                     )
                 return False
 
-            logger.info(f"【{log_account_id}】开始使用无头浏览器进行密码登录刷新Cookie...")
+            logger.info(f"【{log_account_id}】开始使用{'有头' if show_browser else '无头'}浏览器进行密码登录刷新Cookie...")
             logger.info(f"【{log_account_id}】使用账号 {username}")
 
             async def notification_callback_wrapper(message: str, screenshot_path: str = None, verification_url: str = None):
@@ -7405,7 +7445,7 @@ class XianyuLive:
             slider = XianyuSliderStealth(
                 user_id=resolved_account_id,
                 enable_learning=True,
-                headless=True,
+                headless=not show_browser,
                 initial_cookies=self.cookies_str,
                 proxy=self.proxy_config,
                 use_account_persistent_profile=reuse_account_persistent_profile,
@@ -7440,6 +7480,7 @@ class XianyuLive:
                 resolved_account_id=resolved_account_id,
                 account=username,
                 password=password,
+                show_browser=show_browser,
                 notification_callback=notification_callback_wrapper,
                 force_clean_context=not reuse_account_persistent_profile,
             )
@@ -7637,6 +7678,7 @@ class XianyuLive:
         resolved_account_id: str,
         account: str,
         password: str,
+        show_browser: bool,
         notification_callback,
         force_clean_context: bool,
     ):
@@ -7694,6 +7736,7 @@ class XianyuLive:
             return slider.login_with_password_browser(
                 account=account,
                 password=password,
+                show_browser=show_browser,
                 notification_callback=notification_callback,
                 force_clean_context=force_clean_context,
                 require_managed_runtime=True,
@@ -9835,24 +9878,72 @@ class XianyuLive:
 
         history_fetcher = None
         try:
-            from utils.order_history_sync import OrderHistoryPageFetcher
+            from utils.order_history_sync import ORDER_LIST_REFERER, OrderHistoryPageFetcher
 
             history_fetcher = OrderHistoryPageFetcher(
                 self.cookies_str,
                 account_id=current_account_id,
                 headless=True,
             )
-            fetch_result = await history_fetcher.fetch_recent_orders(
-                max_orders=max_orders,
-                utc_start=utc_start,
-                utc_end_exclusive=utc_end_exclusive,
-            )
+            cookie_update_source = "order_history_sync_http"
+            try:
+                fetch_result = await history_fetcher.fetch_recent_orders(
+                    max_orders=max_orders,
+                    utc_start=utc_start,
+                    utc_end_exclusive=utc_end_exclusive,
+                )
+            except RuntimeError as http_fetch_error:
+                logger.warning(
+                    f"【{current_account_id}】历史订单列表 HTTP 抓取失败，尝试切换浏览器回退链路: "
+                    f"{self._safe_str(http_fetch_error)}"
+                )
+                runtime_lease = None
+                browser = None
+                context = None
+                page = None
+                release_reason = "order_history_sync_browser_failed"
+                try:
+                    runtime_lease, browser, context, _ = await self._open_browser_recovery_context(
+                        "历史订单列表浏览器回退",
+                        runtime_purpose="order_history_sync",
+                    )
+                    if runtime_lease is None or context is None:
+                        raise RuntimeError(
+                            f"【{current_account_id}】历史订单列表浏览器回退未获取到可用 runtime"
+                        ) from http_fetch_error
+
+                    cookie_payload = self._build_browser_cookie_payload(self.cookies_str)
+                    if cookie_payload:
+                        add_cookies = getattr(context, "add_cookies", None)
+                        if callable(add_cookies):
+                            await add_cookies(cookie_payload)
+
+                    page, context = await account_browser_runtime_manager.get_fresh_page(runtime_lease)
+                    await page.goto(ORDER_LIST_REFERER, wait_until='domcontentloaded', timeout=30000)
+                    fetch_result = await history_fetcher.fetch_recent_orders_via_browser(
+                        page,
+                        context=context,
+                        max_orders=max_orders,
+                        utc_start=utc_start,
+                        utc_end_exclusive=utc_end_exclusive,
+                    )
+                    cookie_update_source = "order_history_sync_browser"
+                    release_reason = "order_history_sync_browser_completed"
+                finally:
+                    if runtime_lease is not None or browser or context or page:
+                        await self._release_browser_recovery_runtime(
+                            runtime_lease,
+                            browser=browser,
+                            context=context,
+                            page=page,
+                            reason=release_reason,
+                        )
 
             if history_fetcher.cookie_string and history_fetcher.cookie_string != self.cookies_str:
                 self._set_runtime_cookie_state(
                     cookies_str=history_fetcher.cookie_string,
                     cookies_dict=history_fetcher.cookies,
-                    source="order_history_sync_http",
+                    source=cookie_update_source,
                 )
 
             return fetch_result
@@ -10006,12 +10097,17 @@ class XianyuLive:
                         if spec_name_2 and spec_value_2:
                             logger.info(f"【{self.account_id}】📋 规格2名称: {spec_name_2}")
                             logger.info(f"【{self.account_id}】📝 规格2值: {spec_value_2}")
-                            print(f"🛍️ 【{self.account_id}】订单 {order_id} 规格信息: {spec_name} -> {spec_value}, {spec_name_2} -> {spec_value_2}")
+                            self._safe_console_print(
+                                f"🛍️ 【{self.account_id}】订单 {order_id} 规格信息: "
+                                f"{spec_name} -> {spec_value}, {spec_name_2} -> {spec_value_2}"
+                            )
                         else:
-                            print(f"🛍️ 【{self.account_id}】订单 {order_id} 规格信息: {spec_name} -> {spec_value}")
+                            self._safe_console_print(
+                                f"🛍️ 【{self.account_id}】订单 {order_id} 规格信息: {spec_name} -> {spec_value}"
+                            )
                     else:
                         logger.warning(f"【{self.account_id}】未获取到有效的规格信息")
-                        print(f"⚠️ 【{self.account_id}】订单 {order_id} 规格信息获取失败")
+                        self._safe_console_print(f"⚠️ 【{self.account_id}】订单 {order_id} 规格信息获取失败")
 
                     if amount:
                         logger.info(f"【{self.account_id}】💰 订单金额: {amount} (source={amount_source})")
@@ -10135,6 +10231,24 @@ class XianyuLive:
                             buyer_nick_source="order_detail",
                             log_prefix=f"【{self.account_id}?",
                         )
+                        if isinstance(result, dict):
+                            result["order_id"] = order_id
+                            result["account_id"] = current_account_id
+                            if item_id is not None:
+                                result["item_id"] = item_id
+                            result["buyer_id"] = buyer_id_to_save
+                            result["buyer_nick"] = buyer_nick_to_save
+                            result["sid"] = sid
+                            result["order_status"] = order_status_to_save or result.get("order_status")
+                            result["amount"] = amount
+                            result["spec_name"] = spec_name
+                            result["spec_value"] = spec_value
+                            result["spec_name_2"] = spec_name_2
+                            result["spec_value_2"] = spec_value_2
+                            result["quantity"] = quantity
+                            result["platform_created_at"] = platform_created_at
+                            result["platform_paid_at"] = platform_paid_at
+                            result["platform_completed_at"] = platform_completed_at
                         if should_skip_write:
                             return result
 
@@ -10187,7 +10301,7 @@ class XianyuLive:
 
                             if success:
                                 logger.info(f"【{self.account_id}】订单信息已保存到数据库: {order_id}")
-                                print(f"💾 【{self.account_id}】订单 {order_id} 信息已保存到数据库")
+                                self._safe_console_print(f"💾 【{self.account_id}】订单 {order_id} 信息已保存到数据库")
                             else:
                                 logger.warning(f"【{self.account_id}】订单信息保存失败: {order_id}")
 
@@ -12520,7 +12634,6 @@ class XianyuLive:
                             context=context,
                             page=page,
                             reason="qr_cookie_refresh_auth_prewarm_handoff_release",
-                            invalidate_after_release=False,
                         )
                     except Exception as early_release_error:
                         logger.warning(
@@ -12545,14 +12658,17 @@ class XianyuLive:
         finally:
             try:
                 if runtime_lease is not None:
+                    release_kwargs = {}
+                    if owns_runtime_lease and not runtime_invalidated_during_auth_prewarm:
+                        release_kwargs["invalidate_after_release"] = True
                     await self._release_browser_recovery_runtime(
-                    runtime_lease,
-                    browser=browser,
-                    context=context,
-                    page=page,
-                    reason="qr_cookie_refresh_completed",
-                    invalidate_after_release=owns_runtime_lease and not runtime_invalidated_during_auth_prewarm,
-                )
+                        runtime_lease,
+                        browser=browser,
+                        context=context,
+                        page=page,
+                        reason="qr_cookie_refresh_completed",
+                        **release_kwargs,
+                    )
                 elif browser or context:
                     await self._async_close_browser(
                         browser=browser,

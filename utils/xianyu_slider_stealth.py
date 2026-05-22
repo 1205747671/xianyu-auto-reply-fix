@@ -1096,6 +1096,26 @@ class RetryStrategyStats:
 
 # 全局策略统计实例
 strategy_stats = RetryStrategyStats()
+_CACHED_XIANYU_LIVE_CLASS = None
+
+
+def _get_xianyu_live_class():
+    global _CACHED_XIANYU_LIVE_CLASS
+
+    module = sys.modules.get("XianyuAutoAsync")
+    live_class = getattr(module, "XianyuLive", None) if module is not None else None
+    if live_class is not None:
+        _CACHED_XIANYU_LIVE_CLASS = live_class
+        return live_class
+
+    if _CACHED_XIANYU_LIVE_CLASS is not None:
+        return _CACHED_XIANYU_LIVE_CLASS
+
+    if live_class is None:
+        from XianyuAutoAsync import XianyuLive as live_class
+
+    _CACHED_XIANYU_LIVE_CLASS = live_class
+    return live_class
 
 class XianyuSliderStealth:
     
@@ -2661,9 +2681,19 @@ class XianyuSliderStealth:
 
     def _build_browser_context_options(self, browser_features: Dict[str, Any]) -> Dict[str, Any]:
         if self._provider_owns_browser_identity():
-            # CloakBrowser 已经在 binary/runtime 层接管指纹；这里不要再把项目侧随机 locale/timezone/viewport
-            # 强压回去，避免“浏览器原生指纹 + 项目自定义画像”互相打架。
-            return {}
+            # CloakBrowser 已在 provider 层接管 UA / locale / timezone 等核心身份；
+            # 这里只保留页面布局相关选项，避免把项目侧随机身份再次压回去。
+            context_options: Dict[str, Any] = {
+                'color_scheme': browser_features['color_scheme'],
+            }
+            if self.headless:
+                context_options['viewport'] = {
+                    'width': browser_features['viewport_width'],
+                    'height': browser_features['viewport_height'],
+                }
+            else:
+                context_options['no_viewport'] = True
+            return context_options
         return self._build_playwright_context_options(browser_features)
 
     def _build_persistent_context_options(
@@ -2672,9 +2702,40 @@ class XianyuSliderStealth:
         context_options: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         persistent_context_options = dict(context_options or self._build_browser_context_options(browser_features))
+        if self._provider_owns_browser_identity():
+            persistent_context_options.setdefault('locale', browser_features.get('locale'))
+            persistent_context_options.setdefault(
+                'timezone',
+                browser_features.get('timezone') or browser_features.get('timezone_id'),
+            )
         persistent_context_options.setdefault('accept_downloads', True)
         persistent_context_options.setdefault('ignore_https_errors', True)
         return persistent_context_options
+
+    def _goto_login_page_with_ready_state_fallback(
+        self,
+        page,
+        login_url: str,
+        *,
+        allow_networkidle_fallback: bool = False,
+    ):
+        if not allow_networkidle_fallback:
+            return page.goto(login_url, wait_until='domcontentloaded', timeout=30000)
+
+        try:
+            return page.goto(login_url, wait_until='networkidle', timeout=60000)
+        except Exception as goto_error:
+            error_text = str(goto_error or '')
+            lowered_error = error_text.lower()
+            if (
+                'timeout' in lowered_error
+                and 'networkidle' in lowered_error
+            ):
+                logger.warning(
+                    f"【{self.pure_user_id}】登录页等待 networkidle 超时，降级到 domcontentloaded: {login_url}"
+                )
+                return page.goto(login_url, wait_until='domcontentloaded', timeout=30000)
+            raise
 
     def _refresh_browser_features_from_page_metrics(self, page=None) -> None:
         if not self._provider_owns_browser_identity():
@@ -4997,8 +5058,7 @@ class XianyuSliderStealth:
         if extracted_device_id:
             self.last_browser_warmup_auth_device_id = extracted_device_id
         try:
-            from XianyuAutoAsync import XianyuLive
-
+            XianyuLive = _get_xianyu_live_class()
             XianyuLive.cache_auth_prewarmed_token(
                 self.pure_user_id,
                 access_token,
@@ -5079,8 +5139,7 @@ class XianyuSliderStealth:
                 if extracted_device_id:
                     self.last_live_browser_auth_device_id = extracted_device_id
                 try:
-                    from XianyuAutoAsync import XianyuLive
-
+                    XianyuLive = _get_xianyu_live_class()
                     XianyuLive.cache_auth_prewarmed_token(
                         self.pure_user_id,
                         access_token,
@@ -8526,14 +8585,28 @@ class XianyuSliderStealth:
             return False
     
     def _simulate_slide_with_provider_humanize(self, slider_button: ElementHandle, trajectory) -> bool:
-        """使用 CloakBrowser humanize 的 page.mouse.* 来执行拖拽，不走自研物理轨迹。"""
+        """优先使用 provider 暴露的原生 mouse 接口执行拖拽，避免自研轨迹和补丁事件相互打架。"""
         try:
             if not self.page:
                 return False
 
-            # humanize 只有在 page.mouse.* 上生效；page._original 是未打补丁版本，别用它。
             page = self.page
-            mouse = page.mouse
+            raw_page = getattr(page, '_original', None)
+            if (
+                raw_page is not None
+                and callable(getattr(raw_page, 'mouse_move', None))
+                and callable(getattr(raw_page, 'mouse_down', None))
+                and callable(getattr(raw_page, 'mouse_up', None))
+            ):
+                mouse = raw_page
+                mouse_move = raw_page.mouse_move
+                mouse_down = raw_page.mouse_down
+                mouse_up = raw_page.mouse_up
+            else:
+                mouse = page.mouse
+                mouse_move = mouse.move
+                mouse_down = mouse.down
+                mouse_up = mouse.up
 
             button_box = slider_button.bounding_box()
             if not button_box:
@@ -8560,18 +8633,16 @@ class XianyuSliderStealth:
             except Exception:
                 pass
 
-            mouse.move(start_x, start_y)
+            mouse_move(start_x, start_y)
             time.sleep(random.uniform(0.05, 0.15))
-            mouse.down()
+            mouse_down()
             time.sleep(random.uniform(0.02, 0.08))
 
-            # 一次性拖到目标位置，让 humanize 自己做曲线/超调/停顿
-            # steps 给个范围，避免“瞬移”
             steps = random.randint(18, 35)
-            mouse.move(start_x + target_dx, start_y, steps=steps)
+            mouse_move(start_x + target_dx, start_y, steps=steps)
 
             time.sleep(random.uniform(0.05, 0.18))
-            mouse.up()
+            mouse_up()
             return True
         except Exception as e:
             logger.warning(f"【{self.pure_user_id}】provider_humanize 拖拽失败: {e}")
@@ -8846,13 +8917,23 @@ class XianyuSliderStealth:
     ) -> Optional[Dict[str, Any]]:
         """统一处理 pureCaptcha 壳页恢复，避免不同流程前后判定打架。"""
         current_block = self._detect_special_captcha_block(target)
-        current_block = self._wait_for_punish_slider_dom_ready_if_needed(
-            target,
-            current_block,
-            context_label,
-            max_wait_seconds=max_wait_seconds,
-            poll_interval=poll_interval,
-        )
+        wait_ready_helper = self._wait_for_punish_slider_dom_ready_if_needed
+        try:
+            current_block = wait_ready_helper(
+                target,
+                current_block,
+                context_label,
+                max_wait_seconds=max_wait_seconds,
+                poll_interval=poll_interval,
+            )
+        except TypeError as wait_ready_error:
+            if "unexpected keyword argument" not in str(wait_ready_error):
+                raise
+            current_block = wait_ready_helper(
+                target,
+                current_block,
+                context_label,
+            )
         current_block = self._recover_punish_slider_shell_if_possible(
             target,
             current_block,
@@ -11993,8 +12074,11 @@ class XianyuSliderStealth:
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
-                        # /im 页面会挂长连接，等 networkidle 容易平白超时；这里先等首屏可交互即可。
-                        page.goto(login_url, wait_until='domcontentloaded', timeout=30000)
+                        self._goto_login_page_with_ready_state_fallback(
+                            page,
+                            login_url,
+                            allow_networkidle_fallback=bool(effective_clean_context),
+                        )
                         try:
                             page.wait_for_load_state('load', timeout=10000)
                         except Exception:

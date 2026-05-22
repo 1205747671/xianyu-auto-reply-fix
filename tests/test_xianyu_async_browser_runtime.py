@@ -6221,7 +6221,14 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 buyer_id_source="message",
             )
 
-        self.assertEqual(result, detail_result)
+        self.assertEqual(result["title"], "detail-title")
+        self.assertEqual(result["order_status"], "pending_ship")
+        self.assertEqual(result["order_id"], "order-detail-1")
+        self.assertEqual(result["item_id"], "item-detail-1")
+        self.assertEqual(result["buyer_id"], "buyer-detail-1")
+        self.assertEqual(result["buyer_nick"], "Buyer Detail")
+        self.assertEqual(result["sid"], "sid-detail-1")
+        self.assertEqual(result["account_id"], "acc-order-detail-1")
         fetch_order_detail_simple.assert_awaited_once_with(
             "order-detail-1",
             "unb=user1; cookie2=v2",
@@ -6307,6 +6314,64 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 fake_db.insert_or_update_order.assert_not_called()
                 live.order_status_handler.handle_order_detail_fetched_status.assert_not_called()
                 live.order_status_handler.on_order_details_fetched.assert_not_called()
+
+    async def test_fetch_order_detail_info_survives_console_unicode_encode_error(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live._legacy_cookie_id = "legacy-order-detail-console"
+        live.account_id = "acc-order-detail-console"
+        live.cookies_str = "unb=user1; cookie2=v2"
+        live._safe_str = str
+        live._order_detail_locks = {"order-detail-console-1": asyncio.Lock()}
+        live._order_detail_lock_times = {}
+        live.order_detail_retry_tasks = {}
+        live.order_status_handler = mock.Mock()
+        live.order_status_handler.handle_order_detail_fetched_status.return_value = True
+        live._apply_bargain_amount_override = mock.Mock(return_value=(None, "unknown"))
+        live._should_reject_order_detail_status_update = mock.Mock(return_value=False)
+        live._should_accept_order_detail_status_correction = mock.Mock(return_value=False)
+        live._resolve_external_order_status = mock.Mock(return_value="pending_ship")
+        live._select_buyer_identity_for_order_write = mock.Mock(
+            return_value=("buyer-detail-1", "Buyer Detail", False)
+        )
+
+        fake_db = mock.Mock()
+        fake_db.get_item_info.return_value = None
+        fake_db.get_order_by_id.return_value = None
+        fake_db.get_cookie_by_id.return_value = {"id": "acc-order-detail-console"}
+        fake_db._normalize_order_status.side_effect = lambda value: value
+        fake_db.insert_or_update_order.return_value = True
+
+        detail_result = {
+            "title": "detail-title",
+            "order_status": "pending_ship",
+            "order_status_source": "structured",
+        }
+
+        def fake_print(*args, **kwargs):
+            message = kwargs.get("sep", " ").join(str(arg) for arg in args)
+            if any(ord(ch) > 127 for ch in message):
+                raise UnicodeEncodeError("gbk", message, 0, 1, "illegal multibyte sequence")
+            return None
+
+        with mock.patch("db_manager.db_manager", fake_db), \
+             mock.patch(
+                 "utils.order_detail_fetcher.fetch_order_detail_simple",
+                 new=mock.AsyncMock(return_value=detail_result),
+                 create=True,
+             ), \
+             mock.patch("builtins.print", side_effect=fake_print):
+            result = await live.fetch_order_detail_info(
+                "order-detail-console-1",
+                item_id="item-detail-1",
+                buyer_id="buyer-detail-1",
+                sid="sid-detail-1",
+                buyer_nick="Buyer Detail",
+                buyer_id_source="message",
+            )
+
+        self.assertEqual(result, detail_result)
+        fake_db.insert_or_update_order.assert_called_once()
+        live.order_status_handler.handle_order_detail_fetched_status.assert_called_once()
 
     async def test_fetch_order_detail_info_scopes_detail_locks_by_canonical_account_id(self):
         shared_locks = {}
@@ -11652,6 +11717,135 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 "x5sec": "test-x5",
             },
             source="order_history_sync_http",
+        )
+
+    async def test_fetch_recent_order_history_candidates_falls_back_to_browser_fetch_when_http_fetch_fails(self):
+        if "aiohttp" not in sys.modules:
+            aiohttp_stub = types.ModuleType("aiohttp")
+
+            class _ClientTimeout:
+                def __init__(self, *args, **kwargs):
+                    self.args = args
+                    self.kwargs = kwargs
+
+            class _ClientSession:
+                pass
+
+            aiohttp_stub.ClientTimeout = _ClientTimeout
+            aiohttp_stub.ClientSession = _ClientSession
+            sys.modules["aiohttp"] = aiohttp_stub
+        if "loguru" not in sys.modules:
+            loguru_stub = types.ModuleType("loguru")
+            loguru_stub.logger = mock.Mock()
+            sys.modules["loguru"] = loguru_stub
+
+        from utils import order_history_sync as order_history_sync_module
+
+        browser = mock.Mock()
+        context = mock.Mock()
+        context.add_cookies = mock.AsyncMock()
+        page = mock.Mock()
+        page.goto = mock.AsyncMock()
+        lease = self._build_runtime_lease(
+            "acc-order-browser-fallback",
+            browser=browser,
+            context=context,
+        )
+        runtime_manager = types.SimpleNamespace(
+            get_fresh_page=mock.AsyncMock(return_value=(page, context)),
+        )
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "acc-order-browser-fallback"
+        live.cookies_str = "unb=test-unb; _m_h5_tk=test-token_123; cookie2=test-cookie2"
+        live._safe_str = str
+        live._set_runtime_cookie_state = mock.Mock()
+        live._build_browser_cookie_payload = mock.Mock(
+            return_value=[{"name": "unb", "value": "test-unb", "domain": ".goofish.com", "path": "/"}]
+        )
+        live._open_browser_recovery_context = mock.AsyncMock(
+            return_value=(lease, browser, context, True)
+        )
+        live._release_browser_recovery_runtime = mock.AsyncMock()
+
+        fake_fetcher = types.SimpleNamespace(
+            cookie_string="unb=test-unb; _m_h5_tk=test-token_789; cookie2=test-cookie2; x5sec=test-x5",
+            cookies={
+                "unb": "test-unb",
+                "_m_h5_tk": "test-token_789",
+                "cookie2": "test-cookie2",
+                "x5sec": "test-x5",
+            },
+            fetch_recent_orders=mock.AsyncMock(side_effect=RuntimeError("http order fetch failed")),
+            fetch_recent_orders_via_browser=mock.AsyncMock(
+                return_value={
+                    "orders": [{"order_id": "order-browser-1"}],
+                    "scanned_count": 1,
+                    "matched_count": 1,
+                    "out_of_range_count": 0,
+                }
+            ),
+            close=mock.AsyncMock(),
+        )
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "account_browser_runtime_manager",
+            new=runtime_manager,
+        ), mock.patch.object(
+            order_history_sync_module,
+            "OrderHistoryPageFetcher",
+            return_value=fake_fetcher,
+        ):
+            result = await live.fetch_recent_order_history_candidates(
+                max_orders=5,
+                utc_start="2026-05-01 00:00:00",
+                utc_end_exclusive="2026-05-02 00:00:00",
+            )
+
+        self.assertEqual(result["matched_count"], 1)
+        fake_fetcher.fetch_recent_orders.assert_awaited_once_with(
+            max_orders=5,
+            utc_start="2026-05-01 00:00:00",
+            utc_end_exclusive="2026-05-02 00:00:00",
+        )
+        live._open_browser_recovery_context.assert_awaited_once_with(
+            "历史订单列表浏览器回退",
+            runtime_purpose="order_history_sync",
+        )
+        runtime_manager.get_fresh_page.assert_awaited_once_with(lease)
+        context.add_cookies.assert_awaited_once_with(
+            [{"name": "unb", "value": "test-unb", "domain": ".goofish.com", "path": "/"}]
+        )
+        page.goto.assert_awaited_once_with(
+            "https://seller.goofish.com/?site=COMMONPRO#/seller-trade/order-manage",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        fake_fetcher.fetch_recent_orders_via_browser.assert_awaited_once_with(
+            page,
+            context=context,
+            max_orders=5,
+            utc_start="2026-05-01 00:00:00",
+            utc_end_exclusive="2026-05-02 00:00:00",
+        )
+        live._release_browser_recovery_runtime.assert_awaited_once_with(
+            lease,
+            browser=browser,
+            context=context,
+            page=page,
+            reason="order_history_sync_browser_completed",
+        )
+        fake_fetcher.close.assert_awaited_once()
+        live._set_runtime_cookie_state.assert_called_once_with(
+            cookies_str="unb=test-unb; _m_h5_tk=test-token_789; cookie2=test-cookie2; x5sec=test-x5",
+            cookies_dict={
+                "unb": "test-unb",
+                "_m_h5_tk": "test-token_789",
+                "cookie2": "test-cookie2",
+                "x5sec": "test-x5",
+            },
+            source="order_history_sync_browser",
         )
 
     async def test_refresh_cookies_from_qr_login_returns_false_when_reopen_after_released_lease_fails(self):
