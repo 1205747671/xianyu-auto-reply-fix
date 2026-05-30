@@ -65,6 +65,11 @@ def test_xianyu_async_contains_expected_text_literals():
         "处理WebSocket消息异常",
         "所有后台任务状态:",
         "心跳(已启动),",
+        'log_prefix = f"【{self.account_id}】[{msg_id}]" if msg_id else f"【{self.account_id}】"',
+        'log_prefix=f"【{self.account_id}】",',
+        'log_prefix = f"【{self.account_id}】"',
+        'logger.warning(f"【{self.account_id}】 - {detail}")',
+        'logger.info(f"【{log_account_id}】 {cookie_name}: {display_value}{change_mark}")',
     ]
 
     for phrase in expected_phrases:
@@ -108,6 +113,11 @@ def test_xianyu_async_does_not_contain_known_garbled_text():
         "[{msg_time}] 【{self.account_id}?",
         "【{log_account_id}?=========================================",
         "【{target_account_id}?=========================================",
+        'log_prefix = f"【{self.account_id}】[{msg_id}]" if msg_id else f"【{self.account_id}?"',
+        'log_prefix=f"【{self.account_id}?",',
+        'log_prefix = f"【{self.account_id}?"',
+        'logger.warning(f"【{self.account_id}? - {detail}")',
+        'logger.info(f"【{log_account_id}? {cookie_name}: {display_value}{change_mark}")',
         "】过CookieManager重启实例...",
         "】开始过浏览器刷新Cookie...",
         "  ?'{key}':",

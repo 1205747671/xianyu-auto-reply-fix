@@ -111,6 +111,7 @@ def normalize_channel_type(channel_type: Any) -> str:
         'email': 'email',
         'webhook': 'webhook',
         'wechat': 'wechat',
+        'weixin': 'wechat',
         'telegram': 'telegram',
         'tg': 'telegram',
         'bark': 'bark',
@@ -131,11 +132,54 @@ def parse_notification_config(config: Any) -> Dict[str, Any]:
     return {'config': config}
 
 
-def get_notification_template_text(template_type: str) -> str:
+def _resolve_notification_template_owner_user_id(
+    *,
+    owner_user_id: Optional[int] = None,
+    owner_account_id: str = '',
+) -> Optional[int]:
     from db_manager import db_manager
 
+    if owner_user_id is not None:
+        try:
+            return int(owner_user_id)
+        except (TypeError, ValueError):
+            pass
+
+    normalized_account_id = str(owner_account_id or '').strip()
+    if not normalized_account_id:
+        return None
+
     try:
-        template_data = db_manager.get_notification_template(template_type)
+        cookie_details = db_manager.get_cookie_details(normalized_account_id)
+        if cookie_details and cookie_details.get('user_id') is not None:
+            return int(cookie_details['user_id'])
+    except Exception as exc:
+        logger.warning(f"解析通知模板归属用户失败: {_safe_str(exc)}")
+
+    return None
+
+
+def get_notification_template_text(
+    template_type: str,
+    *,
+    owner_user_id: Optional[int] = None,
+    owner_account_id: str = '',
+) -> str:
+    from db_manager import db_manager
+
+    resolved_owner_user_id = _resolve_notification_template_owner_user_id(
+        owner_user_id=owner_user_id,
+        owner_account_id=owner_account_id,
+    )
+
+    if resolved_owner_user_id is None:
+        return DEFAULT_NOTIFICATION_TEMPLATES.get(template_type, '')
+
+    try:
+        template_data = db_manager.get_notification_template(
+            template_type,
+            user_id=resolved_owner_user_id,
+        )
         if template_data and template_data.get('template'):
             return template_data['template']
     except Exception as exc:
@@ -155,8 +199,18 @@ def format_notification_template(template: str, **kwargs: Any) -> str:
         return rendered
 
 
-def render_notification_template(template_type: str, **kwargs: Any) -> str:
-    template = get_notification_template_text(template_type)
+def render_notification_template(
+    template_type: str,
+    *,
+    owner_user_id: Optional[int] = None,
+    owner_account_id: str = '',
+    **kwargs: Any,
+) -> str:
+    template = get_notification_template_text(
+        template_type,
+        owner_user_id=owner_user_id,
+        owner_account_id=owner_account_id,
+    )
     return format_notification_template(template, **kwargs)
 
 
@@ -192,6 +246,7 @@ def build_face_verify_notification(
     verification_url: str = '',
     error_message: str = '',
     has_screenshot: bool = False,
+    owner_user_id: Optional[int] = None,
 ) -> str:
     verification_type_label = resolve_verification_type_label(
         verification_type,
@@ -208,6 +263,8 @@ def build_face_verify_notification(
 
     return render_notification_template(
         'face_verify',
+        owner_user_id=owner_user_id,
+        owner_account_id=account_id,
         account_id=account_id,
         time=time_text,
         verification_action=verification_action,
@@ -294,7 +351,7 @@ async def _send_feishu_notification(config_data: Dict[str, Any], message: str, *
     }
     if secret:
         string_to_sign = f'{timestamp}\n{secret}'
-        hmac_code = hmac.new(string_to_sign.encode('utf-8'), ''.encode('utf-8'), digestmod=hashlib.sha256).digest()
+        hmac_code = hmac.new(secret.encode('utf-8'), string_to_sign.encode('utf-8'), digestmod=hashlib.sha256).digest()
         data['sign'] = base64.b64encode(hmac_code).decode('utf-8')
 
     async with aiohttp.ClientSession() as session:

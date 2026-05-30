@@ -76,6 +76,10 @@ class XianyuSearcher:
         slider_handler.playwright = playwright
         return slider_handler
 
+    def _build_remote_control_session_id(self) -> str:
+        account_scope = str(getattr(self, 'account_id', '') or getattr(self, 'user_id', 'default')).strip() or 'default'
+        return f"item-search-{account_scope}-{time.time_ns()}"
+
     async def _handle_scratch_captcha_manual(self, page, max_retries=3, wait_for_completion=True):
         """人工处理刮刮乐滑块（远程控制 + 截图备份）
         
@@ -90,8 +94,8 @@ class XianyuSearcher:
         logger.warning("🎨 检测到刮刮乐验证，需要人工处理！")
         logger.warning("=" * 60)
         
-        # 获取会话ID
-        session_id = getattr(self, 'user_id', 'default')
+        # 使用唯一会话ID，避免同账号多次验证互相串会话
+        session_id = self._build_remote_control_session_id()
         
         # 只有显式 debug 开关开启时才允许进入人工远控链路
         use_remote_control = self._is_manual_scratch_captcha_debug_enabled() and getattr(self, 'use_remote_control', False)
@@ -912,7 +916,11 @@ class XianyuSearcher:
                 
                 if not slider_result:
                     logger.error(f"❌ 滑块验证失败，搜索终止")
-                    return None
+                    return {
+                        'items': [],
+                        'total': 0,
+                        'error': '滑块验证失败'
+                    }
                 # 等待更多数据
                 await asyncio.sleep(3)
 
@@ -1565,6 +1573,9 @@ async def search_xianyu_items(
             logger.info(f"开始单页搜索，尝试次数: {attempt + 1}/{max_retries + 1}")
             result = await searcher.search_items(keyword, page, page_size)
 
+            if not isinstance(result, dict):
+                raise RuntimeError("商品搜索返回结果格式异常")
+
             # 如果成功获取到数据，直接返回
             if result.get('items') or not result.get('error'):
                 logger.info(f"单页搜索成功，获取到 {len(result.get('items', []))} 条数据")
@@ -1632,6 +1643,9 @@ async def search_multiple_pages_xianyu(
 
             logger.info(f"开始多页搜索，尝试次数: {attempt + 1}/{max_retries + 1}")
             result = await searcher.search_multiple_pages(keyword, total_pages)
+
+            if not isinstance(result, dict):
+                raise RuntimeError("多页商品搜索返回结果格式异常")
 
             # 如果成功获取到数据，直接返回
             if result.get('items') or not result.get('error'):

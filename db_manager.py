@@ -20,6 +20,12 @@ from loguru import logger
 ACCOUNT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 class DBManager:
+    ADMIN_DATA_HIDDEN_SYSTEM_SETTING_KEYS = {
+        "admin_password_hash",
+        "smtp_password",
+        "qq_reply_secret_key",
+    }
+
     """SQLite数据库管理，持久化存储Cookie和关键字"""
     
     def __init__(self, db_path: str = None):
@@ -81,6 +87,14 @@ class DBManager:
             self._migrate_plaintext_cookie_secrets()
         except Exception as e:
             logger.warning(f"迁移明文账号敏感信息失败: {e}")
+
+    def _configure_connection(self) -> None:
+        """统一配置 SQLite 连接级行为。"""
+        if self.conn is None:
+            return
+
+        # SQLite 默认不启用外键约束；管理台删除/清空强依赖级联约束清理关联表。
+        self.conn.execute("PRAGMA foreign_keys = ON")
 
     def _init_secret_cipher(self):
         """初始化敏感字段加密器。"""
@@ -280,6 +294,7 @@ class DBManager:
         """初始化数据库表结构"""
         try:
             self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._configure_connection()
             cursor = self.conn.cursor()
             
             # 创建用户表
@@ -810,10 +825,13 @@ class DBManager:
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS notification_templates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                type TEXT NOT NULL UNIQUE CHECK (type IN ('message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success')),
+                user_id INTEGER NOT NULL,
+                type TEXT NOT NULL CHECK (type IN ('message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success')),
                 template TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, type),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
             ''')
 
@@ -838,67 +856,12 @@ class DBManager:
             )
             ''')
 
-            # 插入默认通知模板
-            cursor.execute('''
-            INSERT OR IGNORE INTO notification_templates (type, template) VALUES
-            ('message', '🚨 接收消息通知
-
-账号: {account_id}
-买家: {buyer_name} (ID: {buyer_id})
-商品ID: {item_id}
-聊天ID: {chat_id}
-消息内容: {message}
-
-时间: {time}'),
-            ('token_refresh', 'Token刷新异常
-
-账号ID: {account_id}
-异常时间: {time}
-异常信息: {error_message}
-
-请检查账号Cookie是否过期，如有需要请及时更新Cookie配置。'),
-            ('delivery', '🚨 自动发货通知
-
-账号: {account_id}
-买家: {buyer_name} (ID: {buyer_id})
-商品ID: {item_id}
-聊天ID: {chat_id}
-结果: {result}
-时间: {time}
-
-请及时处理！'),
-            ('slider_success', '✅ 滑块验证成功，{status_text}
-
-账号: {account_id}
-时间: {time}'),
-            ('face_verify', '⚠️ 需要{verification_type} 🚫
-在验证期间，发货及自动回复暂时无法使用。
-
-{verification_action}
-{verification_url}
-
-账号: {account_id}
-时间: {time}'),
-            ('password_login_success', '✅ 密码登录成功
-
-账号: {account_id}
-时间: {time}
-Cookie数量: {cookie_count}
-
-账号Cookie已更新，正在重启服务...'),
-            ('cookie_refresh_success', '✅ 刷新Cookie成功
-
-账号: {account_id}
-时间: {time}
-Cookie数量: {cookie_count}
-
-账号已可正常使用。')
-            ''')
+            # 通知模板默认值在 _migrate_notification_templates 中按 user_id 维度补齐。
 
             # 插入默认系统设置（不包括管理员密码，由reply_server.py初始化）
             cursor.execute('''
             INSERT OR IGNORE INTO system_settings (key, value, description) VALUES
-            ('theme_color', 'blue', '主题颜色'),
+            ('theme_color', '#4f46e5', '主题颜色'),
             ('registration_enabled', 'true', '是否开启用户注册'),
             ('show_default_login_info', 'true', '是否显示默认登录信息'),
             ('login_captcha_enabled', 'true', '是否开启登录验证码'),
@@ -1206,66 +1169,106 @@ Cookie数量: {cookie_count}
                 logger.error(f"检查cards表约束时出现未知错误: {e}")
 
     def _migrate_notification_templates(self, cursor):
-        """迁移notification_templates表以支持新的模板类型"""
+        """迁移notification_templates表以支持新的模板类型和用户隔离。"""
         try:
-            # 检查是否已存在cookie_refresh_success模板
-            cursor.execute("SELECT COUNT(*) FROM notification_templates WHERE type = 'cookie_refresh_success'")
-            if cursor.fetchone()[0] == 0:
-                logger.info("添加Cookie刷新成功通知模板...")
+            self._execute_sql(
+                cursor,
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='notification_templates'",
+            )
+            create_table_row = cursor.fetchone()
+            create_table_sql = str((create_table_row or [""])[0] or "")
+            normalized_create_table_sql = "".join(create_table_sql.lower().split())
 
-                # 重建表以更新CHECK约束
-                cursor.execute('''
-                CREATE TABLE IF NOT EXISTS notification_templates_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    type TEXT NOT NULL UNIQUE CHECK (type IN ('message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success')),
-                    template TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            needs_rebuild = (
+                "user_id" not in normalized_create_table_sql
+                or "unique(user_id,type)" not in normalized_create_table_sql
+                or "cookie_refresh_success" not in create_table_sql
+            )
+
+            self._execute_sql(cursor, "SELECT id FROM users ORDER BY id")
+            all_user_ids = [
+                int(row[0])
+                for row in cursor.fetchall()
+                if row and row[0] is not None
+            ]
+            admin_user_id = all_user_ids[0] if all_user_ids else 1
+
+            if needs_rebuild:
+                logger.info("检测到通知模板仍使用遗留全局结构，开始重建为 user_id 隔离结构")
+                self._execute_sql(cursor, "DROP TABLE IF EXISTS notification_templates_new")
+                self._execute_sql(
+                    cursor,
+                    '''
+                    CREATE TABLE IF NOT EXISTS notification_templates_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        type TEXT NOT NULL CHECK (type IN ('message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success')),
+                        template TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(user_id, type),
+                        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                    )
+                    ''',
                 )
-                ''')
 
-                # 复制现有数据
-                cursor.execute('''
-                INSERT OR IGNORE INTO notification_templates_new (id, type, template, created_at, updated_at)
-                SELECT id, type, template, created_at, updated_at FROM notification_templates
-                ''')
+                self._execute_sql(cursor, "PRAGMA table_info(notification_templates)")
+                existing_columns = [column[1] for column in cursor.fetchall()]
+                migrated_rows = []
 
-                # 删除旧表
-                cursor.execute("DROP TABLE notification_templates")
+                if "user_id" in existing_columns:
+                    self._execute_sql(
+                        cursor,
+                        '''
+                        SELECT type, template, user_id, created_at, updated_at
+                        FROM notification_templates
+                        ''',
+                    )
+                    for template_type, template, row_user_id, created_at, updated_at in cursor.fetchall():
+                        migrated_rows.append(
+                            (
+                                int(row_user_id or admin_user_id),
+                                template_type,
+                                template,
+                                created_at,
+                                updated_at,
+                            )
+                        )
+                else:
+                    self._execute_sql(
+                        cursor,
+                        '''
+                        SELECT type, template, created_at, updated_at
+                        FROM notification_templates
+                        ''',
+                    )
+                    legacy_rows = list(cursor.fetchall())
+                    for user_id in all_user_ids:
+                        for template_type, template, created_at, updated_at in legacy_rows:
+                            migrated_rows.append(
+                                (
+                                    user_id,
+                                    template_type,
+                                    template,
+                                    created_at,
+                                    updated_at,
+                                )
+                            )
 
-                # 重命名新表
-                cursor.execute("ALTER TABLE notification_templates_new RENAME TO notification_templates")
+                if migrated_rows:
+                    cursor.executemany(
+                        '''
+                        INSERT OR IGNORE INTO notification_templates_new
+                        (user_id, type, template, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        ''',
+                        migrated_rows,
+                    )
 
-                # 插入新的默认模板（包括之前可能缺失的）
-                cursor.execute('''
-                INSERT OR IGNORE INTO notification_templates (type, template) VALUES
-                ('slider_success', '✅ 滑块验证成功，{status_text}
+                self._execute_sql(cursor, "DROP TABLE notification_templates")
+                self._execute_sql(cursor, "ALTER TABLE notification_templates_new RENAME TO notification_templates")
 
-账号: {account_id}
-时间: {time}'),
-                ('face_verify', '⚠️ 需要{verification_type} 🚫
-在验证期间，发货及自动回复暂时无法使用。
-
-{verification_action}
-{verification_url}
-
-账号: {account_id}
-时间: {time}'),
-                ('password_login_success', '✅ 密码登录成功
-
-账号: {account_id}
-时间: {time}
-Cookie数量: {cookie_count}
-
-账号Cookie已更新，正在重启服务...'),
-                ('cookie_refresh_success', '✅ 刷新Cookie成功
-
-账号: {account_id}
-时间: {time}
-Cookie数量: {cookie_count}
-
-账号已可正常使用。')
-                ''')
+            self._seed_notification_template_defaults(cursor, all_user_ids)
 
             old_slider_success_template = '''✅ 滑块验证成功，cookies已自动更新到数据库
 
@@ -1285,10 +1288,9 @@ Cookie数量: {cookie_count}
                 (new_slider_success_template, old_slider_success_template)
             )
 
-            logger.info("通知模板类型迁移完成")
+            logger.info("通知模板迁移完成，已切换为 user_id 隔离结构")
         except Exception as e:
             logger.warning(f"迁移notification_templates表时出错（可能表不存在）: {e}")
-            # 如果迁移失败，尝试清理
             try:
                 cursor.execute("DROP TABLE IF EXISTS notification_templates_new")
             except:
@@ -1976,6 +1978,7 @@ Cookie数量: {cookie_count}
         """获取数据库连接，如果已关闭则重新连接"""
         if self.conn is None:
             self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._configure_connection()
         return self.conn
 
     def _log_sql(self, sql: str, params: tuple = None, operation: str = "EXECUTE"):
@@ -2067,7 +2070,52 @@ Cookie数量: {cookie_count}
                 return {row[0]: self._decrypt_secret(row[1]) for row in cursor.fetchall()}
             except Exception as e:
                 logger.error(f"获取所有Cookie失败: {e}")
-                return {}
+                raise
+
+    def get_account_ids(self, user_id: int = None) -> List[str]:
+        """仅获取账号ID列表，避免在只需要ID时解密整包 Cookie 值。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if user_id is not None:
+                    self._execute_sql(cursor, "SELECT id FROM cookies WHERE user_id = ? ORDER BY id", (user_id,))
+                else:
+                    self._execute_sql(cursor, "SELECT id FROM cookies ORDER BY id")
+                return [str(row[0]) for row in cursor.fetchall() if row and row[0]]
+            except Exception as e:
+                logger.error(f"获取账号ID列表失败: {e}")
+                raise
+
+    def get_cookie_list_metadata(self, account_id: str) -> Optional[Dict[str, Any]]:
+        """获取账号列表/摘要场景需要的轻量元数据，不解密敏感字段。"""
+        normalized_account_id = self._require_account_id(account_id)
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT id, remark, pause_duration, username, password
+                    FROM cookies
+                    WHERE id = ?
+                    """,
+                    (normalized_account_id,),
+                )
+                result = cursor.fetchone()
+                if not result:
+                    return None
+
+                return {
+                    "id": result[0],
+                    "account_id": result[0],
+                    "remark": result[1] or "",
+                    "pause_duration": result[2] if result[2] is not None else 10,
+                    "username": result[3] or "",
+                    "has_password": bool(result[4]),
+                }
+            except Exception as e:
+                logger.error(f"获取账号列表元数据失败: account_id={account_id}, error={e}")
+                raise
 
 
 
@@ -2172,7 +2220,7 @@ Cookie数量: {cookie_count}
                 }
             except Exception as e:
                 logger.error(f"获取账号绑定信息失败: {e}")
-                return None
+                raise
 
     def bind_cookie_account_unb(self, account_id: str, bound_unb: str, *, user_id: int = None) -> bool:
         """首次绑定账号 unb；已绑定到其他 unb 时拒绝覆盖。"""
@@ -2341,7 +2389,7 @@ Cookie数量: {cookie_count}
                 return result
             except Exception as e:
                 logger.error(f"获取所有关键字失败: {e}")
-                return {}
+                raise
 
 
 
@@ -2400,7 +2448,7 @@ Cookie数量: {cookie_count}
                 return presets
             except Exception as e:
                 logger.error(f"获取AI配置预设失败: {e}")
-                return []
+                raise
 
     def delete_ai_config_preset(self, user_id: int, preset_id: int) -> bool:
         """删除AI配置预设（带user_id校验）"""
@@ -2417,7 +2465,8 @@ Cookie数量: {cookie_count}
                 return deleted
             except Exception as e:
                 logger.error(f"删除AI配置预设失败: {e}")
-                return False
+                self.conn.rollback()
+                raise
 
     # -------------------- 默认回复操作 --------------------
 
@@ -2428,18 +2477,55 @@ Cookie数量: {cookie_count}
 
 
     # -------------------- 通知渠道操作 --------------------
-    def create_notification_channel(self, name: str, channel_type: str, config: str, user_id: int = None) -> int:
+    def _normalize_notification_channel_name(self, name: Any) -> str:
+        normalized_name = str(name or "").strip()
+        if not normalized_name:
+            raise ValueError("通知渠道名称不能为空")
+        return normalized_name
+
+    def _normalize_notification_channel_type(self, channel_type: Any) -> str:
+        normalized_type = str(channel_type or "").strip().lower()
+        type_aliases = {
+            'ding_talk': 'dingtalk',
+            'dingtalk': 'dingtalk',
+            'dingding': 'dingtalk',
+            'lark': 'feishu',
+            'feishu': 'feishu',
+            'qq': 'qq',
+            'bark': 'bark',
+            'email': 'email',
+            'webhook': 'webhook',
+            'wechat': 'wechat',
+            'weixin': 'wechat',
+            'telegram': 'telegram',
+            'tg': 'telegram',
+        }
+        resolved_type = type_aliases.get(normalized_type)
+        if not resolved_type:
+            raise ValueError("通知渠道类型无效")
+        return resolved_type
+
+    def create_notification_channel(
+        self,
+        name: str,
+        channel_type: str,
+        config: str,
+        user_id: int = None,
+        enabled: bool = True,
+    ) -> int:
         """创建通知渠道"""
         with self.lock:
             try:
+                normalized_name = self._normalize_notification_channel_name(name)
+                normalized_type = self._normalize_notification_channel_type(channel_type)
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                INSERT INTO notification_channels (name, type, config, user_id)
-                VALUES (?, ?, ?, ?)
-                ''', (name, channel_type, config, user_id))
+                INSERT INTO notification_channels (name, type, config, user_id, enabled)
+                VALUES (?, ?, ?, ?, ?)
+                ''', (normalized_name, normalized_type, config, user_id, int(enabled)))
                 self.conn.commit()
                 channel_id = cursor.lastrowid
-                logger.debug(f"创建通知渠道: {name} (ID: {channel_id})")
+                logger.debug(f"创建通知渠道: {normalized_name} (ID: {channel_id})")
                 return channel_id
             except Exception as e:
                 logger.error(f"创建通知渠道失败: {e}")
@@ -2480,7 +2566,7 @@ Cookie数量: {cookie_count}
                 return channels
             except Exception as e:
                 logger.error(f"获取通知渠道失败: {e}")
-                return []
+                raise
 
     def get_notification_channel(self, channel_id: int, user_id: int = None) -> Optional[Dict[str, any]]:
         """获取指定通知渠道"""
@@ -2513,32 +2599,33 @@ Cookie数量: {cookie_count}
                 return None
             except Exception as e:
                 logger.error(f"获取通知渠道失败: {e}")
-                return None
+                raise
 
     def update_notification_channel(self, channel_id: int, name: str, config: str, enabled: bool = True, user_id: int = None) -> bool:
         """更新通知渠道"""
         with self.lock:
             try:
+                normalized_name = self._normalize_notification_channel_name(name)
                 cursor = self.conn.cursor()
                 if user_id is not None:
                     cursor.execute('''
                     UPDATE notification_channels
                     SET name = ?, config = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ? AND user_id = ?
-                    ''', (name, config, enabled, channel_id, user_id))
+                    ''', (normalized_name, config, enabled, channel_id, user_id))
                 else:
                     cursor.execute('''
                     UPDATE notification_channels
                     SET name = ?, config = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
-                    ''', (name, config, enabled, channel_id))
+                    ''', (normalized_name, config, enabled, channel_id))
                 self.conn.commit()
                 logger.debug(f"更新通知渠道: {channel_id}")
                 return cursor.rowcount > 0
             except Exception as e:
                 logger.error(f"更新通知渠道失败: {e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def delete_notification_channel(self, channel_id: int, user_id: int = None) -> bool:
         """删除通知渠道"""
@@ -2546,8 +2633,27 @@ Cookie数量: {cookie_count}
             try:
                 cursor = self.conn.cursor()
                 if user_id is not None:
-                    self._execute_sql(cursor, "DELETE FROM notification_channels WHERE id = ? AND user_id = ?", (channel_id, user_id))
+                    self._execute_sql(
+                        cursor,
+                        """
+                        DELETE FROM message_notifications
+                        WHERE channel_id IN (
+                            SELECT id FROM notification_channels WHERE id = ? AND user_id = ?
+                        )
+                        """,
+                        (channel_id, user_id),
+                    )
+                    self._execute_sql(
+                        cursor,
+                        "DELETE FROM notification_channels WHERE id = ? AND user_id = ?",
+                        (channel_id, user_id),
+                    )
                 else:
+                    self._execute_sql(
+                        cursor,
+                        "DELETE FROM message_notifications WHERE channel_id = ?",
+                        (channel_id,),
+                    )
                     self._execute_sql(cursor, "DELETE FROM notification_channels WHERE id = ?", (channel_id,))
                 self.conn.commit()
                 logger.debug(f"删除通知渠道: {channel_id}")
@@ -2555,7 +2661,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"删除通知渠道失败: {e}")
                 self.conn.rollback()
-                return False
+                raise
 
     # -------------------- 消息通知配置操作 --------------------
 
@@ -2581,20 +2687,111 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"删除消息通知配置失败: {e}")
                 self.conn.rollback()
-                return False
+                raise
 
 
     # -------------------- 通知模板操作 --------------------
-    def get_all_notification_templates(self) -> List[Dict[str, any]]:
-        """获取所有通知模板"""
+    def _get_notification_template_defaults(self) -> Dict[str, str]:
+        return {
+            'message': '''🚨 接收消息通知
+
+账号: {account_id}
+买家: {buyer_name} (ID: {buyer_id})
+商品ID: {item_id}
+聊天ID: {chat_id}
+消息内容: {message}
+
+时间: {time}''',
+            'token_refresh': '''Token刷新异常
+
+账号ID: {account_id}
+异常时间: {time}
+异常信息: {error_message}
+
+请检查账号Cookie是否过期，如有需要请及时更新Cookie配置。''',
+            'delivery': '''🚨 自动发货通知
+
+账号: {account_id}
+买家: {buyer_name} (ID: {buyer_id})
+商品ID: {item_id}
+聊天ID: {chat_id}
+结果: {result}
+时间: {time}
+
+请及时处理！''',
+            'slider_success': '''✅ 滑块验证成功，{status_text}
+
+账号: {account_id}
+时间: {time}''',
+            'face_verify': '''⚠️ 需要{verification_type} 🚫
+在验证期间，发货及自动回复暂时无法使用。
+
+{verification_action}
+{verification_url}
+
+账号: {account_id}
+时间: {time}''',
+            'password_login_success': '''✅ 密码登录成功
+
+账号: {account_id}
+时间: {time}
+Cookie数量: {cookie_count}
+
+账号Cookie已更新，正在重启服务...''',
+            'cookie_refresh_success': '''✅ 刷新Cookie成功
+
+账号: {account_id}
+时间: {time}
+Cookie数量: {cookie_count}
+
+账号已可正常使用。''',
+        }
+
+    def _seed_notification_template_defaults(self, cursor, user_ids: List[int]) -> None:
+        normalized_user_ids = []
+        for user_id in user_ids or []:
+            try:
+                normalized_user_id = int(user_id)
+            except (TypeError, ValueError):
+                continue
+            if normalized_user_id not in normalized_user_ids:
+                normalized_user_ids.append(normalized_user_id)
+
+        if not normalized_user_ids:
+            return
+
+        default_templates = self._get_notification_template_defaults()
+        rows = []
+        for user_id in normalized_user_ids:
+            for template_type, template in default_templates.items():
+                rows.append((user_id, template_type, template))
+
+        cursor.executemany(
+            '''
+            INSERT OR IGNORE INTO notification_templates (user_id, type, template)
+            VALUES (?, ?, ?)
+            ''',
+            rows,
+        )
+
+    def get_all_notification_templates(self, user_id: int = None) -> List[Dict[str, any]]:
+        """获取通知模板列表"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                cursor.execute('''
-                SELECT id, type, template, created_at, updated_at
-                FROM notification_templates
-                ORDER BY id
-                ''')
+                if user_id is not None:
+                    cursor.execute('''
+                    SELECT id, type, template, created_at, updated_at, user_id
+                    FROM notification_templates
+                    WHERE user_id = ?
+                    ORDER BY id
+                    ''', (user_id,))
+                else:
+                    cursor.execute('''
+                    SELECT id, type, template, created_at, updated_at, user_id
+                    FROM notification_templates
+                    ORDER BY user_id, id
+                    ''')
 
                 templates = []
                 for row in cursor.fetchall():
@@ -2603,24 +2800,28 @@ Cookie数量: {cookie_count}
                         'type': row[1],
                         'template': row[2],
                         'created_at': row[3],
-                        'updated_at': row[4]
+                        'updated_at': row[4],
+                        'user_id': row[5],
                     })
 
                 return templates
             except Exception as e:
                 logger.error(f"获取通知模板失败: {e}")
-                return []
+                raise
 
-    def get_notification_template(self, template_type: str) -> Optional[Dict[str, any]]:
-        """获取指定类型的通知模板"""
+    def get_notification_template(self, template_type: str, user_id: int = None) -> Optional[Dict[str, any]]:
+        """获取指定用户的通知模板"""
         with self.lock:
             try:
+                if user_id is None:
+                    logger.warning(f"获取通知模板缺少 user_id，拒绝跨用户读取: {template_type}")
+                    return None
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, type, template, created_at, updated_at
+                SELECT id, type, template, created_at, updated_at, user_id
                 FROM notification_templates
-                WHERE type = ?
-                ''', (template_type,))
+                WHERE type = ? AND user_id = ?
+                ''', (template_type, user_id))
 
                 row = cursor.fetchone()
                 if row:
@@ -2629,150 +2830,55 @@ Cookie数量: {cookie_count}
                         'type': row[1],
                         'template': row[2],
                         'created_at': row[3],
-                        'updated_at': row[4]
+                        'updated_at': row[4],
+                        'user_id': row[5],
                     }
                 return None
             except Exception as e:
                 logger.error(f"获取通知模板失败: {e}")
-                return None
+                raise
 
-    def update_notification_template(self, template_type: str, template: str) -> bool:
-        """更新通知模板"""
+    def update_notification_template(self, template_type: str, template: str, user_id: int = None) -> bool:
+        """更新指定用户的通知模板"""
         with self.lock:
             try:
+                normalized_template = str(template or "").strip()
+                if not normalized_template:
+                    raise ValueError("通知模板内容不能为空")
+                if user_id is None:
+                    logger.warning(f"更新通知模板缺少 user_id，拒绝跨用户写入: {template_type}")
+                    return False
                 cursor = self.conn.cursor()
+                self._seed_notification_template_defaults(cursor, [user_id])
                 self._execute_sql(cursor, '''
                 UPDATE notification_templates
                 SET template = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE type = ?
-                ''', (template, template_type))
+                WHERE type = ? AND user_id = ?
+                ''', (normalized_template, template_type, user_id))
                 self.conn.commit()
-                logger.info(f"更新通知模板: {template_type}")
+                logger.info(f"更新通知模板: user_id={user_id}, type={template_type}")
                 return cursor.rowcount > 0
             except Exception as e:
                 logger.error(f"更新通知模板失败: {e}")
                 self.conn.rollback()
-                return False
+                raise
 
-    def reset_notification_template(self, template_type: str) -> bool:
-        """重置通知模板为默认值"""
-        default_templates = {
-            'message': '''🚨 接收消息通知
-
-账号: {account_id}
-买家: {buyer_name} (ID: {buyer_id})
-商品ID: {item_id}
-聊天ID: {chat_id}
-消息内容: {message}
-
-时间: {time}''',
-            'token_refresh': '''Token刷新异常
-
-账号ID: {account_id}
-异常时间: {time}
-异常信息: {error_message}
-
-请检查账号Cookie是否过期，如有需要请及时更新Cookie配置。''',
-            'delivery': '''🚨 自动发货通知
-
-账号: {account_id}
-买家: {buyer_name} (ID: {buyer_id})
-商品ID: {item_id}
-聊天ID: {chat_id}
-结果: {result}
-时间: {time}
-
-请及时处理！''',
-            'slider_success': '''✅ 滑块验证成功，{status_text}
-
-账号: {account_id}
-时间: {time}''',
-            'face_verify': '''⚠️ 需要{verification_type} 🚫
-在验证期间，发货及自动回复暂时无法使用。
-
-{verification_action}
-{verification_url}
-
-账号: {account_id}
-时间: {time}''',
-            'password_login_success': '''✅ 密码登录成功
-
-账号: {account_id}
-时间: {time}
-Cookie数量: {cookie_count}
-
-账号Cookie已更新，正在重启服务...''',
-            'cookie_refresh_success': '''✅ 刷新Cookie成功
-
-账号: {account_id}
-时间: {time}
-Cookie数量: {cookie_count}
-
-账号已可正常使用。'''
-        }
-
+    def reset_notification_template(self, template_type: str, user_id: int = None) -> bool:
+        """将指定用户的通知模板重置为默认值"""
+        default_templates = self._get_notification_template_defaults()
         if template_type not in default_templates:
             logger.error(f"未知的模板类型: {template_type}")
             return False
 
-        return self.update_notification_template(template_type, default_templates[template_type])
+        return self.update_notification_template(
+            template_type,
+            default_templates[template_type],
+            user_id=user_id,
+        )
 
     def get_default_notification_template(self, template_type: str) -> Optional[str]:
         """获取默认通知模板"""
-        default_templates = {
-            'message': '''🚨 接收消息通知
-
-账号: {account_id}
-买家: {buyer_name} (ID: {buyer_id})
-商品ID: {item_id}
-聊天ID: {chat_id}
-消息内容: {message}
-
-时间: {time}''',
-            'token_refresh': '''Token刷新异常
-
-账号ID: {account_id}
-异常时间: {time}
-异常信息: {error_message}
-
-请检查账号Cookie是否过期，如有需要请及时更新Cookie配置。''',
-            'delivery': '''🚨 自动发货通知
-
-账号: {account_id}
-买家: {buyer_name} (ID: {buyer_id})
-商品ID: {item_id}
-聊天ID: {chat_id}
-结果: {result}
-时间: {time}
-
-请及时处理！''',
-            'slider_success': '''✅ 滑块验证成功，{status_text}
-
-账号: {account_id}
-时间: {time}''',
-            'face_verify': '''⚠️ 需要{verification_type} 🚫
-在验证期间，发货及自动回复暂时无法使用。
-
-{verification_action}
-{verification_url}
-
-账号: {account_id}
-时间: {time}''',
-            'password_login_success': '''✅ 密码登录成功
-
-账号: {account_id}
-时间: {time}
-Cookie数量: {cookie_count}
-
-账号Cookie已更新，正在重启服务...''',
-            'cookie_refresh_success': '''✅ 刷新Cookie成功
-
-账号: {account_id}
-时间: {time}
-Cookie数量: {cookie_count}
-
-账号已可正常使用。'''
-        }
+        default_templates = self._get_notification_template_defaults()
 
         return default_templates.get(template_type)
 
@@ -2790,7 +2896,7 @@ Cookie数量: {cookie_count}
                 return result[0] if result else None
             except Exception as e:
                 logger.error(f"获取系统设置失败: {e}")
-                return None
+                raise
 
     def set_system_setting(self, key: str, value: str, description: str = None) -> bool:
         """设置系统设置"""
@@ -2807,7 +2913,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"设置系统设置失败: {e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def get_all_system_settings(self) -> Dict[str, str]:
         """获取所有系统设置"""
@@ -2823,7 +2929,7 @@ Cookie数量: {cookie_count}
                 return settings
             except Exception as e:
                 logger.error(f"获取所有系统设置失败: {e}")
-                return {}
+                raise
 
     # 管理员密码现在统一使用用户表管理，不再需要单独的方法
 
@@ -2840,6 +2946,7 @@ Cookie数量: {cookie_count}
                 INSERT INTO users (username, email, password_hash)
                 VALUES (?, ?, ?)
                 ''', (username, email, password_hash))
+                self._seed_notification_template_defaults(cursor, [cursor.lastrowid])
 
                 self.conn.commit()
                 logger.info(f"创建用户成功: {username} ({email})")
@@ -3276,18 +3383,27 @@ Cookie数量: {cookie_count}
 
     # ==================== 卡券管理方法 ====================
 
+    def _normalize_card_name(self, name: Any) -> str:
+        normalized_name = str(name or "").strip()
+        if not normalized_name:
+            raise ValueError("卡券名称不能为空")
+        return normalized_name
+
+    def _normalize_card_type(self, card_type: Any) -> str:
+        normalized_card_type = str(card_type or "").strip()
+        allowed_card_types = {'api', 'yifan_api', 'text', 'data', 'image'}
+        if normalized_card_type not in allowed_card_types:
+            raise ValueError("卡券类型无效")
+        return normalized_card_type
+
     def create_card(self, name: str, card_type: str, api_config=None,
                    text_content: str = None, data_content: str = None, image_url: str = None,
                    description: str = None, enabled: bool = True, delay_seconds: int = 0,
                    is_multi_spec: bool = False, spec_name: str = None, spec_value: str = None,
                    spec_name_2: str = None, spec_value_2: str = None, user_id: int = None):
         """创建新卡券（支持双规格）"""
-        # 调试日志
-        logger.info(f"[DEBUG DB] create_card 被调用 - name: {name}")
-        logger.info(f"[DEBUG DB] is_multi_spec: {is_multi_spec}, type: {type(is_multi_spec)}")
-        logger.info(f"[DEBUG DB] spec_name: {spec_name}, spec_value: {spec_value}")
-        logger.info(f"[DEBUG DB] spec_name_2: {spec_name_2}, type: {type(spec_name_2)}")
-        logger.info(f"[DEBUG DB] spec_value_2: {spec_value_2}, type: {type(spec_value_2)}")
+        normalized_name = self._normalize_card_name(name)
+        normalized_card_type = self._normalize_card_type(card_type)
 
         with self.lock:
             try:
@@ -3301,20 +3417,20 @@ Cookie数量: {cookie_count}
                     cursor.execute('''
                     SELECT COUNT(*) FROM cards
                     WHERE name = ? AND spec_name = ? AND spec_value = ? AND user_id = ?
-                    ''', (name, spec_name, spec_value, user_id))
+                    ''', (normalized_name, spec_name, spec_value, user_id))
 
                     if cursor.fetchone()[0] > 0:
-                        raise ValueError(f"卡券已存在：{name} - {spec_name}:{spec_value}")
+                        raise ValueError(f"卡券已存在：{normalized_name} - {spec_name}:{spec_value}")
                 else:
                     # 检查唯一性：仅卡券名称
                     cursor = self.conn.cursor()
                     cursor.execute('''
                     SELECT COUNT(*) FROM cards
                     WHERE name = ? AND (is_multi_spec = 0 OR is_multi_spec IS NULL) AND user_id = ?
-                    ''', (name, user_id))
+                    ''', (normalized_name, user_id))
 
                     if cursor.fetchone()[0] > 0:
-                        raise ValueError(f"卡券名称已存在：{name}")
+                        raise ValueError(f"卡券名称已存在：{normalized_name}")
 
                 # 处理api_config参数 - 如果是字典则转换为JSON字符串
                 api_config_str = None
@@ -3330,80 +3446,111 @@ Cookie数量: {cookie_count}
                                  description, enabled, delay_seconds, is_multi_spec,
                                  spec_name, spec_value, spec_name_2, spec_value_2, user_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (name, card_type, api_config_str, text_content, data_content, image_url,
+                ''', (normalized_name, normalized_card_type, api_config_str, text_content, data_content, image_url,
                       description, enabled, delay_seconds, is_multi_spec,
                       spec_name, spec_value, spec_name_2, spec_value_2, user_id))
                 self.conn.commit()
                 card_id = cursor.lastrowid
 
                 if is_multi_spec:
-                    logger.info(f"创建多规格卡券成功: {name} - {spec_name}:{spec_value} (ID: {card_id})")
+                    logger.info(f"创建多规格卡券成功: {normalized_name} - {spec_name}:{spec_value} (ID: {card_id})")
                 else:
-                    logger.info(f"创建卡券成功: {name} (ID: {card_id})")
+                    logger.info(f"创建卡券成功: {normalized_name} (ID: {card_id})")
                 return card_id
             except Exception as e:
                 logger.error(f"创建卡券失败: {e}")
                 raise
 
-    def get_all_cards(self, user_id: int = None):
+    def get_all_cards(self, user_id: int = None, summary_only: bool = False):
         """获取所有卡券（支持用户隔离）"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                if user_id is not None:
-                    cursor.execute('''
-                    SELECT id, name, type, api_config, text_content, data_content, image_url,
-                           description, enabled, delay_seconds, is_multi_spec,
+                if summary_only:
+                    select_sql = '''
+                    SELECT id, name, type, data_content, description, enabled, delay_seconds, is_multi_spec,
                            spec_name, spec_value, spec_name_2, spec_value_2, created_at, updated_at
                     FROM cards
-                    WHERE user_id = ?
-                    ORDER BY created_at DESC
-                    ''', (user_id,))
+                    '''
+                    if user_id is not None:
+                        cursor.execute(select_sql + "WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
+                    else:
+                        cursor.execute(select_sql + "ORDER BY created_at DESC")
                 else:
-                    cursor.execute('''
-                    SELECT id, name, type, api_config, text_content, data_content, image_url,
-                           description, enabled, delay_seconds, is_multi_spec,
-                           spec_name, spec_value, spec_name_2, spec_value_2, created_at, updated_at
-                    FROM cards
-                    ORDER BY created_at DESC
-                    ''')
+                    if user_id is not None:
+                        cursor.execute('''
+                        SELECT id, name, type, api_config, text_content, data_content, image_url,
+                               description, enabled, delay_seconds, is_multi_spec,
+                               spec_name, spec_value, spec_name_2, spec_value_2, created_at, updated_at
+                        FROM cards
+                        WHERE user_id = ?
+                        ORDER BY created_at DESC
+                        ''', (user_id,))
+                    else:
+                        cursor.execute('''
+                        SELECT id, name, type, api_config, text_content, data_content, image_url,
+                               description, enabled, delay_seconds, is_multi_spec,
+                               spec_name, spec_value, spec_name_2, spec_value_2, created_at, updated_at
+                        FROM cards
+                        ORDER BY created_at DESC
+                        ''')
 
                 cards = []
                 for row in cursor.fetchall():
-                    # 解析api_config JSON字符串
-                    api_config = row[3]
-                    if api_config:
-                        try:
-                            import json
-                            api_config = json.loads(api_config)
-                        except (json.JSONDecodeError, TypeError):
-                            # 如果解析失败，保持原始字符串
-                            pass
+                    if summary_only:
+                        raw_data_content = str(row[3] or '')
+                        data_count = len([line for line in raw_data_content.splitlines() if line.strip()])
+                        cards.append({
+                            'id': row[0],
+                            'name': row[1],
+                            'type': row[2],
+                            'description': row[4],
+                            'enabled': bool(row[5]),
+                            'delay_seconds': row[6] or 0,
+                            'is_multi_spec': bool(row[7]) if row[7] is not None else False,
+                            'spec_name': row[8],
+                            'spec_value': row[9],
+                            'spec_name_2': row[10],
+                            'spec_value_2': row[11],
+                            'created_at': row[12],
+                            'updated_at': row[13],
+                            'data_count': data_count,
+                        })
+                    else:
+                        # 解析api_config JSON字符串
+                        api_config = row[3]
+                        if api_config:
+                            try:
+                                import json
+                                api_config = json.loads(api_config)
+                            except (json.JSONDecodeError, TypeError):
+                                # 如果解析失败，保持原始字符串
+                                pass
 
-                    cards.append({
-                        'id': row[0],
-                        'name': row[1],
-                        'type': row[2],
-                        'api_config': api_config,
-                        'text_content': row[4],
-                        'data_content': row[5],
-                        'image_url': row[6],
-                        'description': row[7],
-                        'enabled': bool(row[8]),
-                        'delay_seconds': row[9] or 0,
-                        'is_multi_spec': bool(row[10]) if row[10] is not None else False,
-                        'spec_name': row[11],
-                        'spec_value': row[12],
-                        'spec_name_2': row[13],
-                        'spec_value_2': row[14],
-                        'created_at': row[15],
-                        'updated_at': row[16]
-                    })
+                        cards.append({
+                            'id': row[0],
+                            'name': row[1],
+                            'type': row[2],
+                            'api_config': api_config,
+                            'text_content': row[4],
+                            'data_content': row[5],
+                            'image_url': row[6],
+                            'description': row[7],
+                            'enabled': bool(row[8]),
+                            'delay_seconds': row[9] or 0,
+                            'is_multi_spec': bool(row[10]) if row[10] is not None else False,
+                            'spec_name': row[11],
+                            'spec_value': row[12],
+                            'spec_name_2': row[13],
+                            'spec_value_2': row[14],
+                            'created_at': row[15],
+                            'updated_at': row[16]
+                        })
 
                 return cards
             except Exception as e:
                 logger.error(f"获取卡券列表失败: {e}")
-                return []
+                raise
 
     def get_card_by_id(self, card_id: int, user_id: int = None):
         """根据ID获取卡券（支持用户隔离）"""
@@ -3459,7 +3606,7 @@ Cookie数量: {cookie_count}
                 return None
             except Exception as e:
                 logger.error(f"获取卡券失败: {e}")
-                return None
+                raise
 
     def update_card(self, card_id: int, name: str = None, card_type: str = None,
                    api_config=None, text_content: str = None, data_content: str = None,
@@ -3468,13 +3615,6 @@ Cookie数量: {cookie_count}
                    spec_value: str = None, spec_name_2: str = None, spec_value_2: str = None,
                    user_id: int = None):
         """更新卡券（支持用户隔离）"""
-        # 调试日志
-        logger.info(f"[DEBUG DB] update_card 被调用 - card_id: {card_id}")
-        logger.info(f"[DEBUG DB] is_multi_spec: {is_multi_spec}, type: {type(is_multi_spec)}")
-        logger.info(f"[DEBUG DB] spec_name: {spec_name}, spec_value: {spec_value}")
-        logger.info(f"[DEBUG DB] spec_name_2: {spec_name_2}, type: {type(spec_name_2)}")
-        logger.info(f"[DEBUG DB] spec_value_2: {spec_value_2}, type: {type(spec_value_2)}")
-
         with self.lock:
             try:
                 # 处理api_config参数
@@ -3488,16 +3628,98 @@ Cookie数量: {cookie_count}
 
                 cursor = self.conn.cursor()
 
+                if user_id is not None:
+                    cursor.execute(
+                        '''
+                        SELECT name, is_multi_spec, spec_name, spec_value, spec_name_2, spec_value_2
+                        FROM cards WHERE id = ? AND user_id = ?
+                        ''',
+                        (card_id, user_id),
+                    )
+                else:
+                    cursor.execute(
+                        '''
+                        SELECT name, is_multi_spec, spec_name, spec_value, spec_name_2, spec_value_2
+                        FROM cards WHERE id = ?
+                        ''',
+                        (card_id,),
+                    )
+
+                current_card = cursor.fetchone()
+                if not current_card:
+                    return False
+
+                target_name = self._normalize_card_name(name) if name is not None else current_card[0]
+                target_is_multi_spec = (
+                    bool(is_multi_spec)
+                    if is_multi_spec is not None
+                    else bool(current_card[1]) if current_card[1] is not None else False
+                )
+                target_spec_name = spec_name if spec_name is not None else current_card[2]
+                target_spec_value = spec_value if spec_value is not None else current_card[3]
+
+                should_clear_spec_fields = False
+                if target_is_multi_spec:
+                    if not target_spec_name or not target_spec_value:
+                        raise ValueError("多规格卡券必须提供规格名称和规格值")
+
+                    if user_id is not None:
+                        cursor.execute(
+                            '''
+                            SELECT COUNT(*) FROM cards
+                            WHERE name = ? AND spec_name = ? AND spec_value = ? AND user_id = ? AND id != ?
+                            ''',
+                            (target_name, target_spec_name, target_spec_value, user_id, card_id),
+                        )
+                    else:
+                        cursor.execute(
+                            '''
+                            SELECT COUNT(*) FROM cards
+                            WHERE name = ? AND spec_name = ? AND spec_value = ? AND id != ?
+                            ''',
+                            (target_name, target_spec_name, target_spec_value, card_id),
+                        )
+
+                    if cursor.fetchone()[0] > 0:
+                        raise ValueError(f"卡券已存在：{target_name} - {target_spec_name}:{target_spec_value}")
+                else:
+                    should_clear_spec_fields = True
+                    spec_name = None
+                    spec_value = None
+                    spec_name_2 = None
+                    spec_value_2 = None
+
+                    if user_id is not None:
+                        cursor.execute(
+                            '''
+                            SELECT COUNT(*) FROM cards
+                            WHERE name = ? AND (is_multi_spec = 0 OR is_multi_spec IS NULL) AND user_id = ? AND id != ?
+                            ''',
+                            (target_name, user_id, card_id),
+                        )
+                    else:
+                        cursor.execute(
+                            '''
+                            SELECT COUNT(*) FROM cards
+                            WHERE name = ? AND (is_multi_spec = 0 OR is_multi_spec IS NULL) AND id != ?
+                            ''',
+                            (target_name, card_id),
+                        )
+
+                    if cursor.fetchone()[0] > 0:
+                        raise ValueError(f"卡券名称已存在：{target_name}")
+
                 # 构建更新语句
                 update_fields = []
                 params = []
 
                 if name is not None:
                     update_fields.append("name = ?")
-                    params.append(name)
+                    params.append(target_name)
                 if card_type is not None:
+                    normalized_card_type = self._normalize_card_type(card_type)
                     update_fields.append("type = ?")
-                    params.append(card_type)
+                    params.append(normalized_card_type)
                 if api_config_str is not None:
                     update_fields.append("api_config = ?")
                     params.append(api_config_str)
@@ -3522,16 +3744,16 @@ Cookie数量: {cookie_count}
                 if is_multi_spec is not None:
                     update_fields.append("is_multi_spec = ?")
                     params.append(is_multi_spec)
-                if spec_name is not None:
+                if spec_name is not None or should_clear_spec_fields:
                     update_fields.append("spec_name = ?")
                     params.append(spec_name)
-                if spec_value is not None:
+                if spec_value is not None or should_clear_spec_fields:
                     update_fields.append("spec_value = ?")
                     params.append(spec_value)
-                if spec_name_2 is not None:
+                if spec_name_2 is not None or should_clear_spec_fields:
                     update_fields.append("spec_name_2 = ?")
                     params.append(spec_name_2)
-                if spec_value_2 is not None:
+                if spec_value_2 is not None or should_clear_spec_fields:
                     update_fields.append("spec_value_2 = ?")
                     params.append(spec_value_2)
 
@@ -3547,8 +3769,6 @@ Cookie数量: {cookie_count}
                 else:
                     sql = f"UPDATE cards SET {', '.join(update_fields)} WHERE id = ?"
 
-                logger.info(f"[DEBUG DB] 执行SQL: {sql}")
-                logger.info(f"[DEBUG DB] 参数: {params}")
                 self._execute_sql(cursor, sql, params)
 
                 if cursor.rowcount > 0:
@@ -3591,12 +3811,29 @@ Cookie数量: {cookie_count}
 
     # ==================== 自动发货规则方法 ====================
 
+    def _normalize_delivery_rule_count(self, delivery_count: Any) -> int:
+        try:
+            normalized_count = int(delivery_count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("发货数量必须为大于等于 1 的整数") from exc
+        if normalized_count < 1:
+            raise ValueError("发货数量必须为大于等于 1 的整数")
+        return normalized_count
+
+    def _normalize_delivery_rule_keyword(self, keyword: Any) -> str:
+        normalized_keyword = str(keyword or "").strip()
+        if not normalized_keyword:
+            raise ValueError("发货规则关键词不能为空")
+        return normalized_keyword
+
     def create_delivery_rule(self, keyword: str, card_id: int, delivery_count: int = 1,
                            enabled: bool = True, description: str = None, user_id: int = None):
         """创建发货规则"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                normalized_keyword = self._normalize_delivery_rule_keyword(keyword)
+                normalized_delivery_count = self._normalize_delivery_rule_count(delivery_count)
 
                 if user_id is not None and card_id is not None:
                     self._execute_sql(cursor, '''
@@ -3608,10 +3845,10 @@ Cookie数量: {cookie_count}
                 cursor.execute('''
                 INSERT INTO delivery_rules (keyword, card_id, delivery_count, enabled, description, user_id)
                 VALUES (?, ?, ?, ?, ?, ?)
-                ''', (keyword, card_id, delivery_count, enabled, description, user_id))
+                ''', (normalized_keyword, card_id, normalized_delivery_count, enabled, description, user_id))
                 self.conn.commit()
                 rule_id = cursor.lastrowid
-                logger.info(f"创建发货规则成功: {keyword} -> 卡券ID {card_id} (规则ID: {rule_id})")
+                logger.info(f"创建发货规则成功: {normalized_keyword} -> 卡券ID {card_id} (规则ID: {rule_id})")
                 return rule_id
             except Exception as e:
                 logger.error(f"创建发货规则失败: {e}")
@@ -3626,7 +3863,7 @@ Cookie数量: {cookie_count}
                     cursor.execute('''
                     SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
                            dr.description, dr.delivery_times, dr.created_at, dr.updated_at,
-                           c.name as card_name, c.type as card_type,
+                           c.name as card_name, c.type as card_type, c.enabled as card_enabled,
                            c.is_multi_spec, c.spec_name, c.spec_value,
                            c.spec_name_2, c.spec_value_2
                     FROM delivery_rules dr
@@ -3638,7 +3875,7 @@ Cookie数量: {cookie_count}
                     cursor.execute('''
                     SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
                            dr.description, dr.delivery_times, dr.created_at, dr.updated_at,
-                           c.name as card_name, c.type as card_type,
+                           c.name as card_name, c.type as card_type, c.enabled as card_enabled,
                            c.is_multi_spec, c.spec_name, c.spec_value,
                            c.spec_name_2, c.spec_value_2
                     FROM delivery_rules dr
@@ -3660,17 +3897,18 @@ Cookie数量: {cookie_count}
                         'updated_at': row[8],
                         'card_name': row[9],
                         'card_type': row[10],
-                        'is_multi_spec': bool(row[11]) if row[11] is not None else False,
-                        'spec_name': row[12],
-                        'spec_value': row[13],
-                        'spec_name_2': row[14],
-                        'spec_value_2': row[15]
+                        'card_enabled': bool(row[11]) if row[11] is not None else False,
+                        'is_multi_spec': bool(row[12]) if row[12] is not None else False,
+                        'spec_name': row[13],
+                        'spec_value': row[14],
+                        'spec_name_2': row[15],
+                        'spec_value_2': row[16]
                     })
 
                 return rules
             except Exception as e:
                 logger.error(f"获取发货规则列表失败: {e}")
-                return []
+                raise
 
     def get_delivery_rules_by_keyword(self, keyword: str, user_id: int = None, only_non_multi_spec: bool = False):
         """根据关键字获取匹配的发货规则
@@ -3818,7 +4056,7 @@ Cookie数量: {cookie_count}
                 return None
             except Exception as e:
                 logger.error(f"获取发货规则失败: {e}")
-                return None
+                raise
 
     def update_delivery_rule(self, rule_id: int, keyword: str = None, card_id: int = None,
                            delivery_count: int = None, enabled: bool = None,
@@ -3827,6 +4065,12 @@ Cookie数量: {cookie_count}
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                normalized_keyword = None
+                if keyword is not None:
+                    normalized_keyword = self._normalize_delivery_rule_keyword(keyword)
+                normalized_delivery_count = None
+                if delivery_count is not None:
+                    normalized_delivery_count = self._normalize_delivery_rule_count(delivery_count)
 
                 if user_id is not None and card_id is not None:
                     self._execute_sql(cursor, '''
@@ -3841,13 +4085,13 @@ Cookie数量: {cookie_count}
 
                 if keyword is not None:
                     update_fields.append("keyword = ?")
-                    params.append(keyword)
+                    params.append(normalized_keyword)
                 if card_id is not None:
                     update_fields.append("card_id = ?")
                     params.append(card_id)
                 if delivery_count is not None:
                     update_fields.append("delivery_count = ?")
-                    params.append(delivery_count)
+                    params.append(normalized_delivery_count)
                 if enabled is not None:
                     update_fields.append("enabled = ?")
                     params.append(enabled)
@@ -3942,7 +4186,7 @@ Cookie数量: {cookie_count}
                 return row[0] if row else 0
             except Exception as e:
                 logger.error(f"获取今日发货统计失败: {e}")
-                return 0
+                raise
 
 
 
@@ -4480,7 +4724,7 @@ Cookie数量: {cookie_count}
                 return settings
             except Exception as e:
                 logger.error(f"获取用户设置失败: {e}")
-                return {}
+                raise
 
     def get_user_setting(self, user_id: int, key: str):
         """获取用户的特定设置"""
@@ -4504,7 +4748,7 @@ Cookie数量: {cookie_count}
                 return None
             except Exception as e:
                 logger.error(f"获取用户设置失败: {e}")
-                return None
+                raise
 
     def set_user_setting(self, user_id: int, key: str, value: str, description: str = None):
         """设置用户配置"""
@@ -4522,7 +4766,35 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"设置用户配置失败: {e}")
                 self.conn.rollback()
-                return False
+                raise
+
+    def replace_user_menu_settings(
+        self,
+        user_id: int,
+        menu_visibility: str,
+        menu_order: str,
+    ) -> int:
+        """原子替换用户的菜单显示/排序设置。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.executemany(
+                    '''
+                    INSERT OR REPLACE INTO user_settings (user_id, key, value, description, updated_at)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ''',
+                    [
+                        (user_id, 'menu_visibility', menu_visibility, '菜单显示设置'),
+                        (user_id, 'menu_order', menu_order, '菜单顺序设置'),
+                    ],
+                )
+                self.conn.commit()
+                logger.info(f"用户菜单设置替换成功: user_id={user_id}")
+                return 2
+            except Exception as e:
+                logger.error(f"替换用户菜单设置失败: user_id={user_id}, error={e}")
+                self.conn.rollback()
+                raise
 
     # ==================== 管理员专用方法 ====================
 
@@ -4568,7 +4840,7 @@ Cookie数量: {cookie_count}
                 return users
             except Exception as e:
                 logger.error(f"获取所有用户失败: {e}")
-                return []
+                raise
 
     def get_user_by_id(self, user_id: int):
         """根据ID获取用户信息"""
@@ -4610,6 +4882,34 @@ Cookie数量: {cookie_count}
                 return None
             except Exception as e:
                 logger.error(f"获取用户信息失败: {e}")
+                raise
+
+    def get_user_id_by_rowid(self, record_id: str) -> Optional[int]:
+        """根据 users 表 rowid 获取真实 user_id。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("SELECT id FROM users WHERE rowid = ?", (record_id,))
+                row = cursor.fetchone()
+                if not row or row[0] is None:
+                    return None
+                return int(row[0])
+            except Exception as e:
+                logger.error(f"根据 rowid 获取用户ID失败: record_id={record_id}, error={e}")
+                return None
+
+    def get_system_setting_key_by_rowid(self, record_id: str) -> Optional[str]:
+        """根据 system_settings 表 rowid 获取真实 key。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("SELECT key FROM system_settings WHERE rowid = ?", (record_id,))
+                row = cursor.fetchone()
+                if not row or row[0] is None:
+                    return None
+                return str(row[0]).strip()
+            except Exception as e:
+                logger.error(f"根据 rowid 获取系统设置键失败: record_id={record_id}, error={e}")
                 return None
 
     def update_user_admin_status(self, user_id: int, is_admin: bool) -> bool:
@@ -4628,59 +4928,41 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"更新用户管理员状态失败: {e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def delete_user_and_data(self, user_id: int):
         """删除用户及其所有相关数据"""
         with self.lock:
+            cursor = None
             try:
                 cursor = self.conn.cursor()
-
-                # 开始事务
                 cursor.execute('BEGIN TRANSACTION')
+                cursor.execute("SELECT id FROM cookies WHERE user_id = ?", (user_id,))
+                user_account_ids = [str(row[0]).strip() for row in cursor.fetchall() if str(row[0] or '').strip()]
 
-                # 删除用户相关的所有数据
-                # 1. 删除用户设置
-                cursor.execute('DELETE FROM user_settings WHERE user_id = ?', (user_id,))
+                self._delete_user_scoped_rows(cursor, user_id)
+                self._delete_account_scoped_rows(cursor, user_account_ids)
 
-                # 2. 删除用户的卡券
-                cursor.execute('DELETE FROM cards WHERE user_id = ?', (user_id,))
-
-                # 3. 删除用户的发货规则
-                cursor.execute('DELETE FROM delivery_rules WHERE user_id = ?', (user_id,))
-
-                # 4. 删除用户的通知渠道
-                cursor.execute('DELETE FROM notification_channels WHERE user_id = ?', (user_id,))
-
-                # 5. 删除用户的Cookie
-
-                # 6. 删除用户的关键字
-                cursor.execute('DELETE FROM keywords WHERE account_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 7. 删除用户的默认回复
-                cursor.execute('DELETE FROM default_replies WHERE account_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 8. 删除用户的AI回复设置
-                cursor.execute('DELETE FROM ai_reply_settings WHERE account_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 9. 删除用户的消息通知
-                cursor.execute('DELETE FROM message_notifications WHERE account_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 10. 最后删除用户本身
-                cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
-
-                # 提交事务
                 cursor.execute('DELETE FROM cookies WHERE user_id = ?', (user_id,))
+                cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
                 cursor.execute('COMMIT')
 
                 logger.info(f"用户及相关数据删除成功: user_id={user_id}")
                 return True
 
             except Exception as e:
-                # 回滚事务
-                cursor.execute('ROLLBACK')
                 logger.error(f"删除用户及相关数据失败: {e}")
-                return False
+                try:
+                    if cursor is not None:
+                        cursor.execute('ROLLBACK')
+                    else:
+                        self.conn.rollback()
+                except Exception:
+                    try:
+                        self.conn.rollback()
+                    except Exception:
+                        pass
+                raise
 
     def get_table_data(self, table_name: str):
         """获取指定表的所有数据"""
@@ -4693,23 +4975,77 @@ Cookie数量: {cookie_count}
                 columns_info = cursor.fetchall()
                 columns = [col[1] for col in columns_info]  # 列名
 
-                # 获取表数据
-                cursor.execute(f"SELECT * FROM {table_name}")
+                # 获取表数据，并补充 rowid 供管理员数据管理模块做稳定删除
+                cursor.execute(f"SELECT rowid, * FROM {table_name}")
                 rows = cursor.fetchall()
 
                 # 转换为字典列表
                 data = []
                 for row in rows:
-                    row_dict = {}
-                    for i, value in enumerate(row):
+                    row_dict = {"__admin_rowid": row[0]}
+                    for i, value in enumerate(row[1:]):
                         row_dict[columns[i]] = value
                     data.append(row_dict)
+
+                if table_name == "system_settings":
+                    data = [
+                        row_dict
+                        for row_dict in data
+                        if str(row_dict.get("key") or "").strip()
+                        not in self.ADMIN_DATA_HIDDEN_SYSTEM_SETTING_KEYS
+                    ]
 
                 return data, columns
 
             except Exception as e:
                 logger.error(f"获取表数据失败: {table_name} - {e}")
-                return [], []
+                raise
+
+    def _delete_account_scoped_rows(self, cursor, account_ids: List[str]) -> None:
+        normalized_account_ids = [str(account_id or '').strip() for account_id in account_ids if str(account_id or '').strip()]
+        if not normalized_account_ids:
+            return
+
+        placeholders = ",".join(["?"] * len(normalized_account_ids))
+        account_scoped_tables = (
+            "keywords",
+            "cookie_status",
+            "default_replies",
+            "default_reply_records",
+            "message_notifications",
+            "item_info",
+            "item_replay",
+            "comment_templates",
+            "risk_control_logs",
+            "ai_reply_settings",
+            "ai_conversations",
+            "orders",
+            "scheduled_tasks",
+            "delivery_logs",
+            "delivery_finalization_states",
+            "data_card_reservations",
+        )
+
+        # SQLite 默认不启用外键级联，这里手动兜底清理账号作用域数据。
+        for table_name in account_scoped_tables:
+            cursor.execute(
+                f"DELETE FROM {table_name} WHERE account_id IN ({placeholders})",
+                normalized_account_ids,
+            )
+
+    def _delete_user_scoped_rows(self, cursor, user_id: int) -> None:
+        user_scoped_tables = (
+            "user_settings",
+            "cards",
+            "delivery_rules",
+            "notification_channels",
+            "notification_templates",
+        )
+        for table_name in user_scoped_tables:
+            cursor.execute(f"DELETE FROM {table_name} WHERE user_id = ?", (user_id,))
+
+        cursor.execute("DELETE FROM delivery_logs WHERE user_id = ?", (user_id,))
+        cursor.execute("DELETE FROM scheduled_tasks WHERE user_id = ?", (user_id,))
 
     # 已知的无效 buyer_id 占位值
     _INVALID_BUYER_IDS = {"unknown_user", "unknown", "", "None", "null", "0", "-", "-1"}
@@ -4746,35 +5082,56 @@ Cookie数量: {cookie_count}
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                cursor.execute('BEGIN TRANSACTION')
 
-                # 根据表名确定主键字段
-                primary_key_map = {
-                    'users': 'id',
-                    'cookies': 'id',
-                    'cookie_status': 'id',
-                    'keywords': 'id',
-                    'default_replies': 'id',
-                    'default_reply_records': 'id',
-                    'item_replay': 'item_id',
-                    'ai_reply_settings': 'id',
-                    'ai_conversations': 'id',
-                    'ai_item_cache': 'id',
-                    'item_info': 'id',
-                    'message_notifications': 'id',
-                    'cards': 'id',
-                    'delivery_rules': 'id',
-                    'notification_channels': 'id',
-                    'user_settings': 'id',
-                    'system_settings': 'id',
-                    'email_verifications': 'id',
-                    'captcha_codes': 'id',
-                    'orders': 'order_id'
-                }
+                if table_name == "users":
+                    cursor.execute("SELECT id FROM users WHERE rowid = ?", (record_id,))
+                    user_row = cursor.fetchone()
+                    if not user_row or user_row[0] is None:
+                        self.conn.rollback()
+                        logger.warning(f"删除表记录失败，用户记录不存在: {table_name}.{record_id}")
+                        return False
 
-                primary_key = primary_key_map.get(table_name, 'id')
+                    target_user_id = int(user_row[0])
+                    cursor.execute("SELECT id FROM cookies WHERE user_id = ?", (target_user_id,))
+                    user_account_ids = [
+                        str(row[0]).strip()
+                        for row in cursor.fetchall()
+                        if str(row[0] or '').strip()
+                    ]
+                    self._delete_user_scoped_rows(cursor, target_user_id)
+                    self._delete_account_scoped_rows(cursor, user_account_ids)
+                    cursor.execute("DELETE FROM cookies WHERE user_id = ?", (target_user_id,))
+                    cursor.execute("DELETE FROM users WHERE id = ?", (target_user_id,))
+                elif table_name == "cookies":
+                    cursor.execute("SELECT id FROM cookies WHERE rowid = ?", (record_id,))
+                    cookie_row = cursor.fetchone()
+                    if not cookie_row or cookie_row[0] is None:
+                        self.conn.rollback()
+                        logger.warning(f"删除表记录失败，账号记录不存在: {table_name}.{record_id}")
+                        return False
 
-                # 删除记录
-                cursor.execute(f"DELETE FROM {table_name} WHERE {primary_key} = ?", (record_id,))
+                    normalized_account_id = self._require_account_id(cookie_row[0])
+                    self._delete_account_scoped_rows(cursor, [normalized_account_id])
+                    cursor.execute("DELETE FROM cookies WHERE id = ?", (normalized_account_id,))
+                elif table_name == "system_settings":
+                    cursor.execute("SELECT key FROM system_settings WHERE rowid = ?", (record_id,))
+                    setting_row = cursor.fetchone()
+                    if not setting_row or setting_row[0] is None:
+                        self.conn.rollback()
+                        logger.warning(f"删除表记录失败，系统设置记录不存在: {table_name}.{record_id}")
+                        return False
+
+                    setting_key = str(setting_row[0]).strip()
+                    if setting_key == "admin_password_hash":
+                        self.conn.rollback()
+                        logger.warning("拒绝删除 system_settings.admin_password_hash 记录")
+                        return False
+
+                    cursor.execute("DELETE FROM system_settings WHERE rowid = ?", (record_id,))
+                else:
+                    # 管理后台数据管理统一使用 rowid 删除，避免文本主键/组合主键表删错或删不掉
+                    cursor.execute(f"DELETE FROM {table_name} WHERE rowid = ?", (record_id,))
 
                 if cursor.rowcount > 0:
                     self.conn.commit()
@@ -4787,16 +5144,34 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"删除表记录失败: {table_name}.{record_id} - {e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def clear_table_data(self, table_name: str):
         """清空指定表的所有数据"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                cursor.execute('BEGIN TRANSACTION')
 
-                # 清空表数据
-                cursor.execute(f"DELETE FROM {table_name}")
+                if table_name == "users":
+                    self.conn.rollback()
+                    logger.warning("拒绝直接清空 users 表，避免破坏管理员账号")
+                    return False
+
+                if table_name == "cookies":
+                    cursor.execute("SELECT id FROM cookies")
+                    account_ids = [
+                        str(row[0]).strip()
+                        for row in cursor.fetchall()
+                        if str(row[0] or '').strip()
+                    ]
+                    self._delete_account_scoped_rows(cursor, account_ids)
+                    cursor.execute("DELETE FROM cookies")
+                elif table_name == "system_settings":
+                    cursor.execute("DELETE FROM system_settings WHERE key != 'admin_password_hash'")
+                else:
+                    # 清空表数据
+                    cursor.execute(f"DELETE FROM {table_name}")
 
                 # 重置自增ID（如果有的话）
                 cursor.execute(f"DELETE FROM sqlite_sequence WHERE name = ?", (table_name,))
@@ -4808,7 +5183,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"清空表数据失败: {table_name} - {e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def upgrade_keywords_table_for_image_support(self, cursor):
         """升级keywords表以支持图片关键词"""
@@ -5299,15 +5674,16 @@ Cookie数量: {cookie_count}
         Returns:
             bool: 删除成功返回True，失败返回False
         """
-        try:
-            with self.lock:
+        with self.lock:
+            try:
                 cursor = self.conn.cursor()
                 cursor.execute('DELETE FROM risk_control_logs WHERE id = ?', (log_id,))
                 self.conn.commit()
                 return cursor.rowcount > 0
-        except Exception as e:
-            logger.error(f"删除风控日志失败: {e}")
-            return False
+            except Exception as e:
+                logger.error(f"删除风控日志失败: {e}")
+                self.conn.rollback()
+                raise
 
     
     def cleanup_old_data(self, days: int = 90) -> dict:
@@ -5457,7 +5833,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"创建定时任务失败: {e}")
                 self.conn.rollback()
-                return None
+                raise
 
     def get_scheduled_tasks(self, user_id=None):
         """获取定时任务列表"""
@@ -5493,7 +5869,7 @@ Cookie数量: {cookie_count}
                 return tasks
             except Exception as e:
                 logger.error(f"获取定时任务列表失败: {e}")
-                return []
+                raise
 
     def get_scheduled_task(self, task_id):
         """获取单个定时任务"""
@@ -5519,7 +5895,7 @@ Cookie数量: {cookie_count}
                 return None
             except Exception as e:
                 logger.error(f"获取定时任务失败: {e}")
-                return None
+                raise
 
     def get_scheduled_task_by_account(self, account_id, user_id=None, task_type=None):
         """按账号获取最新的定时任务"""
@@ -5558,7 +5934,7 @@ Cookie数量: {cookie_count}
                 return None
             except Exception as e:
                 logger.error(f"按账号获取定时任务失败: {e}")
-                return None
+                raise
 
     def update_scheduled_task(self, task_id, **kwargs):
         """更新定时任务"""
@@ -5587,7 +5963,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"更新定时任务失败: {e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def delete_scheduled_task(self, task_id):
         """删除定时任务"""
@@ -5600,7 +5976,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"删除定时任务失败: {e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def get_due_tasks(self):
         """获取到期需要执行的任务"""
@@ -5631,7 +6007,7 @@ Cookie数量: {cookie_count}
                 return tasks
             except Exception as e:
                 logger.error(f"获取到期任务失败: {e}")
-                return []
+                raise
 
     def update_task_run_result(self, task_id, result, next_run_at):
         """更新任务执行结果和下次运行时间"""
@@ -5880,7 +6256,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"插入或更新订单失败: order_id={order_id}, account_id={account_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def get_order_by_id(self, order_id: str, *, account_id: str, user_id: int = None):
         normalized_account_id = self._require_account_id(account_id)
@@ -5906,7 +6282,7 @@ Cookie数量: {cookie_count}
                 return self._order_row_to_dict(row) if row else None
             except Exception as e:
                 logger.error(f"获取订单信息失败: order_id={order_id}, account_id={account_id}, error={e}")
-                return None
+                raise
 
     def get_order_pre_refund_status(self, order_id: str, *, account_id: str) -> str:
         normalized_account_id = self._require_account_id(account_id)
@@ -5925,16 +6301,14 @@ Cookie数量: {cookie_count}
                 logger.error(
                     f"获取订单退款前状态失败: order_id={order_id}, account_id={account_id}, error={e}"
                 )
-                return None
+                raise
 
-    def get_orders_by_account(self, account_id: str, limit: int = 100):
+    def get_orders_by_account(self, account_id: str, limit: Optional[int] = 100):
         normalized_account_id = self._require_account_id(account_id)
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                safe_limit = max(1, min(int(limit), 1000))
-                cursor.execute(
-                    """
+                sql = """
                     SELECT order_id, item_id, buyer_id, buyer_nick, sid, spec_name, spec_value,
                            spec_name_2, spec_value_2, quantity, amount, bargain_flow_detected, bargain_success_detected,
                            order_status, pre_refund_status, account_id, platform_created_at, platform_paid_at,
@@ -5943,14 +6317,17 @@ Cookie数量: {cookie_count}
                     FROM orders
                     WHERE account_id = ?
                     ORDER BY datetime(COALESCE(updated_at, created_at)) DESC, created_at DESC
-                    LIMIT ?
-                    """,
-                    (normalized_account_id, safe_limit),
-                )
+                """
+                params = [normalized_account_id]
+                if limit is not None:
+                    sql += "\n                    LIMIT ?"
+                    params.append(max(1, int(limit)))
+
+                cursor.execute(sql, tuple(params))
                 return [self._order_row_to_dict(row) for row in cursor.fetchall()]
             except Exception as e:
                 logger.error(f"获取账号订单列表失败: account_id={account_id}, error={e}")
-                return []
+                raise
 
     def delete_order(self, order_id: str, *, account_id: str) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -5971,7 +6348,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"删除订单失败: order_id={order_id}, account_id={account_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def update_buyer_nick_by_buyer_id(self, buyer_id: str, buyer_nick: str, *, account_id: str):
         normalized_account_id = self._require_account_id(account_id)
@@ -6221,7 +6598,7 @@ Cookie数量: {cookie_count}
                     f"更新订单易凡状态失败: order_id={order_id}, account_id={account_id}, error={e}"
                 )
                 self.conn.rollback()
-                return False
+                raise
 
     def get_order_info(self, order_id: str, *, account_id: str):
         return self.get_order_by_id(order_id, account_id=account_id)
@@ -6252,7 +6629,7 @@ Cookie数量: {cookie_count}
                 logger.error(
                     f"根据易凡订单号获取订单失败: yifan_orderno={yifan_orderno}, account_id={account_id}, error={e}"
                 )
-                return None
+                raise
 
     def update_order_chat_id(self, order_id: str, chat_id: str, *, account_id: str) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -6279,7 +6656,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"更新订单 chat_id 失败: order_id={order_id}, account_id={account_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
 
     def _item_row_to_dict(self, row: Tuple[Any, ...]) -> Dict[str, Any]:
@@ -6360,7 +6737,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"保存商品信息失败: account_id={account_id}, item_id={item_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def get_item_info(self, account_id: str, item_id: str) -> Optional[Dict]:
         normalized_account_id = self._require_account_id(account_id)
@@ -6381,7 +6758,7 @@ Cookie数量: {cookie_count}
                 return self._item_row_to_dict(row) if row else None
             except Exception as e:
                 logger.error(f"获取商品信息失败: account_id={account_id}, item_id={item_id}, error={e}")
-                return None
+                raise
 
     def get_items_by_account(self, account_id: str) -> List[Dict]:
         normalized_account_id = self._require_account_id(account_id)
@@ -6402,7 +6779,26 @@ Cookie数量: {cookie_count}
                 return [self._item_row_to_dict(row) for row in cursor.fetchall()]
             except Exception as e:
                 logger.error(f"获取账号商品列表失败: account_id={account_id}, error={e}")
-                return []
+                raise
+
+    def count_items_by_account(self, account_id: str) -> int:
+        normalized_account_id = self._require_account_id(account_id)
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM item_info
+                    WHERE account_id = ?
+                    """,
+                    (normalized_account_id,),
+                )
+                row = cursor.fetchone()
+                return int(row[0] or 0) if row else 0
+            except Exception as e:
+                logger.error(f"统计账号商品数量失败: account_id={account_id}, error={e}")
+                raise
 
     def batch_save_item_basic_info(self, items_data: list) -> int:
         if not items_data:
@@ -6461,7 +6857,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"批量保存商品基础信息失败: {e}")
                 self.conn.rollback()
-                return 0
+                raise
 
     def batch_update_item_title_price(self, items_data: list) -> int:
         if not items_data:
@@ -6498,7 +6894,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"批量更新商品标题价格失败: {e}")
                 self.conn.rollback()
-                return 0
+                raise
 
     def delete_item_info(self, account_id: str, item_id: str) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -6517,7 +6913,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"删除商品信息失败: account_id={account_id}, item_id={item_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def batch_delete_item_info(self, items_to_delete: list) -> int:
         if not items_to_delete:
@@ -6543,7 +6939,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"批量删除商品信息失败: {e}")
                 self.conn.rollback()
-                return 0
+                raise
 
     def get_item_replay(self, account_id: str, item_id: str) -> Optional[Dict[str, Any]]:
         normalized_account_id = self._require_account_id(account_id)
@@ -6837,6 +7233,39 @@ Cookie数量: {cookie_count}
                 logger.error(f"获取带商品ID关键词失败: account_id={account_id}, error={e}")
                 return []
 
+    def get_keyword_counts(self, user_id: int = None) -> Dict[str, int]:
+        """按账号汇总关键词数量；支持按用户过滤。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if user_id is not None:
+                    cursor.execute(
+                        """
+                        SELECT k.account_id, COUNT(*)
+                        FROM keywords k
+                        JOIN cookies c ON k.account_id = c.id
+                        WHERE c.user_id = ?
+                        GROUP BY k.account_id
+                        """,
+                        (user_id,),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT account_id, COUNT(*)
+                        FROM keywords
+                        GROUP BY account_id
+                        """
+                    )
+                return {
+                    str(row[0]): int(row[1] or 0)
+                    for row in cursor.fetchall()
+                    if row and row[0]
+                }
+            except Exception as e:
+                logger.error(f"获取关键词数量汇总失败: error={e}")
+                raise
+
     def check_keyword_duplicate(self, account_id: str, keyword: str, item_id: str = None) -> bool:
         normalized_account_id = self._require_account_id(account_id)
         normalized_item_id = str(item_id).strip() if item_id is not None and str(item_id).strip() else None
@@ -6888,6 +7317,33 @@ Cookie数量: {cookie_count}
                 logger.error(f"保存图片关键词失败: account_id={account_id}, keyword={keyword}, error={e}")
                 self.conn.rollback()
                 return False
+
+    def count_keywords_by_image_url(self, account_id: str, image_url: str) -> int:
+        normalized_account_id = self._require_account_id(account_id)
+        normalized_image_url = (image_url or "").strip()
+        if not normalized_image_url:
+            return 0
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM keywords
+                    WHERE account_id = ?
+                      AND COALESCE(type, 'text') = 'image'
+                      AND image_url = ?
+                    """,
+                    (normalized_account_id, normalized_image_url),
+                )
+                row = cursor.fetchone()
+                return int(row[0]) if row else 0
+            except Exception as e:
+                logger.error(
+                    f"统计图片关键词引用数量失败: account_id={account_id}, image_url={image_url}, error={e}"
+                )
+                return -1
 
     def get_keywords_with_type(self, account_id: str) -> List[Dict[str, Any]]:
         normalized_account_id = self._require_account_id(account_id)
@@ -6997,7 +7453,7 @@ Cookie数量: {cookie_count}
                 return bool(result[0]) if result else True
             except Exception as e:
                 logger.error(f"获取账号启用状态失败: account_id={account_id}, error={e}")
-                return True
+                raise
 
     def get_all_cookie_status(self) -> Dict[str, bool]:
         with self.lock:
@@ -7007,7 +7463,7 @@ Cookie数量: {cookie_count}
                 return {row[0]: bool(row[1]) for row in cursor.fetchall()}
             except Exception as e:
                 logger.error(f"获取全部账号启用状态失败: error={e}")
-                return {}
+                raise
 
     def save_ai_reply_settings(self, account_id: str, settings: dict) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -7054,7 +7510,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"保存 AI 回复设置失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def get_ai_reply_settings(self, account_id: str) -> dict:
         normalized_account_id = self._require_account_id(account_id)
@@ -7089,21 +7545,33 @@ Cookie数量: {cookie_count}
                 }
             except Exception as e:
                 logger.error(f"获取 AI 回复设置失败: account_id={account_id}, error={e}")
-                return defaults
+                raise
 
-    def get_all_ai_reply_settings(self) -> Dict[str, dict]:
+    def get_all_ai_reply_settings(self, user_id: int = None) -> Dict[str, dict]:
         defaults = self._default_ai_reply_settings()
 
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                cursor.execute(
-                    """
-                    SELECT account_id, ai_enabled, model_name, api_key, base_url, api_type,
-                           max_discount_percent, max_discount_amount, max_bargain_rounds, custom_prompts
-                    FROM ai_reply_settings
-                    """
-                )
+                if user_id is not None:
+                    cursor.execute(
+                        """
+                        SELECT ars.account_id, ars.ai_enabled, ars.model_name, ars.api_key, ars.base_url, ars.api_type,
+                               ars.max_discount_percent, ars.max_discount_amount, ars.max_bargain_rounds, ars.custom_prompts
+                        FROM ai_reply_settings ars
+                        JOIN cookies c ON ars.account_id = c.id
+                        WHERE c.user_id = ?
+                        """,
+                        (user_id,),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT account_id, ai_enabled, model_name, api_key, base_url, api_type,
+                               max_discount_percent, max_discount_amount, max_bargain_rounds, custom_prompts
+                        FROM ai_reply_settings
+                        """
+                    )
 
                 result = {}
                 for row in cursor.fetchall():
@@ -7122,7 +7590,7 @@ Cookie数量: {cookie_count}
                 return result
             except Exception as e:
                 logger.error(f"获取全部 AI 回复设置失败: error={e}")
-                return {}
+                raise
 
     def save_default_reply(self, account_id: str, enabled: bool, reply_content: str = None, reply_once: bool = False):
         normalized_account_id = self._require_account_id(account_id)
@@ -7171,18 +7639,29 @@ Cookie数量: {cookie_count}
                 }
             except Exception as e:
                 logger.error(f"获取默认回复失败: account_id={account_id}, error={e}")
-                return None
+                raise
 
-    def get_all_default_replies(self) -> Dict[str, Dict[str, Any]]:
+    def get_all_default_replies(self, user_id: int = None) -> Dict[str, Dict[str, Any]]:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                cursor.execute(
-                    """
-                    SELECT account_id, enabled, reply_content, reply_once, created_at, updated_at
-                    FROM default_replies
-                    """
-                )
+                if user_id is not None:
+                    cursor.execute(
+                        """
+                        SELECT dr.account_id, dr.enabled, dr.reply_content, dr.reply_once, dr.created_at, dr.updated_at
+                        FROM default_replies dr
+                        JOIN cookies c ON dr.account_id = c.id
+                        WHERE c.user_id = ?
+                        """,
+                        (user_id,),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT account_id, enabled, reply_content, reply_once, created_at, updated_at
+                        FROM default_replies
+                        """
+                    )
                 result = {}
                 for row in cursor.fetchall():
                     result[row[0]] = {
@@ -7195,7 +7674,7 @@ Cookie数量: {cookie_count}
                 return result
             except Exception as e:
                 logger.error(f"获取全部默认回复失败: error={e}")
-                return {}
+                raise
 
     def add_default_reply_record(self, account_id: str, chat_id: str):
         normalized_account_id = self._require_account_id(account_id)
@@ -7253,7 +7732,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"删除默认回复失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def set_message_notification(self, account_id: str, channel_id: int, enabled: bool = True) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -7276,7 +7755,79 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"保存消息通知设置失败: account_id={account_id}, channel_id={channel_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
+
+    def replace_account_notifications(
+        self,
+        account_id: str,
+        channel_ids: List[int],
+        *,
+        enabled: bool = True,
+        user_id: int = None,
+    ) -> int:
+        normalized_account_id = self._require_account_id(account_id)
+        normalized_channel_ids: List[int] = []
+        seen_channel_ids = set()
+
+        for channel_id in channel_ids or []:
+            try:
+                normalized_channel_id = int(channel_id)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("通知渠道ID无效") from exc
+
+            if normalized_channel_id <= 0:
+                raise ValueError("通知渠道ID无效")
+            if normalized_channel_id in seen_channel_ids:
+                continue
+
+            seen_channel_ids.add(normalized_channel_id)
+            normalized_channel_ids.append(normalized_channel_id)
+
+        if not normalized_channel_ids:
+            raise ValueError("请选择通知渠道")
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if user_id is not None:
+                    placeholders = ", ".join(["?"] * len(normalized_channel_ids))
+                    cursor.execute(
+                        f"""
+                        SELECT id
+                        FROM notification_channels
+                        WHERE user_id = ? AND id IN ({placeholders})
+                        """,
+                        (user_id, *normalized_channel_ids),
+                    )
+                    existing_channel_ids = {int(row[0]) for row in cursor.fetchall()}
+                    missing_channel_ids = [
+                        channel_id for channel_id in normalized_channel_ids if channel_id not in existing_channel_ids
+                    ]
+                    if missing_channel_ids:
+                        raise ValueError("通知渠道不存在")
+
+                cursor.execute(
+                    "DELETE FROM message_notifications WHERE account_id = ?",
+                    (normalized_account_id,),
+                )
+                cursor.executemany(
+                    """
+                    INSERT INTO message_notifications (account_id, channel_id, enabled, created_at, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """,
+                    [
+                        (normalized_account_id, channel_id, int(enabled))
+                        for channel_id in normalized_channel_ids
+                    ],
+                )
+                self.conn.commit()
+                return len(normalized_channel_ids)
+            except Exception as e:
+                logger.error(
+                    f"替换账号消息通知设置失败: account_id={account_id}, channel_ids={channel_ids}, error={e}"
+                )
+                self.conn.rollback()
+                raise
 
     def get_account_notifications(self, account_id: str) -> List[Dict[str, Any]]:
         normalized_account_id = self._require_account_id(account_id)
@@ -7291,7 +7842,7 @@ Cookie数量: {cookie_count}
                     FROM message_notifications mn
                     JOIN notification_channels nc ON mn.channel_id = nc.id
                     JOIN cookies c ON mn.account_id = c.id
-                    WHERE mn.account_id = ? AND nc.enabled = 1 AND nc.user_id = c.user_id
+                    WHERE mn.account_id = ? AND nc.user_id = c.user_id
                     ORDER BY mn.id
                     """,
                     (normalized_account_id,),
@@ -7313,23 +7864,37 @@ Cookie数量: {cookie_count}
                 ]
             except Exception as e:
                 logger.error(f"获取账号消息通知设置失败: account_id={account_id}, error={e}")
-                return []
+                raise
 
-    def get_all_message_notifications(self) -> Dict[str, List[Dict[str, Any]]]:
+    def get_all_message_notifications(self, user_id: int = None) -> Dict[str, List[Dict[str, Any]]]:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                cursor.execute(
-                    """
-                    SELECT mn.id, mn.account_id, mn.channel_id, mn.enabled, mn.created_at, mn.updated_at,
-                           nc.name, nc.type, nc.config, nc.enabled
-                    FROM message_notifications mn
-                    JOIN notification_channels nc ON mn.channel_id = nc.id
-                    JOIN cookies c ON mn.account_id = c.id
-                    WHERE nc.enabled = 1 AND nc.user_id = c.user_id
-                    ORDER BY mn.account_id, mn.id
-                    """
-                )
+                if user_id is not None:
+                    cursor.execute(
+                        """
+                        SELECT mn.id, mn.account_id, mn.channel_id, mn.enabled, mn.created_at, mn.updated_at,
+                               nc.name, nc.type, nc.config, nc.enabled
+                        FROM message_notifications mn
+                        JOIN notification_channels nc ON mn.channel_id = nc.id
+                        JOIN cookies c ON mn.account_id = c.id
+                        WHERE nc.user_id = c.user_id AND c.user_id = ?
+                        ORDER BY mn.account_id, mn.id
+                        """,
+                        (user_id,),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT mn.id, mn.account_id, mn.channel_id, mn.enabled, mn.created_at, mn.updated_at,
+                               nc.name, nc.type, nc.config, nc.enabled
+                        FROM message_notifications mn
+                        JOIN notification_channels nc ON mn.channel_id = nc.id
+                        JOIN cookies c ON mn.account_id = c.id
+                        WHERE nc.user_id = c.user_id
+                        ORDER BY mn.account_id, mn.id
+                        """
+                    )
 
                 result: Dict[str, List[Dict[str, Any]]] = {}
                 for row in cursor.fetchall():
@@ -7350,7 +7915,7 @@ Cookie数量: {cookie_count}
                 return result
             except Exception as e:
                 logger.error(f"获取全部消息通知设置失败: error={e}")
-                return {}
+                raise
 
     def delete_account_notifications(self, account_id: str, user_id: int = None) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -7375,7 +7940,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"删除账号消息通知设置失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def update_auto_confirm(self, account_id: str, auto_confirm: bool) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -7395,7 +7960,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"更新自动确认发货设置失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def update_cookie_pause_duration(self, account_id: str, pause_duration: int) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -7416,7 +7981,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"更新自动回复暂停时间失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def get_cookie_pause_duration(self, account_id: str) -> int:
         normalized_account_id = self._require_account_id(account_id)
@@ -7435,7 +8000,7 @@ Cookie数量: {cookie_count}
                 return int(result[0])
             except Exception as e:
                 logger.error(f"获取自动回复暂停时间失败: account_id={account_id}, error={e}")
-                return 10
+                raise
 
     def get_auto_confirm(self, account_id: str) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -7448,7 +8013,7 @@ Cookie数量: {cookie_count}
                 return bool(result[0]) if result else True
             except Exception as e:
                 logger.error(f"获取自动确认发货设置失败: account_id={account_id}, error={e}")
-                return True
+                raise
 
     def get_auto_comment(self, account_id: str) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -7463,7 +8028,7 @@ Cookie数量: {cookie_count}
                 return False
             except Exception as e:
                 logger.error(f"获取自动好评设置失败: account_id={account_id}, error={e}")
-                return False
+                raise
 
     def update_auto_comment(self, account_id: str, auto_comment: bool) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -7483,7 +8048,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"更新自动好评设置失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def get_comment_templates(self, account_id: str) -> List[Dict]:
         normalized_account_id = self._require_account_id(account_id)
@@ -7503,7 +8068,7 @@ Cookie数量: {cookie_count}
                 return [self._comment_template_row_to_dict(row) for row in cursor.fetchall()]
             except Exception as e:
                 logger.error(f"获取好评模板列表失败: account_id={account_id}, error={e}")
-                return []
+                raise
 
     def get_active_comment_template(self, account_id: str) -> Optional[Dict]:
         normalized_account_id = self._require_account_id(account_id)
@@ -7525,7 +8090,7 @@ Cookie数量: {cookie_count}
                 return self._comment_template_row_to_dict(row) if row else None
             except Exception as e:
                 logger.error(f"获取激活好评模板失败: account_id={account_id}, error={e}")
-                return None
+                raise
 
     def add_comment_template(self, account_id: str, name: str, content: str, is_active: bool = False) -> Optional[int]:
         normalized_account_id = self._require_account_id(account_id)
@@ -7550,7 +8115,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"添加好评模板失败: account_id={account_id}, name={name}, error={e}")
                 self.conn.rollback()
-                return None
+                raise
 
     def update_comment_template(self, account_id: str, template_id: int, name: str = None, content: str = None, is_active: bool = None) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -7594,7 +8159,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"更新好评模板失败: account_id={account_id}, template_id={template_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def delete_comment_template(self, account_id: str, template_id: int) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -7611,7 +8176,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"删除好评模板失败: account_id={account_id}, template_id={template_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def set_active_comment_template(self, account_id: str, template_id: int) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -7640,7 +8205,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"设置激活好评模板失败: account_id={account_id}, template_id={template_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def _delivery_log_row_to_dict(self, row: Tuple[Any, ...]) -> Dict[str, Any]:
         return {
@@ -7874,7 +8439,7 @@ Cookie数量: {cookie_count}
                 logger.error(
                     f"获取发货 finalize 状态失败: order_id={order_id}, unit_index={unit_index}, account_id={account_id}, error={e}"
                 )
-                return None
+                raise
 
     def get_delivery_finalization_states(self, order_id: str, account_id: str = None):
         normalized_account_id = self._require_account_id(account_id)
@@ -7895,7 +8460,7 @@ Cookie数量: {cookie_count}
                 return [self._delivery_state_row_to_dict(row) for row in cursor.fetchall()]
             except Exception as e:
                 logger.error(f"获取发货 finalize 状态列表失败: order_id={order_id}, account_id={account_id}, error={e}")
-                return []
+                raise
 
     def get_delivery_progress_summary(self, order_id: str, account_id: str = None, expected_quantity: int = 1):
         self._require_account_id(account_id)
@@ -7968,7 +8533,7 @@ Cookie数量: {cookie_count}
                 return [self._delivery_log_row_to_dict(row) for row in cursor.fetchall()]
             except Exception as e:
                 logger.error(f"获取最近发货日志失败: user_id={user_id}, error={e}")
-                return []
+                raise
 
     def reserve_batch_data(self, card_id: int, order_id: str, unit_index: int = 1,
                            account_id: str = None, buyer_id: str = None, ttl_minutes: int = 30):
@@ -8109,15 +8674,16 @@ Cookie数量: {cookie_count}
                 return cursor.lastrowid
         except Exception as e:
             logger.error(f"添加风控日志失败: account_id={account_id}, error={e}")
-            return None
+            self.conn.rollback()
+            raise
 
     def get_risk_control_logs(self, account_id: str = None, processing_status: str = None,
                               event_type: str = None, trigger_scene: str = None,
                               session_id: str = None, result_code: str = None,
                               date_from: str = None, date_to: str = None,
                               limit: int = 100, offset: int = 0) -> List[Dict]:
-        try:
-            with self.lock:
+        with self.lock:
+            try:
                 cursor = self.conn.cursor()
 
                 query = """
@@ -8168,16 +8734,16 @@ Cookie数量: {cookie_count}
 
                 cursor.execute(query, params)
                 return [self._risk_control_row_to_dict(row) for row in cursor.fetchall()]
-        except Exception as e:
-            logger.error(f"获取风控日志失败: account_id={account_id}, error={e}")
-            return []
+            except Exception as e:
+                logger.error(f"获取风控日志失败: account_id={account_id}, error={e}")
+                raise
 
     def get_risk_control_logs_count(self, account_id: str = None, processing_status: str = None,
                                     event_type: str = None, trigger_scene: str = None,
                                     session_id: str = None, result_code: str = None,
                                     date_from: str = None, date_to: str = None) -> int:
-        try:
-            with self.lock:
+        with self.lock:
+            try:
                 cursor = self.conn.cursor()
                 query = "SELECT COUNT(*) FROM risk_control_logs"
                 conditions: List[str] = []
@@ -8217,9 +8783,9 @@ Cookie数量: {cookie_count}
                 cursor.execute(query, params)
                 result = cursor.fetchone()
                 return int(result[0] if result else 0)
-        except Exception as e:
-            logger.error(f"获取风控日志数量失败: account_id={account_id}, error={e}")
-            return 0
+            except Exception as e:
+                logger.error(f"获取风控日志数量失败: account_id={account_id}, error={e}")
+                raise
 
     def get_slider_verification_session_stats(self, account_ids: Optional[List[str]] = None, range_key: str = 'all') -> Dict[str, Any]:
         empty_stats = {
@@ -8278,19 +8844,19 @@ Cookie数量: {cookie_count}
             start_utc = start_local.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             return ["datetime(created_at) >= datetime(?)"], [start_utc], label_map[normalized_range]
 
-        try:
-            normalized_account_ids = _normalize_account_ids(account_ids)
-            normalized_range = _normalize_range(range_key)
+        normalized_account_ids = _normalize_account_ids(account_ids)
+        normalized_range = _normalize_range(range_key)
 
-            if account_ids is not None and not normalized_account_ids:
-                empty_result = dict(empty_stats)
-                empty_result.update({
-                    "selected_range": normalized_range,
-                    "range_label": _build_range_filter(normalized_range)[2],
-                })
-                return empty_result
+        if account_ids is not None and not normalized_account_ids:
+            empty_result = dict(empty_stats)
+            empty_result.update({
+                "selected_range": normalized_range,
+                "range_label": _build_range_filter(normalized_range)[2],
+            })
+            return empty_result
 
-            with self.lock:
+        with self.lock:
+            try:
                 cursor = self.conn.cursor()
                 scope_conditions: List[str] = []
                 scope_params: List[Any] = []
@@ -8379,19 +8945,9 @@ Cookie数量: {cookie_count}
                     "selected_range": normalized_range,
                     "range_label": range_label,
                 }
-        except Exception as e:
-            logger.error(f"获取滑块验证统计失败: error={e}")
-            empty_result = dict(empty_stats)
-            normalized_range = str(range_key or "").strip().lower()
-            if normalized_range in {"today", "7d"}:
-                empty_result.update(
-                    {
-                        "selected_range": normalized_range,
-                        "range_label": "当日" if normalized_range == "today" else "近 7 天",
-                        "summary_text": "当日暂无滑块验证记录" if normalized_range == "today" else "近 7 天暂无滑块验证记录",
-                    }
-                )
-            return empty_result
+            except Exception as e:
+                logger.error(f"获取滑块验证统计失败: error={e}")
+                raise
 
     def mark_stale_risk_control_logs_failed(self, timeout_minutes: int = 15, account_id: str = None) -> int:
         try:
@@ -8429,7 +8985,8 @@ Cookie数量: {cookie_count}
                 return cursor.rowcount
         except Exception as e:
             logger.error(f"标记超时风控日志失败: account_id={account_id}, error={e}")
-            return 0
+            self.conn.rollback()
+            raise
 
     def export_backup(self, user_id: int = None) -> Dict[str, any]:
         def _fetch_table(cursor, table_name: str, where_clause: str = "", params: List[Any] = None) -> Dict[str, Any]:
@@ -8457,15 +9014,24 @@ Cookie数量: {cookie_count}
                     cookie_rows = backup_data["data"]["cookies"]["rows"]
                     user_account_ids = [row[0] for row in cookie_rows]
 
-                    try:
-                        backup_data["data"]["notification_channels"] = _fetch_table(
-                            cursor,
-                            "notification_channels",
-                            " WHERE user_id = ?",
-                            [user_id],
-                        )
-                    except Exception:
-                        pass
+                    user_scoped_tables = (
+                        "notification_templates",
+                        "notification_channels",
+                        "user_settings",
+                        "cards",
+                        "delivery_rules",
+                        "ai_config_presets",
+                    )
+                    for table_name in user_scoped_tables:
+                        try:
+                            backup_data["data"][table_name] = _fetch_table(
+                                cursor,
+                                table_name,
+                                " WHERE user_id = ?",
+                                [user_id],
+                            )
+                        except Exception:
+                            pass
 
                     if user_account_ids:
                         placeholders = ",".join(["?"] * len(user_account_ids))
@@ -8482,6 +9048,11 @@ Cookie数量: {cookie_count}
                             "risk_control_logs",
                             "ai_reply_settings",
                             "ai_conversations",
+                            "orders",
+                            "scheduled_tasks",
+                            "delivery_logs",
+                            "delivery_finalization_states",
+                            "data_card_reservations",
                         ]
 
                         for table_name in related_tables:
@@ -8503,13 +9074,18 @@ Cookie数量: {cookie_count}
                         "data_card_reservations",
                         "default_replies",
                         "default_reply_records",
+                        "notification_templates",
                         "notification_channels",
                         "message_notifications",
+                        "user_settings",
+                        "ai_config_presets",
                         "system_settings",
                         "item_info",
                         "item_replay",
                         "comment_templates",
                         "risk_control_logs",
+                        "orders",
+                        "scheduled_tasks",
                         "ai_reply_settings",
                         "ai_conversations",
                         "ai_item_cache",
@@ -8531,6 +9107,53 @@ Cookie数量: {cookie_count}
         def _table_columns(cursor, table_name: str) -> List[str]:
             cursor.execute(f"PRAGMA table_info({table_name})")
             return [row[1] for row in cursor.fetchall()]
+
+        def _all_user_ids(cursor) -> List[int]:
+            cursor.execute("SELECT id FROM users ORDER BY id")
+            return [int(row[0]) for row in cursor.fetchall() if row and row[0] is not None]
+
+        user_scoped_autoincrement_tables = {
+            "notification_templates",
+            "notification_channels",
+            "user_settings",
+            "ai_config_presets",
+            "cards",
+            "delivery_rules",
+            "default_reply_records",
+            "message_notifications",
+            "item_info",
+            "item_replay",
+            "comment_templates",
+            "risk_control_logs",
+            "scheduled_tasks",
+            "delivery_logs",
+            "delivery_finalization_states",
+            "data_card_reservations",
+            "ai_conversations",
+        }
+        remapped_identity_tables = {
+            "notification_channels",
+            "cards",
+            "delivery_rules",
+        }
+        relation_id_maps: Dict[str, Dict[int, int]] = {
+            table_name: {}
+            for table_name in remapped_identity_tables
+        }
+
+        def _normalize_mapping_key(raw_value: Any) -> Optional[int]:
+            if raw_value in (None, ""):
+                return None
+            try:
+                return int(raw_value)
+            except (TypeError, ValueError):
+                return None
+
+        def _resolve_remapped_id(table_name: str, raw_value: Any) -> Optional[int]:
+            normalized_key = _normalize_mapping_key(raw_value)
+            if normalized_key is None:
+                return None
+            return relation_id_maps.get(table_name, {}).get(normalized_key)
 
         with self.lock:
             try:
@@ -8555,6 +9178,11 @@ Cookie数量: {cookie_count}
                             "risk_control_logs",
                             "ai_conversations",
                             "ai_reply_settings",
+                            "orders",
+                            "scheduled_tasks",
+                            "delivery_logs",
+                            "delivery_finalization_states",
+                            "data_card_reservations",
                         ]
                         for table_name in related_tables:
                             cursor.execute(
@@ -8564,8 +9192,18 @@ Cookie数量: {cookie_count}
 
                         cursor.execute("DELETE FROM cookies WHERE user_id = ?", (user_id,))
 
-                    if "notification_channels" in backup_data.get("data", {}):
-                        cursor.execute("DELETE FROM notification_channels WHERE user_id = ?", (user_id,))
+                    user_scoped_tables = (
+                        "scheduled_tasks",
+                        "delivery_rules",
+                        "cards",
+                        "ai_config_presets",
+                        "user_settings",
+                        "notification_channels",
+                        "notification_templates",
+                    )
+                    for table_name in user_scoped_tables:
+                        if table_name in backup_data.get("data", {}):
+                            cursor.execute(f"DELETE FROM {table_name} WHERE user_id = ?", (user_id,))
                 else:
                     delete_tables = [
                         "data_card_reservations",
@@ -8578,12 +9216,17 @@ Cookie数量: {cookie_count}
                         "risk_control_logs",
                         "ai_conversations",
                         "ai_reply_settings",
+                        "orders",
+                        "scheduled_tasks",
+                        "notification_templates",
                         "item_replay",
                         "item_info",
                         "cookie_status",
                         "keywords",
                         "delivery_rules",
                         "cards",
+                        "ai_config_presets",
+                        "user_settings",
                         "notification_channels",
                         "ai_item_cache",
                         "cookies",
@@ -8595,7 +9238,10 @@ Cookie数量: {cookie_count}
 
                 import_order = [
                     "cookies",
+                    "notification_templates",
                     "notification_channels",
+                    "user_settings",
+                    "ai_config_presets",
                     "cards",
                     "delivery_rules",
                     "system_settings",
@@ -8608,6 +9254,8 @@ Cookie数量: {cookie_count}
                     "item_replay",
                     "comment_templates",
                     "risk_control_logs",
+                    "orders",
+                    "scheduled_tasks",
                     "delivery_logs",
                     "delivery_finalization_states",
                     "data_card_reservations",
@@ -8629,30 +9277,152 @@ Cookie数量: {cookie_count}
 
                     existing_columns = _table_columns(cursor, table_name)
                     filtered_columns = [column for column in columns if column in existing_columns]
+                    if (
+                        user_id is not None
+                        and table_name in user_scoped_autoincrement_tables
+                    ):
+                        filtered_columns = [column for column in filtered_columns if column != "id"]
+                    if (
+                        table_name in {
+                            "notification_templates",
+                            "notification_channels",
+                            "user_settings",
+                            "cards",
+                            "delivery_rules",
+                            "ai_config_presets",
+                            "scheduled_tasks",
+                            "delivery_logs",
+                        }
+                        and "user_id" in existing_columns
+                        and "user_id" not in filtered_columns
+                    ):
+                        filtered_columns.append("user_id")
                     if not filtered_columns:
                         continue
 
-                    filtered_rows = []
+                    prepared_row_dicts = []
+                    import_target_user_ids = None
                     for row in rows:
                         row_dict = dict(zip(columns, row))
-                        if user_id is not None and table_name in {"cookies", "notification_channels"} and "user_id" in row_dict:
+                        if table_name == "notification_channels" and "type" in filtered_columns:
+                            row_dict["type"] = self._normalize_notification_channel_type(row_dict.get("type"))
+                        if user_id is not None and table_name in {
+                            "cookies",
+                            "notification_channels",
+                            "notification_templates",
+                            "user_settings",
+                            "cards",
+                            "delivery_rules",
+                            "ai_config_presets",
+                            "scheduled_tasks",
+                            "delivery_logs",
+                        }:
                             row_dict["user_id"] = user_id
-                        filtered_rows.append([row_dict.get(column) for column in filtered_columns])
+                        if user_id is not None and table_name == "message_notifications":
+                            mapped_channel_id = _resolve_remapped_id("notification_channels", row_dict.get("channel_id"))
+                            if mapped_channel_id is None:
+                                logger.warning(
+                                    f"用户备份导入跳过消息通知记录：未找到通知渠道映射 channel_id={row_dict.get('channel_id')}"
+                                )
+                                continue
+                            row_dict["channel_id"] = mapped_channel_id
+                        if user_id is not None and table_name == "delivery_rules":
+                            mapped_card_id = _resolve_remapped_id("cards", row_dict.get("card_id"))
+                            if mapped_card_id is None:
+                                logger.warning(
+                                    f"用户备份导入跳过发货规则：未找到卡券映射 card_id={row_dict.get('card_id')}"
+                                )
+                                continue
+                            row_dict["card_id"] = mapped_card_id
+                        if user_id is not None and table_name == "delivery_logs":
+                            mapped_rule_id = _resolve_remapped_id("delivery_rules", row_dict.get("rule_id"))
+                            if row_dict.get("rule_id") not in (None, ""):
+                                row_dict["rule_id"] = mapped_rule_id
+                        if user_id is not None and table_name == "data_card_reservations":
+                            mapped_card_id = _resolve_remapped_id("cards", row_dict.get("card_id"))
+                            if mapped_card_id is None:
+                                logger.warning(
+                                    f"用户备份导入跳过批量数据预占记录：未找到卡券映射 card_id={row_dict.get('card_id')}"
+                                )
+                                continue
+                            row_dict["card_id"] = mapped_card_id
+                        if table_name == "notification_templates" and "user_id" in filtered_columns:
+                            raw_template_user_id = row_dict.get("user_id")
+                            target_user_ids = []
+                            if user_id is not None:
+                                target_user_ids = [user_id]
+                            elif raw_template_user_id not in (None, ""):
+                                try:
+                                    target_user_ids = [int(raw_template_user_id)]
+                                except (TypeError, ValueError):
+                                    target_user_ids = []
+                            else:
+                                if import_target_user_ids is None:
+                                    import_target_user_ids = _all_user_ids(cursor)
+                                target_user_ids = list(import_target_user_ids)
+
+                            for target_user_id in target_user_ids:
+                                cloned_row_dict = dict(row_dict)
+                                cloned_row_dict["user_id"] = target_user_id
+                                prepared_row_dicts.append(cloned_row_dict)
+                            continue
+
+                        prepared_row_dicts.append(row_dict)
+
+                    if not prepared_row_dicts:
+                        continue
 
                     placeholders = ",".join(["?"] * len(filtered_columns))
                     if table_name == "system_settings":
-                        for row in filtered_rows:
-                            key_value = row[filtered_columns.index("key")] if "key" in filtered_columns else None
+                        for row_dict in prepared_row_dicts:
+                            row_values = [row_dict.get(column) for column in filtered_columns]
+                            key_value = row_values[filtered_columns.index("key")] if "key" in filtered_columns else None
                             if key_value != "admin_password_hash":
                                 cursor.execute(
                                     f"INSERT INTO {table_name} ({','.join(filtered_columns)}) VALUES ({placeholders})",
-                                    row,
+                                    row_values,
                                 )
+                    elif user_id is not None and table_name in remapped_identity_tables:
+                        for row_dict in prepared_row_dicts:
+                            row_values = [row_dict.get(column) for column in filtered_columns]
+                            cursor.execute(
+                                f"INSERT INTO {table_name} ({','.join(filtered_columns)}) VALUES ({placeholders})",
+                                row_values,
+                            )
+                            original_row_id = _normalize_mapping_key(row_dict.get("id"))
+                            if original_row_id is not None:
+                                relation_id_maps[table_name][original_row_id] = int(cursor.lastrowid)
                     else:
+                        filtered_rows = [
+                            [row_dict.get(column) for column in filtered_columns]
+                            for row_dict in prepared_row_dicts
+                        ]
                         cursor.executemany(
                             f"INSERT INTO {table_name} ({','.join(filtered_columns)}) VALUES ({placeholders})",
                             filtered_rows,
                         )
+
+                if user_id is None:
+                    cursor.execute(
+                        """
+                        INSERT OR IGNORE INTO system_settings (key, value, description) VALUES
+                        ('theme_color', '#4f46e5', '主题颜色'),
+                        ('registration_enabled', 'true', '是否开启用户注册'),
+                        ('show_default_login_info', 'true', '是否显示默认登录信息'),
+                        ('login_captcha_enabled', 'true', '是否开启登录验证码'),
+                        ('smtp_server', '', 'SMTP服务器地址'),
+                        ('smtp_port', '587', 'SMTP端口'),
+                        ('smtp_user', '', 'SMTP登录用户名（发件邮箱）'),
+                        ('smtp_password', '', 'SMTP登录密码/授权码'),
+                        ('smtp_from', '', '发件人显示名（留空则使用邮箱地址）'),
+                        ('smtp_use_tls', 'true', '是否启用TLS'),
+                        ('smtp_use_ssl', 'false', '是否启用SSL'),
+                        ('verification_email_api_url', '', '验证码邮件API地址（留空则仅使用SMTP）'),
+                        ('qq_notification_api_url', '', 'QQ通知API地址（留空则禁用QQ通知）'),
+                        ('auto_comment_api_url', '', '自动好评辅助API地址（留空则禁用外部辅助）'),
+                        ('qq_reply_secret_key', 'xianyu_qq_reply_2024', 'QQ回复消息API秘钥')
+                        """
+                    )
 
                 self.conn.commit()
                 logger.info(f"导入备份成功: user_id={user_id}")
@@ -8660,7 +9430,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"导入备份失败: {e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def save_cookie(self, account_id: str, cookie_value: str, user_id: int = None) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -8698,21 +9468,32 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"保存账号 Cookie 失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
-    def delete_cookie(self, account_id: str) -> bool:
+    def delete_cookie(self, account_id: str, user_id: int = None) -> bool:
         normalized_account_id = self._require_account_id(account_id)
 
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                if user_id is not None:
+                    cursor.execute("SELECT user_id FROM cookies WHERE id = ?", (normalized_account_id,))
+                    existing_row = cursor.fetchone()
+                    if existing_row is not None and existing_row[0] not in (None, user_id):
+                        logger.warning(
+                            f"账号 {normalized_account_id} 已绑定用户 {existing_row[0]}，拒绝删除给用户 {user_id}"
+                        )
+                        return False
+                cursor.execute('BEGIN TRANSACTION')
+                self._delete_account_scoped_rows(cursor, [normalized_account_id])
                 cursor.execute("DELETE FROM cookies WHERE id = ?", (normalized_account_id,))
-                self.conn.commit()
-                return cursor.rowcount > 0
+                deleted = cursor.rowcount > 0
+                cursor.execute('COMMIT')
+                return deleted
             except Exception as e:
                 logger.error(f"删除账号 Cookie 失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def get_cookie(self, account_id: str) -> Optional[str]:
         normalized_account_id = self._require_account_id(account_id)
@@ -8727,7 +9508,7 @@ Cookie数量: {cookie_count}
                 return self._decrypt_secret(result[0])
             except Exception as e:
                 logger.error(f"获取账号 Cookie 失败: account_id={account_id}, error={e}")
-                return None
+                raise
 
     def get_cookie_by_id(self, account_id: str) -> Optional[Dict[str, str]]:
         normalized_account_id = self._require_account_id(account_id)
@@ -8753,7 +9534,7 @@ Cookie数量: {cookie_count}
                 }
             except Exception as e:
                 logger.error(f"根据账号 ID 获取 Cookie 失败: account_id={account_id}, error={e}")
-                return None
+                raise
 
     def get_cookie_details(self, account_id: str) -> Optional[Dict[str, Any]]:
         normalized_account_id = self._require_account_id(account_id)
@@ -8801,7 +9582,7 @@ Cookie数量: {cookie_count}
                 }
             except Exception as e:
                 logger.error(f"获取账号详细信息失败: account_id={account_id}, error={e}")
-                return None
+                raise
 
     def update_cookie_remark(self, account_id: str, remark: str) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -8818,7 +9599,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"更新账号备注失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def update_cookie_account_info(
         self,
@@ -8905,7 +9686,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"更新账号信息失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def update_cookie_proxy_config(
         self,
@@ -8962,7 +9743,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"更新代理配置失败: account_id={account_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def get_cookie_proxy_config(self, account_id: str) -> Dict[str, any]:
         normalized_account_id = self._require_account_id(account_id)
@@ -8998,7 +9779,7 @@ Cookie数量: {cookie_count}
                 }
             except Exception as e:
                 logger.error(f"获取代理配置失败: account_id={account_id}, error={e}")
-                return dict(default_config)
+                raise
 
     def save_item_basic_info(self, account_id: str, item_id: str, item_title: str = None,
                              item_description: str = None, item_category: str = None,
@@ -9100,7 +9881,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"更新商品多规格状态失败: account_id={account_id}, item_id={item_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def get_item_multi_spec_status(self, account_id: str, item_id: str) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -9123,7 +9904,7 @@ Cookie数量: {cookie_count}
                 return bool(row[0]) if row and row[0] is not None else False
             except Exception as e:
                 logger.error(f"获取商品多规格状态失败: account_id={account_id}, item_id={item_id}, error={e}")
-                return False
+                raise
 
     def update_item_multi_quantity_delivery_status(self, account_id: str, item_id: str, multi_quantity_delivery: bool) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -9150,7 +9931,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"更新商品多数量发货状态失败: account_id={account_id}, item_id={item_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def get_item_multi_quantity_delivery_status(self, account_id: str, item_id: str) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -9173,7 +9954,7 @@ Cookie数量: {cookie_count}
                 return bool(row[0]) if row and row[0] is not None else False
             except Exception as e:
                 logger.error(f"获取商品多数量发货状态失败: account_id={account_id}, item_id={item_id}, error={e}")
-                return False
+                raise
 
     def update_item_detail(self, account_id: str, item_id: str, item_detail: str) -> bool:
         normalized_account_id = self._require_account_id(account_id)
@@ -9204,7 +9985,7 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"更新商品详情失败: account_id={account_id}, item_id={item_id}, error={e}")
                 self.conn.rollback()
-                return False
+                raise
 
     def update_item_title_only(self, account_id: str, item_id: str, item_title: str) -> bool:
         normalized_account_id = self._require_account_id(account_id)

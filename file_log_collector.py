@@ -123,8 +123,10 @@ class FileLogCollector:
         
         try:
             # 解析loguru格式的日志
-            # 格式: 2025-07-23 15:46:03.430 | INFO | __main__:debug_collector:70 - 消息
-            pattern = r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}) \| (\w+) \| ([^:]+):([^:]+):(\d+) - (.*)'
+            # 兼容两种 level 列宽：
+            # - "| INFO |"
+            # - "| INFO     |"
+            pattern = r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s*\|\s*(\w+)\s*\|\s*([^:]+):([^:]+):(\d+)\s*-\s*(.*)'
             match = re.match(pattern, line)
             
             if match:
@@ -169,7 +171,11 @@ class FileLogCollector:
         
         # 应用过滤器
         if level_filter:
-            logs_list = [log for log in logs_list if log['level'] == level_filter]
+            normalized_level_filter = str(level_filter or '').strip().upper()
+            logs_list = [
+                log for log in logs_list
+                if str(log.get('level') or '').strip().upper() == normalized_level_filter
+            ]
         
         if source_filter:
             logs_list = [log for log in logs_list if source_filter.lower() in log['source'].lower()]

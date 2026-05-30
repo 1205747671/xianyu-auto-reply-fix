@@ -119,6 +119,23 @@ class CookieManagerAccountRuntimeAsyncTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("acc-finished-runtime-1", self.manager.tasks)
 
+    async def test_stale_done_callback_does_not_remove_new_runtime_indexes(self):
+        old_task = asyncio.get_running_loop().create_future()
+        new_task = asyncio.get_running_loop().create_future()
+        new_live = object()
+
+        self.manager.tasks["acc-stale-done-1"] = new_task
+        self.manager.live_instances["acc-stale-done-1"] = new_live
+
+        with mock.patch.object(self.manager, "_get_account_browser_runtime_manager", return_value=self.runtime_manager):
+            self.manager._handle_runtime_task_done("acc-stale-done-1", old_task)
+            await asyncio.sleep(0)
+
+        self.runtime_manager.invalidate_runtime.assert_not_awaited()
+        self.runtime_manager.invalidate_runtime_sync.assert_not_called()
+        self.assertIs(self.manager.tasks["acc-stale-done-1"], new_task)
+        self.assertIs(self.manager.live_instances["acc-stale-done-1"], new_live)
+
     async def test_run_xianyu_passes_account_id_alias_to_live_constructor(self):
         fake_live = mock.Mock()
         fake_live.main = mock.AsyncMock(return_value=None)
@@ -232,6 +249,21 @@ class CookieManagerAccountRuntimeSyncTest(unittest.TestCase):
             self.manager.update_cookie_status("acc-enable-1", True)
 
         start_task_mock.assert_called_once_with("acc-enable-1")
+
+    def test_update_cookie_status_rolls_back_memory_state_when_db_write_fails(self):
+        self.manager.cookies["acc-status-rollback-1"] = "cookie=value"
+        self.manager.cookie_status["acc-status-rollback-1"] = True
+
+        with mock.patch.object(
+            cookie_manager.db_manager,
+            "save_cookie_status",
+            side_effect=RuntimeError("save status exploded"),
+        ), mock.patch.object(self.manager, "_stop_cookie_task") as stop_task_mock:
+            with self.assertRaisesRegex(RuntimeError, "save status exploded"):
+                self.manager.update_cookie_status("acc-status-rollback-1", False)
+
+        stop_task_mock.assert_not_called()
+        self.assertTrue(self.manager.cookie_status["acc-status-rollback-1"])
 
     def test_get_xianyu_instance_uses_account_key(self):
         fake_live = object()
@@ -450,6 +482,25 @@ class CookieManagerAccountRuntimeSyncTest(unittest.TestCase):
         )
         start_task_mock.assert_called_once_with("acc-stale-live-1")
 
+    def test_reload_from_db_stops_disabled_account_when_current_runtime_still_exists(self):
+        self.manager.cookies = {"acc-disabled-runtime-1": "cookie-same"}
+        self.manager.keywords = {"acc-disabled-runtime-1": [("k", "v")]}
+        self.manager.cookie_status = {"acc-disabled-runtime-1": True}
+        self.manager.auto_confirm_settings = {"acc-disabled-runtime-1": True}
+
+        def _reload_snapshot():
+            self.manager.cookies = {"acc-disabled-runtime-1": "cookie-same"}
+            self.manager.keywords = {"acc-disabled-runtime-1": [("k", "v")]}
+            self.manager.cookie_status = {"acc-disabled-runtime-1": False}
+            self.manager.auto_confirm_settings = {"acc-disabled-runtime-1": False}
+            self.manager.live_instances["acc-disabled-runtime-1"] = object()
+
+        with mock.patch.object(self.manager, "_load_from_db", side_effect=_reload_snapshot), \
+             mock.patch.object(self.manager, "_stop_cookie_task") as stop_task_mock:
+            self.manager.reload_from_db()
+
+        stop_task_mock.assert_called_once_with("acc-disabled-runtime-1")
+
 
 class CookieManagerLoadFromDbTest(unittest.TestCase):
     def test_load_from_db_ignores_blank_cookie_accounts_for_runtime_tracking(self):
@@ -485,6 +536,94 @@ class CookieManagerLoadFromDbTest(unittest.TestCase):
         )
         self.assertEqual({"acc-live-1": False}, manager.cookie_status)
         self.assertEqual({"acc-live-1": False}, manager.auto_confirm_settings)
+
+    def test_load_from_db_stops_masking_keyword_and_status_load_failures(self):
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+
+        for failure_target, failure_message in (
+            ("get_all_keywords", "keywords exploded"),
+            ("get_all_cookie_status", "status exploded"),
+        ):
+            with self.subTest(failure_target=failure_target):
+                get_all_keywords_patch = mock.patch.object(
+                    cookie_manager.db_manager,
+                    "get_all_keywords",
+                    side_effect=RuntimeError(failure_message),
+                ) if failure_target == "get_all_keywords" else mock.patch.object(
+                    cookie_manager.db_manager,
+                    "get_all_keywords",
+                    return_value={"acc-live-1": [("你好", "您好")]},
+                )
+                get_all_cookie_status_patch = mock.patch.object(
+                    cookie_manager.db_manager,
+                    "get_all_cookie_status",
+                    side_effect=RuntimeError(failure_message),
+                ) if failure_target == "get_all_cookie_status" else mock.patch.object(
+                    cookie_manager.db_manager,
+                    "get_all_cookie_status",
+                    return_value={"acc-live-1": True},
+                )
+
+                with mock.patch.object(
+                    cookie_manager.db_manager,
+                    "get_all_cookies",
+                    return_value={"acc-live-1": " cookie=value; foo=bar "},
+                ), get_all_keywords_patch, get_all_cookie_status_patch, mock.patch.object(
+                    cookie_manager.db_manager,
+                    "get_auto_confirm",
+                    return_value=False,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, failure_message):
+                        cookie_manager.CookieManager(loop)
+
+    def test_reload_from_db_keeps_existing_cache_when_status_reload_fails(self):
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+
+        with mock.patch.object(
+            cookie_manager.db_manager,
+            "get_all_cookies",
+            return_value={"acc-old-1": "cookie-old"},
+        ), mock.patch.object(
+            cookie_manager.db_manager,
+            "get_all_keywords",
+            return_value={"acc-old-1": [("你好", "您好")]},
+        ), mock.patch.object(
+            cookie_manager.db_manager,
+            "get_all_cookie_status",
+            return_value={"acc-old-1": False},
+        ), mock.patch.object(
+            cookie_manager.db_manager,
+            "get_auto_confirm",
+            return_value=False,
+        ):
+            manager = cookie_manager.CookieManager(loop)
+
+        with mock.patch.object(
+            cookie_manager.db_manager,
+            "get_all_cookies",
+            return_value={"acc-new-1": "cookie-new"},
+        ), mock.patch.object(
+            cookie_manager.db_manager,
+            "get_all_keywords",
+            return_value={"acc-new-1": [("新的", "回复")]},
+        ), mock.patch.object(
+            cookie_manager.db_manager,
+            "get_all_cookie_status",
+            side_effect=RuntimeError("status reload exploded"),
+        ), mock.patch.object(
+            cookie_manager.db_manager,
+            "get_auto_confirm",
+            side_effect=AssertionError("status reload failed after cache assignment"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "status reload exploded"):
+                manager.reload_from_db()
+
+        self.assertEqual({"acc-old-1": "cookie-old"}, manager.cookies)
+        self.assertEqual({"acc-old-1": [("你好", "您好")]}, manager.keywords)
+        self.assertEqual({"acc-old-1": False}, manager.cookie_status)
+        self.assertEqual({"acc-old-1": False}, manager.auto_confirm_settings)
 
 
 class CookieManagerAccountRuntimeSameLoopTest(unittest.IsolatedAsyncioTestCase):

@@ -237,7 +237,11 @@ class OrderDetailFetcher:
                             or self._resolve_account_id()
                         )
                         if existing_order.get('item_id') and cached_account_id:
-                            item_config = db_manager.get_item_info(cached_account_id, existing_order.get('item_id'))
+                            try:
+                                item_config = db_manager.get_item_info(cached_account_id, existing_order.get('item_id'))
+                            except Exception as e:
+                                logger.warning(f"读取订单 {order_id} 的商品配置缓存失败，回退为无配置继续判定: {e}")
+                                item_config = None
 
                         if _should_use_cached_order(existing_order, item_config=item_config):
                             logger.info(f"📋 订单 {order_id} 已存在于数据库中且金额有效({amount})，直接返回缓存数据")

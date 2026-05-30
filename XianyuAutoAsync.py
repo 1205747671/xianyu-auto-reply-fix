@@ -2525,7 +2525,7 @@ class XianyuLive:
         buyer_nick = None
         sid = ""
         item_id = None
-        log_prefix = f"【{self.account_id}】[{msg_id}]" if msg_id else f"【{self.account_id}?"
+        log_prefix = f"【{self.account_id}】[{msg_id}]" if msg_id else f"【{self.account_id}】"
 
         try:
             message_1 = message.get("1")
@@ -2644,7 +2644,7 @@ class XianyuLive:
                 existing_order=existing_order,
                 buyer_id_source=buyer_id_source,
                 buyer_nick_source="preload",
-                log_prefix=f"【{self.account_id}?",
+                log_prefix=f"【{self.account_id}】",
             )
             if should_skip_write:
                 return False
@@ -3172,7 +3172,7 @@ class XianyuLive:
                     "【default】发货日志缺少 canonical account_id，拒绝继续运行"
                 )
                 return False
-            log_prefix = f"【{self.account_id}?"
+            log_prefix = f"【{self.account_id}】"
             resolved_buyer_nick = self._resolve_delivery_log_buyer_nick(
                 buyer_nick,
                 order_id=order_id,
@@ -8026,7 +8026,7 @@ class XianyuLive:
         else:
             logger.warning(f"【{self.account_id}】❌ Cookie验证失败:")
             for detail in result['details']:
-                logger.warning(f"【{self.account_id}? - {detail}")
+                logger.warning(f"【{self.account_id}】 - {detail}")
 
         result['details'] = '; '.join(result['details'])
         return result
@@ -8948,7 +8948,11 @@ class XianyuLive:
             return 0.0
 
     def _get_notification_template(self, template_type: str) -> str:
-        return get_notification_template_text(template_type)
+        return get_notification_template_text(
+            template_type,
+            owner_user_id=getattr(self, 'user_id', None),
+            owner_account_id=self._canonical_account_id() or '',
+        )
 
     def _format_template(self, template: str, **kwargs) -> str:
         return format_notification_template(template, **kwargs)
@@ -8992,6 +8996,8 @@ class XianyuLive:
 
                 notification_msg = render_notification_template(
                     'message',
+                    owner_user_id=getattr(self, 'user_id', None),
+                    owner_account_id=current_account_id,
                     account_id=current_account_id,
                     buyer_name=send_user_name,
                     buyer_id=send_user_id,
@@ -9164,8 +9170,8 @@ class XianyuLive:
             if secret:
                 string_to_sign = f'{timestamp}\n{secret}'
                 hmac_code = hmac.new(
+                    secret.encode('utf-8'),
                     string_to_sign.encode('utf-8'),
-                    ''.encode('utf-8'),
                     digestmod=hashlib.sha256
                 ).digest()
                 sign = base64.b64encode(hmac_code).decode('utf-8')
@@ -9570,6 +9576,8 @@ class XianyuLive:
                 )
                 notification_msg = render_notification_template(
                     'slider_success',
+                    owner_user_id=getattr(self, 'user_id', None),
+                    owner_account_id=current_account_id,
                     account_id=current_account_id,
                     time=time.strftime('%Y-%m-%d %H:%M:%S'),
                     status_text=slider_status_text
@@ -9577,6 +9585,8 @@ class XianyuLive:
             elif "密码登录成功" in error_message or notification_type == "password_login_success":
                 notification_msg = render_notification_template(
                     'password_login_success',
+                    owner_user_id=getattr(self, 'user_id', None),
+                    owner_account_id=current_account_id,
                     account_id=current_account_id,
                     time=time.strftime('%Y-%m-%d %H:%M:%S'),
                     cookie_count='已获取'
@@ -9584,6 +9594,8 @@ class XianyuLive:
             elif "刷新Cookie成功" in error_message or notification_type == "cookie_refresh_success":
                 notification_msg = render_notification_template(
                     'cookie_refresh_success',
+                    owner_user_id=getattr(self, 'user_id', None),
+                    owner_account_id=current_account_id,
                     account_id=current_account_id,
                     time=time.strftime('%Y-%m-%d %H:%M:%S'),
                     cookie_count='已获取'
@@ -9591,6 +9603,8 @@ class XianyuLive:
             elif "人脸验证" in error_message or "短信验证" in error_message or "二维码验证" in error_message or "身份验证" in error_message or (verification_url and "passport" in verification_url):
                 notification_msg = render_notification_template(
                     'face_verify',
+                    owner_user_id=getattr(self, 'user_id', None),
+                    owner_account_id=current_account_id,
                     account_id=current_account_id,
                     time=time.strftime('%Y-%m-%d %H:%M:%S'),
                     verification_url=verification_url or '',
@@ -9599,6 +9613,8 @@ class XianyuLive:
             elif verification_url:
                 notification_msg = render_notification_template(
                     'token_refresh',
+                    owner_user_id=getattr(self, 'user_id', None),
+                    owner_account_id=current_account_id,
                     account_id=current_account_id,
                     time=time.strftime('%Y-%m-%d %H:%M:%S'),
                     error_message=error_message,
@@ -9607,6 +9623,8 @@ class XianyuLive:
             else:
                 notification_msg = render_notification_template(
                     'token_refresh',
+                    owner_user_id=getattr(self, 'user_id', None),
+                    owner_account_id=current_account_id,
                     account_id=current_account_id,
                     time=time.strftime('%Y-%m-%d %H:%M:%S'),
                     error_message=error_message,
@@ -9759,6 +9777,8 @@ class XianyuLive:
                 return
             notification_message = render_notification_template(
                 'delivery',
+                owner_user_id=getattr(self, 'user_id', None),
+                owner_account_id=current_account_id,
                 account_id=current_account_id,
                 buyer_name=send_user_name,
                 buyer_id=send_user_id,
@@ -10229,7 +10249,7 @@ class XianyuLive:
                             existing_order=existing_order,
                             buyer_id_source=buyer_id_source,
                             buyer_nick_source="order_detail",
-                            log_prefix=f"【{self.account_id}?",
+                            log_prefix=f"【{self.account_id}】",
                         )
                         if isinstance(result, dict):
                             result["order_id"] = order_id
@@ -11777,8 +11797,10 @@ class XianyuLive:
                     has_more = body.get("hasMore") == 1
                     next_cursor = body.get("nextCursor")
                     for user_message in body.get("userMessageModels", []):
-                        extension = user_message.get("message", {}).get("extension", {})
-                        custom_content = user_message.get("message", {}).get("content", {}).get("custom", {})
+                        message_payload = user_message.get("message", {})
+                        extension = message_payload.get("extension", {}) if isinstance(message_payload, dict) else {}
+                        content_payload = message_payload.get("content", {}) if isinstance(message_payload, dict) else {}
+                        custom_content = content_payload.get("custom", {}) if isinstance(content_payload, dict) else {}
                         send_message_base64 = custom_content.get("data", "")
                         parsed_message = None
                         if send_message_base64:
@@ -11786,10 +11808,20 @@ class XianyuLive:
                                 parsed_message = json.loads(base64.b64decode(send_message_base64).decode('utf-8'))
                             except Exception:
                                 parsed_message = {"raw": send_message_base64}
+                        if parsed_message is None:
+                            direct_text = ""
+                            if isinstance(content_payload, dict):
+                                direct_text = str(
+                                    ((content_payload.get("text") or {}).get("text") or "")
+                                ).strip()
+                            reminder_content = str(extension.get("reminderContent", "") or "").strip()
+                            fallback_text = direct_text or reminder_content
+                            if fallback_text:
+                                parsed_message = fallback_text
 
                         history_messages.insert(0, {
-                            "send_user_id": extension.get("senderUserId", ""),
-                            "send_user_name": extension.get("reminderTitle", ""),
+                            "send_user_id": extension.get("senderUserId", "") or extension.get("senderId", ""),
+                            "send_user_name": extension.get("senderNick", "") or extension.get("reminderTitle", ""),
                             "message": parsed_message,
                         })
 
@@ -12115,7 +12147,16 @@ class XianyuLive:
                 heartbeat_was_running = False
                 if self.heartbeat_task and not self.heartbeat_task.done():
                     heartbeat_was_running = True
-                    self.heartbeat_task.cancel()
+                    previous_heartbeat_task = self.heartbeat_task
+                    previous_heartbeat_task.cancel()
+                    try:
+                        await previous_heartbeat_task
+                    except asyncio.CancelledError:
+                        logger.info(f"【{self.account_id}】心跳任务已安全停止")
+                    except Exception as heartbeat_cancel_error:
+                        logger.warning(
+                            f"【{self.account_id}】等待心跳任务停止时出错: {self._safe_str(heartbeat_cancel_error)}"
+                        )
                     logger.warning(f"【{self.account_id}】已暂停心跳任务")
 
                 success = await asyncio.wait_for(
@@ -12517,7 +12558,7 @@ class XianyuLive:
                 if len(str(value)) > 50:
                     logger.info(f"【{target_account_id}】  {i:2d}. {key}: {str(value)[:30]}...{str(value)[-20:]} (长度: {len(str(value))})")
                 else:
-                    logger.info(f"【{target_account_id}? {i:2d}. {key}: {value}")
+                    logger.info(f"【{target_account_id}】  {i:2d}. {key}: {value}")
 
             important_keys = list(REQUIRED_SESSION_COOKIE_FIELDS) + list(OBSERVED_SESSION_COOKIE_FIELDS)
             logger.info(f"【{target_account_id}】关键字段检查:")
@@ -12574,7 +12615,7 @@ class XianyuLive:
                     change_mark = " [已变化]" if cookie_name in changed_cookies else " [新增]" if cookie_name in new_cookies else " [无变化]"
 
                     logger.info(f"【{target_account_id}】{cookie_name}{change_mark}:")
-                    logger.info(f"【{target_account_id}? ? {self._mask_secret_value(cookie_value, head=8, tail=6)}")
+                    logger.info(f"【{target_account_id}】  值: {self._mask_secret_value(cookie_value, head=8, tail=6)}")
                     logger.info(f"【{target_account_id}】  长度: {len(cookie_value)}")
 
                     if cookie_name in qr_cookies_dict:
@@ -12582,7 +12623,7 @@ class XianyuLive:
                         if old_value != cookie_value:
                             logger.info(f"【{target_account_id}】  原值: {self._mask_secret_value(old_value, head=8, tail=6)}")
                             logger.info(f"【{target_account_id}】  原长度: {len(old_value)}")
-                    logger.info(f"【{target_account_id}? ---")
+                    logger.info(f"【{target_account_id}】  ---")
                 else:
                     logger.info(f"【{target_account_id}】{cookie_name}: [不存在]")
 
@@ -13940,7 +13981,7 @@ class XianyuLive:
                         display_value = cookie_value
 
                     change_mark = " [已变化]" if cookie_name in changed_cookies else " [新增]" if cookie_name in new_cookies else ""
-                    logger.info(f"【{log_account_id}? {cookie_name}: {display_value}{change_mark}")
+                    logger.info(f"【{log_account_id}】 {cookie_name}: {display_value}{change_mark}")
 
             try:
                 await self.update_config_cookies()
@@ -16416,93 +16457,7 @@ class XianyuLive:
                 data={'data': data_val}
             ) as response:
                 res_json = await response.json()
-
-                if await self._apply_response_cookie_updates(response.headers, "item_list"):
-                    logger.warning("已更新Cookie到数据库")
-
-                logger.info(f"商品信息获取响应: {res_json}")
-
-                if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
-                    items_data = res_json.get('data', {})
-                    card_list = items_data.get('cardList', [])
-
-                    items_list = []
-                    for card in card_list:
-                        card_data = card.get('cardData', {})
-                        if card_data:
-                            item_info = {
-                                'id': card_data.get('id', ''),
-                                'title': card_data.get('title', ''),
-                                'price': card_data.get('priceInfo', {}).get('price', ''),
-                                'price_text': card_data.get('priceInfo', {}).get('preText', '') + card_data.get('priceInfo', {}).get('price', ''),
-                                'category_id': card_data.get('categoryId', ''),
-                                'auction_type': card_data.get('auctionType', ''),
-                                'item_status': card_data.get('itemStatus', 0),
-                                'detail_url': card_data.get('detailUrl', ''),
-                                'pic_info': card_data.get('picInfo', {}),
-                                'detail_params': card_data.get('detailParams', {}),
-                                'track_params': card_data.get('trackParams', {}),
-                                'item_label_data': card_data.get('itemLabelDataVO', {}),
-                                'card_type': card.get('cardType', 0)
-                            }
-                            items_list.append(item_info)
-
-                    logger.info(f"成功获取 {len(items_list)} 个商品")
-
-                    print("\n" + "="*80)
-                    print(f"📦 账号 {self.myid} 的商品列表(第{page_number}页，{len(items_list)} 个商品")
-                    print("="*80)
-
-                    for i, item in enumerate(items_list, 1):
-                        print(f"\n🔸 商品 {i}:")
-                        print(f"   商品ID: {item.get('id', 'N/A')}")
-                        print(f"   商品标题: {item.get('title', 'N/A')}")
-                        print(f"   价格: {item.get('price_text', 'N/A')}")
-                        print(f"   分类ID: {item.get('category_id', 'N/A')}")
-                        print(f"   商品状态: {item.get('item_status', 'N/A')}")
-                        print(f"   拍卖类型: {item.get('auction_type', 'N/A')}")
-                        print(f"   详情链接: {item.get('detail_url', 'N/A')}")
-                        if item.get('pic_info'):
-                            pic_info = item['pic_info']
-                            print(f"   图片信息: {pic_info.get('width', 'N/A')}x{pic_info.get('height', 'N/A')}")
-                            print(f"   图片链接: {pic_info.get('picUrl', 'N/A')}")
-                        print(f"   完整信息: {json.dumps(item, ensure_ascii=False, indent=2)}")
-
-                    print("\n" + "="*80)
-                    print("商品列表获取完成")
-                    print("="*80)
-
-                    if items_list:
-                        saved_count = await self.save_items_list_to_db(
-                            items_list,
-                            sync_item_details=sync_item_details,
-                        )
-                        logger.info(f"已将 {saved_count} 个商品信息保存到数据库")
-
-                    return {
-                        "success": True,
-                        "page_number": page_number,
-                        "page_size": page_size,
-                        "current_count": len(items_list),
-                        "items": items_list,
-                        "saved_count": saved_count if items_list else 0,
-                        "raw_data": items_data
-                    }
-                else:
-                    error_msg = res_json.get('ret', [''])[0] if res_json.get('ret') else ''
-                    if 'FAIL_SYS_TOKEN_EXOIRED' in error_msg or 'token' in error_msg.lower():
-                        logger.warning(f"Token失效，准备重试 {error_msg}")
-                        await asyncio.sleep(0.5)
-                        return await self.get_item_list_info(
-                            page_number,
-                            page_size,
-                            retry_count + 1,
-                            sync_item_details=sync_item_details,
-                        )
-                    else:
-                        logger.error(f"获取商品信息失败: {res_json}")
-                        return {"error": f"获取商品信息失败: {error_msg}"}
-
+                response_headers = dict(response.headers)
         except Exception as e:
             logger.error(f"商品信息API请求异常: {self._safe_str(e)}")
             await asyncio.sleep(0.5)
@@ -16512,6 +16467,92 @@ class XianyuLive:
                 retry_count + 1,
                 sync_item_details=sync_item_details,
             )
+
+        if await self._apply_response_cookie_updates(response_headers, "item_list"):
+            logger.warning("已更新Cookie到数据库")
+
+        logger.info(f"商品信息获取响应: {res_json}")
+
+        if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
+            items_data = res_json.get('data', {})
+            card_list = items_data.get('cardList', [])
+
+            items_list = []
+            for card in card_list:
+                card_data = card.get('cardData', {})
+                if card_data:
+                    item_info = {
+                        'id': card_data.get('id', ''),
+                        'title': card_data.get('title', ''),
+                        'price': card_data.get('priceInfo', {}).get('price', ''),
+                        'price_text': card_data.get('priceInfo', {}).get('preText', '') + card_data.get('priceInfo', {}).get('price', ''),
+                        'category_id': card_data.get('categoryId', ''),
+                        'auction_type': card_data.get('auctionType', ''),
+                        'item_status': card_data.get('itemStatus', 0),
+                        'detail_url': card_data.get('detailUrl', ''),
+                        'pic_info': card_data.get('picInfo', {}),
+                        'detail_params': card_data.get('detailParams', {}),
+                        'track_params': card_data.get('trackParams', {}),
+                        'item_label_data': card_data.get('itemLabelDataVO', {}),
+                        'card_type': card.get('cardType', 0)
+                    }
+                    items_list.append(item_info)
+
+            logger.info(f"成功获取 {len(items_list)} 个商品")
+
+            print("\n" + "="*80)
+            print(f"📦 账号 {self.myid} 的商品列表(第{page_number}页，{len(items_list)} 个商品")
+            print("="*80)
+
+            for i, item in enumerate(items_list, 1):
+                print(f"\n🔸 商品 {i}:")
+                print(f"   商品ID: {item.get('id', 'N/A')}")
+                print(f"   商品标题: {item.get('title', 'N/A')}")
+                print(f"   价格: {item.get('price_text', 'N/A')}")
+                print(f"   分类ID: {item.get('category_id', 'N/A')}")
+                print(f"   商品状态: {item.get('item_status', 'N/A')}")
+                print(f"   拍卖类型: {item.get('auction_type', 'N/A')}")
+                print(f"   详情链接: {item.get('detail_url', 'N/A')}")
+                if item.get('pic_info'):
+                    pic_info = item['pic_info']
+                    print(f"   图片信息: {pic_info.get('width', 'N/A')}x{pic_info.get('height', 'N/A')}")
+                    print(f"   图片链接: {pic_info.get('picUrl', 'N/A')}")
+                print(f"   完整信息: {json.dumps(item, ensure_ascii=False, indent=2)}")
+
+            print("\n" + "="*80)
+            print("商品列表获取完成")
+            print("="*80)
+
+            if items_list:
+                saved_count = await self.save_items_list_to_db(
+                    items_list,
+                    sync_item_details=sync_item_details,
+                )
+                logger.info(f"已将 {saved_count} 个商品信息保存到数据库")
+
+            return {
+                "success": True,
+                "page_number": page_number,
+                "page_size": page_size,
+                "current_count": len(items_list),
+                "items": items_list,
+                "saved_count": saved_count if items_list else 0,
+                "raw_data": items_data
+            }
+
+        error_msg = res_json.get('ret', [''])[0] if res_json.get('ret') else ''
+        if 'FAIL_SYS_TOKEN_EXOIRED' in error_msg or 'token' in error_msg.lower():
+            logger.warning(f"Token失效，准备重试 {error_msg}")
+            await asyncio.sleep(0.5)
+            return await self.get_item_list_info(
+                page_number,
+                page_size,
+                retry_count + 1,
+                sync_item_details=sync_item_details,
+            )
+
+        logger.error(f"获取商品信息失败: {res_json}")
+        return {"error": f"获取商品信息失败: {error_msg}"}
 
     async def get_all_items(self, page_size=20, max_pages=None, sync_item_details=False):
         all_items = []

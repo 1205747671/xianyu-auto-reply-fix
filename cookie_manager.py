@@ -28,22 +28,27 @@ class CookieManager:
         """从数据库加载账号、关键词和状态。"""
         try:
             raw_cookies = db_manager.get_all_cookies()
-            self.cookies = {
+            normalized_cookies = {
                 account_id: normalized_cookie
                 for account_id, cookie_value in raw_cookies.items()
                 for normalized_cookie in [str(cookie_value or "").strip()]
                 if normalized_cookie
             }
-            self.keywords = db_manager.get_all_keywords()
+            keywords = db_manager.get_all_keywords()
             raw_cookie_status = db_manager.get_all_cookie_status()
-            self.cookie_status = {
+            cookie_status = {
                 account_id: raw_cookie_status.get(account_id, True)
-                for account_id in self.cookies.keys()
+                for account_id in normalized_cookies.keys()
             }
-            self.auto_confirm_settings = {}
+            auto_confirm_settings = {}
 
-            for account_id in self.cookies.keys():
-                self.auto_confirm_settings[account_id] = db_manager.get_auto_confirm(account_id)
+            for account_id in normalized_cookies.keys():
+                auto_confirm_settings[account_id] = db_manager.get_auto_confirm(account_id)
+
+            self.cookies = normalized_cookies
+            self.keywords = keywords
+            self.cookie_status = cookie_status
+            self.auto_confirm_settings = auto_confirm_settings
 
             logger.info(
                 "从数据库加载了 %s 个账号、%s 组关键词、%s 个状态记录和 %s 个自动确认设置",
@@ -54,6 +59,7 @@ class CookieManager:
             )
         except Exception as exc:
             logger.error(f"从数据库加载数据失败: {exc}")
+            raise
 
     def reload_from_db(self):
         """重新从数据库加载数据，并协调账号任务/运行时状态。"""
@@ -93,9 +99,10 @@ class CookieManager:
             cookie_changed = old_cookies.get(account_id) != self.cookies.get(account_id)
             had_old_cookie = account_id in old_cookies
             task_active = account_id in self.tasks and not self._prune_finished_task(account_id)
+            has_current_runtime = task_active or account_id in self.live_instances
 
             if not enabled:
-                if had_task_or_instance:
+                if had_task_or_instance or has_current_runtime:
                     self._stop_cookie_task(account_id)
                 continue
 
@@ -422,7 +429,11 @@ class CookieManager:
 
         old_status = self.cookie_status.get(account_id, True)
         self.cookie_status[account_id] = enabled
-        db_manager.save_cookie_status(account_id, enabled)
+        try:
+            db_manager.save_cookie_status(account_id, enabled)
+        except Exception:
+            self.cookie_status[account_id] = old_status
+            raise
         logger.info(f"更新账号状态: {account_id} -> {'启用' if enabled else '禁用'}")
 
         if old_status != enabled:

@@ -46,6 +46,7 @@
       document.documentElement.classList.add('theme-ready');
     })();
   </script>
+  <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/static/lib/bootstrap/bootstrap.min.css">
   <link rel="stylesheet" href="/static/lib/bootstrap-icons/bootstrap-icons.css">
 
@@ -85,6 +86,12 @@
         <a href="javascript:void(0)" class="nav-link" onclick="showSection('items')">
           <i class="bi bi-box-seam"></i>
           <span>商品管理</span>
+        </a>
+      </div>
+      <div class="nav-item" data-menu-id="item-search">
+        <a href="javascript:void(0)" class="nav-link" onclick="showSection('item-search')">
+          <i class="bi bi-search"></i>
+          <span>商品搜索</span>
         </a>
       </div>
       <div class="nav-item" data-menu-id="orders">
@@ -699,10 +706,10 @@
                     <input type="number" class="form-control" id="pageNumber" placeholder="页码" min="1" value="1" style="width: 80px;">
                   </div>
                   <div class="d-flex gap-2">
-                    <button class="btn btn-success" onclick="getAllItemsFromAccount()">
+                    <button class="btn btn-success" onclick="getAllItemsFromAccount(event)">
                       <i class="bi bi-download me-1"></i>同步指定页
                     </button>
-                    <button class="btn btn-warning" onclick="getAllItemsFromAccountAll()">
+                    <button class="btn btn-warning" onclick="getAllItemsFromAccountAll(event)">
                       <i class="bi bi-collection me-1"></i>同步所有页
                     </button>
                     <button class="btn btn-primary" onclick="refreshItems()">
@@ -1336,7 +1343,7 @@
                     </thead>
                     <tbody id="cardsTableBody">
                       <tr>
-                        <td colspan="7" class="text-center py-4 text-muted">
+                        <td colspan="8" class="text-center py-4 text-muted">
                           <i class="bi bi-credit-card fs-1 d-block mb-3"></i>
                           <h5>暂无卡券数据</h5>
                           <p class="mb-0">点击"添加卡券"开始创建您的第一个卡券</p>
@@ -1421,7 +1428,7 @@
                     </thead>
                     <tbody id="deliveryRulesTableBody">
                       <tr>
-                        <td colspan="7" class="text-center py-4 text-muted">
+                        <td colspan="6" class="text-center py-4 text-muted">
                           <i class="bi bi-truck fs-1 d-block mb-3"></i>
                           <h5>暂无发货规则</h5>
                           <p class="mb-0">点击"添加规则"开始配置自动发货规则</p>
@@ -1493,7 +1500,7 @@
 
             <!-- 通知渠道类型按钮 -->
             <div class="row g-2">
-              <!-- <div class="col-sm-6 col-md-4 col-lg-3 col-xl-2">
+              <div class="col-sm-6 col-md-4 col-lg-3 col-xl-2">
                 <div class="card h-100 channel-type-card" onclick="showAddChannelModal('qq')">
                   <div class="card-body text-center">
                     <div class="channel-icon">
@@ -1508,7 +1515,7 @@
                     </div>
                   </div>
                 </div>
-              </div> -->
+              </div>
 
               <div class="col-sm-6 col-md-4 col-lg-3 col-xl-2">
                 <div class="card h-100 channel-type-card" onclick="showAddChannelModal('dingtalk')">
@@ -2333,6 +2340,51 @@
                         <option value="password_error">账号密码错误</option>
                       </select>
                     </div>
+
+                    <div class="risk-filter-field risk-filter-field-scene">
+                      <label class="form-label">触发场景</label>
+                      <select class="form-select" id="riskLogTriggerSceneFilter" onchange="loadRiskControlLogs()">
+                        <option value="">全部场景</option>
+                        <option value="token_refresh">Token刷新</option>
+                        <option value="auto_cookie_refresh">自动Cookie刷新</option>
+                        <option value="manual_password_refresh">手动账密刷新</option>
+                        <option value="manual_qr_refresh">手动扫码刷新</option>
+                        <option value="password_login">密码登录</option>
+                        <option value="qr_login">扫码登录</option>
+                      </select>
+                    </div>
+
+                    <div class="risk-filter-field risk-filter-field-date">
+                      <label class="form-label">开始日期</label>
+                      <input type="date" class="form-control" id="riskLogDateFrom" onchange="loadRiskControlLogs()">
+                    </div>
+
+                    <div class="risk-filter-field risk-filter-field-date">
+                      <label class="form-label">结束日期</label>
+                      <input type="date" class="form-control" id="riskLogDateTo" onchange="loadRiskControlLogs()">
+                    </div>
+
+                    <div class="risk-filter-field risk-filter-field-session">
+                      <label class="form-label">链路ID</label>
+                      <input
+                        type="text"
+                        class="form-control"
+                        id="riskLogSessionFilter"
+                        placeholder="输入链路ID筛选"
+                        onkeydown="if (event.key === 'Enter') { event.preventDefault(); loadRiskControlLogs(); }"
+                      >
+                    </div>
+
+                    <div class="risk-filter-field risk-filter-field-session">
+                      <label class="form-label">结果代码</label>
+                      <input
+                        type="text"
+                        class="form-control"
+                        id="riskLogResultCodeFilter"
+                        placeholder="输入结果代码筛选"
+                        onkeydown="if (event.key === 'Enter') { event.preventDefault(); loadRiskControlLogs(); }"
+                      >
+                    </div>
                   </div>
 
                   <div class="risk-filter-status-bar">
@@ -2527,11 +2579,17 @@
             </div>
             <form id="itemSearchForm">
               <div class="row">
-                <div class="col-md-5">
+                <div class="col-md-2">
+                  <label for="itemSearchAccountFilter" class="form-label">搜索账号</label>
+                  <select class="form-select" id="itemSearchAccountFilter">
+                    <option value="">请选择账号</option>
+                  </select>
+                </div>
+                <div class="col-md-4">
                   <label for="searchKeyword" class="form-label">搜索关键词</label>
                   <input type="text" class="form-control" id="searchKeyword" placeholder="请输入商品关键词" required>
                 </div>
-                <div class="col-md-3">
+                <div class="col-md-2">
                   <label for="searchTotalPages" class="form-label">查询总页数</label>
                   <input type="number" class="form-control" id="searchTotalPages" value="1" min="1" max="20" placeholder="输入页数">
                 </div>
@@ -3100,6 +3158,7 @@
                   <option value="email_verifications">email_verifications - 邮箱验证表</option>
                   <option value="captcha_codes">captcha_codes - 验证码表</option>
                   <option value="orders">orders - 订单表</option>
+                  <option value="risk_control_logs">risk_control_logs - 风控日志表</option>
                 </select>
               </div>
               <div class="col-md-3">
@@ -3130,6 +3189,9 @@
               <i class="bi bi-table"></i> 数据表
             </h5>
             <div class="btn-group">
+              <button class="btn btn-outline-primary btn-sm" onclick="exportTableData()" id="exportBtn" disabled>
+                <i class="bi bi-download"></i> 导出
+              </button>
               <button class="btn btn-outline-danger btn-sm" onclick="clearTableData()" id="clearBtn" disabled>
                 <i class="bi bi-trash"></i> 清空
               </button>
@@ -3375,10 +3437,10 @@
             </div>
             <div class="mb-3">
               <label for="notificationChannel" class="form-label">选择通知渠道 <span class="text-danger">*</span></label>
-              <select class="form-select" id="notificationChannel" required>
+              <select class="form-select" id="notificationChannel" multiple size="6" required>
                 <option value="">请选择通知渠道</option>
               </select>
-              <small class="form-text text-muted">选择要接收此账号消息通知的渠道</small>
+              <small class="form-text text-muted">支持按住 Ctrl / Shift 选择多个渠道，保存时会覆盖该账号当前的渠道集合</small>
             </div>
             <div class="mb-3">
               <div class="form-check">
@@ -4728,7 +4790,7 @@
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
         </div>
         <div class="modal-body">
-          <p>您确定要删除这个用户吗？</p>
+          <p>您确定要删除用户 <strong id="deleteUserNameText">-</strong> 吗？</p>
           <div class="alert alert-warning">
             <i class="bi bi-exclamation-triangle me-2"></i>
             <strong>警告：</strong>此操作将同时删除该用户的所有数据，包括Cookie、关键词、卡券等，且不可撤销！

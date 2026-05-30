@@ -2493,6 +2493,104 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         fake_db.batch_save_item_basic_info.assert_not_called()
         live._fetch_item_details.assert_not_awaited()
 
+    async def test_save_items_list_to_db_returns_zero_when_batch_write_fails(self):
+        items_list = [
+            {
+                "id": "item-1",
+                "title": "Demo title",
+                "price_text": "10",
+                "category_id": "cat-1",
+                "price": "10",
+            }
+        ]
+
+        for scenario_name, existing_item, failing_method, expected_message in (
+            ("batch-save", None, "batch_save_item_basic_info", "batch save exploded"),
+            ("batch-update", {"item_id": "item-1"}, "batch_update_item_title_price", "batch update exploded"),
+        ):
+            with self.subTest(scenario=scenario_name):
+                live = XianyuLive.__new__(XianyuLive)
+                live._legacy_cookie_id = "legacy-cookie-name"
+                live.account_id = "acc-item-batch-1"
+                live._safe_str = str
+                live._fetch_item_details = mock.AsyncMock(return_value=0)
+
+                fake_db = mock.Mock()
+                fake_db.get_item_info.return_value = existing_item
+                getattr(fake_db, failing_method).side_effect = RuntimeError(expected_message)
+
+                with mock.patch("db_manager.db_manager", fake_db):
+                    saved_count = await live.save_items_list_to_db(items_list, sync_item_details=False)
+
+                self.assertEqual(0, saved_count)
+                fake_db.get_item_info.assert_called_once_with("acc-item-batch-1", "item-1")
+                live._fetch_item_details.assert_not_awaited()
+
+    async def test_get_item_list_info_re_raises_database_failures_after_successful_api_response(self):
+        class _FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+                self.headers = {}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def json(self):
+                return self._payload
+
+        class _FakeSession:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def post(self, *args, **kwargs):
+                return _FakeResponse(self._payload)
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.session = _FakeSession(
+            {
+                "ret": ["SUCCESS::调用成功"],
+                "data": {
+                    "cardList": [
+                        {
+                            "cardData": {
+                                "id": "item-1",
+                                "title": "Demo title",
+                                "priceInfo": {"price": "10", "preText": "￥"},
+                                "categoryId": "cat-1",
+                                "auctionType": "normal",
+                                "itemStatus": 1,
+                                "detailUrl": "https://demo/item-1",
+                                "picInfo": {},
+                                "detailParams": {},
+                                "trackParams": {},
+                                "itemLabelDataVO": {},
+                            },
+                            "cardType": 0,
+                        }
+                    ]
+                },
+            }
+        )
+        live.create_session = mock.AsyncMock()
+        live.cookies_str = "_m_h5_tk=test_token_123456;"
+        live.myid = "user-demo-1"
+        live._apply_response_cookie_updates = mock.AsyncMock(return_value=False)
+        live.save_items_list_to_db = mock.AsyncMock(side_effect=RuntimeError("item batch write exploded"))
+        live._mask_secret_value = lambda value, head=6, tail=4: value
+        live._safe_str = str
+
+        with mock.patch("XianyuAutoAsync.trans_cookies", return_value={"_m_h5_tk": "test_token_123456"}), \
+             mock.patch("XianyuAutoAsync.generate_sign", return_value="demo-sign"), \
+             mock.patch("builtins.print"):
+            with self.assertRaisesRegex(RuntimeError, "item batch write exploded"):
+                await live.get_item_list_info(page_number=1, page_size=20, sync_item_details=True)
+
+        live._apply_response_cookie_updates.assert_awaited_once_with({}, "item_list")
+        live.save_items_list_to_db.assert_awaited_once()
+
     async def test_get_item_specific_reply_prefers_account_id_alias(self):
         live = XianyuLive.__new__(XianyuLive)
         live._legacy_cookie_id = "legacy-cookie-name"
@@ -2963,16 +3061,16 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 chat_id="chat-1",
             )
 
-        render_mock.assert_called_once_with(
-            "message",
-            account_id="acc-notify-1",
-            buyer_name="buyer-name",
-            buyer_id="buyer-1",
-            item_id="item-1",
-            chat_id="chat-1",
-            message="hello world",
-            time=mock.ANY,
-        )
+        render_mock.assert_called_once()
+        called_args, called_kwargs = render_mock.call_args
+        self.assertEqual("message", called_args[0])
+        self.assertEqual("acc-notify-1", called_kwargs.get("account_id"))
+        self.assertEqual("buyer-name", called_kwargs.get("buyer_name"))
+        self.assertEqual("buyer-1", called_kwargs.get("buyer_id"))
+        self.assertEqual("item-1", called_kwargs.get("item_id"))
+        self.assertEqual("chat-1", called_kwargs.get("chat_id"))
+        self.assertEqual("hello world", called_kwargs.get("message"))
+        self.assertIn("time", called_kwargs)
         dispatch_mock.assert_awaited_once_with(
             "acc-notify-1",
             "rendered-message",
@@ -3033,16 +3131,16 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 chat_id="chat-2",
             )
 
-        render_mock.assert_called_once_with(
-            "delivery",
-            account_id="acc-notify-delivery-1",
-            buyer_name="buyer-name",
-            buyer_id="buyer-2",
-            item_id="item-2",
-            chat_id="chat-2",
-            result="failed",
-            time=mock.ANY,
-        )
+        render_mock.assert_called_once()
+        called_args, called_kwargs = render_mock.call_args
+        self.assertEqual("delivery", called_args[0])
+        self.assertEqual("acc-notify-delivery-1", called_kwargs.get("account_id"))
+        self.assertEqual("buyer-name", called_kwargs.get("buyer_name"))
+        self.assertEqual("buyer-2", called_kwargs.get("buyer_id"))
+        self.assertEqual("item-2", called_kwargs.get("item_id"))
+        self.assertEqual("chat-2", called_kwargs.get("chat_id"))
+        self.assertEqual("failed", called_kwargs.get("result"))
+        self.assertIn("time", called_kwargs)
         dispatch_mock.assert_awaited_once_with(
             "acc-notify-delivery-1",
             "rendered-delivery-message",
@@ -3102,13 +3200,13 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 notification_type="token_refresh",
             )
 
-        render_mock.assert_called_once_with(
-            "token_refresh",
-            account_id="acc-token-notify-1",
-            time=mock.ANY,
-            error_message="token refresh failed",
-            verification_url="无",
-        )
+        render_mock.assert_called_once()
+        called_args, called_kwargs = render_mock.call_args
+        self.assertEqual("token_refresh", called_args[0])
+        self.assertEqual("acc-token-notify-1", called_kwargs.get("account_id"))
+        self.assertEqual("token refresh failed", called_kwargs.get("error_message"))
+        self.assertEqual("无", called_kwargs.get("verification_url"))
+        self.assertIn("time", called_kwargs)
         dispatch_mock.assert_awaited_once_with(
             "acc-token-notify-1",
             "rendered-token-message",
@@ -3176,12 +3274,12 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 notification_type="slider_success",
             )
 
-        render_mock.assert_called_once_with(
-            "slider_success",
-            account_id="acc-token-notify-2",
-            time=mock.ANY,
-            status_text="cookies已自动更新到数据库",
-        )
+        render_mock.assert_called_once()
+        called_args, called_kwargs = render_mock.call_args
+        self.assertEqual("slider_success", called_args[0])
+        self.assertEqual("acc-token-notify-2", called_kwargs.get("account_id"))
+        self.assertEqual("cookies已自动更新到数据库", called_kwargs.get("status_text"))
+        self.assertIn("time", called_kwargs)
         dispatch_mock.assert_awaited_once_with(
             "acc-token-notify-2",
             "rendered-slider-message",
@@ -5384,6 +5482,18 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(meta)
         fake_db.get_delivery_finalization_state.assert_not_called()
 
+    def test_get_pending_delivery_finalization_meta_surfaces_database_failures(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live._legacy_cookie_id = "legacy-delivery-pending-error"
+        live.account_id = "acc-delivery-pending-error-1"
+
+        fake_db = mock.Mock()
+        fake_db.get_delivery_finalization_state.side_effect = RuntimeError("delivery state exploded")
+
+        with mock.patch("db_manager.db_manager", fake_db):
+            with self.assertRaisesRegex(RuntimeError, "delivery state exploded"):
+                live._get_pending_delivery_finalization_meta("order-pending-error-1", 2)
+
     def test_summarize_delivery_progress_prefers_account_id_alias(self):
         live = XianyuLive.__new__(XianyuLive)
         live._legacy_cookie_id = "legacy-delivery-summary"
@@ -5409,6 +5519,18 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             account_id="acc-delivery-summary-1",
             expected_quantity=2,
         )
+
+    def test_summarize_delivery_progress_surfaces_database_failures(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live._legacy_cookie_id = "legacy-delivery-summary-error"
+        live.account_id = "acc-delivery-summary-error-1"
+
+        fake_db = mock.Mock()
+        fake_db.get_delivery_progress_summary.side_effect = RuntimeError("delivery progress exploded")
+
+        with mock.patch("db_manager.db_manager", fake_db):
+            with self.assertRaisesRegex(RuntimeError, "delivery progress exploded"):
+                live._summarize_delivery_progress("order-summary-error-1", expected_quantity=2)
 
     def test_mark_order_bargain_flow_prefers_account_id_alias(self):
         live = XianyuLive.__new__(XianyuLive)
@@ -8637,6 +8759,60 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         create_task.assert_not_called()
         self.assertEqual(0, live.last_cookie_refresh_time)
         self.assertEqual(1, live.last_message_received_time)
+
+    async def test_execute_cookie_refresh_waits_for_cancelled_heartbeat_before_restart(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live._legacy_cookie_id = "legacy-cookie-name"
+        live.account_id = "acc-cookie-refresh-heartbeat-1"
+        live._safe_str = str
+        live.cookie_refresh_lock = asyncio.Lock()
+        live.is_manual_refresh_active = mock.Mock(return_value=False)
+        live._refresh_cookies_via_browser = mock.AsyncMock(return_value=True)
+        live._verify_cookie_validity = mock.AsyncMock(
+            return_value={"valid": True, "details": "ok", "inconclusive": False}
+        )
+        live.ws = mock.Mock()
+        live.ws.closed = False
+        live.last_message_received_time = 99
+        live.last_cookie_refresh_time = 0
+
+        cancel_state = {"awaited": False}
+
+        class _HeartbeatTask:
+            def __init__(self):
+                self.cancel_called = False
+
+            def done(self):
+                return False
+
+            def cancel(self):
+                self.cancel_called = True
+
+            def __await__(self):
+                cancel_state["awaited"] = True
+                if False:
+                    yield None
+                raise asyncio.CancelledError()
+
+        previous_heartbeat_task = _HeartbeatTask()
+        live.heartbeat_task = previous_heartbeat_task
+        live.heartbeat_loop = mock.AsyncMock()
+
+        def create_task_after_cancel(coro):
+            self.assertTrue(cancel_state["awaited"])
+            coro.close()
+            restarted_task = mock.Mock()
+            restarted_task.done.return_value = False
+            return restarted_task
+
+        with mock.patch("XianyuAutoAsync.asyncio.create_task", side_effect=create_task_after_cancel) as create_task:
+            await live._execute_cookie_refresh(current_time=123.0)
+
+        self.assertTrue(previous_heartbeat_task.cancel_called)
+        self.assertTrue(cancel_state["awaited"])
+        create_task.assert_called_once()
+        self.assertEqual(123.0, live.last_cookie_refresh_time)
+        self.assertEqual(0, live.last_message_received_time)
 
     def test_sync_order_delivery_progress_forwards_account_id(self):
         live = XianyuLive.__new__(XianyuLive)
@@ -13273,6 +13449,35 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             await live._restart_instance()
 
         cookie_manager_module.manager.update_cookie.assert_not_called()
+
+    async def test_restart_instance_preserves_disabled_account_restart_semantics(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "account-restart-disabled-1"
+        live.cookies_str = "unb=user1; cookie2=restarted-cookie2"
+        live._safe_str = str
+
+        cookie_manager_module = self._build_cookie_manager_module(enabled=False)
+        cookie_manager_module.manager.update_cookie = mock.Mock()
+
+        class _ImmediateThread:
+            def __init__(self, target=None, daemon=None):
+                self._target = target
+                self.daemon = daemon
+
+            def start(self):
+                if self._target is not None:
+                    self._target()
+
+        with mock.patch.dict(sys.modules, {"cookie_manager": cookie_manager_module}), \
+             mock.patch("threading.Thread", _ImmediateThread), \
+             mock.patch("time.sleep", return_value=None):
+            await live._restart_instance()
+
+        cookie_manager_module.manager.update_cookie.assert_called_once_with(
+            "account-restart-disabled-1",
+            "unb=user1; cookie2=restarted-cookie2",
+            save_to_db=False,
+        )
 
     async def test_update_cookies_and_restart_logs_account_id_alias_instead_of_stale_cookie_id(self):
         live = XianyuLive.__new__(XianyuLive)

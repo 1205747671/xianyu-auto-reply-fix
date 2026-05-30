@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>登录 - 闲鱼管理系统</title>
+  <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/static/lib/bootstrap/bootstrap.min.css">
   <link rel="stylesheet" href="/static/lib/bootstrap-icons/bootstrap-icons.css">
   <style>
@@ -314,9 +315,13 @@
     let loginCaptchaEnabled = true;  // 登录验证码是否启用
 
     // 检查登录验证码是否启用
-    async function checkLoginCaptchaEnabled() {
-      try {
-        const response = await fetch('/api/login-captcha-enabled');
+      async function checkLoginCaptchaEnabled() {
+        try {
+          const response = await fetch('/api/login-captcha-enabled');
+          if (!response.ok) {
+            const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+          throw new Error(errorMessage);
+        }
         const result = await response.json();
         loginCaptchaEnabled = result.enabled;
         securityCaptchaRequired = result.enabled;
@@ -338,16 +343,27 @@
           }
         }
 
-        return loginCaptchaEnabled;
-      } catch (error) {
-        console.error('检查登录验证码状态失败:', error);
-        return true; // 出错时默认需要验证码
+          return loginCaptchaEnabled;
+        } catch (error) {
+          console.error('检查登录验证码状态失败:', error);
+          loginCaptchaEnabled = true;
+          securityCaptchaRequired = true;
+          return true; // 出错时默认需要验证码
+        }
       }
-    }
     
     function showError(message) {
       errorMessage.textContent = message;
       errorAlert.classList.remove('d-none');
+    }
+
+    async function readResponseErrorMessage(response, fallbackMessage = '') {
+      try {
+        const data = await response.json();
+        return data.detail || data.message || fallbackMessage || `HTTP ${response.status}`;
+      } catch (error) {
+        return fallbackMessage || `HTTP ${response.status}`;
+      }
     }
     
     function hideError() {
@@ -367,22 +383,27 @@
     }
     
     // 检查是否需要安全验证码
-    async function checkSecurityCaptchaRequired() {
-      try {
-        const response = await fetch('/captcha/check-required');
-        const result = await response.json();
-        securityCaptchaRequired = result.required;
-        
-        if (result.required) {
-          showSecurityCaptcha();
+      async function checkSecurityCaptchaRequired() {
+        try {
+          const response = await fetch('/captcha/check-required');
+          if (!response.ok) {
+            const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+            throw new Error(errorMessage);
+          }
+          const result = await response.json();
+          securityCaptchaRequired = result.required;
+
+          if (result.required) {
+            showSecurityCaptcha();
+          }
+
+          return result.required;
+        } catch (error) {
+          console.error('检查验证码状态失败:', error);
+          securityCaptchaRequired = true;
+          return true;
         }
-        
-        return result.required;
-      } catch (error) {
-        console.error('检查验证码状态失败:', error);
-        return false;
       }
-    }
     
     // 显示安全验证码
     function showSecurityCaptcha() {
@@ -881,12 +902,14 @@
     async function checkRegistrationStatus() {
       try {
         const response = await fetch('/registration-status');
-        if (response.ok) {
-          const data = await response.json();
-          const registerSection = document.getElementById('registerSection');
-          if (registerSection) {
-            registerSection.style.display = data.enabled ? 'block' : 'none';
-          }
+        if (!response.ok) {
+          const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+          throw new Error(errorMessage);
+        }
+        const data = await response.json();
+        const registerSection = document.getElementById('registerSection');
+        if (registerSection) {
+          registerSection.style.display = data.enabled ? 'block' : 'none';
         }
       } catch (error) {
         console.error('检查注册状态失败:', error);
@@ -895,9 +918,13 @@
     }
 
     // 检查默认登录信息显示状态
-    async function checkLoginInfoStatus() {
-      try {
-        const response = await fetch('/login-info-status');
+      async function checkLoginInfoStatus() {
+        try {
+          const response = await fetch('/login-info-status');
+          if (!response.ok) {
+            const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+          throw new Error(errorMessage);
+        }
         const result = await response.json();
 
         const defaultLoginInfo = document.getElementById('defaultLoginInfo');
@@ -905,13 +932,16 @@
           defaultLoginInfo.style.display = 'block';
         } else {
           defaultLoginInfo.style.display = 'none';
+          }
+        } catch (error) {
+          console.error('检查登录信息显示状态失败:', error);
+          // 出错时默认显示
+          const defaultLoginInfo = document.getElementById('defaultLoginInfo');
+          if (defaultLoginInfo) {
+            defaultLoginInfo.style.display = 'block';
+          }
         }
-      } catch (error) {
-        console.error('检查登录信息显示状态失败:', error);
-        // 出错时默认显示
-        document.getElementById('defaultLoginInfo').style.display = 'block';
       }
-    }
 
     // 事件监听器
     document.addEventListener('DOMContentLoaded', async function() {

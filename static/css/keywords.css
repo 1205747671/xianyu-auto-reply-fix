@@ -547,6 +547,14 @@
   font-weight: bold;
 }
 
+.chip-edit-btn {
+  background: rgba(255, 255, 255, 0.45);
+}
+
+.chip-edit-btn:hover {
+  background: rgba(255, 255, 255, 0.65);
+}
+
 /* 回复内容编辑按钮 */
 .reply-edit-btn {
   background: none;
@@ -767,6 +775,14 @@
 
 [data-theme="dark"] .chip-remove-btn:hover {
   background: rgba(255, 255, 255, 0.25);
+}
+
+[data-theme="dark"] .chip-edit-btn {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+[data-theme="dark"] .chip-edit-btn:hover {
+  background: rgba(255, 255, 255, 0.3);
 }
 
 /* 暗色 - 操作按钮 */

@@ -144,6 +144,15 @@ class ItemSearchSliderPolicyTest(unittest.IsolatedAsyncioTestCase):
             wait_for_completion=True,
         )
 
+    def test_manual_remote_control_session_id_uses_unique_search_scope_instead_of_plain_account_id(self):
+        searcher = self._make_searcher()
+
+        with mock.patch("utils.item_search.time.time_ns", return_value=123456789):
+            session_id = searcher._build_remote_control_session_id()
+
+        self.assertEqual(session_id, "item-search-test-account-123456789")
+        self.assertNotEqual(session_id, "test-account")
+
 
 if __name__ == "__main__":
     unittest.main()

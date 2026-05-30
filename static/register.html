@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>用户注册 - 闲鱼管理系统</title>
+    <link rel="icon" href="data:,">
     <link rel="stylesheet" href="/static/lib/bootstrap/bootstrap.min.css">
     <link rel="stylesheet" href="/static/lib/bootstrap-icons/bootstrap-icons.css">
     <style>
@@ -292,6 +293,52 @@
             return re.test(email);
         }
 
+        async function readResponseErrorMessage(response, fallbackMessage = '') {
+            try {
+                const errorText = await response.text();
+                if (!errorText) {
+                    return fallbackMessage || `HTTP ${response.status}`;
+                }
+                try {
+                    const errorJson = JSON.parse(errorText);
+                    return errorJson.detail || errorJson.message || errorText;
+                } catch (parseError) {
+                    return errorText;
+                }
+            } catch (error) {
+                return fallbackMessage || `HTTP ${response.status}`;
+            }
+        }
+
+        async function checkRegistrationStatus() {
+            try {
+                const response = await fetch('/registration-status');
+                if (!response.ok) {
+                    const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+                    throw new Error(errorMessage);
+                }
+
+                const data = await response.json();
+                if (data && data.enabled === false) {
+                    const registerForm = document.getElementById('registerForm');
+                    if (registerForm) {
+                        registerForm.style.display = 'none';
+                    }
+                    showAlert('注册功能已关闭，请返回登录页联系管理员', 'warning');
+                    setTimeout(() => {
+                        window.location.href = '/login.html';
+                    }, 1500);
+                    return false;
+                }
+
+                return true;
+            } catch (error) {
+                console.error('检查注册状态失败:', error);
+                showAlert(`注册状态检查失败: ${error.message || '请稍后重试'}`);
+                return false;
+            }
+        }
+
         async function loadCaptcha() {
             const captchaImage = document.getElementById('captchaImage');
             const captchaLoading = document.getElementById('captchaLoading');
@@ -540,7 +587,11 @@
         });
 
         // 页面加载完成后初始化
-        document.addEventListener('DOMContentLoaded', function() {
+        document.addEventListener('DOMContentLoaded', async function() {
+            const registrationEnabled = await checkRegistrationStatus();
+            if (!registrationEnabled) {
+                return;
+            }
             loadCaptcha();
         });
 

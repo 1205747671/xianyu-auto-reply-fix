@@ -98,6 +98,9 @@ test_*.py
 *_test.py
 !tests/source_text_integrity_test.py
 !tests/xianyu_async_text_integrity_test.py
+!tests/admin_frontend_static_contracts_test.py
+!tests/admin_data_management_contracts_test.py
+!tests/admin_logs_contracts_test.py
 keywords_sample.xlsx
 
 # 备份文件
