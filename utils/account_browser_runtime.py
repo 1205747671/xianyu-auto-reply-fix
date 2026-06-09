@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import hashlib
 import inspect
+import json
 import os
 import queue
 import re
@@ -13,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
+from loguru import logger
 from utils import browser_provider as _browser_provider
 
 launch_managed_browser_runtime = getattr(
@@ -94,9 +96,10 @@ class SyncAccountBrowserRuntimeLease:
 class _RuntimeState:
     generation: int = 0
     runtime: Any = None
-    runtime_identity: Optional[Tuple[str, bool]] = None
+    runtime_identity: Optional[Tuple[str, bool, str]] = None
     claimed_profile_dir: Optional[str] = None
     claim_owner: Optional[Tuple[int, str, str]] = None
+    current_purpose: Optional[str] = None
     active_leases: int = 0
     active_exclusive: bool = False
     last_released_at: float = 0.0
@@ -108,9 +111,10 @@ class _RuntimeState:
 class _SyncRuntimeState:
     generation: int = 0
     runtime: Any = None
-    runtime_identity: Optional[Tuple[str, bool]] = None
+    runtime_identity: Optional[Tuple[str, bool, str]] = None
     claimed_profile_dir: Optional[str] = None
     claim_owner: Optional[Tuple[int, str, str]] = None
+    current_purpose: Optional[str] = None
     owner_thread_id: Optional[int] = None
     active_leases: int = 0
     active_exclusive: bool = False
@@ -124,6 +128,8 @@ class _SyncAccountTaskCall:
     func: Callable[..., Any]
     args: tuple[Any, ...]
     kwargs: Dict[str, Any]
+    started: threading.Event = field(default_factory=threading.Event)
+    abandoned: threading.Event = field(default_factory=threading.Event)
     done: threading.Event = field(default_factory=threading.Event)
     result: Any = None
     exception: Optional[BaseException] = None
@@ -142,6 +148,14 @@ class _SyncAccountWorkerState:
 @dataclass
 class _ProfileClaimState:
     owner: Optional[Tuple[int, str, str]] = None
+    owner_metadata: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class _OwnerModeState:
+    mode: Optional[str] = None
+    active_count: int = 0
+    condition: threading.Condition = field(default_factory=threading.Condition)
 
 
 _PROFILE_CLAIMS_GUARD = threading.Lock()
@@ -229,6 +243,39 @@ def resolve_runtime_attach_metadata(
     return browser_features, profile_id
 
 
+def capture_owner_lock_token(owner_lock: Any) -> Any:
+    capture_owner_token = getattr(owner_lock, "capture_owner_token", None)
+    if callable(capture_owner_token):
+        return capture_owner_token()
+    return None
+
+
+def release_owner_lock_if_owned(owner_lock: Any, owner_token: Any = None) -> bool:
+    if owner_lock is None:
+        return False
+    release_if_owner = getattr(owner_lock, "release_by_token_if_owner", None)
+    if callable(release_if_owner):
+        if owner_token is None:
+            return False
+        return bool(release_if_owner(owner_token))
+
+    release_by_token = getattr(owner_lock, "release_by_token", None)
+    if callable(release_by_token):
+        if owner_token is None:
+            return False
+        try:
+            release_by_token(owner_token)
+            return True
+        except RuntimeError:
+            return False
+
+    locked = getattr(owner_lock, "locked", None)
+    if callable(locked) and locked():
+        owner_lock.release()
+        return True
+    return False
+
+
 def _call_runtime_factory(factory: Callable[..., Any], *args, runtime_request: Optional[Dict[str, Any]] = None) -> Any:
     parameters = inspect.signature(factory).parameters
     accepts_var_kwargs = any(
@@ -258,25 +305,74 @@ def _normalize_profile_dir_key(profile_dir: str) -> str:
     return str(Path(profile_dir).resolve())
 
 
-def _format_profile_claim_owner(owner: Optional[Tuple[int, str, str]]) -> str:
+def _normalize_runtime_purpose(purpose: Any) -> str:
+    normalized = str(purpose or "").strip()
+    return normalized or "unknown"
+
+
+def _build_profile_claim_metadata(
+    *,
+    purpose: Any,
+    thread_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    return {
+        "purpose": _normalize_runtime_purpose(purpose),
+        "thread_id": thread_id,
+        "updated_at": time.time(),
+    }
+
+
+def _format_profile_claim_owner(
+    owner: Optional[Tuple[int, str, str]],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> str:
     if owner is None:
         return "unknown-owner"
     manager_instance_id, account_id, mode = owner
-    return f"manager={manager_instance_id}, account_id={account_id}, mode={mode}"
+    details = [
+        f"manager={manager_instance_id}",
+        f"account_id={account_id}",
+        f"mode={mode}",
+    ]
+    safe_metadata = dict(metadata or {})
+    purpose = _normalize_runtime_purpose(safe_metadata.get("purpose"))
+    if purpose and purpose != "unknown":
+        details.append(f"purpose={purpose}")
+    thread_id = safe_metadata.get("thread_id")
+    if thread_id is not None:
+        details.append(f"thread_id={thread_id}")
+    return ", ".join(details)
 
 
-def _claim_profile_dir(profile_dir: str, owner: Tuple[int, str, str]) -> str:
+def _claim_profile_dir(
+    profile_dir: str,
+    owner: Tuple[int, str, str],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> str:
     profile_dir_key = _normalize_profile_dir_key(profile_dir)
     with _PROFILE_CLAIMS_GUARD:
         claim_state = _PROFILE_CLAIMS.setdefault(profile_dir_key, _ProfileClaimState())
         if claim_state.owner is None:
             claim_state.owner = owner
+            claim_state.owner_metadata = dict(metadata or {})
             return profile_dir_key
         if claim_state.owner == owner:
+            claim_state.owner_metadata = dict(metadata or claim_state.owner_metadata or {})
             return profile_dir_key
+        formatted_existing_owner = _format_profile_claim_owner(
+            claim_state.owner,
+            claim_state.owner_metadata,
+        )
+        formatted_requested_owner = _format_profile_claim_owner(owner, metadata)
+        logger.warning(
+            "账号级 browser profile claim 冲突: "
+            f"profile_dir={profile_dir_key}, current_owner={formatted_existing_owner}, "
+            f"requested_owner={formatted_requested_owner}"
+        )
         raise RuntimeError(
             "账号级 browser profile 已被其他 runtime 持有，拒绝并发复用: "
-            f"profile_dir={profile_dir_key}, owner={_format_profile_claim_owner(claim_state.owner)}"
+            f"profile_dir={profile_dir_key}, owner={formatted_existing_owner}, "
+            f"requested_owner={formatted_requested_owner}"
         )
 
 
@@ -472,28 +568,26 @@ async def _default_async_runtime_closer(runtime: Any, *, reason: str) -> Any:
     browser = getattr(runtime, "browser", None)
     playwright = getattr(runtime, "playwright", None)
 
-    try:
-        if page is not None:
-            await _maybe_await(page.close())
-    except Exception:
-        pass
-    try:
-        if context is not None:
-            await _maybe_await(context.close())
-    except Exception:
-        pass
-    try:
-        if browser is not None:
-            await _maybe_await(browser.close())
-    except Exception:
-        pass
-    try:
-        if playwright is not None:
-            await _maybe_await(playwright.stop())
-    except Exception:
-        pass
-    return runtime
+    async def _close_component(target: Any, method_name: str) -> None:
+        if target is None:
+            return
+        close_method = getattr(target, method_name, None)
+        if not callable(close_method):
+            return
+        try:
+            await _maybe_await(close_method())
+        except asyncio.CancelledError:
+            logger.debug(
+                f"default async runtime closer ignored CancelledError from {method_name}()"
+            )
+        except Exception:
+            pass
 
+    await _close_component(page, "close")
+    await _close_component(context, "close")
+    await _close_component(browser, "close")
+    await _close_component(playwright, "stop")
+    return runtime
 
 def _default_sync_runtime_factory(
     account_id: str,
@@ -606,14 +700,41 @@ def _build_runtime_identity(
     runtime_request: Optional[Dict[str, Any]] = None,
     *,
     default_persistent_context: bool,
-) -> Tuple[str, bool]:
+) -> Tuple[str, bool, str]:
     request = dict(runtime_request or {})
     use_persistent_context = request.get("use_persistent_context")
     if use_persistent_context is None:
         use_persistent_context = default_persistent_context
     else:
         use_persistent_context = bool(use_persistent_context)
-    return (profile_dir, use_persistent_context)
+    launch_options = dict(request.get("launch_options") or {})
+    context_options = dict(request.get("context_options") or {})
+    persistent_context_options = dict(request.get("persistent_context_options") or {})
+    managed_launch_options = _resolve_managed_launch_options(
+        request=request,
+        launch_options=launch_options,
+        context_options=context_options,
+        persistent_context_options=persistent_context_options,
+        use_persistent_context=use_persistent_context,
+    )
+    identity_payload = {
+        "use_persistent_context": use_persistent_context,
+        "launch_options": managed_launch_options,
+        "context_options": context_options if not use_persistent_context else {},
+        "persistent_context_options": persistent_context_options if use_persistent_context else {},
+        "browser_features": request.get("browser_features") or {},
+        "profile_id": request.get("profile_id"),
+    }
+    try:
+        identity_signature = json.dumps(
+            identity_payload,
+            sort_keys=True,
+            ensure_ascii=True,
+            default=str,
+        )
+    except TypeError:
+        identity_signature = repr(identity_payload)
+    return (profile_dir, use_persistent_context, identity_signature)
 
 
 class AccountBrowserRuntimeManager:
@@ -641,6 +762,8 @@ class AccountBrowserRuntimeManager:
         self._sync_states_guard = threading.Lock()
         self._sync_account_workers: Dict[str, _SyncAccountWorkerState] = {}
         self._sync_account_workers_guard = threading.Lock()
+        self._owner_mode_states: Dict[str, _OwnerModeState] = {}
+        self._owner_mode_states_guard = threading.Lock()
 
     def _normalize_account_id(self, account_id: str) -> str:
         normalized = str(account_id or "").strip()
@@ -667,11 +790,18 @@ class AccountBrowserRuntimeManager:
         account_id: str,
         profile_dir: str,
         mode: str,
+        purpose: str,
+        thread_id: Optional[int] = None,
     ) -> str:
         owner = self._build_profile_claim_owner(account_id, mode=mode)
+        claim_metadata = _build_profile_claim_metadata(
+            purpose=purpose,
+            thread_id=thread_id,
+        )
         if state.claimed_profile_dir == profile_dir and state.claim_owner == owner:
+            _claim_profile_dir(profile_dir, owner, claim_metadata)
             return profile_dir
-        claimed_profile_dir = _claim_profile_dir(profile_dir, owner)
+        claimed_profile_dir = _claim_profile_dir(profile_dir, owner, claim_metadata)
         state.claimed_profile_dir = claimed_profile_dir
         state.claim_owner = owner
         return claimed_profile_dir
@@ -712,17 +842,23 @@ class AccountBrowserRuntimeManager:
         state: _SyncAccountWorkerState,
         task: _SyncAccountTaskCall,
     ) -> None:
+        if task.done.is_set() or task.abandoned.is_set():
+            return
         try:
             with state.lock:
                 state.last_used_at = self.time_fn()
                 state.stop_requested = False
+            task.started.set()
+            if task.done.is_set() or task.abandoned.is_set():
+                return
             task.result = task.func(*task.args, **task.kwargs)
         except BaseException as exc:
             task.exception = exc
         finally:
             with state.lock:
                 state.last_used_at = self.time_fn()
-            task.done.set()
+            if not task.done.is_set():
+                task.done.set()
 
     def _get_sync_account_worker_state(self, account_id: str) -> _SyncAccountWorkerState:
         with self._sync_account_workers_guard:
@@ -823,6 +959,8 @@ class AccountBrowserRuntimeManager:
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    call.abandoned.set()
+                    call.done.set()
                     raise TimeoutError(f"account browser worker task timed out: account_id={account_id}")
                 wait_slice = min(0.05, remaining)
             else:
@@ -855,6 +993,126 @@ class AccountBrowserRuntimeManager:
             **kwargs,
         )
 
+    def _get_owner_mode_state(self, account_id: str) -> _OwnerModeState:
+        with self._owner_mode_states_guard:
+            return self._owner_mode_states.setdefault(account_id, _OwnerModeState())
+
+    @staticmethod
+    def _try_acquire_owner_mode_locked(
+        state: _OwnerModeState,
+        requested_mode: str,
+    ) -> Tuple[bool, Optional[str]]:
+        if state.mode is None:
+            state.mode = requested_mode
+            state.active_count = 1
+            return True, None
+        if state.mode == requested_mode:
+            state.active_count += 1
+            return True, None
+        if state.active_count == 0:
+            previous_mode = state.mode
+            state.mode = requested_mode
+            state.active_count = 1
+            return True, previous_mode
+        return False, None
+
+    def _try_acquire_owner_mode_once_sync(
+        self,
+        account_id: str,
+        requested_mode: str,
+    ) -> Tuple[bool, Optional[str]]:
+        state = self._get_owner_mode_state(account_id)
+        with state.condition:
+            return self._try_acquire_owner_mode_locked(state, requested_mode)
+
+    def _acquire_owner_mode_sync(self, account_id: str, requested_mode: str) -> Optional[str]:
+        state = self._get_owner_mode_state(account_id)
+        with state.condition:
+            while True:
+                acquired, previous_mode = self._try_acquire_owner_mode_locked(
+                    state,
+                    requested_mode,
+                )
+                if acquired:
+                    return previous_mode
+                state.condition.wait()
+
+    async def _acquire_owner_mode_async(self, account_id: str, requested_mode: str) -> Optional[str]:
+        while True:
+            acquire_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self._try_acquire_owner_mode_once_sync,
+                    account_id,
+                    requested_mode,
+                )
+            )
+            try:
+                acquired, previous_mode = await asyncio.shield(acquire_task)
+            except asyncio.CancelledError:
+                try:
+                    acquired, _previous_mode = await acquire_task
+                except Exception:
+                    acquired = False
+                if acquired:
+                    self._release_owner_mode(account_id, requested_mode)
+                raise
+            if acquired:
+                return previous_mode
+            await asyncio.sleep(0.05)
+
+    def _release_owner_mode(self, account_id: str, requested_mode: str) -> None:
+        state = self._get_owner_mode_state(account_id)
+        with state.condition:
+            if state.mode != requested_mode:
+                return
+            if state.active_count > 0:
+                state.active_count -= 1
+            if state.active_count == 0:
+                state.condition.notify_all()
+
+    def _reset_owner_mode(self, account_id: str) -> None:
+        state = self._get_owner_mode_state(account_id)
+        with state.condition:
+            state.mode = None
+            state.active_count = 0
+            state.condition.notify_all()
+
+    def _reset_owner_mode_if_matches(self, account_id: str, expected_mode: str) -> None:
+        state = self._get_owner_mode_state(account_id)
+        with state.condition:
+            if state.mode != expected_mode:
+                return
+            state.mode = None
+            state.active_count = 0
+            state.condition.notify_all()
+
+    def _invalidate_async_runtime_blocking(self, account_id: str, *, reason: str) -> bool:
+        async def _invalidate():
+            return await self.invalidate_runtime(account_id, reason=reason)
+
+        result_box: Dict[str, Any] = {}
+        error_box: Dict[str, BaseException] = {}
+        done = threading.Event()
+
+        def _runner() -> None:
+            try:
+                result_box["value"] = asyncio.run(_invalidate())
+            except BaseException as exc:  # noqa: BLE001
+                error_box["error"] = exc
+            finally:
+                done.set()
+
+        thread = threading.Thread(
+            target=_runner,
+            name=f"account-browser-invalidate-async-{account_id}",
+            daemon=True,
+        )
+        thread.start()
+        done.wait()
+        if "error" in error_box:
+            raise error_box["error"]
+        return bool(result_box.get("value"))
+
     def resolve_profile_dir(self, account_id: str) -> str:
         account_id = self._normalize_account_id(account_id)
         browser_data_dir = (Path(self.base_dir) / "browser_data").resolve()
@@ -868,9 +1126,127 @@ class AccountBrowserRuntimeManager:
         if runtime is not None and self.runtime_closer is not None:
             await self.runtime_closer(runtime, reason=reason)
 
+    async def _close_async_page_shielded(self, page: Any) -> bool:
+        close_task = asyncio.create_task(_close_async_page(page))
+        try:
+            await asyncio.shield(close_task)
+            return False
+        except asyncio.CancelledError:
+            try:
+                await asyncio.wait_for(close_task, timeout=0.5)
+            except asyncio.CancelledError:
+                pass
+            except asyncio.TimeoutError:
+                close_task.cancel()
+                try:
+                    await close_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as close_error:
+                    logger.debug(
+                        f"[runtime-manager#{self._manager_instance_id}] async page close failed after forced cancellation: "
+                        f"error={close_error}"
+                    )
+                logger.debug(
+                    f"[runtime-manager#{self._manager_instance_id}] async page close did not stop promptly after cancellation"
+                )
+            except Exception as close_error:
+                logger.debug(
+                    f"[runtime-manager#{self._manager_instance_id}] async page close failed after cancellation: "
+                    f"error={close_error}"
+                )
+            return True
+
+    async def _create_async_page_shielded(self, page_awaitable: Any) -> Tuple[Any, bool]:
+        create_task = asyncio.ensure_future(page_awaitable)
+        try:
+            return await asyncio.shield(create_task), False
+        except asyncio.CancelledError:
+            was_cancelled = bool(asyncio.current_task() and asyncio.current_task().cancelling())
+            try:
+                page = await create_task
+            except asyncio.CancelledError:
+                raise
+            except Exception as create_error:
+                if was_cancelled:
+                    logger.debug(
+                        f"[runtime-manager#{self._manager_instance_id}] async page creation failed after cancellation: "
+                        f"error={create_error}"
+                    )
+                    raise asyncio.CancelledError() from create_error
+                raise
+            return page, True
+
+    async def _close_async_runtime_shielded(
+        self,
+        runtime: Any,
+        *,
+        reason: str,
+    ) -> bool:
+        close_task = asyncio.create_task(
+            self._close_async_runtime(runtime, reason=reason)
+        )
+        try:
+            await asyncio.shield(close_task)
+            return False
+        except asyncio.CancelledError:
+            try:
+                await close_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as close_error:
+                logger.warning(
+                    f"[runtime-manager#{self._manager_instance_id}] async runtime close failed after cancellation: "
+                    f"reason={reason}, error={close_error}"
+                )
+            finally:
+                pass
+            return True
+
     def _close_sync_runtime(self, runtime: Any, *, reason: str) -> None:
         if runtime is not None:
             self.sync_runtime_closer(runtime, reason=reason)
+
+    def _should_close_sync_runtime_on_account_worker(
+        self,
+        account_id: str,
+        runtime: Any,
+        *,
+        owner_thread_id: Optional[int],
+        current_thread_id: int,
+    ) -> bool:
+        return bool(
+            runtime is not None
+            and owner_thread_id is not None
+            and owner_thread_id != current_thread_id
+            and not getattr(runtime, "cdp_endpoint", None)
+            and self.is_sync_account_worker_thread(account_id, thread_id=owner_thread_id)
+        )
+
+    def _close_sync_runtime_on_owner_thread_if_needed(
+        self,
+        account_id: str,
+        runtime: Any,
+        *,
+        reason: str,
+        owner_thread_id: Optional[int],
+        current_thread_id: int,
+    ) -> None:
+        if self._should_close_sync_runtime_on_account_worker(
+            account_id,
+            runtime,
+            owner_thread_id=owner_thread_id,
+            current_thread_id=current_thread_id,
+        ):
+            self.run_sync_task_on_account_thread(
+                account_id,
+                lambda runtime_to_close=runtime: self._close_sync_runtime(
+                    runtime_to_close,
+                    reason=reason,
+                ),
+            )
+            return
+        self._close_sync_runtime(runtime, reason=reason)
 
     @staticmethod
     def _take_sync_closures_for_thread(
@@ -938,6 +1314,8 @@ class AccountBrowserRuntimeManager:
             account_id=account_id,
             profile_dir=profile_dir,
             mode="async",
+            purpose=purpose,
+            thread_id=threading.get_ident(),
         )
         runtime_identity = _build_runtime_identity(
             profile_dir,
@@ -945,15 +1323,30 @@ class AccountBrowserRuntimeManager:
             default_persistent_context=True,
         )
         if _runtime_is_alive(state.runtime):
-            if state.runtime_identity is not None and state.runtime_identity != runtime_identity:
-                raise ValueError("同账号已存在不兼容的 async runtime，请先失效再重建")
-            return state.runtime
+            if state.runtime_identity is None or state.runtime_identity == runtime_identity:
+                return state.runtime
+            if state.active_leases > 0:
+                raise ValueError("同账号已存在不兼容的 async runtime 正在使用中，请稍后重试")
         stale_runtime = state.runtime
         if stale_runtime is not None:
             state.runtime = None
             state.runtime_identity = None
+            state.current_purpose = None
             state.generation += 1
-            await self._close_async_runtime(stale_runtime, reason="stale_runtime")
+            close_cancelled = False
+            try:
+                close_cancelled = await self._close_async_runtime_shielded(
+                    stale_runtime,
+                    reason="stale_runtime",
+                )
+            except (Exception, asyncio.CancelledError):
+                if state.runtime is None:
+                    self._release_profile_claim(state)
+                raise
+            if close_cancelled:
+                if state.runtime is None:
+                    self._release_profile_claim(state)
+                raise asyncio.CancelledError()
         try:
             runtime = await _call_runtime_factory(
                 self.runtime_factory,
@@ -964,12 +1357,13 @@ class AccountBrowserRuntimeManager:
                 exclusive,
                 runtime_request=runtime_request,
             )
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             if state.runtime is None:
                 self._release_profile_claim(state)
             raise
         state.runtime = runtime
         state.runtime_identity = runtime_identity
+        state.current_purpose = _normalize_runtime_purpose(purpose)
         return runtime
 
     async def acquire_runtime(
@@ -981,37 +1375,54 @@ class AccountBrowserRuntimeManager:
         runtime_request: Optional[Dict[str, Any]] = None,
     ) -> AccountBrowserRuntimeLease:
         account_id = self._normalize_account_id(account_id)
-        state = self._states.setdefault(account_id, _RuntimeState())
-        async with state.condition:
-            self._raise_if_runtime_draining_pending_closures(
-                state,
-                account_id=account_id,
-                mode="async",
-            )
-            while state.active_leases and (exclusive or state.active_exclusive):
-                await state.condition.wait()
+        normalized_purpose = _normalize_runtime_purpose(purpose)
+        request_thread_id = threading.get_ident()
+        previous_mode = await self._acquire_owner_mode_async(account_id, "async")
+        logger.info(
+            f"[runtime-manager#{self._manager_instance_id}] async acquire requested: "
+            f"account_id={account_id}, purpose={normalized_purpose}, exclusive={bool(exclusive)}, "
+            f"thread_id={request_thread_id}"
+        )
+        try:
+            if previous_mode == "sync":
+                self.invalidate_runtime_sync(
+                    account_id,
+                    reason="owner_mode_switch_to_async",
+                )
+            state = self._states.setdefault(account_id, _RuntimeState())
+            async with state.condition:
                 self._raise_if_runtime_draining_pending_closures(
                     state,
                     account_id=account_id,
                     mode="async",
                 )
-            runtime = await self._ensure_async_runtime(
-                account_id,
-                state,
-                purpose,
-                exclusive,
-                runtime_request=runtime_request,
-            )
-            state.active_leases += 1
-            state.active_exclusive = bool(exclusive)
-            return AccountBrowserRuntimeLease(
-                account_id=account_id,
-                purpose=purpose,
-                exclusive=exclusive,
-                generation=state.generation,
-                profile_dir=self.resolve_profile_dir(account_id),
-                runtime=runtime,
-            )
+                while state.active_leases and (exclusive or state.active_exclusive):
+                    await state.condition.wait()
+                    self._raise_if_runtime_draining_pending_closures(
+                        state,
+                        account_id=account_id,
+                        mode="async",
+                    )
+                runtime = await self._ensure_async_runtime(
+                    account_id,
+                    state,
+                    purpose,
+                    exclusive,
+                    runtime_request=runtime_request,
+                )
+                state.active_leases += 1
+                state.active_exclusive = bool(exclusive)
+                return AccountBrowserRuntimeLease(
+                    account_id=account_id,
+                    purpose=normalized_purpose,
+                    exclusive=exclusive,
+                    generation=state.generation,
+                    profile_dir=self.resolve_profile_dir(account_id),
+                    runtime=runtime,
+                )
+        except (Exception, asyncio.CancelledError):
+            self._release_owner_mode(account_id, "async")
+            raise
 
     async def release_runtime(
         self,
@@ -1019,12 +1430,18 @@ class AccountBrowserRuntimeManager:
         *,
         reason: str = "released",
     ) -> None:
-        _ = reason
         if lease is None or lease.released:
             return
+        normalized_reason = str(reason or "released")
+        logger.info(
+            f"[runtime-manager#{self._manager_instance_id}] async release requested: "
+            f"account_id={lease.account_id}, purpose={_normalize_runtime_purpose(lease.purpose)}, "
+            f"reason={normalized_reason}, thread_id={threading.get_ident()}"
+        )
         state = self._states.get(lease.account_id)
         if state is None:
             lease.released = True
+            self._release_owner_mode(lease.account_id, "async")
             return
         runtime = lease.runtime
         pages_to_close = [
@@ -1033,10 +1450,8 @@ class AccountBrowserRuntimeManager:
         ]
         lease.pages.clear()
         for page in pages_to_close:
-            try:
-                await _close_async_page(page)
-            except Exception:
-                pass
+            if getattr(runtime, "page", None) is page:
+                runtime.page = None
         closures_to_run = []
         should_release_claim = False
         async with state.condition:
@@ -1048,24 +1463,50 @@ class AccountBrowserRuntimeManager:
                 closures_to_run = list(state.pending_closures)
                 state.pending_closures.clear()
                 should_release_claim = state.runtime is None
+                if state.runtime is None:
+                    state.current_purpose = None
             lease.released = True
             state.condition.notify_all()
         close_errors = []
+        release_cancelled = False
         try:
+            for page in pages_to_close:
+                try:
+                    if await self._close_async_page_shielded(page):
+                        release_cancelled = True
+                except asyncio.CancelledError:
+                    if closures_to_run:
+                        release_cancelled = True
+                        break
+                    raise
+                except Exception:
+                    pass
             for runtime, close_reason in closures_to_run:
                 try:
-                    await self._close_async_runtime(runtime, reason=close_reason)
+                    if await self._close_async_runtime_shielded(runtime, reason=close_reason):
+                        release_cancelled = True
+                except asyncio.CancelledError:
+                    release_cancelled = True
                 except Exception as close_error:
                     close_errors.append(close_error)
         finally:
             if should_release_claim:
                 self._release_profile_claim(state)
+            self._release_owner_mode(lease.account_id, "async")
+        logger.info(
+            f"[runtime-manager#{self._manager_instance_id}] async release completed: "
+            f"account_id={lease.account_id}, purpose={_normalize_runtime_purpose(lease.purpose)}, "
+            f"reason={normalized_reason}, active_leases={getattr(state, 'active_leases', 'unknown')}, "
+            f"thread_id={threading.get_ident()}"
+        )
         if close_errors:
             first_error = close_errors[0]
             process_lookup_errors = [err for err in close_errors if isinstance(err, ProcessLookupError)]
             if len(process_lookup_errors) == len(close_errors):
                 return
             raise first_error
+        if release_cancelled:
+            raise asyncio.CancelledError()
 
     async def get_fresh_page(self, lease: AccountBrowserRuntimeLease) -> Tuple[Any, Any]:
         if lease.released:
@@ -1082,34 +1523,66 @@ class AccountBrowserRuntimeManager:
         if not callable(new_page):
             raise RuntimeError("runtime context cannot create pages")
         page = new_page()
+        page_create_cancelled = False
         if inspect.isawaitable(page):
-            page = await page
+            page, page_create_cancelled = await self._create_async_page_shielded(page)
         runtime.page = page
         lease.pages.append(page)
+        if page_create_cancelled:
+            raise asyncio.CancelledError()
         return page, context
 
     async def invalidate_runtime(self, account_id: str, *, reason: str = "invalidated") -> bool:
         account_id = self._normalize_account_id(account_id)
+        normalized_reason = str(reason or "invalidated")
+        logger.info(
+            f"[runtime-manager#{self._manager_instance_id}] async invalidate requested: "
+            f"account_id={account_id}, reason={normalized_reason}, thread_id={threading.get_ident()}"
+        )
         state = self._states.setdefault(account_id, _RuntimeState())
         should_release_claim = False
         async with state.condition:
             runtime = state.runtime
             if runtime is None:
+                logger.info(
+                    f"[runtime-manager#{self._manager_instance_id}] async invalidate skipped: "
+                    f"account_id={account_id}, reason={normalized_reason}, runtime=missing"
+                )
                 return False
             state.runtime = None
             state.runtime_identity = None
             state.generation += 1
             if state.active_leases > 0:
                 state.pending_closures.append((runtime, reason))
+                logger.info(
+                    f"[runtime-manager#{self._manager_instance_id}] async invalidate deferred: "
+                    f"account_id={account_id}, reason={normalized_reason}, active_leases={state.active_leases}"
+                )
                 return True
             should_release_claim = True
-        await self._close_async_runtime(runtime, reason=reason)
-        if should_release_claim:
-            self._release_profile_claim(state)
+        close_error = None
+        close_cancelled = False
+        try:
+            close_cancelled = await self._close_async_runtime_shielded(runtime, reason=reason)
+        except Exception as error:
+            close_error = error
+        finally:
+            if should_release_claim:
+                self._release_profile_claim(state)
+                self._reset_owner_mode_if_matches(account_id, "async")
+        logger.info(
+            f"[runtime-manager#{self._manager_instance_id}] async invalidate completed: "
+            f"account_id={account_id}, reason={normalized_reason}, thread_id={threading.get_ident()}"
+        )
+        if close_error is not None:
+            raise close_error
+        if close_cancelled:
+            raise asyncio.CancelledError()
         return True
 
     async def cleanup_idle_runtimes(self) -> int:
         closed_count = 0
+        close_errors = []
         for account_id, state in list(self._states.items()):
             runtime_to_close = None
             should_release_claim = False
@@ -1127,10 +1600,26 @@ class AccountBrowserRuntimeManager:
                     should_release_claim = True
             if runtime_to_close is None:
                 continue
-            await self._close_async_runtime(runtime_to_close, reason="idle_timeout")
-            if should_release_claim:
-                self._release_profile_claim(state)
-            closed_count += 1
+            close_error = None
+            close_cancelled = False
+            try:
+                close_cancelled = await self._close_async_runtime_shielded(
+                    runtime_to_close,
+                    reason="idle_timeout",
+                )
+                closed_count += 1
+            except Exception as error:
+                close_error = error
+            finally:
+                if should_release_claim:
+                    self._release_profile_claim(state)
+                    self._reset_owner_mode_if_matches(account_id, "async")
+            if close_error is not None:
+                close_errors.append(close_error)
+            if close_cancelled:
+                raise asyncio.CancelledError()
+        if close_errors:
+            raise close_errors[0]
         return closed_count
 
     def _ensure_sync_runtime(
@@ -1149,6 +1638,8 @@ class AccountBrowserRuntimeManager:
             account_id=account_id,
             profile_dir=profile_dir,
             mode="sync",
+            purpose=purpose,
+            thread_id=current_thread_id,
         )
         runtime_identity = _build_runtime_identity(
             profile_dir,
@@ -1156,9 +1647,10 @@ class AccountBrowserRuntimeManager:
             default_persistent_context=False,
         )
         if _runtime_is_alive(state.runtime) and state.owner_thread_id == current_thread_id:
-            if state.runtime_identity is not None and state.runtime_identity != runtime_identity:
-                raise ValueError("同账号已存在不兼容的 sync runtime，请先失效再重建")
-            return state.runtime
+            if state.runtime_identity is None or state.runtime_identity == runtime_identity:
+                return state.runtime
+            if state.active_leases > 0:
+                raise ValueError("同账号已存在不兼容的 sync runtime 正在使用中，请稍后重试")
         stale_runtime = state.runtime
         if stale_runtime is not None:
             stale_owner_thread_id = state.owner_thread_id
@@ -1169,17 +1661,37 @@ class AccountBrowserRuntimeManager:
             )
             state.runtime = None
             state.runtime_identity = None
+            state.current_purpose = None
             state.owner_thread_id = None
             state.generation += 1
-            closures_to_run = self._defer_or_close_sync_runtime(
-                state,
+            if self._should_close_sync_runtime_on_account_worker(
+                account_id,
                 stale_runtime,
-                reason=stale_reason,
                 owner_thread_id=stale_owner_thread_id,
                 current_thread_id=current_thread_id,
-            )
-            for runtime, close_reason in closures_to_run:
-                self._close_sync_runtime(runtime, reason=close_reason)
+            ):
+                closures_to_run = [(stale_runtime, stale_reason)]
+            else:
+                closures_to_run = self._defer_or_close_sync_runtime(
+                    state,
+                    stale_runtime,
+                    reason=stale_reason,
+                    owner_thread_id=stale_owner_thread_id,
+                    current_thread_id=current_thread_id,
+                )
+            try:
+                for runtime, close_reason in closures_to_run:
+                    self._close_sync_runtime_on_owner_thread_if_needed(
+                        account_id,
+                        runtime,
+                        reason=close_reason,
+                        owner_thread_id=stale_owner_thread_id,
+                        current_thread_id=current_thread_id,
+                    )
+            except Exception:
+                if state.runtime is None:
+                    self._release_profile_claim(state)
+                raise
         try:
             runtime = _call_runtime_factory(
                 self.sync_runtime_factory,
@@ -1196,6 +1708,7 @@ class AccountBrowserRuntimeManager:
             raise
         state.runtime = runtime
         state.runtime_identity = runtime_identity
+        state.current_purpose = _normalize_runtime_purpose(purpose)
         state.owner_thread_id = current_thread_id
         return runtime
 
@@ -1208,25 +1721,24 @@ class AccountBrowserRuntimeManager:
         runtime_request: Optional[Dict[str, Any]] = None,
     ) -> SyncAccountBrowserRuntimeLease:
         account_id = self._normalize_account_id(account_id)
+        normalized_purpose = _normalize_runtime_purpose(purpose)
         with self._sync_states_guard:
             state = self._sync_states.setdefault(account_id, _SyncRuntimeState())
         current_thread_id = threading.get_ident()
-        closures_to_run = []
-        with state.condition:
-            self._raise_if_runtime_draining_pending_closures(
-                state,
-                account_id=account_id,
-                mode="sync",
-            )
-            can_reenter_current_runtime = bool(
-                state.active_leases
-                and state.owner_thread_id == current_thread_id
-                and _runtime_is_alive(state.runtime)
-            )
-            while state.active_leases and (exclusive or state.active_exclusive):
-                if can_reenter_current_runtime:
-                    break
-                state.condition.wait()
+        previous_mode = self._acquire_owner_mode_sync(account_id, "sync")
+        logger.info(
+            f"[runtime-manager#{self._manager_instance_id}] sync acquire requested: "
+            f"account_id={account_id}, purpose={normalized_purpose}, exclusive={bool(exclusive)}, "
+            f"thread_id={current_thread_id}"
+        )
+        try:
+            if previous_mode == "async":
+                self._invalidate_async_runtime_blocking(
+                    account_id,
+                    reason="owner_mode_switch_to_sync",
+                )
+            closures_to_run = []
+            with state.condition:
                 self._raise_if_runtime_draining_pending_closures(
                     state,
                     account_id=account_id,
@@ -1237,27 +1749,58 @@ class AccountBrowserRuntimeManager:
                     and state.owner_thread_id == current_thread_id
                     and _runtime_is_alive(state.runtime)
                 )
-            closures_to_run = self._take_sync_closures_for_thread(state, current_thread_id)
-            runtime = self._ensure_sync_runtime(
-                account_id,
-                state,
-                purpose,
-                exclusive,
-                runtime_request=runtime_request,
+                while state.active_leases and (
+                    exclusive
+                    or state.active_exclusive
+                    or (
+                        state.owner_thread_id is not None
+                        and state.owner_thread_id != current_thread_id
+                        and _runtime_is_alive(state.runtime)
+                    )
+                ):
+                    if can_reenter_current_runtime:
+                        break
+                    state.condition.wait()
+                    self._raise_if_runtime_draining_pending_closures(
+                        state,
+                        account_id=account_id,
+                        mode="sync",
+                    )
+                    can_reenter_current_runtime = bool(
+                        state.active_leases
+                        and state.owner_thread_id == current_thread_id
+                        and _runtime_is_alive(state.runtime)
+                    )
+                closures_to_run = self._take_sync_closures_for_thread(state, current_thread_id)
+                runtime = self._ensure_sync_runtime(
+                    account_id,
+                    state,
+                    purpose,
+                    exclusive,
+                    runtime_request=runtime_request,
+                )
+                state.active_leases += 1
+                state.active_exclusive = bool(exclusive)
+                lease = SyncAccountBrowserRuntimeLease(
+                    account_id=account_id,
+                    purpose=normalized_purpose,
+                    exclusive=exclusive,
+                    generation=state.generation,
+                    profile_dir=self.resolve_profile_dir(account_id),
+                    runtime=runtime,
+                )
+            for runtime_to_close, close_reason in closures_to_run:
+                self._close_sync_runtime(runtime_to_close, reason=close_reason)
+            logger.info(
+                f"[runtime-manager#{self._manager_instance_id}] sync acquire granted: "
+                f"account_id={account_id}, purpose={normalized_purpose}, exclusive={bool(exclusive)}, "
+                f"generation={lease.generation}, active_leases={state.active_leases}, "
+                f"active_exclusive={state.active_exclusive}, thread_id={current_thread_id}"
             )
-            state.active_leases += 1
-            state.active_exclusive = bool(exclusive)
-            lease = SyncAccountBrowserRuntimeLease(
-                account_id=account_id,
-                purpose=purpose,
-                exclusive=exclusive,
-                generation=state.generation,
-                profile_dir=self.resolve_profile_dir(account_id),
-                runtime=runtime,
-            )
-        for runtime_to_close, close_reason in closures_to_run:
-            self._close_sync_runtime(runtime_to_close, reason=close_reason)
-        return lease
+            return lease
+        except Exception:
+            self._release_owner_mode(account_id, "sync")
+            raise
 
     def release_runtime_sync(
         self,
@@ -1265,12 +1808,19 @@ class AccountBrowserRuntimeManager:
         *,
         reason: str = "released",
     ) -> None:
-        _ = reason
         if lease is None or lease.released:
             return
+        normalized_reason = str(reason or "released")
+        current_thread_id = threading.get_ident()
+        logger.info(
+            f"[runtime-manager#{self._manager_instance_id}] sync release requested: "
+            f"account_id={lease.account_id}, purpose={_normalize_runtime_purpose(lease.purpose)}, "
+            f"reason={normalized_reason}, thread_id={current_thread_id}"
+        )
         state = self._sync_states.get(lease.account_id)
         if state is None:
             lease.released = True
+            self._release_owner_mode(lease.account_id, "sync")
             return
         runtime = lease.runtime
         pages_to_close = [
@@ -1283,7 +1833,6 @@ class AccountBrowserRuntimeManager:
                 _close_sync_page(page)
             except Exception:
                 pass
-        current_thread_id = threading.get_ident()
         closures_to_run = []
         should_release_claim = False
         with state.condition:
@@ -1292,14 +1841,56 @@ class AccountBrowserRuntimeManager:
             if state.active_leases == 0:
                 state.active_exclusive = False
                 state.last_released_at = self.time_fn()
-                closures_to_run = self._take_sync_closures_for_thread(state, current_thread_id)
-                should_release_claim = state.runtime is None
+                remaining_pending_closures = []
+                for pending_runtime, close_reason, owner_thread_id in state.pending_closures:
+                    if pending_runtime is None:
+                        continue
+                    can_close_now = bool(
+                        owner_thread_id is None
+                        or owner_thread_id == current_thread_id
+                        or not _thread_id_is_alive(owner_thread_id)
+                        or self._should_close_sync_runtime_on_account_worker(
+                            lease.account_id,
+                            pending_runtime,
+                            owner_thread_id=owner_thread_id,
+                            current_thread_id=current_thread_id,
+                        )
+                    )
+                    if can_close_now:
+                        closures_to_run.append((pending_runtime, close_reason, owner_thread_id))
+                    else:
+                        remaining_pending_closures.append((pending_runtime, close_reason, owner_thread_id))
+                state.pending_closures = remaining_pending_closures
+                should_release_claim = state.runtime is None and not state.pending_closures
+                if state.runtime is None:
+                    state.current_purpose = None
             lease.released = True
             state.condition.notify_all()
-        for runtime_to_close, close_reason in closures_to_run:
-            self._close_sync_runtime(runtime_to_close, reason=close_reason)
-        if should_release_claim:
-            self._release_profile_claim(state)
+        close_errors = []
+        try:
+            for runtime_to_close, close_reason, owner_thread_id in closures_to_run:
+                try:
+                    self._close_sync_runtime_on_owner_thread_if_needed(
+                        lease.account_id,
+                        runtime_to_close,
+                        reason=close_reason,
+                        owner_thread_id=owner_thread_id,
+                        current_thread_id=current_thread_id,
+                    )
+                except Exception as close_error:
+                    close_errors.append(close_error)
+        finally:
+            if should_release_claim:
+                self._release_profile_claim(state)
+            self._release_owner_mode(lease.account_id, "sync")
+            logger.info(
+                f"[runtime-manager#{self._manager_instance_id}] sync release completed: "
+                f"account_id={lease.account_id}, purpose={_normalize_runtime_purpose(lease.purpose)}, "
+                f"reason={normalized_reason}, active_leases={getattr(state, 'active_leases', 'unknown')}, "
+                f"thread_id={current_thread_id}"
+            )
+        if close_errors:
+            raise close_errors[0]
 
     def get_fresh_page_sync(self, lease: SyncAccountBrowserRuntimeLease) -> Tuple[Any, Any]:
         if lease.released:
@@ -1322,22 +1913,55 @@ class AccountBrowserRuntimeManager:
 
     def invalidate_runtime_sync(self, account_id: str, *, reason: str = "invalidated") -> bool:
         account_id = self._normalize_account_id(account_id)
+        normalized_reason = str(reason or "invalidated")
         with self._sync_states_guard:
             state = self._sync_states.setdefault(account_id, _SyncRuntimeState())
         current_thread_id = threading.get_ident()
+        logger.info(
+            f"[runtime-manager#{self._manager_instance_id}] sync invalidate requested: "
+            f"account_id={account_id}, reason={normalized_reason}, thread_id={current_thread_id}"
+        )
         closures_to_run = []
         should_release_claim = False
         with state.condition:
             runtime = state.runtime
             owner_thread_id = state.owner_thread_id
             if runtime is None:
+                logger.info(
+                    f"[runtime-manager#{self._manager_instance_id}] sync invalidate skipped: "
+                    f"account_id={account_id}, reason={normalized_reason}, runtime=missing"
+                )
                 return False
             state.runtime = None
             state.runtime_identity = None
             state.owner_thread_id = None
             state.generation += 1
             if state.active_leases > 0:
-                state.pending_closures.append((runtime, reason, owner_thread_id))
+                if getattr(runtime, "cdp_endpoint", None):
+                    closures_to_run.extend(
+                        self._defer_or_close_sync_runtime(
+                            state,
+                            runtime,
+                            reason=reason,
+                            owner_thread_id=owner_thread_id,
+                            current_thread_id=current_thread_id,
+                        )
+                    )
+                    # Runtime 已被强制关闭，但旧 lease 还没释放；用空闭包作 draining 哨兵，
+                    # 阻止同账号提前重建，release_runtime_sync() 会在 active_leases 归零时清掉它。
+                    state.pending_closures.append((None, reason, None))
+                    logger.info(
+                        f"[runtime-manager#{self._manager_instance_id}] sync invalidate force-closing managed runtime: "
+                        f"account_id={account_id}, reason={normalized_reason}, active_leases={state.active_leases}, "
+                        f"owner_thread_id={owner_thread_id}"
+                    )
+                else:
+                    state.pending_closures.append((runtime, reason, owner_thread_id))
+                    logger.info(
+                        f"[runtime-manager#{self._manager_instance_id}] sync invalidate deferred: "
+                        f"account_id={account_id}, reason={normalized_reason}, active_leases={state.active_leases}, "
+                        f"owner_thread_id={owner_thread_id}"
+                    )
             else:
                 closures_to_run.extend(
                     self._defer_or_close_sync_runtime(
@@ -1350,17 +1974,31 @@ class AccountBrowserRuntimeManager:
                 )
                 closures_to_run.extend(self._take_sync_closures_for_thread(state, current_thread_id))
                 should_release_claim = True
-        for runtime_to_close, close_reason in closures_to_run:
-            self._close_sync_runtime(runtime_to_close, reason=close_reason)
-        if should_release_claim:
-            self._release_profile_claim(state)
+        close_errors = []
+        try:
+            for runtime_to_close, close_reason in closures_to_run:
+                try:
+                    self._close_sync_runtime(runtime_to_close, reason=close_reason)
+                except Exception as close_error:
+                    close_errors.append(close_error)
+        finally:
+            if should_release_claim:
+                self._release_profile_claim(state)
+                self._reset_owner_mode_if_matches(account_id, "sync")
+        logger.info(
+            f"[runtime-manager#{self._manager_instance_id}] sync invalidate completed: "
+            f"account_id={account_id}, reason={normalized_reason}, thread_id={current_thread_id}"
+        )
+        if close_errors:
+            raise close_errors[0]
         return True
 
     async def close_all_runtimes(self, *, reason: str = "shutdown") -> Dict[str, int]:
         async_runtimes_to_close = []
+        async_states_to_release = []
         async_states_snapshot = list(self._states.items())
 
-        for _account_id, state in async_states_snapshot:
+        for account_id, state in async_states_snapshot:
             should_release_claim = False
             async with state.condition:
                 runtime = state.runtime
@@ -1376,28 +2014,54 @@ class AccountBrowserRuntimeManager:
                 state.last_released_at = self.time_fn()
                 state.condition.notify_all()
                 async_runtimes_to_close.extend(
-                    [runtime] if runtime is not None else []
+                    [(account_id, state, runtime)] if runtime is not None else []
                 )
                 async_runtimes_to_close.extend(
-                    pending_runtime
+                    (account_id, state, pending_runtime)
                     for pending_runtime, _close_reason in pending_closures
                     if pending_runtime is not None
                 )
                 should_release_claim = True
             if should_release_claim:
-                self._release_profile_claim(state)
+                async_states_to_release.append((account_id, state))
 
         closed_async = 0
         seen_async_runtime_ids = set()
-        for runtime in async_runtimes_to_close:
-            runtime_id = id(runtime)
-            if runtime is None or runtime_id in seen_async_runtime_ids:
-                continue
-            seen_async_runtime_ids.add(runtime_id)
-            await self._close_async_runtime(runtime, reason=reason)
-            closed_async += 1
+        close_errors = []
+        close_cancelled = False
+        try:
+            for _account_id, _state, runtime in async_runtimes_to_close:
+                runtime_id = id(runtime)
+                if runtime is None or runtime_id in seen_async_runtime_ids:
+                    continue
+                seen_async_runtime_ids.add(runtime_id)
+                try:
+                    if await self._close_async_runtime_shielded(runtime, reason=reason):
+                        close_cancelled = True
+                    closed_async += 1
+                except asyncio.CancelledError:
+                    close_cancelled = True
+                except Exception as close_error:
+                    close_errors.append(close_error)
+        finally:
+            released_state_ids = set()
+            for account_id, state in async_states_to_release:
+                state_id = id(state)
+                if state_id in released_state_ids:
+                    continue
+                released_state_ids.add(state_id)
+                self._release_profile_claim(state)
+                self._reset_owner_mode_if_matches(account_id, "async")
 
-        closed_sync = self.close_all_runtimes_sync(reason=reason)
+        closed_sync = 0
+        try:
+            closed_sync = self.close_all_runtimes_sync(reason=reason)
+        except Exception as close_error:
+            close_errors.append(close_error)
+        if close_errors:
+            raise close_errors[0]
+        if close_cancelled:
+            raise asyncio.CancelledError()
         return {
             "async": closed_async,
             "sync": closed_sync,
@@ -1405,10 +2069,12 @@ class AccountBrowserRuntimeManager:
 
     def cleanup_idle_runtimes_sync(self) -> int:
         closed_count = 0
+        all_close_errors = []
+        idle_worker_accounts_to_stop = set()
         current_thread_id = threading.get_ident()
         with self._sync_states_guard:
             states = list(self._sync_states.items())
-        for _account_id, state in states:
+        for account_id, state in states:
             closures_to_run = []
             should_release_claim = False
             with state.condition:
@@ -1420,29 +2086,82 @@ class AccountBrowserRuntimeManager:
                 if is_idle:
                     runtime_to_close = state.runtime
                     owner_thread_id = state.owner_thread_id
-                    state.runtime = None
-                    state.runtime_identity = None
-                    state.owner_thread_id = None
-                    state.generation += 1
-                    closures_to_run.extend(
-                        self._defer_or_close_sync_runtime(
-                            state,
+                    can_close_now = bool(
+                        owner_thread_id is None
+                        or owner_thread_id == current_thread_id
+                        or not _thread_id_is_alive(owner_thread_id)
+                        or getattr(runtime_to_close, "cdp_endpoint", None)
+                    )
+                    if not can_close_now:
+                        can_close_on_owner_worker = self._should_close_sync_runtime_on_account_worker(
+                            account_id,
                             runtime_to_close,
-                            reason="idle_timeout",
                             owner_thread_id=owner_thread_id,
                             current_thread_id=current_thread_id,
                         )
-                    )
+                        if not can_close_on_owner_worker:
+                            continue
+                    state.runtime = None
+                    state.runtime_identity = None
+                    state.owner_thread_id = None
+                    state.current_purpose = None
+                    state.generation += 1
+                    if can_close_now:
+                        closures_to_run.extend(
+                            (
+                                runtime_to_close,
+                                close_reason,
+                                owner_thread_id,
+                            )
+                            for runtime_to_close, close_reason in self._defer_or_close_sync_runtime(
+                                state,
+                                runtime_to_close,
+                                reason="idle_timeout",
+                                owner_thread_id=owner_thread_id,
+                                current_thread_id=current_thread_id,
+                            )
+                        )
+                    else:
+                        closures_to_run.append((runtime_to_close, "idle_timeout", owner_thread_id))
                     should_release_claim = True
-                closures_to_run.extend(self._take_sync_closures_for_thread(state, current_thread_id))
+                closures_to_run.extend(
+                    (runtime_to_close, close_reason, None)
+                    for runtime_to_close, close_reason in self._take_sync_closures_for_thread(
+                        state,
+                        current_thread_id,
+                    )
+                )
             if not closures_to_run:
                 continue
-            for runtime_to_close, close_reason in closures_to_run:
-                self._close_sync_runtime(runtime_to_close, reason=close_reason)
-                closed_count += 1
-            if should_release_claim:
-                self._release_profile_claim(state)
+            close_errors = []
+            try:
+                for runtime_to_close, close_reason, owner_thread_id in closures_to_run:
+                    try:
+                        self._close_sync_runtime_on_owner_thread_if_needed(
+                            account_id,
+                            runtime_to_close,
+                            reason=close_reason,
+                            owner_thread_id=owner_thread_id,
+                            current_thread_id=current_thread_id,
+                        )
+                        closed_count += 1
+                    except Exception as close_error:
+                        close_errors.append(close_error)
+            finally:
+                if should_release_claim:
+                    self._release_profile_claim(state)
+                    self._reset_owner_mode_if_matches(account_id, "sync")
+            if close_errors:
+                all_close_errors.extend(close_errors)
+            elif should_release_claim:
+                idle_worker_accounts_to_stop.add(account_id)
+        if idle_worker_accounts_to_stop:
+            closed_count += self.close_all_account_workers_sync(
+                account_ids=idle_worker_accounts_to_stop,
+            )
         closed_count += self.cleanup_idle_account_workers_sync()
+        if all_close_errors:
+            raise all_close_errors[0]
         return closed_count
 
     def cleanup_idle_account_workers_sync(self) -> int:
@@ -1474,15 +2193,58 @@ class AccountBrowserRuntimeManager:
                             self._sync_account_workers.pop(account_id, None)
         return stopped_count
 
+    def close_all_account_workers_sync(
+        self,
+        *,
+        join_timeout: float = 1.0,
+        account_ids: Optional[set[str]] = None,
+    ) -> int:
+        stopped_count = 0
+        current_thread_id = threading.get_ident()
+        with self._sync_account_workers_guard:
+            workers = list(self._sync_account_workers.items())
+        for account_id, state in workers:
+            if account_ids is not None and account_id not in account_ids:
+                continue
+            thread_to_join = None
+            should_forget_stale_worker = False
+            with state.lock:
+                thread = state.thread
+                if thread is None or not thread.is_alive():
+                    should_forget_stale_worker = True
+                else:
+                    state.stop_requested = True
+                    if state.thread_id != current_thread_id:
+                        thread_to_join = thread
+            if should_forget_stale_worker:
+                with self._sync_account_workers_guard:
+                    existing_state = self._sync_account_workers.get(account_id)
+                    if existing_state is state:
+                        self._sync_account_workers.pop(account_id, None)
+                continue
+            if thread_to_join is None:
+                continue
+            thread_to_join.join(timeout=max(0.0, float(join_timeout)))
+            if not thread_to_join.is_alive():
+                stopped_count += 1
+                with self._sync_account_workers_guard:
+                    existing_state = self._sync_account_workers.get(account_id)
+                    if existing_state is state:
+                        self._sync_account_workers.pop(account_id, None)
+        return stopped_count
+
     def close_all_runtimes_sync(self, *, reason: str = "shutdown") -> int:
         runtimes_to_close = []
+        states_to_release = []
+        current_thread_id = threading.get_ident()
         with self._sync_states_guard:
             states_snapshot = list(self._sync_states.items())
 
-        for _account_id, state in states_snapshot:
+        for account_id, state in states_snapshot:
             should_release_claim = False
             with state.condition:
                 runtime = state.runtime
+                owner_thread_id = state.owner_thread_id
                 pending_closures = list(state.pending_closures)
                 if runtime is None and not pending_closures:
                     continue
@@ -1496,26 +2258,124 @@ class AccountBrowserRuntimeManager:
                 state.last_released_at = self.time_fn()
                 state.condition.notify_all()
                 if runtime is not None:
-                    runtimes_to_close.append(runtime)
+                    runtimes_to_close.append((account_id, state, runtime, owner_thread_id))
                 runtimes_to_close.extend(
-                    pending_runtime
-                    for pending_runtime, _close_reason, _owner_thread_id in pending_closures
+                    (account_id, state, pending_runtime, pending_owner_thread_id)
+                    for pending_runtime, _close_reason, pending_owner_thread_id in pending_closures
                     if pending_runtime is not None
                 )
                 should_release_claim = True
             if should_release_claim:
-                self._release_profile_claim(state)
+                states_to_release.append((account_id, state))
 
         closed_count = 0
         seen_runtime_ids = set()
-        for runtime in runtimes_to_close:
-            runtime_id = id(runtime)
-            if runtime_id in seen_runtime_ids:
-                continue
-            seen_runtime_ids.add(runtime_id)
-            self._close_sync_runtime(runtime, reason=reason)
-            closed_count += 1
+        close_errors = []
+        try:
+            for account_id, _state, runtime, owner_thread_id in runtimes_to_close:
+                runtime_id = id(runtime)
+                if runtime_id in seen_runtime_ids:
+                    continue
+                seen_runtime_ids.add(runtime_id)
+                try:
+                    self._close_sync_runtime_on_owner_thread_if_needed(
+                        account_id,
+                        runtime,
+                        reason=reason,
+                        owner_thread_id=owner_thread_id,
+                        current_thread_id=current_thread_id,
+                    )
+                    closed_count += 1
+                except Exception as close_error:
+                    close_errors.append(close_error)
+        finally:
+            released_state_ids = set()
+            for account_id, state in states_to_release:
+                state_id = id(state)
+                if state_id in released_state_ids:
+                    continue
+                released_state_ids.add(state_id)
+                self._release_profile_claim(state)
+                self._reset_owner_mode_if_matches(account_id, "sync")
+            self.close_all_account_workers_sync()
+        if close_errors:
+            raise close_errors[0]
         return closed_count
+
+    def get_account_runtime_state_snapshot(self, account_id: str) -> Dict[str, Any]:
+        account_id = self._normalize_account_id(account_id)
+
+        owner_mode_state = self._get_owner_mode_state(account_id)
+        with owner_mode_state.condition:
+            owner_mode = owner_mode_state.mode
+            owner_mode_active_count = owner_mode_state.active_count
+
+        async_state = self._states.get(account_id)
+        async_snapshot = {
+            "runtime_exists": False,
+            "runtime_alive": False,
+            "current_purpose": None,
+            "active_leases": 0,
+            "active_exclusive": False,
+            "pending_closures": 0,
+            "claimed_profile_dir": None,
+        }
+        if async_state is not None:
+            async_snapshot = {
+                "runtime_exists": async_state.runtime is not None,
+                "runtime_alive": _runtime_is_alive(async_state.runtime),
+                "current_purpose": _normalize_runtime_purpose(getattr(async_state, "current_purpose", None)),
+                "active_leases": int(getattr(async_state, "active_leases", 0) or 0),
+                "active_exclusive": bool(getattr(async_state, "active_exclusive", False)),
+                "pending_closures": len(getattr(async_state, "pending_closures", []) or []),
+                "claimed_profile_dir": getattr(async_state, "claimed_profile_dir", None),
+            }
+
+        with self._sync_states_guard:
+            sync_state = self._sync_states.get(account_id)
+        sync_snapshot = {
+            "runtime_exists": False,
+            "runtime_alive": False,
+            "current_purpose": None,
+            "active_leases": 0,
+            "active_exclusive": False,
+            "pending_closures": 0,
+            "claimed_profile_dir": None,
+            "owner_thread_id": None,
+        }
+        if sync_state is not None:
+            with sync_state.condition:
+                sync_snapshot = {
+                    "runtime_exists": sync_state.runtime is not None,
+                    "runtime_alive": _runtime_is_alive(sync_state.runtime),
+                    "current_purpose": _normalize_runtime_purpose(getattr(sync_state, "current_purpose", None)),
+                    "active_leases": int(getattr(sync_state, "active_leases", 0) or 0),
+                    "active_exclusive": bool(getattr(sync_state, "active_exclusive", False)),
+                    "pending_closures": len(getattr(sync_state, "pending_closures", []) or []),
+                    "claimed_profile_dir": getattr(sync_state, "claimed_profile_dir", None),
+                    "owner_thread_id": getattr(sync_state, "owner_thread_id", None),
+                }
+
+        return {
+            "account_id": account_id,
+            "owner_mode": owner_mode,
+            "owner_mode_active_count": owner_mode_active_count,
+            "async_runtime_exists": async_snapshot["runtime_exists"],
+            "async_runtime_alive": async_snapshot["runtime_alive"],
+            "async_current_purpose": async_snapshot["current_purpose"],
+            "async_active_leases": async_snapshot["active_leases"],
+            "async_active_exclusive": async_snapshot["active_exclusive"],
+            "async_pending_closures": async_snapshot["pending_closures"],
+            "async_claimed_profile_dir": async_snapshot["claimed_profile_dir"],
+            "sync_runtime_exists": sync_snapshot["runtime_exists"],
+            "sync_runtime_alive": sync_snapshot["runtime_alive"],
+            "sync_current_purpose": sync_snapshot["current_purpose"],
+            "sync_active_leases": sync_snapshot["active_leases"],
+            "sync_active_exclusive": sync_snapshot["active_exclusive"],
+            "sync_pending_closures": sync_snapshot["pending_closures"],
+            "sync_claimed_profile_dir": sync_snapshot["claimed_profile_dir"],
+            "sync_owner_thread_id": sync_snapshot["owner_thread_id"],
+        }
 
 
 account_browser_runtime_manager = AccountBrowserRuntimeManager()

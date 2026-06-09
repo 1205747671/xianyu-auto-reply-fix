@@ -315,14 +315,17 @@
     let loginCaptchaEnabled = true;  // 登录验证码是否启用
 
     // 检查登录验证码是否启用
-      async function checkLoginCaptchaEnabled() {
-        try {
-          const response = await fetch('/api/login-captcha-enabled');
-          if (!response.ok) {
-            const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+    async function checkLoginCaptchaEnabled() {
+      try {
+        const response = await fetch('/api/login-captcha-enabled');
+        if (!response.ok) {
+          const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
           throw new Error(errorMessage);
         }
-        const result = await response.json();
+        const result = await response.json().catch(() => ({}));
+        if (hasMalformedEnabledFlagResult(result)) {
+          throw new Error('登录验证码配置返回格式异常');
+        }
         loginCaptchaEnabled = result.enabled;
         securityCaptchaRequired = result.enabled;
 
@@ -343,14 +346,14 @@
           }
         }
 
-          return loginCaptchaEnabled;
-        } catch (error) {
-          console.error('检查登录验证码状态失败:', error);
-          loginCaptchaEnabled = true;
-          securityCaptchaRequired = true;
-          return true; // 出错时默认需要验证码
-        }
+        return loginCaptchaEnabled;
+      } catch (error) {
+        console.error('检查登录验证码状态失败:', error);
+        loginCaptchaEnabled = true;
+        securityCaptchaRequired = true;
+        return true; // 出错时默认需要验证码
       }
+    }
     
     function showError(message) {
       errorMessage.textContent = message;
@@ -358,12 +361,99 @@
     }
 
     async function readResponseErrorMessage(response, fallbackMessage = '') {
-      try {
-        const data = await response.json();
-        return data.detail || data.message || fallbackMessage || `HTTP ${response.status}`;
-      } catch (error) {
-        return fallbackMessage || `HTTP ${response.status}`;
+      if (!response) {
+        return fallbackMessage || '请求失败';
       }
+
+      try {
+        const errorText = await response.text();
+        if (!errorText) {
+          return fallbackMessage || `HTTP ${response.status} ${response.statusText}`;
+        }
+
+        try {
+          const errorJson = JSON.parse(errorText);
+          return errorJson.detail || errorJson.message || errorText;
+        } catch (jsonError) {
+          return errorText;
+        }
+      } catch (error) {
+        return fallbackMessage || `HTTP ${response.status} ${response.statusText}`;
+      }
+    }
+
+    function isPlainObjectPayload(value) {
+      return !!value && typeof value === 'object' && !Array.isArray(value);
+    }
+
+    function hasMalformedEnabledFlagResult(result) {
+      return !isPlainObjectPayload(result) || typeof result.enabled !== 'boolean';
+    }
+
+    function hasMalformedCaptchaRequiredResult(result) {
+      return (
+        !isPlainObjectPayload(result)
+        || typeof result.required !== 'boolean'
+        || (result.failure_count != null && (!Number.isFinite(Number(result.failure_count)) || Number(result.failure_count) < 0))
+        || (result.threshold != null && (!Number.isFinite(Number(result.threshold)) || Number(result.threshold) < 0))
+      );
+    }
+
+    function hasMalformedLoginResult(result) {
+      if (
+        !isPlainObjectPayload(result)
+        || typeof result.success !== 'boolean'
+        || typeof result.message !== 'string'
+      ) {
+        return true;
+      }
+      if (result.captcha_required != null && typeof result.captcha_required !== 'boolean') {
+        return true;
+      }
+      if (!result.success) {
+        return false;
+      }
+      return (
+        typeof result.token !== 'string'
+        || !result.token.trim()
+        || !Number.isFinite(Number(result.user_id))
+        || typeof result.username !== 'string'
+        || !result.username.trim()
+        || typeof result.is_admin !== 'boolean'
+      );
+    }
+
+    function hasMalformedCaptchaGenerationResult(result) {
+      return (
+        !isPlainObjectPayload(result)
+        || typeof result.success !== 'boolean'
+        || typeof result.captcha_image !== 'string'
+        || typeof result.session_id !== 'string'
+        || typeof result.message !== 'string'
+      );
+    }
+
+    function hasMalformedSuccessMessageResult(result) {
+      return (
+        !isPlainObjectPayload(result)
+        || typeof result.success !== 'boolean'
+        || typeof result.message !== 'string'
+      );
+    }
+
+    function hasMalformedVerifyResult(result) {
+      if (!isPlainObjectPayload(result) || typeof result.authenticated !== 'boolean') {
+        return true;
+      }
+      if (!result.authenticated) {
+        return false;
+      }
+      return (
+        !Number.isFinite(Number(result.user_id))
+        || typeof result.username !== 'string'
+        || !result.username.trim()
+        || typeof result.is_admin !== 'boolean'
+      );
     }
     
     function hideError() {
@@ -383,27 +473,30 @@
     }
     
     // 检查是否需要安全验证码
-      async function checkSecurityCaptchaRequired() {
-        try {
-          const response = await fetch('/captcha/check-required');
-          if (!response.ok) {
-            const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
-            throw new Error(errorMessage);
-          }
-          const result = await response.json();
-          securityCaptchaRequired = result.required;
-
-          if (result.required) {
-            showSecurityCaptcha();
-          }
-
-          return result.required;
-        } catch (error) {
-          console.error('检查验证码状态失败:', error);
-          securityCaptchaRequired = true;
-          return true;
+    async function checkSecurityCaptchaRequired() {
+      try {
+        const response = await fetch('/captcha/check-required');
+        if (!response.ok) {
+          const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+          throw new Error(errorMessage);
         }
+        const result = await response.json().catch(() => ({}));
+        if (hasMalformedCaptchaRequiredResult(result)) {
+          throw new Error('验证码需求配置返回格式异常');
+        }
+        securityCaptchaRequired = result.required;
+
+        if (result.required) {
+          showSecurityCaptcha();
+        }
+
+        return result.required;
+      } catch (error) {
+        console.error('检查验证码状态失败:', error);
+        securityCaptchaRequired = true;
+        return true;
       }
+    }
     
     // 显示安全验证码
     function showSecurityCaptcha() {
@@ -571,11 +664,6 @@
           const email = document.getElementById('emailForCode').value;
           const verificationCode = document.getElementById('verificationCode').value;
 
-          if (!captchaVerified) {
-            showError('请先验证图形验证码');
-            return;
-          }
-
           if (!email) {
             showError('请输入邮箱地址');
             return;
@@ -602,7 +690,15 @@
           body: JSON.stringify(loginData)
         });
 
-        const result = await response.json();
+        if (!response.ok) {
+          const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+          throw new Error(errorMessage);
+        }
+
+        const result = await response.json().catch(() => ({}));
+        if (hasMalformedLoginResult(result)) {
+          throw new Error('登录响应返回格式异常');
+        }
 
         if (result.success) {
           // 保存token到localStorage
@@ -628,7 +724,7 @@
             window.location.href = '/admin';
           }
         } else {
-          showError(result.message);
+          showError(result.message || '登录失败，请检查账号密码是否正确');
 
           // 登录失败，刷新验证码（仅在验证码启用时）
           if (loginCaptchaEnabled) {
@@ -640,7 +736,7 @@
           }
         }
       } catch (error) {
-        showError('登录失败，请检查网络连接');
+        showError(error.message || '登录失败，请检查网络连接');
       } finally {
         setLoading(false);
       }
@@ -650,21 +746,32 @@
     const token = localStorage.getItem('auth_token');
     if (token) {
       // 验证token是否有效
-      fetch('/verify', {
-        headers: {
-          'Authorization': `Bearer ${token}`
+      (async () => {
+        try {
+          const response = await fetch('/verify', {
+            headers: {
+              'Authorization': `Bearer ${token}`
+            }
+          });
+          if (!response.ok) {
+            const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+            throw new Error(errorMessage);
+          }
+          const result = await response.json().catch(() => ({}));
+          if (hasMalformedVerifyResult(result)) {
+            throw new Error('认证状态返回格式异常');
+          }
+          if (result.authenticated) {
+            window.location.href = '/admin';
+            return;
+          }
+
+          localStorage.removeItem('auth_token');
+          localStorage.removeItem('user_info');
+        } catch (error) {
+          console.warn('验证登录态失败:', error);
         }
-      })
-      .then(response => response.json())
-      .then(result => {
-        if (result.authenticated) {
-          window.location.href = '/admin';
-        }
-      })
-      .catch(() => {
-        // token无效，清除
-        localStorage.removeItem('auth_token');
-      });
+      })();
     }
 
     // 登录方式切换相关变量
@@ -735,7 +842,15 @@
           body: JSON.stringify({ session_id: sessionId })
         });
 
-        const result = await response.json();
+        if (!response.ok) {
+          const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+          throw new Error(errorMessage);
+        }
+
+        const result = await response.json().catch(() => ({}));
+        if (hasMalformedCaptchaGenerationResult(result)) {
+          throw new Error('图形验证码返回格式异常');
+        }
 
         if (result.success) {
           captchaImage.src = result.captcha_image;
@@ -743,11 +858,11 @@
           captchaVerified = false;
           updateSendCodeButton();
         } else {
-          captchaStatus.textContent = '图形验证码加载失败，请刷新页面重试';
+          captchaStatus.textContent = result.message || '图形验证码加载失败，请刷新页面重试';
         }
       } catch (error) {
         console.error('加载图形验证码失败:', error);
-        captchaStatus.textContent = '图形验证码加载失败，请检查网络连接';
+        captchaStatus.textContent = error.message || '图形验证码加载失败，请检查网络连接';
       } finally {
         captchaLoading.style.display = 'none';
         captchaImage.style.display = 'block';
@@ -756,7 +871,14 @@
 
     // 刷新图形验证码
     function refreshCaptcha() {
+      sessionId = generateSessionId();
       loadCaptcha();
+    }
+
+    function invalidateEmailCodeCaptchaState() {
+      captchaVerified = false;
+      sessionId = generateSessionId();
+      updateSendCodeButton();
     }
 
     // 验证图形验证码
@@ -783,13 +905,27 @@
           })
         });
 
-        const result = await response.json();
+        if (!response.ok) {
+          const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+          throw new Error(errorMessage);
+        }
+
+        const result = await response.json().catch(() => ({}));
+        if (hasMalformedSuccessMessageResult(result)) {
+          throw new Error('图形验证码校验返回格式异常');
+        }
 
         if (result.success) {
-          captchaStatus.innerHTML = '<span style="color: green;">✓ 图形验证码验证成功</span>';
+          const successStatus = document.createElement('span');
+          successStatus.style.color = 'green';
+          successStatus.textContent = '✓ 图形验证码验证成功';
+          captchaStatus.replaceChildren(successStatus);
           captchaVerified = true;
         } else {
-          captchaStatus.innerHTML = '<span style="color: red;">✗ 图形验证码错误，请重新输入</span>';
+          const errorStatus = document.createElement('span');
+          errorStatus.style.color = 'red';
+          errorStatus.textContent = `✗ ${result.message || '图形验证码错误，请重新输入'}`;
+          captchaStatus.replaceChildren(errorStatus);
           captchaVerified = false;
           refreshCaptcha(); // 自动刷新验证码
         }
@@ -798,7 +934,10 @@
 
       } catch (error) {
         console.error('验证图形验证码失败:', error);
-        captchaStatus.innerHTML = '<span style="color: red;">验证失败，请检查网络连接</span>';
+        const errorStatus = document.createElement('span');
+        errorStatus.style.color = 'red';
+        errorStatus.textContent = error.message || '验证失败，请检查网络连接';
+        captchaStatus.replaceChildren(errorStatus);
         captchaVerified = false;
         updateSendCodeButton();
       }
@@ -846,9 +985,9 @@
 
         if (countdownSeconds <= 0) {
           clearInterval(countdownTimer);
-          sendCodeBtn.disabled = false;
+          countdownTimer = null;
           sendCodeBtn.textContent = '发送验证码';
-          codeStatus.textContent = '可以重新发送验证码';
+          updateSendCodeButton();
         }
       }, 1000);
     }
@@ -885,16 +1024,30 @@
           })
         });
 
-        const result = await response.json();
+        if (!response.ok) {
+          const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+          throw new Error(errorMessage);
+        }
+
+        const result = await response.json().catch(() => ({}));
+        if (hasMalformedSuccessMessageResult(result)) {
+          throw new Error('邮箱验证码发送返回格式异常');
+        }
 
         if (result.success) {
+          invalidateEmailCodeCaptchaState();
+          refreshCaptcha();
           startCountdown();
         } else {
-          showError(result.message);
+          invalidateEmailCodeCaptchaState();
+          refreshCaptcha();
+          showError(result.message || '发送验证码失败，请稍后重试');
         }
       } catch (error) {
+        invalidateEmailCodeCaptchaState();
+        refreshCaptcha();
         console.error('发送验证码失败:', error);
-        showError('发送验证码失败，请检查网络连接');
+        showError(error.message || '发送验证码失败，请检查网络连接');
       }
     }
 
@@ -906,7 +1059,10 @@
           const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
           throw new Error(errorMessage);
         }
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
+        if (hasMalformedEnabledFlagResult(data)) {
+          throw new Error('注册状态返回格式异常');
+        }
         const registerSection = document.getElementById('registerSection');
         if (registerSection) {
           registerSection.style.display = data.enabled ? 'block' : 'none';
@@ -918,30 +1074,31 @@
     }
 
     // 检查默认登录信息显示状态
-      async function checkLoginInfoStatus() {
-        try {
-          const response = await fetch('/login-info-status');
-          if (!response.ok) {
-            const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+    async function checkLoginInfoStatus() {
+      try {
+        const response = await fetch('/login-info-status');
+        if (!response.ok) {
+          const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
           throw new Error(errorMessage);
         }
-        const result = await response.json();
+        const result = await response.json().catch(() => ({}));
+        if (hasMalformedEnabledFlagResult(result)) {
+          throw new Error('登录信息显示配置返回格式异常');
+        }
 
         const defaultLoginInfo = document.getElementById('defaultLoginInfo');
-        if (result.enabled) {
+        if (defaultLoginInfo) {
+          defaultLoginInfo.style.display = result.enabled ? 'block' : 'none';
+        }
+      } catch (error) {
+        console.error('检查登录信息显示状态失败:', error);
+        // 出错时默认显示
+        const defaultLoginInfo = document.getElementById('defaultLoginInfo');
+        if (defaultLoginInfo) {
           defaultLoginInfo.style.display = 'block';
-        } else {
-          defaultLoginInfo.style.display = 'none';
-          }
-        } catch (error) {
-          console.error('检查登录信息显示状态失败:', error);
-          // 出错时默认显示
-          const defaultLoginInfo = document.getElementById('defaultLoginInfo');
-          if (defaultLoginInfo) {
-            defaultLoginInfo.style.display = 'block';
-          }
         }
       }
+    }
 
     // 事件监听器
     document.addEventListener('DOMContentLoaded', async function() {

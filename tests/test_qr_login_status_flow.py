@@ -232,6 +232,10 @@ class QRLoginStatusFlowTest(unittest.IsolatedAsyncioTestCase):
             "_should_show_verification_browser",
             return_value=False,
         ), mock.patch.object(
+            qr_login,
+            "_get_account_browser_owner_lock",
+            return_value=asyncio.Lock(),
+        ), mock.patch.object(
             qr_login.account_browser_runtime_manager,
             "acquire_runtime",
             acquire_runtime,
@@ -269,6 +273,388 @@ class QRLoginStatusFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("timezone_id", persistent_context_options)
         self.assertNotIn("viewport", persistent_context_options)
         self.assertNotIn("no_viewport", persistent_context_options)
+
+    async def test_launch_verification_browser_context_binds_owner_lock_to_lease_and_release_unlocks(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession(
+            "qr-verification-owner-lock",
+            user_id=1,
+            account_id="owner-lock-account",
+        )
+        browser = mock.Mock()
+        context = types.SimpleNamespace(browser=browser)
+        lease = types.SimpleNamespace(runtime=types.SimpleNamespace(context=context, browser=browser))
+        owner_lock = asyncio.Lock()
+        acquire_runtime = mock.AsyncMock(return_value=lease)
+        release_runtime = mock.AsyncMock(return_value=None)
+
+        with mock.patch.object(
+            manager,
+            "_should_show_verification_browser",
+            return_value=False,
+        ), mock.patch.object(
+            qr_login,
+            "_get_account_browser_owner_lock",
+            return_value=owner_lock,
+        ), mock.patch.object(
+            qr_login.account_browser_runtime_manager,
+            "acquire_runtime",
+            acquire_runtime,
+        ), mock.patch.object(
+            qr_login.account_browser_runtime_manager,
+            "release_runtime",
+            release_runtime,
+        ):
+            returned_lease, returned_browser, returned_context, show_browser = (
+                await manager._launch_verification_browser_context(session)
+            )
+
+            self.assertIs(returned_lease, lease)
+            self.assertIs(returned_browser, browser)
+            self.assertIs(returned_context, context)
+            self.assertFalse(show_browser)
+            self.assertIs(getattr(lease, "_owner_lock", None), owner_lock)
+            self.assertTrue(getattr(lease, "_owner_lock_acquired", False))
+            self.assertTrue(owner_lock.locked())
+
+            await manager._release_verification_runtime_lease(
+                lease,
+                reason="qr_login_owner_lock_release",
+            )
+
+        release_runtime.assert_awaited_once_with(
+            lease,
+            reason="qr_login_owner_lock_release",
+        )
+        self.assertFalse(owner_lock.locked())
+
+    async def test_release_verification_runtime_lease_waits_for_runtime_release_when_cancelled(self):
+        manager = qr_login.QRLoginManager()
+        lease = types.SimpleNamespace()
+        owner_lock = asyncio.Lock()
+        await owner_lock.acquire()
+        manager._bind_runtime_owner_lock(lease, owner_lock, True)
+        release_started = asyncio.Event()
+        release_can_finish = asyncio.Event()
+        release_finished = False
+
+        async def fake_release_runtime(_lease, *, reason):
+            nonlocal release_finished
+            self.assertEqual("unit-test-release-cancel", reason)
+            release_started.set()
+            await release_can_finish.wait()
+            release_finished = True
+
+        with mock.patch.object(
+            qr_login.account_browser_runtime_manager,
+            "release_runtime",
+            new=mock.AsyncMock(side_effect=fake_release_runtime),
+        ):
+            task = asyncio.create_task(
+                manager._release_verification_runtime_lease(
+                    lease,
+                    reason="unit-test-release-cancel",
+                )
+            )
+            await release_started.wait()
+
+            task.cancel()
+            await asyncio.sleep(0)
+
+            self.assertFalse(task.done())
+            self.assertTrue(owner_lock.locked())
+
+            release_can_finish.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertTrue(release_finished)
+        self.assertFalse(owner_lock.locked())
+
+    async def test_launch_verification_browser_context_releases_runtime_when_attach_metadata_access_raises(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession(
+            "qr-verification-attach-fail",
+            user_id=1,
+            account_id="attach-fail-account",
+        )
+
+        class _ExplodingRuntime:
+            @property
+            def context(self):
+                raise RuntimeError("verification runtime context accessor exploded")
+
+        lease = types.SimpleNamespace(runtime=_ExplodingRuntime())
+        owner_lock = asyncio.Lock()
+        acquire_runtime = mock.AsyncMock(return_value=lease)
+        release_runtime = mock.AsyncMock(return_value=None)
+
+        with mock.patch.object(
+            manager,
+            "_should_show_verification_browser",
+            return_value=False,
+        ), mock.patch.object(
+            qr_login,
+            "_get_account_browser_owner_lock",
+            return_value=owner_lock,
+        ), mock.patch.object(
+            qr_login.account_browser_runtime_manager,
+            "acquire_runtime",
+            acquire_runtime,
+        ), mock.patch.object(
+            qr_login.account_browser_runtime_manager,
+            "release_runtime",
+            release_runtime,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "verification runtime context accessor exploded"):
+                await manager._launch_verification_browser_context(session)
+
+        release_runtime.assert_awaited_once_with(
+            lease,
+            reason="verification_context_attach_failed",
+        )
+        self.assertFalse(owner_lock.locked())
+
+    async def test_launch_verification_browser_context_releases_owner_lock_when_runtime_acquire_is_cancelled(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession(
+            "qr-verification-acquire-cancel",
+            user_id=1,
+            account_id="acquire-cancel-account",
+        )
+        owner_lock = asyncio.Lock()
+        acquire_runtime = mock.AsyncMock(side_effect=asyncio.CancelledError())
+        release_runtime = mock.AsyncMock()
+
+        with mock.patch.object(
+            manager,
+            "_should_show_verification_browser",
+            return_value=False,
+        ), mock.patch.object(
+            qr_login,
+            "_get_account_browser_owner_lock",
+            return_value=owner_lock,
+        ), mock.patch.object(
+            qr_login.account_browser_runtime_manager,
+            "acquire_runtime",
+            acquire_runtime,
+        ), mock.patch.object(
+            qr_login.account_browser_runtime_manager,
+            "release_runtime",
+            release_runtime,
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await manager._launch_verification_browser_context(session)
+
+        acquire_runtime.assert_awaited_once()
+        release_runtime.assert_not_awaited()
+        self.assertFalse(owner_lock.locked())
+
+    async def test_launch_verification_browser_context_releases_missing_context_runtime_once(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession(
+            "qr-verification-missing-context",
+            user_id=1,
+            account_id="missing-context-account",
+        )
+        lease = types.SimpleNamespace(runtime=types.SimpleNamespace(context=None, browser=mock.Mock()))
+        owner_lock = asyncio.Lock()
+        acquire_runtime = mock.AsyncMock(return_value=lease)
+        release_runtime = mock.AsyncMock(return_value=None)
+
+        with mock.patch.object(
+            manager,
+            "_should_show_verification_browser",
+            return_value=False,
+        ), mock.patch.object(
+            qr_login,
+            "_get_account_browser_owner_lock",
+            return_value=owner_lock,
+        ), mock.patch.object(
+            qr_login.account_browser_runtime_manager,
+            "acquire_runtime",
+            acquire_runtime,
+        ), mock.patch.object(
+            qr_login.account_browser_runtime_manager,
+            "release_runtime",
+            release_runtime,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "runtime 缺少 context"):
+                await manager._launch_verification_browser_context(session)
+
+        release_runtime.assert_awaited_once_with(
+            lease,
+            reason="verification_context_missing",
+        )
+        self.assertFalse(owner_lock.locked())
+
+    async def test_launch_verification_browser_context_preserves_missing_context_error_when_release_fails(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession(
+            "qr-verification-missing-context-release-fail",
+            user_id=1,
+            account_id="missing-context-release-fail-account",
+        )
+        lease = types.SimpleNamespace(runtime=types.SimpleNamespace(context=None, browser=mock.Mock()))
+        owner_lock = asyncio.Lock()
+        acquire_runtime = mock.AsyncMock(return_value=lease)
+        release_runtime = mock.AsyncMock(side_effect=RuntimeError("release exploded"))
+
+        with mock.patch.object(
+            manager,
+            "_should_show_verification_browser",
+            return_value=False,
+        ), mock.patch.object(
+            qr_login,
+            "_get_account_browser_owner_lock",
+            return_value=owner_lock,
+        ), mock.patch.object(
+            qr_login.account_browser_runtime_manager,
+            "acquire_runtime",
+            acquire_runtime,
+        ), mock.patch.object(
+            qr_login.account_browser_runtime_manager,
+            "release_runtime",
+            release_runtime,
+        ), mock.patch.object(qr_login, "logger") as mock_logger:
+            with self.assertRaisesRegex(RuntimeError, "runtime 缺少 context"):
+                await manager._launch_verification_browser_context(session)
+
+        release_runtime.assert_awaited_once_with(
+            lease,
+            reason="verification_context_missing",
+        )
+        self.assertFalse(owner_lock.locked())
+        mock_logger.warning.assert_called()
+
+    async def test_generate_qr_code_masks_unexpected_internal_errors(self):
+        manager = qr_login.QRLoginManager()
+
+        with mock.patch.object(
+            manager,
+            "_resolve_existing_account_proxy_config",
+            side_effect=RuntimeError("qr manager internal detail exploded"),
+        ):
+            result = await manager.generate_qr_code(
+                account_id="qr_mask_error_account",
+                user_id=1,
+            )
+
+        self.assertEqual(
+            {"success": False, "message": "生成二维码失败，请稍后重试"},
+            result,
+        )
+
+    async def test_generate_qr_code_uses_provided_client_session_id(self):
+        manager = qr_login.QRLoginManager()
+
+        class _FakeGenerateResponse:
+            text = '{"content":{"success":true}}'
+
+            def json(self):
+                return {
+                    "content": {
+                        "success": True,
+                        "data": {
+                            "t": "qr-t",
+                            "ck": "qr-ck",
+                            "codeContent": "https://example.invalid/qr",
+                        },
+                    },
+                }
+
+        class _FakeAsyncClient:
+            def __init__(self, *args, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, *args, **kwargs):
+                return _FakeGenerateResponse()
+
+        class _FakeQrImage:
+            def save(self, buffer, format=None):
+                buffer.write(b"fake-png")
+
+        class _FakeQRCode:
+            def __init__(self, *args, **kwargs):
+                self.data = []
+
+            def add_data(self, data):
+                self.data.append(data)
+
+            def make(self):
+                return None
+
+            def make_image(self):
+                return _FakeQrImage()
+
+        def fake_create_task(coro):
+            coro.close()
+            return mock.Mock()
+
+        with mock.patch.object(manager, "_resolve_existing_account_proxy_config"), \
+             mock.patch.object(manager, "_get_mh5tk", new=mock.AsyncMock()), \
+             mock.patch.object(manager, "_get_login_params", new=mock.AsyncMock(return_value={"login": "params"})), \
+             mock.patch.object(qr_login.httpx, "AsyncClient", _FakeAsyncClient), \
+             mock.patch.object(qr_login.qrcode, "QRCode", _FakeQRCode), \
+             mock.patch.object(qr_login.asyncio, "create_task", side_effect=fake_create_task):
+            result = await manager.generate_qr_code(
+                account_id="qr_client_session_account",
+                user_id=7,
+                session_id="qr-client-session-1",
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual("qr-client-session-1", result["session_id"])
+        self.assertIn("qr-client-session-1", manager.sessions)
+        self.assertEqual(
+            "qr-client-session-1",
+            manager.sessions["qr-client-session-1"].session_id,
+        )
+
+    async def test_launch_verification_browser_context_times_out_when_owner_lock_is_busy(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession(
+            "qr-verification-owner-lock-busy",
+            user_id=1,
+            account_id="owner-lock-busy-account",
+        )
+        owner_lock = asyncio.Lock()
+        await owner_lock.acquire()
+        acquire_runtime = mock.AsyncMock()
+        original_wait_for = asyncio.wait_for
+
+        async def short_wait_for(awaitable, timeout=None):
+            return await original_wait_for(awaitable, timeout=0.01)
+
+        with mock.patch.object(
+            manager,
+            "_should_show_verification_browser",
+            return_value=False,
+        ), mock.patch.object(
+            qr_login,
+            "_get_account_browser_owner_lock",
+            return_value=owner_lock,
+        ), mock.patch.object(
+            qr_login.asyncio,
+            "wait_for",
+            new=short_wait_for,
+        ), mock.patch.object(
+            qr_login.account_browser_runtime_manager,
+            "acquire_runtime",
+            acquire_runtime,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "当前有其他浏览器任务正在执行"):
+                await manager._launch_verification_browser_context(session)
+
+        acquire_runtime.assert_not_awaited()
+        self.assertTrue(owner_lock.locked())
+        owner_lock.release()
 
     async def test_monitor_qr_status_requires_complete_cookies_before_api_success(self):
         manager = qr_login.QRLoginManager()
@@ -321,7 +707,7 @@ class QRLoginStatusFlowTest(unittest.IsolatedAsyncioTestCase):
             await manager._launch_verification_page(session.session_id)
 
         self.assertEqual(session.status, "failed")
-        self.assertIn("verification browser exploded", session.error_message)
+        self.assertEqual("打开验证页面失败，请稍后重试", session.error_message)
 
     async def test_launch_verification_page_releases_runtime_lease_when_navigation_fails(self):
         manager = qr_login.QRLoginManager()
@@ -351,6 +737,10 @@ class QRLoginStatusFlowTest(unittest.IsolatedAsyncioTestCase):
             "_get_or_create_context_page",
             new=mock.AsyncMock(return_value=page),
         ), mock.patch.object(
+            qr_login,
+            "_get_account_browser_owner_lock",
+            return_value=asyncio.Lock(),
+        ), mock.patch.object(
             qr_login.account_browser_runtime_manager,
             "release_runtime",
             release_runtime,
@@ -358,7 +748,7 @@ class QRLoginStatusFlowTest(unittest.IsolatedAsyncioTestCase):
             await manager._launch_verification_page(session.session_id)
 
         self.assertEqual(session.status, "failed")
-        self.assertIn("verification navigation exploded", session.error_message)
+        self.assertEqual("打开验证页面失败，请稍后重试", session.error_message)
         release_runtime.assert_awaited_once_with(
             runtime_lease,
             reason="qr_login_verification_page_closed",
@@ -366,6 +756,32 @@ class QRLoginStatusFlowTest(unittest.IsolatedAsyncioTestCase):
         page.close.assert_not_awaited()
         context.close.assert_not_awaited()
         browser.close.assert_not_awaited()
+
+    async def test_monitor_qr_status_masks_unexpected_internal_errors_in_failed_session_status(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession(
+            "qr-monitor-mask-error-session",
+            user_id=9,
+            account_id="qr-monitor-mask-account",
+        )
+        manager.sessions[session.session_id] = session
+
+        with mock.patch.object(
+            manager,
+            "_poll_qrcode_status",
+            new=mock.AsyncMock(side_effect=RuntimeError("qr monitor internal exploded")),
+        ), mock.patch.object(
+            qr_login.asyncio,
+            "sleep",
+            new=mock.AsyncMock(side_effect=RuntimeError("monitor outer loop exploded")),
+        ):
+            await manager._monitor_qr_status(session.session_id)
+
+        result = manager.get_session_status(session.session_id)
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("monitor_failed", result["phase"])
+        self.assertEqual("扫码状态检查失败，请稍后重试", result["message"])
+        self.assertEqual("扫码状态检查失败，请稍后重试", result["error"])
 
     async def test_launch_verification_page_releases_runtime_lease_when_cancelled(self):
         manager = qr_login.QRLoginManager()
@@ -398,6 +814,10 @@ class QRLoginStatusFlowTest(unittest.IsolatedAsyncioTestCase):
             manager,
             "_probe_browser_login_success",
             new=mock.AsyncMock(side_effect=asyncio.CancelledError()),
+        ), mock.patch.object(
+            qr_login,
+            "_get_account_browser_owner_lock",
+            return_value=asyncio.Lock(),
         ), mock.patch.object(
             qr_login.account_browser_runtime_manager,
             "release_runtime",
@@ -467,6 +887,135 @@ class QRLoginStatusFlowTest(unittest.IsolatedAsyncioTestCase):
         release_runtime.assert_not_awaited()
         page.close.assert_awaited_once_with()
 
+    async def test_launch_verification_page_waits_for_direct_page_close_when_cancelled_again(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession("qr-verification-direct-close-cancel")
+        session.status = "verification_required"
+        session.verification_url = "https://passport.goofish.com/iv/test"
+        manager.sessions[session.session_id] = session
+        close_started = asyncio.Event()
+        close_can_finish = asyncio.Event()
+
+        class BlockingVerificationPage:
+            url = "https://passport.goofish.com/iv/test"
+
+            async def goto(self, *_args, **_kwargs):
+                return None
+
+            async def wait_for_timeout(self, *_args, **_kwargs):
+                return None
+
+            async def screenshot(self, *_args, **_kwargs):
+                return b"image"
+
+            async def close(self):
+                close_started.set()
+                await close_can_finish.wait()
+                self.closed = True
+
+        page = BlockingVerificationPage()
+        page.closed = False
+        browser = mock.Mock(close=mock.AsyncMock())
+        context = mock.Mock(add_cookies=mock.AsyncMock(), close=mock.AsyncMock())
+
+        with mock.patch.object(
+            manager,
+            "_launch_verification_browser_context",
+            new=mock.AsyncMock(return_value=(None, browser, context, False)),
+        ), mock.patch.object(
+            manager,
+            "_get_or_create_context_page",
+            new=mock.AsyncMock(return_value=page),
+        ), mock.patch.object(
+            manager,
+            "_probe_browser_login_success",
+            new=mock.AsyncMock(side_effect=asyncio.CancelledError()),
+        ), mock.patch.object(
+            qr_login.image_manager,
+            "save_image",
+            return_value="verification.png",
+        ):
+            task = asyncio.create_task(manager._launch_verification_page(session.session_id))
+            await close_started.wait()
+
+            task.cancel()
+            await asyncio.sleep(0)
+
+            self.assertFalse(task.done())
+
+            close_can_finish.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertTrue(page.closed)
+        context.close.assert_awaited_once_with()
+        browser.close.assert_awaited_once_with()
+        self.assertIsNone(session.verification_task)
+
+    async def test_probe_browser_login_success_waits_for_probe_page_close_when_cancelled(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession("qr-probe-close-cancel-session")
+        current_page = types.SimpleNamespace(url="https://passport.goofish.com/iv/test")
+        context = types.SimpleNamespace(
+            cookies=mock.AsyncMock(return_value=[]),
+            pages=[],
+            browser=mock.Mock(),
+        )
+        probe_context = types.SimpleNamespace(cookies=mock.AsyncMock(return_value=[]))
+        close_started = asyncio.Event()
+        close_can_finish = asyncio.Event()
+
+        class BlockingProbePage:
+            url = "https://www.goofish.com/not-logged-in"
+
+            async def goto(self, *_args, **_kwargs):
+                return None
+
+            async def wait_for_timeout(self, *_args, **_kwargs):
+                return None
+
+            async def query_selector(self, *_args, **_kwargs):
+                return None
+
+            async def close(self):
+                close_started.set()
+                await close_can_finish.wait()
+                self.closed = True
+
+        probe_page = BlockingProbePage()
+        probe_page.closed = False
+        runtime_lease = types.SimpleNamespace(pages=[probe_page])
+
+        with mock.patch.object(manager, "_has_completed_login_cookies", return_value=True), \
+             mock.patch.object(manager, "_is_logged_in_url", return_value=False), \
+             mock.patch.object(
+                 qr_login.account_browser_runtime_manager,
+                 "get_fresh_page",
+                 new=mock.AsyncMock(return_value=(probe_page, probe_context)),
+             ):
+            task = asyncio.create_task(
+                manager._probe_browser_login_success(
+                    session,
+                    current_page,
+                    context,
+                    managed_runtime_lease=runtime_lease,
+                )
+            )
+            await close_started.wait()
+
+            task.cancel()
+            await asyncio.sleep(0)
+
+            self.assertFalse(task.done())
+            self.assertIn(probe_page, runtime_lease.pages)
+
+            close_can_finish.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertTrue(probe_page.closed)
+        self.assertNotIn(probe_page, runtime_lease.pages)
+
     def test_get_session_status_exposes_phase_verification_type_and_handoff_state(self):
         manager = qr_login.QRLoginManager()
         session = qr_login.QRLoginSession("qr-session-status-fields")
@@ -488,6 +1037,23 @@ class QRLoginStatusFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(result["verification_type"], {"face_verify", "人脸验证"})
         self.assertEqual(result["handoff_status"], "pending")
         self.assertEqual(result["screenshot_path"], "face_verify.png")
+
+    def test_get_session_status_keeps_active_verification_session_after_qr_ttl(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession("qr-session-active-verification-expired-ttl")
+        session.status = "verification_required"
+        session.phase = "awaiting_verification"
+        session.verification_url = "https://passport.goofish.com/iv/test"
+        session.browser_alive = True
+        session.created_time -= session.expire_time + 1
+        manager.sessions[session.session_id] = session
+
+        result = manager.get_session_status(session.session_id)
+
+        self.assertEqual(result["status"], "verification_required")
+        self.assertEqual(result["phase"], "awaiting_verification")
+        self.assertTrue(result["browser_alive"])
+        self.assertEqual(session.status, "verification_required")
 
     def test_qr_login_session_to_dict_includes_user_and_account_identity(self):
         session = qr_login.QRLoginSession(
@@ -525,6 +1091,204 @@ class QRLoginStatusFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.handoff_status, "failed")
         self.assertEqual(session.handoff_error, "cookie not ready yet")
         self.assertIsNone(session.error_message)
+
+    def test_cleanup_expired_sessions_keeps_success_session_until_handoff_completes(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession(
+            "qr-session-success-pending-handoff",
+            user_id=5,
+            account_id="qr_account_pending_handoff",
+        )
+        session.status = "success"
+        session.handoff_status = "processing"
+        session.created_time -= session.expire_time + 1
+        manager.sessions[session.session_id] = session
+
+        with mock.patch.object(manager, "_cleanup_pending_account_placeholder") as cleanup_placeholder, \
+             mock.patch.object(manager, "_cleanup_session_assets") as cleanup_assets:
+            manager.cleanup_expired_sessions()
+
+        self.assertIn(session.session_id, manager.sessions)
+        cleanup_placeholder.assert_not_called()
+        cleanup_assets.assert_not_called()
+
+    def test_cleanup_expired_sessions_keeps_active_verification_session(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession(
+            "qr-session-active-verification-cleanup",
+            user_id=8,
+            account_id="qr_account_active_verification",
+        )
+        session.status = "verification_required"
+        session.phase = "awaiting_verification"
+        session.verification_url = "https://passport.goofish.com/iv/test"
+        session.browser_alive = True
+        session.created_time -= session.expire_time + 1
+        manager.sessions[session.session_id] = session
+
+        with mock.patch.object(manager, "_cleanup_pending_account_placeholder") as cleanup_placeholder, \
+             mock.patch.object(manager, "_cleanup_session_assets") as cleanup_assets:
+            manager.cleanup_expired_sessions()
+
+        self.assertIn(session.session_id, manager.sessions)
+        cleanup_placeholder.assert_not_called()
+        cleanup_assets.assert_not_called()
+
+    def test_cleanup_expired_sessions_removes_success_session_after_failed_handoff(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession(
+            "qr-session-success-failed-handoff",
+            user_id=6,
+            account_id="qr_account_failed_handoff",
+        )
+        session.status = "success"
+        session.handoff_status = "failed"
+        session.handoff_error = "cookie handoff failed"
+        session.created_time -= session.expire_time + 1
+        manager.sessions[session.session_id] = session
+
+        with mock.patch.object(manager, "_cleanup_pending_account_placeholder") as cleanup_placeholder, \
+             mock.patch.object(manager, "_cleanup_session_assets") as cleanup_assets:
+            manager.cleanup_expired_sessions()
+
+        self.assertNotIn(session.session_id, manager.sessions)
+        cleanup_placeholder.assert_called_once_with(
+            session,
+            reason='qr_login_session_expired_cleanup',
+        )
+        cleanup_assets.assert_called_once_with(
+            session,
+            reason='qr_login_session_expired_cleanup',
+        )
+
+    async def test_cleanup_session_assets_cancels_monitor_task(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession("qr-monitor-cleanup-session")
+        monitor_task = mock.Mock()
+        monitor_task.done.return_value = False
+        session.monitor_task = monitor_task
+
+        with mock.patch.object(manager, "_close_managed_browser_handles", new=mock.AsyncMock()):
+            manager._cleanup_session_assets(session, reason="unit-test-cleanup-monitor")
+
+        monitor_task.cancel.assert_called_once_with()
+        self.assertIsNone(session.monitor_task)
+
+    async def test_cleanup_session_assets_tracks_asset_cleanup_task_until_release_finishes(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession("qr-asset-cleanup-track-session")
+        session.managed_runtime_lease = object()
+
+        release_gate = asyncio.Event()
+
+        async def fake_release(_lease, *, reason):
+            await release_gate.wait()
+
+        with mock.patch.object(
+            manager,
+            "_release_verification_runtime_lease",
+            new=mock.AsyncMock(side_effect=fake_release),
+        ):
+            manager._cleanup_session_assets(session, reason="unit-test-track-cleanup")
+            cleanup_task = session.asset_cleanup_task
+            self.assertIsInstance(cleanup_task, asyncio.Task)
+            self.assertFalse(cleanup_task.done())
+
+            release_gate.set()
+            await cleanup_task
+
+        self.assertIsNone(session.asset_cleanup_task)
+
+    async def test_cleanup_session_assets_reuses_existing_asset_cleanup_task(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession("qr-asset-cleanup-reuse-session")
+        session.managed_runtime_lease = object()
+
+        release_gate = asyncio.Event()
+
+        async def fake_release(_lease, *, reason):
+            await release_gate.wait()
+
+        release_mock = mock.AsyncMock(side_effect=fake_release)
+
+        with mock.patch.object(
+            manager,
+            "_release_verification_runtime_lease",
+            new=release_mock,
+        ):
+            manager._cleanup_session_assets(session, reason="unit-test-reuse-cleanup")
+            cleanup_task = session.asset_cleanup_task
+            self.assertIsInstance(cleanup_task, asyncio.Task)
+            await asyncio.sleep(0)
+
+            manager._cleanup_session_assets(session, reason="unit-test-reuse-cleanup-again")
+
+            self.assertIs(session.asset_cleanup_task, cleanup_task)
+            self.assertEqual(1, release_mock.await_count)
+
+            release_gate.set()
+            await cleanup_task
+
+        self.assertIsNone(session.asset_cleanup_task)
+
+    async def test_cleanup_session_assets_waits_for_direct_page_close_when_cleanup_task_cancelled(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession("qr-direct-cleanup-cancel-session")
+        close_started = asyncio.Event()
+        close_can_finish = asyncio.Event()
+
+        class BlockingManagedPage:
+            async def close(self):
+                close_started.set()
+                await close_can_finish.wait()
+                self.closed = True
+
+        page = BlockingManagedPage()
+        page.closed = False
+        session.managed_page = page
+
+        manager._cleanup_session_assets(session, reason="unit-test-direct-cleanup-cancel")
+        cleanup_task = session.asset_cleanup_task
+        self.assertIsInstance(cleanup_task, asyncio.Task)
+        await close_started.wait()
+
+        cleanup_task.cancel()
+        await asyncio.sleep(0)
+
+        self.assertFalse(cleanup_task.done())
+
+        close_can_finish.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await cleanup_task
+
+        self.assertTrue(page.closed)
+        self.assertIsNone(session.asset_cleanup_task)
+
+    async def test_monitor_qr_status_clears_session_monitor_task_reference_when_finished(self):
+        manager = qr_login.QRLoginManager()
+        session = qr_login.QRLoginSession("qr-monitor-finished-session")
+        session.params = {"t": "1"}
+        manager.sessions[session.session_id] = session
+
+        response = mock.Mock()
+        response.json.return_value = {
+            "content": {
+                "data": {
+                    "qrCodeStatus": "EXPIRED",
+                    "iframeRedirect": False,
+                }
+            }
+        }
+        response.cookies = {}
+
+        session.monitor_task = asyncio.create_task(manager._monitor_qr_status(session.session_id))
+
+        with mock.patch.object(manager, "_poll_qrcode_status", new=mock.AsyncMock(return_value=response)), \
+             mock.patch.object(qr_login.asyncio, "sleep", new=mock.AsyncMock()):
+            await session.monitor_task
+
+        self.assertIsNone(session.monitor_task)
+        self.assertEqual("expired", session.status)
 
 
 class ReplyServerQrLoginStatusFlowTest(unittest.TestCase):
@@ -765,6 +1529,140 @@ class ReplyServerQrLoginStatusFlowTest(unittest.TestCase):
             [(session_id, "qr_login_handoff_completed")],
         )
 
+    def test_check_qr_code_status_keeps_handoff_success_when_cookie_processing_returns_masked_runtime_switch_warning(self):
+        session_id = "qr-session-handoff-masked-runtime-warning"
+        warning_message = "真实Cookie已获取，但切换账号任务失败，请稍后重试或手动启动账号任务"
+        process_mock = mock.AsyncMock(return_value={
+            "account_id": "qr_account",
+            "task_restarted": False,
+            "real_cookie_refreshed": True,
+            "warning_message": warning_message,
+        })
+
+        class _FakeQRManager:
+            def __init__(self):
+                self.handoff_updates = []
+                self.release_calls = []
+
+            def cleanup_expired_sessions(self):
+                return None
+
+            def get_session_status(self, current_session_id):
+                return {
+                    "status": "success",
+                    "session_id": current_session_id,
+                    "user_id": 1,
+                    "account_id": "qr_account",
+                    "phase": "browser_cookie_ready",
+                    "handoff_status": "pending",
+                }
+
+            def get_session_cookies(self, _session_id):
+                return {
+                    "account_id": "qr_account",
+                    "cookies": "unb=test_user; cookie2=test_cookie2",
+                    "unb": "test_user",
+                }
+
+            def update_session_handoff_status(self, current_session_id, status, **kwargs):
+                self.handoff_updates.append((current_session_id, status, kwargs))
+
+            def release_session_assets(self, current_session_id, *, reason):
+                self.release_calls.append((current_session_id, reason))
+
+        fake_manager = _FakeQRManager()
+        reply_server.qr_login_manager = fake_manager
+
+        async def invoke():
+            result = await reply_server.check_qr_code_status(
+                session_id,
+                current_user={"user_id": 1, "username": "admin"},
+            )
+            await asyncio.sleep(0)
+            return result
+
+        with mock.patch.object(reply_server, "cleanup_qr_check_records"), \
+             mock.patch.object(reply_server, "process_qr_login_cookies", process_mock), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual(fake_manager.handoff_updates[-1][1], "success")
+        self.assertEqual(
+            fake_manager.handoff_updates[-1][2]["account_info"]["warning_message"],
+            warning_message,
+        )
+        self.assertEqual(
+            reply_server.qr_check_processed[session_id]["account_info"]["warning_message"],
+            warning_message,
+        )
+
+    def test_check_qr_code_status_returns_failed_payload_when_handoff_background_task_cannot_be_scheduled(self):
+        session_id = "qr-session-handoff-schedule-failed"
+
+        class _FakeQRManager:
+            def __init__(self):
+                self.handoff_updates = []
+                self.release_calls = []
+
+            def cleanup_expired_sessions(self):
+                return None
+
+            def get_session_status(self, current_session_id):
+                return {
+                    "status": "success",
+                    "session_id": current_session_id,
+                    "user_id": 1,
+                    "account_id": "qr_account",
+                    "phase": "browser_cookie_ready",
+                    "handoff_status": "pending",
+                }
+
+            def get_session_cookies(self, _session_id):
+                return {
+                    "account_id": "qr_account",
+                    "cookies": "unb=test_user; cookie2=test_cookie2",
+                    "unb": "test_user",
+                }
+
+            def update_session_handoff_status(self, current_session_id, status, **kwargs):
+                self.handoff_updates.append((current_session_id, status, kwargs))
+
+            def release_session_assets(self, current_session_id, *, reason):
+                self.release_calls.append((current_session_id, reason))
+
+        fake_manager = _FakeQRManager()
+        reply_server.qr_login_manager = fake_manager
+
+        async def invoke():
+            return await reply_server.check_qr_code_status(
+                session_id,
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        with mock.patch.object(reply_server, "cleanup_qr_check_records"), \
+             mock.patch.object(reply_server.asyncio, "create_task", side_effect=RuntimeError("event loop is closing")), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["handoff_status"], "failed")
+        self.assertIn("启动扫码登录Cookie处理任务失败", result["message"])
+        self.assertNotIn("event loop is closing", result["message"])
+        self.assertEqual(fake_manager.handoff_updates, [
+            (session_id, "processing", {}),
+            (session_id, "failed", {"error": result["message"]}),
+        ])
+        self.assertTrue(reply_server.qr_check_processed[session_id]["processed"])
+        self.assertFalse(reply_server.qr_check_processed[session_id]["processing"])
+        self.assertEqual(reply_server.qr_check_processed[session_id]["user_id"], 1)
+        self.assertEqual(reply_server.qr_check_processed[session_id]["account_id"], "qr_account")
+        self.assertEqual(reply_server.qr_check_processed[session_id]["error"], result["message"])
+        self.assertEqual(
+            fake_manager.release_calls,
+            [(session_id, "qr_login_handoff_schedule_failed")],
+        )
+
     def test_check_qr_code_status_processing_response_clears_stale_handoff_error(self):
         session_id = "qr-session-processing-clears-stale-error"
         process_mock = mock.AsyncMock(return_value={"account_id": "qr_account"})
@@ -863,6 +1761,45 @@ class ReplyServerQrLoginStatusFlowTest(unittest.TestCase):
         self.assertEqual(result["phase"], "handoff_completed")
         self.assertEqual(result["handoff_status"], "success")
         self.assertIsNone(result["handoff_error"])
+        self.assertEqual(result["account_info"]["account_id"], "qr_account")
+        self.assertTrue(result["already_processed"])
+
+    def test_check_qr_code_status_processed_success_survives_session_cleanup(self):
+        session_id = "qr-session-processed-success-without-session"
+        reply_server.qr_check_processed[session_id] = {
+            "processed": True,
+            "processing": False,
+            "timestamp": 0,
+            "user_id": 1,
+            "account_id": "qr_account",
+            "account_info": {"account_id": "qr_account"},
+        }
+
+        class _FakeQRManager:
+            def cleanup_expired_sessions(self):
+                return None
+
+            def get_session_status(self, current_session_id):
+                return {
+                    "status": "not_found",
+                    "session_id": current_session_id,
+                }
+
+        reply_server.qr_login_manager = _FakeQRManager()
+
+        async def invoke():
+            return await reply_server.check_qr_code_status(
+                session_id,
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        with mock.patch.object(reply_server, "cleanup_qr_check_records"), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["phase"], "handoff_completed")
+        self.assertEqual(result["handoff_status"], "success")
         self.assertEqual(result["account_info"]["account_id"], "qr_account")
         self.assertTrue(result["already_processed"])
 
@@ -1196,6 +2133,103 @@ class ReplyServerQrLoginStatusFlowTest(unittest.TestCase):
             user_id=1,
         )
 
+    def test_generate_qr_code_passes_client_session_id_to_manager(self):
+        fake_db = mock.Mock()
+        fake_db.get_cookie_binding_info.return_value = None
+        fake_db.assert_cookie_belongs_to_user = mock.Mock()
+        fake_db.create_cookie_account_placeholder.return_value = True
+        fake_manager = mock.Mock()
+        fake_manager.invalidate_account_sessions.return_value = []
+        fake_manager.generate_qr_code = mock.AsyncMock(return_value={
+            "success": True,
+            "session_id": "qr-client-route-session",
+            "qr_code_url": "data:image/png;base64,unit",
+        })
+
+        async def invoke():
+            return await reply_server.generate_qr_code(
+                {
+                    "account_id": "qr_account_route_session",
+                    "session_id": "qr-client-route-session",
+                },
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(reply_server, "qr_login_manager", fake_manager), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertTrue(result["success"])
+        fake_manager.generate_qr_code.assert_awaited_once_with(
+            account_id="qr_account_route_session",
+            user_id=1,
+            session_id="qr-client-route-session",
+        )
+
+    def test_pre_cancelled_qr_client_session_id_does_not_start_qr_generation(self):
+        fake_db = mock.Mock()
+        fake_db.get_cookie_binding_info.return_value = None
+        fake_db.create_cookie_account_placeholder.return_value = True
+        fake_manager = mock.Mock()
+        fake_manager.sessions = {}
+        fake_manager.cleanup_expired_sessions = mock.Mock()
+        fake_manager.invalidate_account_sessions = mock.Mock(return_value=[])
+        fake_manager.generate_qr_code = mock.AsyncMock(return_value={
+            "success": True,
+            "session_id": "qr-client-cancel-1",
+            "qr_code_url": "data:image/png;base64,unit",
+        })
+        original_prestart_cancellations = dict(
+            getattr(reply_server, "account_verification_prestart_cancellations", {})
+        )
+        if hasattr(reply_server, "account_verification_prestart_cancellations"):
+            reply_server.account_verification_prestart_cancellations.clear()
+
+        def restore_prestart_cancellations():
+            if hasattr(reply_server, "account_verification_prestart_cancellations"):
+                reply_server.account_verification_prestart_cancellations.clear()
+                reply_server.account_verification_prestart_cancellations.update(
+                    original_prestart_cancellations
+                )
+
+        self.addCleanup(restore_prestart_cancellations)
+
+        async def invoke():
+            cancel_result = await reply_server.cancel_qr_login_session(
+                "qr-client-cancel-1",
+                current_user={"user_id": 7, "username": "tester"},
+            )
+            start_result = await reply_server.generate_qr_code(
+                reply_server.QRLoginGenerateRequest(
+                    account_id="qr_client_cancel_account",
+                    session_id="qr-client-cancel-1",
+                ),
+                current_user={"user_id": 7, "username": "tester"},
+            )
+            return cancel_result, start_result
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(reply_server, "qr_login_manager", fake_manager), \
+             mock.patch.object(reply_server, "log_with_user"):
+            cancel_result, start_result = asyncio.run(invoke())
+
+        self.assertEqual("not_found", cancel_result["status"])
+        self.assertEqual(
+            {
+                "success": False,
+                "status": "cancelled",
+                "session_id": "qr-client-cancel-1",
+                "message": "扫码登录会话已取消",
+            },
+            start_result,
+        )
+        fake_manager.cleanup_expired_sessions.assert_not_called()
+        fake_manager.invalidate_account_sessions.assert_not_called()
+        fake_manager.generate_qr_code.assert_not_called()
+        fake_db.get_cookie_binding_info.assert_not_called()
+        fake_db.create_cookie_account_placeholder.assert_not_called()
+
 
     def test_generate_qr_code_validates_existing_account_owner(self):
         fake_db = mock.Mock()
@@ -1445,6 +2479,41 @@ class ReplyServerQrLoginStatusFlowTest(unittest.TestCase):
         self.assertIs(refresh_kwargs["managed_runtime_lease"], managed_runtime_lease)
         self.assertNotIn("cookie_id", refresh_kwargs)
 
+    def test_refresh_cookies_from_qr_login_masks_unexpected_errors_in_risk_log(self):
+        class _FakeLive:
+            def __init__(self, *args, **kwargs):
+                self.refresh_cookies_from_qr_login = mock.AsyncMock(
+                    side_effect=RuntimeError("manual qr refresh internal exploded")
+                )
+                self.close_session = mock.AsyncMock()
+
+        async def invoke():
+            return await reply_server.refresh_cookies_from_qr_login(
+                {
+                    "qr_cookies": "unb=test_user; cookie2=qr_cookie",
+                    "account_id": "qr_account",
+                },
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        fake_db = mock.Mock()
+        fake_db.add_risk_control_log.return_value = 123
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="qr_account"), \
+             mock.patch.object(reply_server, "_get_user_cookies_map", return_value={"qr_account": "old"}), \
+             mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch("XianyuAutoAsync.XianyuLive", _FakeLive), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertFalse(result["success"])
+        self.assertEqual("刷新Cookie失败，请稍后重试", result["message"])
+        fake_db.update_risk_control_log.assert_called_once()
+        self.assertEqual(
+            "扫码刷新Cookie失败，请稍后重试",
+            fake_db.update_risk_control_log.call_args.kwargs["error_message"],
+        )
+
     def test_process_qr_login_cookies_rejects_default_account_id_before_placeholder_or_binding(self):
         class _FailIfConstructed:
             def __init__(self, *args, **kwargs):
@@ -1524,7 +2593,9 @@ class QRLoginFrontendContractTest(unittest.TestCase):
 
         self.assertIn("function getQRCodeLoginAccountId()", app_js)
         self.assertIn("const accountId = getQRCodeLoginAccountId();", app_js)
-        self.assertIn("JSON.stringify({ account_id: accountId })", app_js)
+        self.assertIn("clientSessionId = createAccountVerificationSessionId('qr');", app_js)
+        self.assertIn("account_id: accountId", app_js)
+        self.assertIn("session_id: clientSessionId", app_js)
         self.assertIn("body:", app_js)
 
     def test_qr_login_modal_has_account_id_input(self):

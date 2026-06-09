@@ -329,6 +329,12 @@ class CaptchaRemoteController:
         if session_id in self.active_sessions:
             del self.active_sessions[session_id]
             logger.info(f"🔒 关闭远程控制会话: {session_id}")
+        websocket = self.websocket_connections.pop(session_id, None)
+        if websocket is not None:
+            try:
+                await websocket.close()
+            except Exception as e:
+                logger.debug(f"关闭远程控制 WebSocket 失败: {e}")
     
     async def auto_refresh_screenshot(self, session_id: str, interval: float = 1.0):
         """自动刷新截图（优化版：按需更新）"""

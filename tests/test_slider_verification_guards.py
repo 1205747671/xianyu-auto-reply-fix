@@ -457,7 +457,6 @@ class SliderVerificationGuardsTest(unittest.TestCase):
             "browser_data",
             "managed_shop_202605130001",
         )
-        mock_launch_persistent.side_effect = RuntimeError("stop-launch-after-profile-dir")
 
         with mock.patch(
             "utils.account_browser_runtime.account_browser_runtime_manager.resolve_profile_dir",
@@ -465,10 +464,10 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         ) as resolve_profile_dir:
             slider.login_with_password_browser("user", "pass", show_browser=False)
 
-        resolve_profile_dir.assert_called_once_with("shop_202605130001")
-        self.assertEqual(
-            mock_launch_persistent.call_args.kwargs["user_data_dir"],
-            expected_profile_dir,
+        resolve_profile_dir.assert_not_called()
+        mock_launch_persistent.assert_not_called()
+        slider._fail_login.assert_called_once_with(
+            "missing managed runtime binding for account-scoped password login"
         )
 
     def test_check_page_changed_does_not_treat_punish_url_as_success(self):
@@ -560,6 +559,114 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         self.assertIsNone(cookies)
         self.assertIn("managed runtime", slider.last_login_error)
         slider.init_browser.assert_not_called()
+
+    def test_login_with_password_browser_keeps_managed_runtime_attached_for_caller_stabilization(self):
+        page = _GenericTaobaoHomepagePage()
+        context = mock.Mock()
+        browser = mock.Mock()
+        playwright = mock.Mock()
+        context.browser = browser
+        managed_binding = {
+            "context": context,
+            "page": page,
+            "browser": browser,
+            "playwright": playwright,
+        }
+
+        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
+        slider.pure_user_id = "managed_password_login_account"
+        slider.headless = True
+        slider.browser_channel = None
+        slider.executable_path = None
+        slider.stealth_mode_override = None
+        slider.slider_max_retries = 1
+        slider._managed_runtime_binding = managed_binding
+        slider.context = context
+        slider.page = page
+        slider.browser = browser
+        slider.playwright = playwright
+        slider._resolve_account_persistent_profile_dir = mock.Mock(
+            return_value="C:/unit/browser_data/user_managed_password_login_account"
+        )
+        slider._get_random_browser_features = mock.Mock(
+            return_value={
+                "profile_id": "unit_profile",
+                "viewport_width": 1600,
+                "viewport_height": 900,
+                "device_scale_factor": 1,
+            }
+        )
+        slider._build_browser_launch_args = mock.Mock(return_value=["--unit-test"])
+        slider._should_prefer_project_browser_for_playwright = mock.Mock(return_value=False)
+        slider._refresh_browser_features_from_page_metrics = mock.Mock()
+        slider._apply_headless_network_fingerprint = mock.Mock()
+        slider._provider_owns_browser_identity = mock.Mock(return_value=True)
+        slider._goto_login_page_with_ready_state_fallback = mock.Mock()
+        slider._find_login_form_with_retry = mock.Mock(return_value=(None, False, None))
+        slider._probe_context_login_success = mock.Mock(return_value=(True, page, {"cookie2": "ok"}))
+        slider._finalize_logged_in_cookies = mock.Mock(return_value={"cookie2": "ok"})
+        slider._release_concurrency_slot = mock.Mock()
+        slider.close_browser = mock.Mock(side_effect=slider._detach_managed_runtime)
+
+        result = slider.login_with_password_browser(
+            "user",
+            "pass",
+            show_browser=False,
+            require_managed_runtime=True,
+        )
+
+        self.assertEqual(result, {"cookie2": "ok"})
+        slider.close_browser.assert_not_called()
+        self.assertIs(slider._managed_runtime_binding, managed_binding)
+        self.assertIs(slider.context, context)
+        self.assertIs(slider.page, page)
+        slider._release_concurrency_slot.assert_any_call("密码登录结束")
+        slider._detach_managed_runtime()
+
+    def test_login_with_password_browser_rejects_managed_runtime_without_page(self):
+        context = mock.Mock()
+        context.pages = []
+        context.new_page = mock.Mock(side_effect=AssertionError("should not create unmanaged page"))
+        browser = mock.Mock()
+        context.browser = browser
+        managed_binding = {
+            "context": context,
+            "page": None,
+            "browser": browser,
+            "playwright": mock.Mock(),
+        }
+
+        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
+        slider.pure_user_id = "managed_password_missing_page"
+        slider.headless = True
+        slider.browser_channel = None
+        slider.executable_path = None
+        slider.stealth_mode_override = None
+        slider._managed_runtime_binding = managed_binding
+        slider._slider_refresh_mode = False
+        slider.risk_trigger_scene = None
+        slider._check_date_validity = mock.Mock(return_value=True)
+        slider._should_prefer_project_browser_for_playwright = mock.Mock(return_value=False)
+        slider._should_use_account_persistent_profile = mock.Mock(return_value=False)
+        slider._resolve_account_persistent_profile_dir = mock.Mock()
+        slider._get_random_browser_features = mock.Mock()
+        slider._build_browser_launch_args = mock.Mock()
+        slider._release_concurrency_slot = mock.Mock()
+        slider._fail_login = mock.Mock(return_value={"failed": True})
+
+        result = slider.login_with_password_browser(
+            "user",
+            "pass",
+            show_browser=False,
+            require_managed_runtime=True,
+        )
+
+        self.assertEqual(result, {"failed": True})
+        context.new_page.assert_not_called()
+        slider._get_random_browser_features.assert_not_called()
+        slider._fail_login.assert_called_once_with(
+            "missing managed runtime binding for account-scoped password login"
+        )
 
     def test_async_run_rejects_missing_managed_runtime_when_explicitly_required(self):
         page = _FakePage(
@@ -856,6 +963,157 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         self.assertFalse(has_verification)
         self.assertIsNone(verification_target)
         slider._capture_verification_screenshot.assert_not_called()
+
+    @mock.patch("utils.xianyu_slider_stealth.time.sleep", return_value=None)
+    def test_prepare_login_page_after_cleanup_closes_fresh_page_when_reopen_probe_raises(self, _mock_sleep):
+        active_page = mock.Mock()
+        fresh_page = mock.Mock()
+        context = mock.Mock()
+        context.new_page.return_value = fresh_page
+
+        slider = self._make_slider(active_page)
+        slider._find_login_form_with_retry = mock.Mock(
+            side_effect=[
+                (None, False, None),
+                RuntimeError("fresh probe boom"),
+            ]
+        )
+
+        result = slider._prepare_login_page_after_cleanup(
+            context,
+            active_page,
+            clear_storage=False,
+            reopen_fresh_page=True,
+            timeout_seconds=1.0,
+        )
+
+        self.assertEqual(result, (active_page, None, False, None, False))
+        fresh_page.close.assert_called_once_with()
+
+    @mock.patch("utils.xianyu_slider_stealth.time.sleep", return_value=None)
+    def test_login_with_password_browser_closes_session_verify_page_when_session_probe_raises(self, _mock_sleep):
+        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
+        slider.pure_user_id = "session_probe_unit"
+        slider.use_account_persistent_profile = False
+        slider.account_persistent_profile_dir = None
+        slider.headless = True
+        slider.browser = None
+        slider.context = None
+        slider.page = None
+        slider.playwright = None
+        slider.browser_channel = None
+        slider.executable_path = None
+        slider.risk_trigger_scene = None
+        slider._managed_runtime_binding = None
+        slider.stealth_mode_override = False
+        slider.slider_max_retries = 1
+        slider._slider_refresh_mode = False
+        slider._password_slider_runtime_hardened = False
+        slider._check_date_validity = lambda: True
+        slider._should_prefer_project_browser_for_playwright = lambda: False
+        slider._build_browser_proxy_settings = lambda: None
+        slider._build_browser_launch_args = lambda: ["--unit-test"]
+        slider._sanitize_provider_launch_options = lambda options: options
+        slider._apply_provider_launch_defaults = lambda options: options
+        slider._build_browser_context_options = lambda _features: {"locale": "zh-CN"}
+        slider._build_persistent_context_options = (
+            lambda _features, context_options=None: {"locale": "zh-CN"}
+        )
+        slider._get_random_browser_features = lambda: {
+            "profile_id": "unit-test-profile",
+            "viewport_width": 1600,
+            "viewport_height": 900,
+            "device_scale_factor": 1.0,
+        }
+        slider._refresh_browser_features_from_page_metrics = lambda _page: None
+        slider._apply_headless_network_fingerprint = lambda _page, _features: None
+        slider._provider_owns_browser_identity = lambda: False
+        slider._install_stealth_init_script = mock.Mock()
+        slider._goto_login_page_with_ready_state_fallback = lambda *_args, **_kwargs: None
+        slider._get_password_login_selectors = lambda: {}
+        slider._find_login_form_with_retry = mock.Mock(return_value=(None, False, None))
+        slider._prepare_login_page_after_cleanup = mock.Mock(
+            return_value=(mock.Mock(), None, False, None, False)
+        )
+        slider._fail_login = mock.Mock(return_value=None)
+        slider._is_profile_in_use_launch_error = lambda _error: False
+        slider._release_concurrency_slot = lambda *_args, **_kwargs: None
+
+        fake_browser = mock.Mock()
+        login_page = mock.Mock()
+        login_page.url = "https://www.goofish.com/im"
+        login_page.title.return_value = "聊天_闲鱼"
+        login_page.query_selector_all.return_value = []
+        login_page.wait_for_load_state.return_value = None
+        login_page.goto.return_value = None
+
+        verify_page = mock.Mock()
+        verify_page.goto.side_effect = RuntimeError("session probe boom")
+        verify_page.content.return_value = ""
+
+        slider._probe_context_login_success = mock.Mock(
+            return_value=(True, login_page, {"cookie2": "ok"})
+        )
+
+        fake_context = mock.Mock()
+        fake_context.new_page.side_effect = [login_page, verify_page]
+        fake_context.browser = fake_browser
+
+        slider._launch_clean_cookie_seeded_context = mock.Mock(return_value=(fake_browser, fake_context))
+
+        result = slider.login_with_password_browser(
+            "user",
+            "pass",
+            show_browser=False,
+            force_clean_context=True,
+        )
+
+        self.assertIsNone(result)
+        verify_page.close.assert_called_once_with()
+        slider._prepare_login_page_after_cleanup.assert_called_once()
+        slider._fail_login.assert_called_once_with("Session验证异常且清理会话状态后未找到登录表单")
+
+    @mock.patch("utils.xianyu_slider_stealth.time.sleep", return_value=None)
+    def test_probe_context_login_success_keeps_probe_page_open_when_returned(self, _mock_sleep):
+        monitor_page = mock.Mock()
+        monitor_page.url = "https://passport.goofish.com/iv/test"
+        probe_page = mock.Mock()
+        probe_page.url = "https://www.goofish.com/im"
+        probe_page.goto.return_value = None
+
+        context = mock.Mock()
+        context.new_page.return_value = probe_page
+
+        cookies = {
+            "unb": "u",
+            "sgcookie": "s",
+            "cookie2": "c2",
+            "_m_h5_tk": "tk",
+            "_m_h5_tk_enc": "tk_enc",
+            "t": "t_cookie",
+            "cna": "cna_cookie",
+        }
+
+        slider = self._make_slider(monitor_page)
+        slider._select_monitor_page = lambda _context, fallback_page=None: fallback_page or monitor_page
+        slider._snapshot_context_cookies = mock.Mock(side_effect=[dict(cookies), dict(cookies)])
+        slider._detect_pending_identity_verification_cookie_state = lambda _cookies: []
+        slider._page_has_slider = lambda _page: False
+        slider._page_looks_like_verification = lambda page: page is monitor_page
+        slider._check_login_success_by_element = lambda page: page is probe_page
+        slider._has_completed_login_cookies = lambda _cookies: True
+        slider._is_logged_in_url = lambda url: str(url).startswith("https://www.goofish.com/im")
+        slider._safe_page_url = lambda page: getattr(page, "url", "")
+
+        login_success, success_page, success_cookies = slider._probe_context_login_success(
+            context,
+            monitor_page,
+        )
+
+        self.assertTrue(login_success)
+        self.assertIs(success_page, probe_page)
+        self.assertEqual(success_cookies, cookies)
+        probe_page.close.assert_not_called()
 
     @mock.patch("utils.xianyu_slider_stealth.time.sleep", return_value=None)
     def test_capture_verification_screenshot_replaces_old_file_and_reuses_last_on_timeout(self, _mock_sleep):
@@ -1270,14 +1528,27 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         self.assertGreaterEqual(slider.current_trajectory_data["random_params"]["steps"], 39)
 
     @mock.patch("utils.xianyu_slider_stealth.launch_browser_persistent_context")
-    def test_init_browser_uses_provider_persistent_context_when_profile_enabled(self, mock_launch):
+    def test_init_browser_uses_bound_managed_runtime_when_profile_enabled(self, mock_launch):
         slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
         slider.use_account_persistent_profile = True
         slider.account_persistent_profile_dir = "browser_data/user_1"
         slider.headless = True
+        fake_page = mock.Mock()
+        fake_browser = mock.Mock()
+        fake_context = mock.Mock()
+        fake_context.browser = fake_browser
+        fake_context.pages = [fake_page]
+        fake_playwright = mock.Mock()
+        slider._managed_runtime_binding = {
+            "browser": fake_browser,
+            "context": fake_context,
+            "page": fake_page,
+            "playwright": fake_playwright,
+        }
         slider.browser = None
         slider.context = None
         slider.page = None
+        slider.playwright = None
         slider._build_browser_proxy_settings = lambda: {"server": "http://127.0.0.1:8888"}
         slider._build_browser_context_options = lambda _features: {
             "user_agent": "unit-test-agent",
@@ -1293,35 +1564,19 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         slider._should_prefer_project_browser_for_playwright = lambda: False
         slider._cleanup_on_init_failure = lambda: None
 
-        fake_context = mock.Mock()
-        fake_context.pages = [mock.Mock()]
-        mock_launch.return_value = fake_context
+        page = slider.init_browser()
 
-        slider.init_browser()
-
-        mock_launch.assert_called_once_with(
-            user_data_dir="browser_data/user_1",
-            headless=True,
-            proxy={"server": "http://127.0.0.1:8888"},
-            args=["--foo"],
-            humanize=True,
-            human_preset="default",
-            user_agent="unit-test-agent",
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
-            viewport={"width": 1600, "height": 900},
-            extra_http_headers={"Accept-Language": "zh-CN,zh;q=0.9"},
-            accept_downloads=True,
-            ignore_https_errors=True,
-        )
-        fake_context.add_cookies.assert_called_once_with(
-            [{"name": "cookie2", "value": "ok", "domain": ".goofish.com", "path": "/"}]
-        )
-        slider._install_stealth_init_script.assert_called_once_with(fake_context.pages[0], {"user_agent": "unit-test-agent"})
+        self.assertIs(page, fake_page)
+        self.assertIs(slider.browser, fake_browser)
+        self.assertIs(slider.context, fake_context)
+        self.assertIs(slider.page, fake_page)
+        self.assertIs(slider.playwright, fake_playwright)
+        mock_launch.assert_not_called()
+        slider._install_stealth_init_script.assert_not_called()
 
     @mock.patch("utils.xianyu_slider_stealth.launch_browser")
     @mock.patch("utils.xianyu_slider_stealth.launch_browser_persistent_context")
-    def test_init_browser_retries_persistent_context_after_stale_lock_cleanup(self, mock_launch_persistent, mock_launch_browser):
+    def test_init_browser_rejects_unbound_persistent_profile_before_stale_lock_cleanup(self, mock_launch_persistent, mock_launch_browser):
         slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
         slider.use_account_persistent_profile = True
         slider.account_persistent_profile_dir = "browser_data/user_retry"
@@ -1340,19 +1595,46 @@ class SliderVerificationGuardsTest(unittest.TestCase):
         slider._is_profile_in_use_launch_error = lambda exc: "profile appears to be in use" in str(exc).lower()
         slider._try_cleanup_stale_chromium_singleton_lock = mock.Mock(return_value=True)
 
-        fake_context = mock.Mock()
-        fake_context.pages = [mock.Mock()]
-        mock_launch_persistent.side_effect = [
-            RuntimeError("BrowserType.launch_persistent_context: The profile appears to be in use by another Chromium process"),
-            fake_context,
-        ]
+        with self.assertRaisesRegex(RuntimeError, "missing managed runtime binding"):
+            slider.init_browser()
 
-        slider.init_browser()
-
-        self.assertEqual(mock_launch_persistent.call_count, 2)
-        slider._try_cleanup_stale_chromium_singleton_lock.assert_called_once_with("browser_data/user_retry")
+        mock_launch_persistent.assert_not_called()
+        slider._try_cleanup_stale_chromium_singleton_lock.assert_not_called()
         mock_launch_browser.assert_not_called()
-        slider._install_stealth_init_script.assert_called_once_with(fake_context.pages[0], {"user_agent": "retry-agent"})
+        slider._install_stealth_init_script.assert_not_called()
+
+    def test_init_browser_incomplete_managed_runtime_detaches_without_closing_managed_handles(self):
+        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
+        slider.pure_user_id = "managed_incomplete"
+        slider.use_account_persistent_profile = True
+        slider.account_persistent_profile_dir = "browser_data/user_managed_incomplete"
+        slider.headless = True
+        fake_context = mock.Mock()
+        fake_context.pages = []
+        fake_browser = mock.Mock()
+        fake_playwright = mock.Mock()
+        slider._managed_runtime_binding = {
+            "browser": fake_browser,
+            "context": fake_context,
+            "page": None,
+            "playwright": fake_playwright,
+        }
+        slider.browser = fake_browser
+        slider.context = fake_context
+        slider.page = None
+        slider.playwright = fake_playwright
+
+        with self.assertRaisesRegex(RuntimeError, "managed runtime binding is incomplete"):
+            slider.init_browser()
+
+        fake_context.close.assert_not_called()
+        fake_browser.close.assert_not_called()
+        fake_playwright.stop.assert_not_called()
+        self.assertIsNone(slider._managed_runtime_binding)
+        self.assertIsNone(slider.browser)
+        self.assertIsNone(slider.context)
+        self.assertIsNone(slider.page)
+        self.assertIsNone(slider.playwright)
 
     @mock.patch("utils.xianyu_slider_stealth.launch_browser")
     @mock.patch("utils.xianyu_slider_stealth.launch_browser_persistent_context")
@@ -1379,11 +1661,11 @@ class SliderVerificationGuardsTest(unittest.TestCase):
             "BrowserType.launch_persistent_context: The profile appears to be in use by another Chromium process"
         )
 
-        with self.assertRaisesRegex(RuntimeError, "拒绝降级到干净上下文"):
+        with self.assertRaisesRegex(RuntimeError, "missing managed runtime binding"):
             slider.init_browser()
 
-        mock_launch_persistent.assert_called_once()
-        slider._try_cleanup_stale_chromium_singleton_lock.assert_called_once_with("browser_data/user_fallback")
+        mock_launch_persistent.assert_not_called()
+        slider._try_cleanup_stale_chromium_singleton_lock.assert_not_called()
         mock_launch_browser.assert_not_called()
 
     @mock.patch("utils.xianyu_slider_stealth.launch_browser")
@@ -1418,13 +1700,11 @@ class SliderVerificationGuardsTest(unittest.TestCase):
             "BrowserType.launch_persistent_context: The profile appears to be in use by another Chromium process"
         )
 
-        with self.assertRaisesRegex(RuntimeError, "拒绝降级到干净上下文"):
+        with self.assertRaisesRegex(RuntimeError, "missing managed runtime binding"):
             slider.init_browser()
 
-        mock_launch_persistent.assert_called_once()
-        slider._try_cleanup_stale_chromium_singleton_lock.assert_called_once_with(
-            "browser_data/user_fallback_explicit"
-        )
+        mock_launch_persistent.assert_not_called()
+        slider._try_cleanup_stale_chromium_singleton_lock.assert_not_called()
         mock_launch_browser.assert_not_called()
         slider._install_stealth_init_script.assert_not_called()
 
@@ -1512,6 +1792,24 @@ class SliderVerificationGuardsTest(unittest.TestCase):
             [{"name": "cookie2", "value": "ok", "domain": ".goofish.com", "path": "/"}]
         )
         slider._install_stealth_init_script.assert_called_once_with(fake_page, {"user_agent": "plain-agent"})
+
+    @mock.patch("utils.xianyu_slider_stealth.launch_browser")
+    def test_launch_clean_cookie_seeded_context_closes_browser_when_new_context_fails(self, mock_launch_browser):
+        slider = XianyuSliderStealth.__new__(XianyuSliderStealth)
+        slider.pure_user_id = "clean_context_fail"
+        slider._build_browser_context_options = lambda _features: {"locale": "zh-CN"}
+
+        fake_browser = mock.Mock()
+        fake_browser.new_context.side_effect = RuntimeError("new context boom")
+        mock_launch_browser.return_value = fake_browser
+
+        with self.assertRaisesRegex(RuntimeError, "new context boom"):
+            slider._launch_clean_cookie_seeded_context(
+                {"headless": True},
+                {"user_agent": "unit-test-agent"},
+            )
+
+        fake_browser.close.assert_called_once_with()
 
     def test_login_with_password_headful_is_alias_of_new_browser_login(self):
         slider = XianyuSliderStealth.__new__(XianyuSliderStealth)

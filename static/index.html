@@ -2499,7 +2499,7 @@
               <i class="bi bi-headset me-2"></i>
               在线客服
             </h2>
-            <p class="text-muted mb-0">内嵌闲鱼IM页面，快速处理客户咨询</p>
+            <p class="text-muted mb-0">内嵌闲鱼IM页面；选择账号仅用于查看和复制登录信息，不会自动共享后台登录态</p>
           </div>
           <div class="d-flex align-items-center gap-2 flex-wrap">
             <select class="form-select form-select-sm" id="imAccountSelect" style="width: auto; min-width: 150px;" onchange="onImAccountChange()">
@@ -2535,6 +2535,11 @@
         </div>
       </div>
       <div class="content-body p-0" style="flex: 1; overflow: hidden;">
+        <div class="alert alert-warning rounded-0 border-start-0 border-end-0 border-top-0 mb-0">
+          <i class="bi bi-exclamation-triangle me-2"></i>
+          当前页面里的 IM iframe 使用的是你本机浏览器上下文，不会复用后台账号运行时的 Cookie。
+          选择账号后仍需你在 iframe 或新窗口里手动完成登录。
+        </div>
         <!-- 内嵌闲鱼IM iframe -->
         <div class="im-iframe-container" style="height: 100%;">
           <iframe

@@ -276,12 +276,21 @@
             return 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
         }
 
+        function escapeHtml(value) {
+            const div = document.createElement('div');
+            div.textContent = value == null ? '' : String(value);
+            return div.innerHTML;
+        }
+
         function showAlert(message, type = 'danger') {
             const alertContainer = document.getElementById('alertContainer');
+            const safeType = ['success', 'warning', 'danger'].includes(type) ? type : 'danger';
+            const icon = safeType === 'success' ? 'check-circle' : 'exclamation-triangle';
+            const safeMessage = escapeHtml(message || '');
             const alertHtml = `
-                <div class="alert alert-${type} alert-dismissible fade show" role="alert">
-                    <i class="bi bi-${type === 'success' ? 'check-circle' : 'exclamation-triangle'}-fill me-2"></i>
-                    ${message}
+                <div class="alert alert-${safeType} alert-dismissible fade show" role="alert">
+                    <i class="bi bi-${icon}-fill me-2"></i>
+                    ${safeMessage}
                     <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
                 </div>
             `;
@@ -310,6 +319,45 @@
             }
         }
 
+        function isPlainObjectPayload(value) {
+            return !!value && typeof value === 'object' && !Array.isArray(value);
+        }
+
+        function hasMalformedEnabledFlagResult(result) {
+            return (
+                !isPlainObjectPayload(result)
+                || typeof result.enabled !== 'boolean'
+                || (result.message != null && typeof result.message !== 'string')
+            );
+        }
+
+        function hasMalformedCaptchaGenerationResult(result) {
+            if (
+                !isPlainObjectPayload(result)
+                || typeof result.success !== 'boolean'
+                || typeof result.session_id !== 'string'
+                || !result.session_id.trim()
+                || typeof result.message !== 'string'
+            ) {
+                return true;
+            }
+
+            if (result.success) {
+                return typeof result.captcha_image !== 'string' || !result.captcha_image.trim();
+            }
+
+            return result.captcha_image != null && typeof result.captcha_image !== 'string';
+        }
+
+        function hasMalformedSuccessMessageResult(result) {
+            return (
+                !isPlainObjectPayload(result)
+                || typeof result.success !== 'boolean'
+                || typeof result.message !== 'string'
+                || !result.message.trim()
+            );
+        }
+
         async function checkRegistrationStatus() {
             try {
                 const response = await fetch('/registration-status');
@@ -318,7 +366,10 @@
                     throw new Error(errorMessage);
                 }
 
-                const data = await response.json();
+                const data = await response.json().catch(() => ({}));
+                if (hasMalformedEnabledFlagResult(data)) {
+                    throw new Error('注册状态返回格式异常');
+                }
                 if (data && data.enabled === false) {
                     const registerForm = document.getElementById('registerForm');
                     if (registerForm) {
@@ -356,7 +407,15 @@
                     body: JSON.stringify({ session_id: sessionId })
                 });
 
-                const result = await response.json();
+                if (!response.ok) {
+                    const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+                    throw new Error(errorMessage);
+                }
+
+                const result = await response.json().catch(() => ({}));
+                if (hasMalformedCaptchaGenerationResult(result)) {
+                    throw new Error('图形验证码返回格式异常');
+                }
 
                 if (result.success) {
                     captchaImage.src = result.captcha_image;
@@ -364,11 +423,11 @@
                     captchaVerified = false;
                     updateSendCodeButton();
                 } else {
-                    captchaStatus.textContent = '图形验证码加载失败，请刷新页面重试';
+                    captchaStatus.textContent = result.message || '图形验证码加载失败，请刷新页面重试';
                 }
             } catch (error) {
                 console.error('加载图形验证码失败:', error);
-                captchaStatus.textContent = '图形验证码加载失败，请检查网络连接';
+                captchaStatus.textContent = error.message || '图形验证码加载失败，请检查网络连接';
             } finally {
                 captchaLoading.style.display = 'none';
                 captchaImage.style.display = 'block';
@@ -379,6 +438,12 @@
             sessionId = generateSessionId(); // 生成新的session ID
             loadCaptcha();
             // 不再自动清空验证码输入框，让用户自己决定是否清空
+        }
+
+        function invalidateRegisterCaptchaState() {
+            captchaVerified = false;
+            sessionId = generateSessionId();
+            updateSendCodeButton();
         }
 
         async function verifyCaptcha() {
@@ -404,13 +469,27 @@
                     })
                 });
 
-                const result = await response.json();
+                if (!response.ok) {
+                    const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+                    throw new Error(errorMessage);
+                }
+
+                const result = await response.json().catch(() => ({}));
+                if (hasMalformedSuccessMessageResult(result)) {
+                    throw new Error('图形验证码校验结果返回格式异常');
+                }
 
                 if (result.success) {
-                    captchaStatus.innerHTML = '<span style="color: green;">✓ 图形验证码验证成功</span>';
+                    const successStatus = document.createElement('span');
+                    successStatus.style.color = 'green';
+                    successStatus.textContent = '✓ 图形验证码验证成功';
+                    captchaStatus.replaceChildren(successStatus);
                     captchaVerified = true;
                 } else {
-                    captchaStatus.innerHTML = '<span style="color: red;">✗ 图形验证码错误，请重新输入</span>';
+                    const errorStatus = document.createElement('span');
+                    errorStatus.style.color = 'red';
+                    errorStatus.textContent = `✗ ${result.message || '图形验证码错误，请重新输入'}`;
+                    captchaStatus.replaceChildren(errorStatus);
                     captchaVerified = false;
                     refreshCaptcha(); // 自动刷新验证码
                 }
@@ -419,7 +498,10 @@
 
             } catch (error) {
                 console.error('验证图形验证码失败:', error);
-                captchaStatus.innerHTML = '<span style="color: red;">验证失败，请检查网络连接</span>';
+                const errorStatus = document.createElement('span');
+                errorStatus.style.color = 'red';
+                errorStatus.textContent = error.message || '验证失败，请检查网络连接';
+                captchaStatus.replaceChildren(errorStatus);
                 captchaVerified = false;
                 updateSendCodeButton();
             }
@@ -459,9 +541,9 @@
                 
                 if (countdownSeconds <= 0) {
                     clearInterval(countdownTimer);
-                    sendCodeBtn.disabled = false;
+                    countdownTimer = null;
                     sendCodeBtn.textContent = '发送验证码';
-                    codeStatus.textContent = '可以重新发送验证码';
+                    updateSendCodeButton();
                 }
             }, 1000);
         }
@@ -495,18 +577,32 @@
                         session_id: sessionId
                     })
                 });
-                
-                const result = await response.json();
+
+                if (!response.ok) {
+                    const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+                    throw new Error(errorMessage);
+                }
+
+                const result = await response.json().catch(() => ({}));
+                if (hasMalformedSuccessMessageResult(result)) {
+                    throw new Error('发送验证码结果返回格式异常');
+                }
                 
                 if (result.success) {
+                    invalidateRegisterCaptchaState();
+                    refreshCaptcha();
                     showAlert(result.message, 'success');
                     startCountdown();
                 } else {
+                    invalidateRegisterCaptchaState();
+                    refreshCaptcha();
                     showAlert(result.message);
                 }
             } catch (error) {
+                invalidateRegisterCaptchaState();
+                refreshCaptcha();
                 console.error('发送验证码失败:', error);
-                showAlert('发送验证码失败，请检查网络连接');
+                showAlert(error.message || '发送验证码失败，请检查网络连接');
             }
         }
 
@@ -522,10 +618,6 @@
             const confirmPassword = formData.get('confirmPassword');
 
             // 前端验证
-            if (!captchaVerified) {
-                showAlert('请先验证图形验证码');
-                return;
-            }
             if (username.length < 3 || username.length > 20) {
                 showAlert('用户名长度必须在3-20个字符之间');
                 return;
@@ -569,8 +661,16 @@
                         password: password
                     })
                 });
-                
-                const result = await response.json();
+
+                if (!response.ok) {
+                    const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+                    throw new Error(errorMessage);
+                }
+
+                const result = await response.json().catch(() => ({}));
+                if (hasMalformedSuccessMessageResult(result)) {
+                    throw new Error('注册结果返回格式异常');
+                }
                 
                 if (result.success) {
                     showAlert(result.message, 'success');
@@ -582,7 +682,7 @@
                 }
             } catch (error) {
                 console.error('注册失败:', error);
-                showAlert('注册失败，请检查网络连接');
+                showAlert(error.message || '注册失败，请检查网络连接');
             }
         });
 

@@ -32,6 +32,7 @@ let aboutDiagnosticsLoadRequestSequence = 0;
 let aboutRuntimeRequestSequence = 0;
 let aboutKeepaliveActionRequestSequence = 0;
 let aboutConversationHistoryRequestSequence = 0;
+let aboutDiagnosticsAbortController = null;
 let dashboardRuntimeRetryTimer = null;
 let aboutRuntimeRetryTimer = null;
 let lastDashboardRuntimeRetryAt = 0;
@@ -57,6 +58,7 @@ let itemsRequestSequence = 0;
 let itemReplaysRequestSequence = 0;
 let itemEditorRequestSequence = 0;
 let itemMutationActionRequestSequence = 0;
+let itemSyncAbortController = null;
 let accountOptionsRequestSequences = {};
 let itemReplyAccountItemsRequestSequence = 0;
 let itemReplyEditorRequestSequence = 0;
@@ -85,9 +87,11 @@ let ordersStreamSessionRequestSequence = 0;
 let ordersListRequestSequence = 0;
 let orderAccountFilterRequestSequence = 0;
 let orderRefreshActionRequestSequence = 0;
+let orderRuntimeActionAbortController = null;
 let orderHistorySyncModalInstance = null;
 let orderHistorySyncPollingTimer = null;
 let activeOrderHistorySyncJobId = '';
+let activeOrderHistorySyncJobStatus = '';
 let orderHistorySyncNotifiedJobId = '';
 let orderHistorySyncAccounts = [];
 let orderHistorySyncModalRequestSequence = 0;
@@ -105,6 +109,7 @@ let accountsRequestSequence = 0;
 let defaultRepliesLoadRequestSequence = 0;
 let accountEditRequestSequence = 0;
 let accountMutationActionRequestSequence = 0;
+let accountRuntimeActionAbortController = null;
 let defaultReplyEditorRequestSequence = 0;
 let aiReplyConfigRequestSequence = 0;
 let commentTemplateActionRequestSequence = 0;
@@ -139,10 +144,41 @@ let backupManagementActionRequestSequence = 0;
 let menuSettingsLoadRequestSequence = 0;
 let menuSettingsActionRequestSequence = 0;
 let systemRestartActionRequestSequence = 0;
+let itemSearchAbortController = null;
 
 // ================================
 // 通用功能 - 菜单切换和导航
 // ================================
+function stopAccountRuntimeActionRequests() {
+    if (accountRuntimeActionAbortController) {
+        accountRuntimeActionAbortController.abort();
+        accountRuntimeActionAbortController = null;
+    }
+}
+
+function resetAccountRuntimeActionAbortController() {
+    stopAccountRuntimeActionRequests();
+    accountRuntimeActionAbortController = new AbortController();
+    return accountRuntimeActionAbortController;
+}
+
+window.addEventListener('pagehide', stopAccountRuntimeActionRequests);
+
+function stopItemSyncRequests() {
+    if (itemSyncAbortController) {
+        itemSyncAbortController.abort();
+        itemSyncAbortController = null;
+    }
+}
+
+function resetItemSyncAbortController() {
+    stopItemSyncRequests();
+    itemSyncAbortController = new AbortController();
+    return itemSyncAbortController;
+}
+
+window.addEventListener('pagehide', stopItemSyncRequests);
+
 function showSection(sectionName) {
     // 获取并校验目标内容区域
     const targetSection = document.getElementById(sectionName + '-section');
@@ -252,8 +288,10 @@ function showSection(sectionName) {
         orderAccountFilterRequestSequence += 1;
         orderRefreshActionRequestSequence += 1;
         orderHistorySyncModalRequestSequence += 1;
+        stopOrderRuntimeActionRequests();
         orderMutationActionRequestSequence += 1;
         orderDetailItemRequestSequence += 1;
+        cancelActiveOrderHistorySyncJobSilently();
         const orderDetailModalElement = document.getElementById('orderDetailModal');
         const orderDetailModal = orderDetailModalElement
             ? bootstrap.Modal.getInstance(orderDetailModalElement)
@@ -350,6 +388,7 @@ function showSection(sectionName) {
     }
 
     if (sectionName !== 'accounts') {
+        stopAboutDiagnosticsRequests();
         aboutDiagnosticsLoadRequestSequence += 1;
         aboutRuntimeRequestSequence += 1;
         aboutKeepaliveActionRequestSequence += 1;
@@ -357,6 +396,7 @@ function showSection(sectionName) {
         accountsRequestSequence += 1;
         defaultRepliesLoadRequestSequence += 1;
         accountEditRequestSequence += 1;
+        stopAccountRuntimeActionRequests();
         accountMutationActionRequestSequence += 1;
         defaultReplyEditorRequestSequence += 1;
         aiReplyConfigRequestSequence += 1;
@@ -439,6 +479,7 @@ function showSection(sectionName) {
     if (sectionName !== 'items') {
         itemsRequestSequence += 1;
         itemEditorRequestSequence += 1;
+        stopItemSyncRequests();
         itemMutationActionRequestSequence += 1;
         accountOptionsRequestSequences.itemAccountFilter = (accountOptionsRequestSequences.itemAccountFilter || 0) + 1;
         const editItemModalElement = document.getElementById('editItemModal');
@@ -585,6 +626,7 @@ function showSection(sectionName) {
     }
 
     if (sectionName !== 'item-search') {
+        stopItemSearchRequests();
         itemSearchRequestSequence += 1;
         accountOptionsRequestSequences.itemSearchAccountFilter = (accountOptionsRequestSequences.itemSearchAccountFilter || 0) + 1;
         stopCaptchaSessionMonitor();
@@ -734,7 +776,11 @@ async function fetchDashboardResource(path, fallbackValue) {
             return fallbackValue;
         }
 
-        return await response.json();
+        const data = await response.json().catch(() => fallbackValue);
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            return fallbackValue;
+        }
+        return data;
     } catch (error) {
         console.error(`加载仪表盘资源失败: ${path}`, error);
         return fallbackValue;
@@ -745,6 +791,1276 @@ function getCookieDetailsAccountId(account) {
     return String(account?.account_id || '').trim();
 }
 
+function hasMalformedAccountSecretDetails(details, expectedAccountId = '') {
+    if (!details || typeof details !== 'object' || Array.isArray(details)) {
+        return true;
+    }
+    const accountId = getCookieDetailsAccountId(details);
+    if (!accountId) {
+        return true;
+    }
+    const normalizedExpectedAccountId = String(expectedAccountId || '').trim();
+    if (normalizedExpectedAccountId && accountId !== normalizedExpectedAccountId) {
+        return true;
+    }
+    if (details.value != null && typeof details.value !== 'string') {
+        return true;
+    }
+    if (details.username != null && typeof details.username !== 'string') {
+        return true;
+    }
+    if (details.password != null && typeof details.password !== 'string') {
+        return true;
+    }
+    if (details.proxy_pass != null && typeof details.proxy_pass !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedCookieDetailsAccounts(accounts) {
+    return accounts.some(account =>
+        !account
+        || typeof account !== 'object'
+        || Array.isArray(account)
+        || !getCookieDetailsAccountId(account)
+        || (account.enabled != null && typeof account.enabled !== 'boolean')
+        || (account.load_error != null && typeof account.load_error !== 'boolean')
+        || (account.remark != null && typeof account.remark !== 'string')
+        || (account.username != null && typeof account.username !== 'string')
+        || (account.has_password != null && typeof account.has_password !== 'boolean')
+        || (account.pause_duration != null && !Number.isFinite(Number(account.pause_duration)))
+        || (account.value != null && typeof account.value !== 'string')
+        || (account.has_cookie_value != null && typeof account.has_cookie_value !== 'boolean')
+        || (account.auto_confirm != null && typeof account.auto_confirm !== 'boolean')
+        || (account.auto_comment != null && typeof account.auto_comment !== 'boolean')
+        || (account.runtime_status_error != null && typeof account.runtime_status_error !== 'string')
+    );
+}
+
+function hasMalformedAboutRuntimeStatusResult(result, expectedAccountId = '') {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    const accountId = String(result.account_id || '').trim();
+    if (!accountId) {
+        return true;
+    }
+    const normalizedExpectedAccountId = String(expectedAccountId || '').trim();
+    if (normalizedExpectedAccountId && accountId !== normalizedExpectedAccountId) {
+        return true;
+    }
+    if (!Object.prototype.hasOwnProperty.call(result, 'runtime_status')) {
+        return true;
+    }
+    if (result.runtime_status != null && (typeof result.runtime_status !== 'object' || Array.isArray(result.runtime_status))) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedAboutSessionKeepaliveResult(result, expectedAccountId = '') {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    const accountId = String(result.account_id || '').trim();
+    if (!accountId) {
+        return true;
+    }
+    const normalizedExpectedAccountId = String(expectedAccountId || '').trim();
+    if (normalizedExpectedAccountId && accountId !== normalizedExpectedAccountId) {
+        return true;
+    }
+    if (typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (typeof result.message !== 'string') {
+        return true;
+    }
+    if (result.runtime_status != null && (typeof result.runtime_status !== 'object' || Array.isArray(result.runtime_status))) {
+        return true;
+    }
+    if (result.runtime_status_error != null && typeof result.runtime_status_error !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedAboutConversationHistoryResult(result, expectedAccountId = '', expectedConversationId = '') {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    const accountId = String(result.account_id || '').trim();
+    if (!accountId) {
+        return true;
+    }
+    const normalizedExpectedAccountId = String(expectedAccountId || '').trim();
+    if (normalizedExpectedAccountId && accountId !== normalizedExpectedAccountId) {
+        return true;
+    }
+    const conversationId = String(result.conversation_id || '').trim();
+    if (!conversationId) {
+        return true;
+    }
+    const normalizedExpectedConversationId = String(expectedConversationId || '').trim().split('@')[0];
+    if (normalizedExpectedConversationId && conversationId !== normalizedExpectedConversationId) {
+        return true;
+    }
+    if (result.success !== true) {
+        return true;
+    }
+    if (!Array.isArray(result.messages)) {
+        return true;
+    }
+    if (result.page_size != null && (!Number.isFinite(Number(result.page_size)) || Number(result.page_size) < 1)) {
+        return true;
+    }
+    if (result.count != null && (!Number.isFinite(Number(result.count)) || Number(result.count) < 0)) {
+        return true;
+    }
+    if (result.runtime_status != null && (typeof result.runtime_status !== 'object' || Array.isArray(result.runtime_status))) {
+        return true;
+    }
+    if (result.runtime_status_error != null && typeof result.runtime_status_error !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedKeywordCountMap(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    return Object.keys(result).some(accountId => {
+        if (!accountId.trim()) {
+            return true;
+        }
+        const count = result[accountId];
+        if (typeof count !== 'number' && typeof count !== 'string') {
+            return true;
+        }
+        if (typeof count === 'string' && !count.trim()) {
+            return true;
+        }
+        const normalizedCount = Number(count);
+        return !Number.isInteger(normalizedCount) || normalizedCount < 0;
+    });
+}
+
+function hasMalformedPolishItemsResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (result.success != null && typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (result.total != null && (!Number.isFinite(Number(result.total)) || Number(result.total) < 0)) {
+        return true;
+    }
+    if (result.polished != null && (!Number.isFinite(Number(result.polished)) || Number(result.polished) < 0)) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedQrRefreshResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (result.success != null && typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedQrCooldownStatusResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (result.success != null && typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (result.account_id != null && typeof result.account_id !== 'string') {
+        return true;
+    }
+    if (result.remaining_time != null && (!Number.isFinite(Number(result.remaining_time)) || Number(result.remaining_time) < 0)) {
+        return true;
+    }
+    if (result.cooldown_duration != null && (!Number.isFinite(Number(result.cooldown_duration)) || Number(result.cooldown_duration) < 0)) {
+        return true;
+    }
+    if (result.last_refresh_time != null && (!Number.isFinite(Number(result.last_refresh_time)) || Number(result.last_refresh_time) < 0)) {
+        return true;
+    }
+    if (result.is_in_cooldown != null && typeof result.is_in_cooldown !== 'boolean') {
+        return true;
+    }
+    if (result.remaining_minutes != null && (!Number.isFinite(Number(result.remaining_minutes)) || Number(result.remaining_minutes) < 0)) {
+        return true;
+    }
+    if (result.remaining_seconds != null && (!Number.isFinite(Number(result.remaining_seconds)) || Number(result.remaining_seconds) < 0)) {
+        return true;
+    }
+    if (result.previous_remaining_time != null && (!Number.isFinite(Number(result.previous_remaining_time)) || Number(result.previous_remaining_time) < 0)) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedQrLoginGenerateResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (result.account_id != null && (typeof result.account_id !== 'string' || !result.account_id.trim())) {
+        return true;
+    }
+    if (result.success === true) {
+        if (typeof result.session_id !== 'string' || !result.session_id.trim()) {
+            return true;
+        }
+        if (typeof result.qr_code_url !== 'string' || !result.qr_code_url.trim()) {
+            return true;
+        }
+        return false;
+    }
+    if (result.session_id != null && (typeof result.session_id !== 'string' || !result.session_id.trim())) {
+        return true;
+    }
+    if (result.qr_code_url != null && typeof result.qr_code_url !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedQrLoginAccountInfo(accountInfo) {
+    if (!accountInfo || typeof accountInfo !== 'object' || Array.isArray(accountInfo)) {
+        return true;
+    }
+    if (accountInfo.account_id != null && (typeof accountInfo.account_id !== 'string' || !accountInfo.account_id.trim())) {
+        return true;
+    }
+    if (accountInfo.is_new_account != null && typeof accountInfo.is_new_account !== 'boolean') {
+        return true;
+    }
+    if (accountInfo.real_cookie_refreshed != null && typeof accountInfo.real_cookie_refreshed !== 'boolean') {
+        return true;
+    }
+    if (accountInfo.fallback_reason != null && typeof accountInfo.fallback_reason !== 'string') {
+        return true;
+    }
+    if (accountInfo.cookie_length != null && (!Number.isFinite(Number(accountInfo.cookie_length)) || Number(accountInfo.cookie_length) < 0)) {
+        return true;
+    }
+    if (accountInfo.token_prewarmed != null && typeof accountInfo.token_prewarmed !== 'boolean') {
+        return true;
+    }
+    if (accountInfo.task_restarted != null && typeof accountInfo.task_restarted !== 'boolean') {
+        return true;
+    }
+    if (accountInfo.warning_message != null && typeof accountInfo.warning_message !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedQrLoginStatusResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.status !== 'string' || !result.status.trim()) {
+        return true;
+    }
+    if (result.session_id != null && (typeof result.session_id !== 'string' || !result.session_id.trim())) {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (result.error != null && typeof result.error !== 'string') {
+        return true;
+    }
+    if (result.phase != null && typeof result.phase !== 'string') {
+        return true;
+    }
+    if (result.handoff_status != null && typeof result.handoff_status !== 'string') {
+        return true;
+    }
+    if (result.handoff_error != null && typeof result.handoff_error !== 'string') {
+        return true;
+    }
+    if (result.verification_type != null && typeof result.verification_type !== 'string') {
+        return true;
+    }
+    if (result.verification_type_label != null && typeof result.verification_type_label !== 'string') {
+        return true;
+    }
+    if (result.success_stage != null && typeof result.success_stage !== 'string') {
+        return true;
+    }
+    if (result.browser_alive != null && typeof result.browser_alive !== 'boolean') {
+        return true;
+    }
+    if (result.verification_url != null && typeof result.verification_url !== 'string') {
+        return true;
+    }
+    if (result.screenshot_path != null && typeof result.screenshot_path !== 'string') {
+        return true;
+    }
+    if (result.qr_code_url != null && typeof result.qr_code_url !== 'string') {
+        return true;
+    }
+    if (result.already_processed != null && typeof result.already_processed !== 'boolean') {
+        return true;
+    }
+    if (result.verification_pending_completion != null && typeof result.verification_pending_completion !== 'boolean') {
+        return true;
+    }
+    if (result.show_verification_link_button != null && typeof result.show_verification_link_button !== 'boolean') {
+        return true;
+    }
+    if (result.account_info != null && hasMalformedQrLoginAccountInfo(result.account_info)) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedAccountToggleMutationResult(result, booleanFieldName = '') {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (result.msg != null && typeof result.msg !== 'string') {
+        return true;
+    }
+    if (booleanFieldName && result[booleanFieldName] != null && typeof result[booleanFieldName] !== 'boolean') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedVerifyResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.authenticated !== 'boolean') {
+        return true;
+    }
+    if (result.authenticated !== true) {
+        return false;
+    }
+    if (
+        (typeof result.user_id !== 'string' || !result.user_id.trim())
+        && (typeof result.user_id !== 'number' || !Number.isFinite(result.user_id))
+    ) {
+        return true;
+    }
+    if (typeof result.username !== 'string' || !result.username.trim()) {
+        return true;
+    }
+    if (typeof result.is_admin !== 'boolean') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedDefaultReplySettings(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.enabled !== 'boolean') {
+        return true;
+    }
+    if (typeof result.reply_content !== 'string') {
+        return true;
+    }
+    if (typeof result.reply_once !== 'boolean') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedDefaultReplySettingsMap(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    return Object.keys(result).some(accountId => !accountId.trim() || hasMalformedDefaultReplySettings(result[accountId]));
+}
+
+function hasMalformedDefaultReplyMutationResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.msg !== 'string' || !result.msg.trim()) {
+        return true;
+    }
+    if (result.enabled != null && typeof result.enabled !== 'boolean') {
+        return true;
+    }
+    if (result.reply_once != null && typeof result.reply_once !== 'boolean') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedAiReplySettings(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.ai_enabled !== 'boolean') {
+        return true;
+    }
+    if (typeof result.model_name !== 'string' || !result.model_name.trim()) {
+        return true;
+    }
+    if (typeof result.api_key !== 'string') {
+        return true;
+    }
+    if (typeof result.base_url !== 'string') {
+        return true;
+    }
+    if (typeof result.api_type !== 'string') {
+        return true;
+    }
+    const nonNegativeIntegerFields = [
+        'max_discount_percent',
+        'max_discount_amount',
+        'max_bargain_rounds',
+    ];
+    if (nonNegativeIntegerFields.some(field => {
+        const value = result[field];
+        if (typeof value !== 'number' && typeof value !== 'string') {
+            return true;
+        }
+        if (typeof value === 'string' && !value.trim()) {
+            return true;
+        }
+        const normalizedValue = Number(value);
+        return !Number.isInteger(normalizedValue) || normalizedValue < 0;
+    })) {
+        return true;
+    }
+    if (typeof result.custom_prompts !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedAiReplySettingsMap(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    return Object.keys(result).some(accountId => !accountId.trim() || hasMalformedAiReplySettings(result[accountId]));
+}
+
+function hasMalformedAiReplyMutationResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.message !== 'string' || !result.message.trim()) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedAiReplyTestResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.message !== 'string' || !result.message.trim()) {
+        return true;
+    }
+    if (typeof result.reply !== 'string') {
+        return true;
+    }
+    if (result.account_id != null && typeof result.account_id !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedKeywordImportResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (result.added == null || !Number.isFinite(Number(result.added)) || Number(result.added) < 0) {
+        return true;
+    }
+    if (result.updated == null || !Number.isFinite(Number(result.updated)) || Number(result.updated) < 0) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedAiPresetMutationResult(result, requirePresetId = false) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (requirePresetId && !Number.isFinite(Number(result.preset_id))) {
+        return true;
+    }
+    if (!requirePresetId && result.preset_id != null && !Number.isFinite(Number(result.preset_id))) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedNotificationChannelMutationResult(result, requireId = false) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (result.msg != null && typeof result.msg !== 'string') {
+        return true;
+    }
+    if (requireId && !Number.isFinite(Number(result.id))) {
+        return true;
+    }
+    if (!requireId && result.id != null && !Number.isFinite(Number(result.id))) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedNotificationChannelDetails(channel) {
+    if (!channel || typeof channel !== 'object' || Array.isArray(channel)) {
+        return true;
+    }
+    if (!Number.isFinite(Number(channel.id))) {
+        return true;
+    }
+    if (typeof channel.name !== 'string') {
+        return true;
+    }
+    if (typeof channel.type !== 'string' || !channel.type.trim()) {
+        return true;
+    }
+    if (typeof channel.enabled !== 'boolean') {
+        return true;
+    }
+    if (typeof channel.config !== 'string') {
+        return true;
+    }
+    if (channel.created_at != null && typeof channel.created_at !== 'string') {
+        return true;
+    }
+    if (channel.updated_at != null && typeof channel.updated_at !== 'string') {
+        return true;
+    }
+    if (channel.user_id != null && !Number.isFinite(Number(channel.user_id))) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedMessageNotificationMutationResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (result.msg != null && typeof result.msg !== 'string') {
+        return true;
+    }
+    if (result.count != null && !Number.isFinite(Number(result.count))) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedUserManagementMutationResult(result, requireSuccessFlag = false) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (requireSuccessFlag && typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (result.success != null && typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (result.user_id != null && !Number.isFinite(Number(result.user_id))) {
+        return true;
+    }
+    if (result.is_admin != null && typeof result.is_admin !== 'boolean') {
+        return true;
+    }
+    if (result.updated_sessions != null && !Number.isFinite(Number(result.updated_sessions))) {
+        return true;
+    }
+    if (result.revoked_sessions != null && !Number.isFinite(Number(result.revoked_sessions))) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedDataManagementMutationResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (result.detail != null && typeof result.detail !== 'string') {
+        return true;
+    }
+    if (result.warning != null && typeof result.warning !== 'string') {
+        return true;
+    }
+    if (result.revoked_sessions != null && !Number.isFinite(Number(result.revoked_sessions))) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedRiskControlLogMutationResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (result.detail != null && typeof result.detail !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedCardMutationResult(result, requireId = false) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (requireId && !Number.isFinite(Number(result.id))) {
+        return true;
+    }
+    if (!requireId && result.id != null && !Number.isFinite(Number(result.id))) {
+        return true;
+    }
+    if (result.delivery_rule_generated != null && typeof result.delivery_rule_generated !== 'boolean') {
+        return true;
+    }
+    if (result.delivery_rule_id != null && !Number.isFinite(Number(result.delivery_rule_id))) {
+        return true;
+    }
+    if (result.delivery_rule_error != null && typeof result.delivery_rule_error !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedCardDetails(card) {
+    if (!card || typeof card !== 'object' || Array.isArray(card)) {
+        return true;
+    }
+    if (!Number.isFinite(Number(card.id))) {
+        return true;
+    }
+    if (typeof card.name !== 'string' || !card.name.trim()) {
+        return true;
+    }
+    if (typeof card.type !== 'string' || !card.type.trim()) {
+        return true;
+    }
+    if (card.api_config != null && (typeof card.api_config !== 'object' || Array.isArray(card.api_config))) {
+        return true;
+    }
+    if (card.text_content != null && typeof card.text_content !== 'string') {
+        return true;
+    }
+    if (card.data_content != null && typeof card.data_content !== 'string') {
+        return true;
+    }
+    if (card.image_url != null && typeof card.image_url !== 'string') {
+        return true;
+    }
+    if (card.description != null && typeof card.description !== 'string') {
+        return true;
+    }
+    if (typeof card.enabled !== 'boolean') {
+        return true;
+    }
+    if (!Number.isFinite(Number(card.delay_seconds)) || Number(card.delay_seconds) < 0) {
+        return true;
+    }
+    if (typeof card.is_multi_spec !== 'boolean') {
+        return true;
+    }
+    if (card.spec_name != null && typeof card.spec_name !== 'string') {
+        return true;
+    }
+    if (card.spec_value != null && typeof card.spec_value !== 'string') {
+        return true;
+    }
+    if (card.spec_name_2 != null && typeof card.spec_name_2 !== 'string') {
+        return true;
+    }
+    if (card.spec_value_2 != null && typeof card.spec_value_2 !== 'string') {
+        return true;
+    }
+    if (card.created_at != null && typeof card.created_at !== 'string') {
+        return true;
+    }
+    if (card.updated_at != null && typeof card.updated_at !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedDeliveryRuleMutationResult(result, requireId = false) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (requireId && !Number.isFinite(Number(result.id))) {
+        return true;
+    }
+    if (!requireId && result.id != null && !Number.isFinite(Number(result.id))) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedDeliveryRuleDetails(rule) {
+    if (!rule || typeof rule !== 'object' || Array.isArray(rule)) {
+        return true;
+    }
+    if (!Number.isFinite(Number(rule.id))) {
+        return true;
+    }
+    if (typeof rule.keyword !== 'string' || !rule.keyword.trim()) {
+        return true;
+    }
+    if (rule.card_id != null && !Number.isFinite(Number(rule.card_id))) {
+        return true;
+    }
+    if (!Number.isFinite(Number(rule.delivery_count)) || Number(rule.delivery_count) < 1) {
+        return true;
+    }
+    if (typeof rule.enabled !== 'boolean') {
+        return true;
+    }
+    if (rule.description != null && typeof rule.description !== 'string') {
+        return true;
+    }
+    if (!Number.isFinite(Number(rule.delivery_times)) || Number(rule.delivery_times) < 0) {
+        return true;
+    }
+    if (rule.card_name != null && typeof rule.card_name !== 'string') {
+        return true;
+    }
+    if (rule.card_type != null && typeof rule.card_type !== 'string') {
+        return true;
+    }
+    if (typeof rule.is_multi_spec !== 'boolean') {
+        return true;
+    }
+    if (rule.spec_name != null && typeof rule.spec_name !== 'string') {
+        return true;
+    }
+    if (rule.spec_value != null && typeof rule.spec_value !== 'string') {
+        return true;
+    }
+    if (rule.spec_name_2 != null && typeof rule.spec_name_2 !== 'string') {
+        return true;
+    }
+    if (rule.spec_value_2 != null && typeof rule.spec_value_2 !== 'string') {
+        return true;
+    }
+    if (rule.created_at != null && typeof rule.created_at !== 'string') {
+        return true;
+    }
+    if (rule.updated_at != null && typeof rule.updated_at !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedItemToggleMutationResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.message !== 'string' || !result.message.trim()) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedItemSyncMutationResult(result, requireCurrentCount = false, requireTotalCount = false, requireTotalPages = false) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (requireCurrentCount && (!Number.isFinite(Number(result.current_count)) || Number(result.current_count) < 0)) {
+        return true;
+    }
+    if (!requireCurrentCount && result.current_count != null && (!Number.isFinite(Number(result.current_count)) || Number(result.current_count) < 0)) {
+        return true;
+    }
+    if (requireTotalCount && (!Number.isFinite(Number(result.total_count)) || Number(result.total_count) < 0)) {
+        return true;
+    }
+    if (!requireTotalCount && result.total_count != null && (!Number.isFinite(Number(result.total_count)) || Number(result.total_count) < 0)) {
+        return true;
+    }
+    if (requireTotalPages && (!Number.isFinite(Number(result.total_pages)) || Number(result.total_pages) < 1)) {
+        return true;
+    }
+    if (!requireTotalPages && result.total_pages != null && (!Number.isFinite(Number(result.total_pages)) || Number(result.total_pages) < 1)) {
+        return true;
+    }
+    if (result.page_number != null && (!Number.isFinite(Number(result.page_number)) || Number(result.page_number) < 1)) {
+        return true;
+    }
+    if (result.page_size != null && (!Number.isFinite(Number(result.page_size)) || Number(result.page_size) < 1)) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedItemMessageMutationResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.message !== 'string' || !result.message.trim()) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedItemBatchDeleteResult(result, requireTotalCount = false) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (!Number.isFinite(Number(result.success_count)) || Number(result.success_count) < 0) {
+        return true;
+    }
+    if (!Number.isFinite(Number(result.failed_count)) || Number(result.failed_count) < 0) {
+        return true;
+    }
+    if (requireTotalCount && (!Number.isFinite(Number(result.total_count)) || Number(result.total_count) < 0)) {
+        return true;
+    }
+    if (!requireTotalCount && result.total_count != null && (!Number.isFinite(Number(result.total_count)) || Number(result.total_count) < 0)) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedOrderDeleteMutationResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedOrderDeliveryMutationResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (typeof result.delivered !== 'boolean') {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (result.result_state != null && typeof result.result_state !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedOrderRefreshMutationResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (typeof result.updated !== 'boolean') {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (result.new_status != null && typeof result.new_status !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedOrderListEntries(orders) {
+    return orders.some(order => {
+        if (!order || typeof order !== 'object' || Array.isArray(order)) {
+            return true;
+        }
+        if (typeof order.order_id !== 'string' || !order.order_id.trim()) {
+            return true;
+        }
+
+        const optionalStringFields = [
+            'item_id',
+            'buyer_id',
+            'buyer_nick',
+            'sid',
+            'spec_name',
+            'spec_value',
+            'spec_name_2',
+            'spec_value_2',
+            'order_status',
+            'pre_refund_status',
+            'account_id',
+            'platform_created_at',
+            'platform_paid_at',
+            'platform_completed_at',
+            'created_at',
+            'updated_at',
+            'yifan_orderno',
+            'delivery_status',
+            'callback_data',
+            'chat_id',
+        ];
+        if (optionalStringFields.some(field => order[field] != null && typeof order[field] !== 'string')) {
+            return true;
+        }
+
+        if (
+            order.quantity != null
+            && typeof order.quantity !== 'string'
+            && (typeof order.quantity !== 'number' || !Number.isFinite(order.quantity))
+        ) {
+            return true;
+        }
+
+        if (
+            order.amount != null
+            && typeof order.amount !== 'string'
+            && (typeof order.amount !== 'number' || !Number.isFinite(order.amount))
+        ) {
+            return true;
+        }
+
+        if (
+            order.bargain_flow_detected != null
+            && typeof order.bargain_flow_detected !== 'boolean'
+            && (
+                typeof order.bargain_flow_detected !== 'number'
+                || !Number.isFinite(order.bargain_flow_detected)
+                || ![0, 1].includes(order.bargain_flow_detected)
+            )
+        ) {
+            return true;
+        }
+
+        if (
+            order.bargain_success_detected != null
+            && typeof order.bargain_success_detected !== 'boolean'
+            && (
+                typeof order.bargain_success_detected !== 'number'
+                || !Number.isFinite(order.bargain_success_detected)
+                || ![0, 1].includes(order.bargain_success_detected)
+            )
+        ) {
+            return true;
+        }
+
+        return false;
+    });
+}
+
+function hasMalformedNotificationTemplateSaveResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.msg !== 'string' || !result.msg.trim()) {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedNotificationTemplateResetResult(result, templateType) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.msg !== 'string' || !result.msg.trim()) {
+        return true;
+    }
+    if (!result.template || typeof result.template !== 'object' || Array.isArray(result.template)) {
+        return true;
+    }
+    if (
+        Object.prototype.hasOwnProperty.call(result.template, 'type')
+        && String(result.template.type || '').trim() !== templateType
+    ) {
+        return true;
+    }
+    if (typeof result.template.template !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedNotificationTemplateTestResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.message !== 'string' || !result.message.trim()) {
+        return true;
+    }
+    if (result.success != null && typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (result.success_channels != null && !Array.isArray(result.success_channels)) {
+        return true;
+    }
+    if (result.failed_channels != null && !Array.isArray(result.failed_channels)) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedCommentTemplateMutationResult(result, requireTemplateId = false) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.msg !== 'string' || !result.msg.trim()) {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (requireTemplateId && !Number.isFinite(Number(result.template_id))) {
+        return true;
+    }
+    if (!requireTemplateId && result.template_id != null && !Number.isFinite(Number(result.template_id))) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedUserSettingMutationResult(result, requireKey = false, requireValue = false) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.msg !== 'string' || !result.msg.trim()) {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (requireKey && (typeof result.key !== 'string' || !result.key.trim())) {
+        return true;
+    }
+    if (!requireKey && result.key != null && typeof result.key !== 'string') {
+        return true;
+    }
+    if (requireValue && typeof result.value !== 'string') {
+        return true;
+    }
+    if (!requireValue && result.value != null && typeof result.value !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedMenuSettingsMutationResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.msg !== 'string' || !result.msg.trim()) {
+        return true;
+    }
+    if (!Number.isFinite(Number(result.count)) || Number(result.count) < 0) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedSystemSettingsMutationResult(result, booleanFieldName = '', requireSuccessFlag = false) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (requireSuccessFlag && typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (result.success != null && typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (result.msg != null && typeof result.msg !== 'string') {
+        return true;
+    }
+    if (booleanFieldName && result[booleanFieldName] != null && typeof result[booleanFieldName] !== 'boolean') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedAccountInlineEditResult(result, stringFieldName = '', numericFieldName = '', minNumericValue = null, maxNumericValue = null) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.message !== 'string' || !result.message.trim()) {
+        return true;
+    }
+    if (stringFieldName && typeof result[stringFieldName] !== 'string') {
+        return true;
+    }
+    if (numericFieldName) {
+        const numericValue = Number(result[numericFieldName]);
+        if (!Number.isFinite(numericValue)) {
+            return true;
+        }
+        if (minNumericValue != null && numericValue < minNumericValue) {
+            return true;
+        }
+        if (maxNumericValue != null && numericValue > maxNumericValue) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function hasMalformedBackupMutationResult(result, requireUserCount = false) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    if (result.warning != null && typeof result.warning !== 'string') {
+        return true;
+    }
+    if (requireUserCount && (!Number.isFinite(Number(result.user_count)) || Number(result.user_count) < 0)) {
+        return true;
+    }
+    if (!requireUserCount && result.user_count != null && (!Number.isFinite(Number(result.user_count)) || Number(result.user_count) < 0)) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedSystemSettingsLoadResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    return Object.keys(result).some(key => result[key] != null && typeof result[key] !== 'string');
+}
+
+function hasMalformedUserSettingsLoadResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    return Object.keys(result).some(key => {
+        const entry = result[key];
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+            return true;
+        }
+        if (entry.value != null && typeof entry.value !== 'string') {
+            return true;
+        }
+        if (entry.description != null && typeof entry.description !== 'string') {
+            return true;
+        }
+        if (entry.updated_at != null && typeof entry.updated_at !== 'string') {
+            return true;
+        }
+        return false;
+    });
+}
+
+function hasMalformedRegistrationStatusResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.enabled !== 'boolean') {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedDeliveryStatsResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (!Number.isFinite(Number(result.today_delivery_count)) || Number(result.today_delivery_count) < 0) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedBackupExportData(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.version !== 'string' || !result.version.trim()) {
+        return true;
+    }
+    if (!Number.isFinite(Number(result.timestamp)) || Number(result.timestamp) < 0) {
+        return true;
+    }
+    if (result.user_id != null && !Number.isFinite(Number(result.user_id))) {
+        return true;
+    }
+    if (!result.data || typeof result.data !== 'object' || Array.isArray(result.data)) {
+        return true;
+    }
+    return false;
+}
+
 async function enrichDashboardAccounts(accounts) {
     const [scheduledTaskData, keywordCountData, defaultReplyData, aiReplyData] = await Promise.all([
         fetchDashboardResource('/scheduled-tasks', { success: false, tasks: [] }),
@@ -752,10 +2068,21 @@ async function enrichDashboardAccounts(accounts) {
         fetchDashboardResource('/default-replies', {}),
         fetchDashboardResource('/ai-reply-settings', {})
     ]);
-    const scheduledTasks = scheduledTaskData && scheduledTaskData.success ? (scheduledTaskData.tasks || []) : [];
-    const keywordCounts = keywordCountData && typeof keywordCountData === 'object' ? keywordCountData : {};
-    const defaultReplies = defaultReplyData && typeof defaultReplyData === 'object' ? defaultReplyData : {};
-    const aiReplySettings = aiReplyData && typeof aiReplyData === 'object' ? aiReplyData : {};
+    const scheduledTasks = scheduledTaskData
+        && scheduledTaskData.success
+        && Array.isArray(scheduledTaskData.tasks)
+        && !hasMalformedScheduledTaskEntries(scheduledTaskData.tasks)
+        ? scheduledTaskData.tasks
+        : [];
+    const keywordCounts = hasMalformedKeywordCountMap(keywordCountData)
+        ? {}
+        : keywordCountData;
+    const defaultReplies = hasMalformedDefaultReplySettingsMap(defaultReplyData)
+        ? {}
+        : defaultReplyData;
+    const aiReplySettings = hasMalformedAiReplySettingsMap(aiReplyData)
+        ? {}
+        : aiReplyData;
 
     return (accounts || []).map((account) => {
         const accountId = getCookieDetailsAccountId(account);
@@ -1334,7 +2661,13 @@ async function loadDashboard() {
         return false;
     }
 
-    const cookiesData = await cookiesResponse.json();
+    const cookiesData = await cookiesResponse.json().catch(() => ({}));
+    if (!Array.isArray(cookiesData)) {
+        throw new Error('账号列表返回格式异常');
+    }
+    if (hasMalformedCookieDetailsAccounts(cookiesData)) {
+        throw new Error('账号列表返回格式异常');
+    }
     if (requestSequence !== dashboardLoadRequestSequence) {
         return false;
     }
@@ -1407,8 +2740,17 @@ async function refreshDashboardRuntimeSnapshots() {
         if (requestSequence !== dashboardRuntimeSnapshotRequestSequence) {
             return;
         }
+        if (!cookieDetails) {
+            return null;
+        }
+        if (!Array.isArray(cookieDetails)) {
+            throw new Error('账号列表返回格式异常');
+        }
+        if (hasMalformedCookieDetailsAccounts(cookieDetails)) {
+            throw new Error('账号列表返回格式异常');
+        }
         const runtimeStatusMap = new Map(
-            (Array.isArray(cookieDetails) ? cookieDetails : []).map(cookie => [String(cookie.account_id), cookie.runtime_status || null])
+            cookieDetails.map(cookie => [String(cookie.account_id), cookie.runtime_status || null])
         );
 
         dashboardData.accounts = dashboardData.accounts.map(account => {
@@ -1458,7 +2800,7 @@ async function loadItemsCount() {
             throw new Error(errorMessage);
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         const count = Number(data.count);
         if (!Number.isFinite(count) || count < 0) {
             throw new Error('商品总数返回格式异常');
@@ -1498,15 +2840,30 @@ async function loadOrderDashboardMetrics() {
             return false;
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (requestSequence !== dashboardOrderMetricsRequestSequence) {
             return false;
+        }
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            throw new Error('订单看板返回格式异常');
+        }
+        if (
+            typeof data.success !== 'boolean'
+            || (data.message != null && typeof data.message !== 'string')
+        ) {
+            throw new Error('订单看板返回格式异常');
         }
         if (!data.success) {
             throw new Error(data.message || '加载订单数量失败');
         }
+        if (!Array.isArray(data.data)) {
+            throw new Error('订单看板返回格式异常');
+        }
+        if (hasMalformedOrderListEntries(data.data)) {
+            throw new Error('订单看板返回格式异常');
+        }
 
-        const orders = Array.isArray(data.data) ? data.data : [];
+        const orders = data.data;
         const totalOrders = orders.length;
 
         let totalSalesAmount = 0;
@@ -1596,11 +2953,23 @@ async function loadSalesSummary() {
             throw new Error(errorMessage);
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (requestSequence !== salesSummaryRequestSequence) {
             return;
         }
-        if (data.success && data.data) {
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            throw new Error('销售额摘要返回格式异常');
+        }
+        if (
+            typeof data.success !== 'boolean'
+            || (data.message != null && typeof data.message !== 'string')
+        ) {
+            throw new Error('销售额摘要返回格式异常');
+        }
+        if (data.success === true) {
+            if (hasMalformedSalesSummaryMetrics(data.data)) {
+                throw new Error('销售额摘要返回格式异常');
+            }
             updateDashboardSalesMetrics(data.data);
         } else {
             showSalesErrorState(todaySalesEl, '获取失败');
@@ -1633,6 +3002,22 @@ function showSalesErrorState(element, message) {
     if (element) {
         element.innerHTML = `<span class="sales-value-error">${message}</span>`;
     }
+}
+
+function hasMalformedSalesSummaryMetrics(metrics) {
+    return (
+        !metrics
+        || typeof metrics !== 'object'
+        || Array.isArray(metrics)
+        || typeof metrics.today_sales !== 'number'
+        || !Number.isFinite(metrics.today_sales)
+        || typeof metrics.week_sales !== 'number'
+        || !Number.isFinite(metrics.week_sales)
+        || typeof metrics.month_sales !== 'number'
+        || !Number.isFinite(metrics.month_sales)
+        || typeof metrics.update_time !== 'string'
+        || !metrics.update_time.trim()
+    );
 }
 
 // 格式化销售额显示（带千分位分隔符）
@@ -1717,14 +3102,26 @@ function startSalesSummaryRefreshTimer() {
                 return;
             }
 
-            const data = await response.json();
+            const data = await response.json().catch(() => ({}));
             if (
                 timerRequestSequence !== salesSummaryRequestSequence
                 || !document.getElementById('dashboard-section')?.classList.contains('active')
             ) {
                 return;
             }
-            if (data.success && data.data) {
+            if (!data || typeof data !== 'object' || Array.isArray(data)) {
+                throw new Error('销售额摘要返回格式异常');
+            }
+            if (
+                typeof data.success !== 'boolean'
+                || (data.message != null && typeof data.message !== 'string')
+            ) {
+                throw new Error('销售额摘要返回格式异常');
+            }
+            if (data.success === true) {
+                if (hasMalformedSalesSummaryMetrics(data.data)) {
+                    throw new Error('销售额摘要返回格式异常');
+                }
                 updateDashboardSalesMetrics(data.data);
             }
         } catch (error) {
@@ -1836,15 +3233,42 @@ async function loadSalesChart(period) {
             throw new Error(errorMessage);
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (requestSequence !== salesChartRequestSequence) {
             return;
         }
         if (!document.getElementById('dashboard-section')?.classList.contains('active')) {
             return;
         }
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            throw new Error('销售额图表返回格式异常');
+        }
+        if (
+            typeof data.success !== 'boolean'
+            || (data.message != null && typeof data.message !== 'string')
+        ) {
+            throw new Error('销售额图表返回格式异常');
+        }
         if (!data.success || !data.data) {
             throw new Error(data.message || '加载销售额数据失败');
+        }
+        if (
+            typeof data.data !== 'object'
+            || Array.isArray(data.data)
+            || !Array.isArray(data.data.sales)
+        ) {
+            throw new Error('销售额图表返回格式异常');
+        }
+        if (data.data.sales.some(item =>
+            !item
+            || typeof item !== 'object'
+            || Array.isArray(item)
+            || typeof item.date !== 'string'
+            || item.date.trim() === ''
+            || typeof item.amount !== 'number'
+            || !Number.isFinite(item.amount)
+        )) {
+            throw new Error('销售额图表返回格式异常');
         }
         currentChartPeriod = period;
         renderSalesChart(data.data.sales, period);
@@ -1906,15 +3330,42 @@ async function loadCustomSalesChart() {
             throw new Error(errorMessage);
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (requestSequence !== salesChartRequestSequence) {
             return;
         }
         if (!document.getElementById('dashboard-section')?.classList.contains('active')) {
             return;
         }
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            throw new Error('销售额图表返回格式异常');
+        }
+        if (
+            typeof data.success !== 'boolean'
+            || (data.message != null && typeof data.message !== 'string')
+        ) {
+            throw new Error('销售额图表返回格式异常');
+        }
         if (!data.success || !data.data) {
             throw new Error(data.message || '加载销售额数据失败');
+        }
+        if (
+            typeof data.data !== 'object'
+            || Array.isArray(data.data)
+            || !Array.isArray(data.data.sales)
+        ) {
+            throw new Error('销售额图表返回格式异常');
+        }
+        if (data.data.sales.some(item =>
+            !item
+            || typeof item !== 'object'
+            || Array.isArray(item)
+            || typeof item.date !== 'string'
+            || item.date.trim() === ''
+            || typeof item.amount !== 'number'
+            || !Number.isFinite(item.amount)
+        )) {
+            throw new Error('销售额图表返回格式异常');
         }
         currentChartPeriod = 'custom';
         renderSalesChart(data.data.sales, 'custom');
@@ -2516,14 +3967,34 @@ async function loadDashboardDeliveryLogs() {
             return;
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             requestSequence !== dashboardDeliveryLogsRequestSequence
             || !document.getElementById('dashboard-section')?.classList.contains('active')
         ) {
             return;
         }
-        const logs = Array.isArray(data.logs) ? data.logs : [];
+        if (!data || typeof data !== 'object' || Array.isArray(data) || !Array.isArray(data.logs)) {
+            throw new Error('发货日志返回格式异常');
+        }
+        if (data.logs.some(log =>
+            !log
+            || typeof log !== 'object'
+            || Array.isArray(log)
+            || (log.created_at != null && typeof log.created_at !== 'string')
+            || (log.order_id != null && typeof log.order_id !== 'string')
+            || (log.status != null && typeof log.status !== 'string')
+            || (log.rule_keyword != null && typeof log.rule_keyword !== 'string')
+            || (log.match_mode != null && typeof log.match_mode !== 'string')
+            || (log.channel != null && typeof log.channel !== 'string')
+            || (log.reason != null && typeof log.reason !== 'string')
+            || (log.order_spec_mode != null && typeof log.order_spec_mode !== 'string')
+            || (log.rule_spec_mode != null && typeof log.rule_spec_mode !== 'string')
+            || (log.item_config_mode != null && typeof log.item_config_mode !== 'string')
+        )) {
+            throw new Error('发货日志返回格式异常');
+        }
+        const logs = data.logs;
         renderDashboardDeliveryLogs(logs);
     } catch (error) {
         if (
@@ -2680,8 +4151,11 @@ async function getAccountKeywordCount(accountId) {
     }
 
     if (response.ok) {
-        const keywordCounts = await response.json();
-        accountKeywordCache = keywordCounts && typeof keywordCounts === 'object' ? keywordCounts : {};
+        const keywordCounts = await response.json().catch(() => null);
+        if (hasMalformedKeywordCountMap(keywordCounts)) {
+            return 0;
+        }
+        accountKeywordCache = keywordCounts;
         const count = Number(accountKeywordCache[accountId] || 0);
 
         // 更新缓存
@@ -2776,7 +4250,13 @@ async function refreshAccountList() {
     }
 
     if (response.ok) {
-        const accounts = await response.json();
+        const accounts = await response.json().catch(() => null);
+        if (!Array.isArray(accounts)) {
+            throw new Error('账号列表返回格式异常');
+        }
+        if (hasMalformedCookieDetailsAccounts(accounts)) {
+            throw new Error('账号列表返回格式异常');
+        }
         if (
             requestSequence !== autoReplyAccountListRequestSequence
             || !document.getElementById('auto-reply-section')?.classList.contains('active')
@@ -2808,7 +4288,10 @@ async function refreshAccountList() {
         } else if (!keywordsResponse.ok) {
             keywordCountLoadFailed = true;
         } else {
-            keywordCounts = await keywordsResponse.json();
+            keywordCounts = await keywordsResponse.json().catch(() => null);
+            if (hasMalformedKeywordCountMap(keywordCounts)) {
+            throw new Error('关键词数量返回格式异常');
+            }
         }
         } catch (error) {
         if (controller.signal.aborted || error?.name === 'AbortError') {
@@ -3023,7 +4506,7 @@ async function refreshKeywordsList() {
             ) {
                 return false;
             }
-            const data = await response.json();
+            const data = await response.json().catch(() => ({}));
             if (
                 requestSequence !== autoReplyKeywordsRequestSequence
                 || currentAccountId !== requestedAccountId
@@ -3165,7 +4648,7 @@ async function loadAccountKeywords() {
             ) {
                 return false;
             }
-            const data = await response.json();
+            const data = await response.json().catch(() => ({}));
             if (
                 requestSequence !== autoReplyKeywordsRequestSequence
                 || isRequestedAccountSelectionChanged()
@@ -3295,7 +4778,7 @@ async function loadItemsList(accountId, options = {}) {
     )) {
     return false;
     }
-    const data = await response.json();
+    const data = await response.json().catch(() => ({}));
     if (requestSequence && (
         requestSequence !== autoReplyKeywordsRequestSequence
         || currentAccountId !== requestedAccountId
@@ -3303,7 +4786,10 @@ async function loadItemsList(accountId, options = {}) {
     )) {
     return false;
     }
-    const items = data.items || [];
+    if (!data || typeof data !== 'object' || !Array.isArray(data.items)) {
+        throw new Error('商品列表返回格式异常');
+    }
+    const items = data.items;
 
     // 更新商品选择下拉框
     if (selectElement) {
@@ -4699,6 +6185,21 @@ function getAboutSelectedAccountId() {
     return document.getElementById('aboutDiagnosticsAccount')?.value?.trim() || '';
 }
 
+function stopAboutDiagnosticsRequests() {
+    if (aboutDiagnosticsAbortController) {
+        aboutDiagnosticsAbortController.abort();
+        aboutDiagnosticsAbortController = null;
+    }
+}
+
+function resetAboutDiagnosticsAbortController() {
+    stopAboutDiagnosticsRequests();
+    aboutDiagnosticsAbortController = new AbortController();
+    return aboutDiagnosticsAbortController;
+}
+
+window.addEventListener('pagehide', stopAboutDiagnosticsRequests);
+
 function getAboutStatusText(type, value) {
     const normalized = String(value || '').trim();
     if (!normalized) {
@@ -5237,14 +6738,22 @@ async function loadAboutRuntimeStatus(accountId = '') {
     renderAboutAccountMeta(selectedAccount);
     renderAboutRuntimeStatus(selectedAccount?.runtime_status || null);
 
+    const controller = resetAboutDiagnosticsAbortController();
     try {
         const result = await fetchJSONWithoutGlobalLoading(`${apiBase}/accounts/${encodeURIComponent(normalizedAccountId)}/runtime-status`, {
-            suppressErrorToast: true
+            suppressErrorToast: true,
+            signal: controller.signal
         });
         if (requestSequence !== aboutRuntimeRequestSequence || getAboutSelectedAccountId() !== normalizedAccountId) {
             return false;
         }
-        const runtimeStatus = result?.runtime_status || null;
+        if (!result) {
+            return null;
+        }
+        if (hasMalformedAboutRuntimeStatusResult(result, normalizedAccountId)) {
+            throw new Error('账号运行态返回格式异常');
+        }
+        const runtimeStatus = result.runtime_status || null;
         const targetAccount = aboutDiagnosticsAccounts.find(account => getCookieDetailsAccountId(account) === normalizedAccountId);
         if (targetAccount) {
             targetAccount.runtime_status = runtimeStatus;
@@ -5254,6 +6763,9 @@ async function loadAboutRuntimeStatus(accountId = '') {
         scheduleAboutRuntimeAutoRetry(normalizedAccountId, runtimeStatus);
         return true;
     } catch (error) {
+        if (controller.signal.aborted || error?.name === 'AbortError') {
+            return false;
+        }
         console.error('加载账号运行态失败:', error);
         if (requestSequence !== aboutRuntimeRequestSequence || getAboutSelectedAccountId() !== normalizedAccountId) {
             return false;
@@ -5270,17 +6782,23 @@ async function loadAboutRuntimeStatus(accountId = '') {
         renderAboutRuntimeStatus(fallbackRuntimeStatus);
         scheduleAboutRuntimeAutoRetry(normalizedAccountId, fallbackRuntimeStatus, { requestFailed: true });
         return false;
+    } finally {
+        if (aboutDiagnosticsAbortController === controller) {
+            aboutDiagnosticsAbortController = null;
+        }
     }
 }
 
 async function loadAboutDiagnostics() {
     initAboutDiagnosticsEvents();
     const requestSequence = ++aboutDiagnosticsLoadRequestSequence;
+    const controller = resetAboutDiagnosticsAbortController();
 
     try {
         const previousAccountId = getAboutSelectedAccountId();
         const accounts = await fetchJSON(`${apiBase}/accounts/details?summary_only=true`, {
-            suppressErrorToast: true
+            suppressErrorToast: true,
+            signal: controller.signal
         });
         if (
             requestSequence !== aboutDiagnosticsLoadRequestSequence
@@ -5290,6 +6808,12 @@ async function loadAboutDiagnostics() {
         }
         if (!accounts) {
             return null;
+        }
+        if (!Array.isArray(accounts)) {
+            throw new Error('账号列表返回格式异常');
+        }
+        if (hasMalformedCookieDetailsAccounts(accounts)) {
+            throw new Error('账号列表返回格式异常');
         }
         aboutDiagnosticsAccounts = Array.isArray(accounts) ? accounts : [];
         populateAboutAccountOptions(aboutDiagnosticsAccounts);
@@ -5322,6 +6846,9 @@ async function loadAboutDiagnostics() {
         }
         await loadAboutRuntimeStatus(nextAccountId);
     } catch (error) {
+        if (controller.signal.aborted || error?.name === 'AbortError') {
+            return null;
+        }
         if (
             requestSequence !== aboutDiagnosticsLoadRequestSequence
             || !document.getElementById('accounts-section')?.classList.contains('active')
@@ -5340,6 +6867,10 @@ async function loadAboutDiagnostics() {
         renderAboutRuntimePlaceholder('加载账号保活诊断失败', '请稍后重试。');
         renderAboutHistoryPlaceholder('暂无历史消息', '账号保活诊断加载失败，请稍后重试。');
         return false;
+    } finally {
+        if (aboutDiagnosticsAbortController === controller) {
+            aboutDiagnosticsAbortController = null;
+        }
     }
 }
 
@@ -5396,10 +6927,12 @@ async function triggerAboutSessionKeepalive() {
         keepaliveButton.innerHTML = '<i class="bi bi-lightning-charge-fill me-1"></i>执行中...';
     }
 
+    const controller = resetAboutDiagnosticsAbortController();
     try {
         const result = await fetchJSONWithoutGlobalLoading(`${apiBase}/accounts/${encodeURIComponent(accountId)}/session-keepalive`, {
             method: 'POST',
             suppressErrorToast: true,
+            signal: controller.signal,
         });
         if (
             actionRequestSequence !== aboutKeepaliveActionRequestSequence
@@ -5408,14 +6941,23 @@ async function triggerAboutSessionKeepalive() {
         ) {
             return null;
         }
+        if (!result) {
+            return null;
+        }
+        if (hasMalformedAboutSessionKeepaliveResult(result, requestedAccountId)) {
+            throw new Error('轻保活结果返回格式异常');
+        }
         const targetAccount = aboutDiagnosticsAccounts.find(account => getCookieDetailsAccountId(account) === requestedAccountId);
         if (targetAccount) {
-            targetAccount.runtime_status = result?.runtime_status || null;
+            targetAccount.runtime_status = result.runtime_status || null;
             renderAboutAccountMeta(targetAccount);
         }
-        renderAboutRuntimeStatus(result?.runtime_status || null);
-        showToast(result?.message || '轻保活已执行', result?.success ? 'success' : 'warning');
+        renderAboutRuntimeStatus(result.runtime_status || null);
+        showToast(result.message || '轻保活已执行', result.success ? 'success' : 'warning');
     } catch (error) {
+        if (controller.signal.aborted || error?.name === 'AbortError') {
+            return null;
+        }
         if (
             actionRequestSequence !== aboutKeepaliveActionRequestSequence
             || getAboutSelectedAccountId() !== requestedAccountId
@@ -5426,6 +6968,9 @@ async function triggerAboutSessionKeepalive() {
         console.error('执行轻保活失败:', error);
         showToast(error?.message || '执行轻保活失败', 'danger');
     } finally {
+        if (aboutDiagnosticsAbortController === controller) {
+            aboutDiagnosticsAbortController = null;
+        }
         if (
             !keepaliveButton
             || actionRequestSequence !== aboutKeepaliveActionRequestSequence
@@ -5465,13 +7010,21 @@ async function loadAboutConversationHistory() {
 
     renderAboutHistoryPlaceholder('正在查询历史消息', '请稍候，系统正在尝试拉取最近的会话消息。');
 
-    try {
-        const result = await fetchJSONWithoutGlobalLoading(
+    const controller = resetAboutDiagnosticsAbortController();
+        try {
+            const result = await fetchJSONWithoutGlobalLoading(
             `${apiBase}/accounts/${encodeURIComponent(accountId)}/conversations/${encodeURIComponent(conversationId)}/history`,
             {
                 suppressErrorToast: true,
+                signal: controller.signal,
             }
         );
+        if (!result) {
+            return null;
+        }
+        if (hasMalformedAboutConversationHistoryResult(result, requestedAccountId, requestedConversationId)) {
+            throw new Error('历史消息返回格式异常');
+        }
         if (
             requestSequence !== aboutConversationHistoryRequestSequence
             || getAboutSelectedAccountId() !== requestedAccountId
@@ -5480,11 +7033,14 @@ async function loadAboutConversationHistory() {
         ) {
             return null;
         }
-        renderAboutConversationHistory(result?.messages || [], {
-            conversationId: result?.conversation_id || conversationId,
+        renderAboutConversationHistory(result.messages, {
+            conversationId: result.conversation_id || conversationId,
         });
         showToast(`账号 "${accountId}" 历史消息查询完成`, 'success');
     } catch (error) {
+        if (controller.signal.aborted || error?.name === 'AbortError') {
+            return null;
+        }
         if (
             requestSequence !== aboutConversationHistoryRequestSequence
             || getAboutSelectedAccountId() !== requestedAccountId
@@ -5496,6 +7052,9 @@ async function loadAboutConversationHistory() {
         console.error('查询历史消息失败:', error);
         renderAboutHistoryPlaceholder('历史消息查询失败', error?.message || '请稍后重试。');
     } finally {
+        if (aboutDiagnosticsAbortController === controller) {
+            aboutDiagnosticsAbortController = null;
+        }
         if (
             !historyButton
             || requestSequence !== aboutConversationHistoryRequestSequence
@@ -5595,6 +7154,9 @@ async function loadAccounts() {
     if (!Array.isArray(cookieDetails)) {
         throw new Error('账号列表返回格式异常');
     }
+    if (hasMalformedCookieDetailsAccounts(cookieDetails)) {
+        throw new Error('账号列表返回格式异常');
+    }
 
     if (cookieDetails.length === 0) {
         tbody.innerHTML = `
@@ -5653,19 +7215,31 @@ async function loadAccounts() {
         if (!keywordsResponse || !keywordsResponse.ok) {
         keywordCountLoadFailed = true;
         } else {
-        keywordCounts = await keywordsResponse.json();
+        keywordCounts = await keywordsResponse.json().catch(() => null);
+        if (hasMalformedKeywordCountMap(keywordCounts)) {
+            keywordCountLoadFailed = true;
+            keywordCounts = {};
+        }
         }
 
         if (!defaultReplyResponse || !defaultReplyResponse.ok) {
         defaultReplyLoadFailed = true;
         } else {
-        defaultReplies = await defaultReplyResponse.json();
+        defaultReplies = await defaultReplyResponse.json().catch(() => null);
+        if (hasMalformedDefaultReplySettingsMap(defaultReplies)) {
+            defaultReplyLoadFailed = true;
+            defaultReplies = {};
+        }
         }
 
         if (!aiReplyResponse || !aiReplyResponse.ok) {
         aiReplyLoadFailed = true;
         } else {
-        aiReplySettings = await aiReplyResponse.json();
+        aiReplySettings = await aiReplyResponse.json().catch(() => null);
+        if (hasMalformedAiReplySettingsMap(aiReplySettings)) {
+            aiReplyLoadFailed = true;
+            aiReplySettings = {};
+        }
         }
     }
 
@@ -5903,6 +7477,9 @@ async function copyCookie(id) {
     if (!details) {
         return null;
     }
+    if (hasMalformedAccountSecretDetails(details, id)) {
+        throw new Error('账号详情返回格式异常');
+    }
     const value = details?.value || '';
 
     if (!value || value === '未设置') {
@@ -5953,12 +7530,15 @@ async function polishAccountItems(accountId) {
         return;
     }
     const actionRequestSequence = ++accountMutationActionRequestSequence;
+    let controller = null;
+    controller = resetAccountRuntimeActionAbortController();
     toggleLoading(true);
     showToast('正在擦亮所有商品，请稍候...', 'info');
     try {
         const response = await fetch(`${apiBase}/accounts/${encodeURIComponent(accountId)}/polish-items`, {
             method: 'POST',
-            headers: { 'Authorization': `Bearer ${authToken}` }
+            headers: { 'Authorization': `Bearer ${authToken}` },
+            signal: controller.signal
         });
         if (handleUnauthorizedApiResponse(response)) {
             return null;
@@ -5974,12 +7554,15 @@ async function polishAccountItems(accountId) {
             showToast(`擦亮失败: ${errorMessage}`, 'danger');
             return;
         }
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             actionRequestSequence !== accountMutationActionRequestSequence
             || !document.getElementById('accounts-section')?.classList.contains('active')
         ) {
             return null;
+        }
+        if (hasMalformedPolishItemsResult(data)) {
+            throw new Error('擦亮结果返回格式异常');
         }
         if (data.success) {
             showToast(`擦亮完成: ${data.polished}/${data.total} 个商品成功`, 'success');
@@ -5987,6 +7570,9 @@ async function polishAccountItems(accountId) {
             showToast(`擦亮失败: ${data.message}`, 'danger');
         }
     } catch (error) {
+    if (controller?.signal.aborted || error?.name === 'AbortError') {
+        return null;
+    }
     if (
         actionRequestSequence !== accountMutationActionRequestSequence
         || !document.getElementById('accounts-section')?.classList.contains('active')
@@ -5995,6 +7581,9 @@ async function polishAccountItems(accountId) {
     }
     showToast(`擦亮请求异常: ${error.message}`, 'danger');
     } finally {
+        if (accountRuntimeActionAbortController === controller) {
+            accountRuntimeActionAbortController = null;
+        }
         if (
             actionRequestSequence !== accountMutationActionRequestSequence
             || !document.getElementById('accounts-section')?.classList.contains('active')
@@ -6013,6 +7602,7 @@ async function refreshRealCookie(accountId, event) {
     }
 
     let actionRequestSequence = 0;
+    let controller = null;
     const button = event?.currentTarget || event?.target?.closest?.('button') || null;
     const originalContent = button ? button.innerHTML : '';
 
@@ -6024,6 +7614,9 @@ async function refreshRealCookie(accountId, event) {
         });
         if (!currentCookie) {
             return null;
+        }
+        if (hasMalformedAccountSecretDetails(currentCookie, accountId)) {
+            throw new Error('账号详情返回格式异常');
         }
         if (!document.getElementById('accounts-section')?.classList.contains('active')) {
             return null;
@@ -6039,6 +7632,7 @@ async function refreshRealCookie(accountId, event) {
             return;
         }
         actionRequestSequence = ++accountMutationActionRequestSequence;
+        controller = resetAccountRuntimeActionAbortController();
 
         // 显示加载状态
         if (button) {
@@ -6053,6 +7647,7 @@ async function refreshRealCookie(accountId, event) {
                 'Authorization': `Bearer ${authToken}`,
                 'Content-Type': 'application/json'
             },
+            signal: controller.signal,
             body: JSON.stringify({
                 qr_cookies: currentCookie.value,
                 account_id: accountId
@@ -6079,12 +7674,15 @@ async function refreshRealCookie(accountId, event) {
             showToast(`真实Cookie刷新失败: ${errorMessage}`, 'danger');
             return;
         }
-        const result = await response.json();
+        const result = await response.json().catch(() => ({}));
         if (
             actionRequestSequence !== accountMutationActionRequestSequence
             || !document.getElementById('accounts-section')?.classList.contains('active')
         ) {
             return null;
+        }
+        if (hasMalformedQrRefreshResult(result)) {
+            throw new Error('真实Cookie刷新结果返回格式异常');
         }
 
         if (result.success) {
@@ -6112,6 +7710,9 @@ async function refreshRealCookie(accountId, event) {
         }
 
     } catch (error) {
+        if (controller?.signal.aborted || error?.name === 'AbortError') {
+            return null;
+        }
         if (
             (actionRequestSequence && actionRequestSequence !== accountMutationActionRequestSequence)
             || !document.getElementById('accounts-section')?.classList.contains('active')
@@ -6121,6 +7722,9 @@ async function refreshRealCookie(accountId, event) {
         console.error('刷新真实Cookie失败:', error);
         showToast(`刷新真实Cookie失败: ${error.message || '未知错误'}`, 'danger');
     } finally {
+        if (accountRuntimeActionAbortController === controller) {
+            accountRuntimeActionAbortController = null;
+        }
         // 恢复按钮状态
         if (
             !button
@@ -6166,12 +7770,15 @@ async function showCooldownStatus(accountId) {
             showToast(`获取冷却状态失败: ${errorMessage}`, 'danger');
             return;
         }
-        const result = await response.json();
+        const result = await response.json().catch(() => ({}));
         if (
             actionRequestSequence !== accountMutationActionRequestSequence
             || !document.getElementById('accounts-section')?.classList.contains('active')
         ) {
             return null;
+        }
+        if (hasMalformedQrCooldownStatusResult(result)) {
+            throw new Error('冷却状态返回格式异常');
         }
 
         if (result.success) {
@@ -6260,12 +7867,15 @@ async function resetCooldownTime(accountId) {
             showToast(`重置冷却时间失败: ${errorMessage}`, 'danger');
             return;
         }
-        const result = await response.json();
+        const result = await response.json().catch(() => ({}));
         if (
             actionRequestSequence !== accountMutationActionRequestSequence
             || !document.getElementById('accounts-section')?.classList.contains('active')
         ) {
             return null;
+        }
+        if (hasMalformedQrCooldownStatusResult(result)) {
+            throw new Error('重置冷却时间结果返回格式异常');
         }
 
         if (result.success) {
@@ -6363,6 +7973,9 @@ async function openAccountEditor(id) {
         if (!details) {
             return null;
         }
+        if (hasMalformedAccountSecretDetails(details, id)) {
+            throw new Error('账号详情返回格式异常');
+        }
         if (
             requestSequence !== accountEditRequestSequence
             || !document.getElementById('accounts-section')?.classList.contains('active')
@@ -6416,6 +8029,9 @@ async function openAccountEditModal(accountData, requestSequence = accountEditRe
     ) {
         return null;
     }
+    if (hasMalformedAccountSecretDetails(accountData)) {
+        throw new Error('账号详情返回格式异常');
+    }
     const accountId = getCookieDetailsAccountId(accountData);
     // 设置模态框数据
     document.getElementById('accountEditId').value = accountId;
@@ -6441,6 +8057,51 @@ async function openAccountEditModal(accountData, requestSequence = accountEditRe
             || !document.getElementById('accounts-section')?.classList.contains('active')
         ) {
             return null;
+        }
+        if (!proxyData || typeof proxyData !== 'object' || Array.isArray(proxyData)) {
+            throw new Error('代理配置返回格式异常');
+        }
+        if (proxyData.success != null && typeof proxyData.success !== 'boolean') {
+            throw new Error('代理配置返回格式异常');
+        }
+        if (proxyData.message != null && typeof proxyData.message !== 'string') {
+            throw new Error('代理配置返回格式异常');
+        }
+        if (proxyData.success !== true) {
+            throw new Error(proxyData.message || '代理配置返回格式异常');
+        }
+        if (!proxyData.data || typeof proxyData.data !== 'object' || Array.isArray(proxyData.data)) {
+            throw new Error('代理配置返回格式异常');
+        }
+        if (
+            proxyData.data.proxy_type != null
+            && typeof proxyData.data.proxy_type !== 'string'
+        ) {
+            throw new Error('代理配置返回格式异常');
+        }
+        if (
+            proxyData.data.proxy_host != null
+            && typeof proxyData.data.proxy_host !== 'string'
+        ) {
+            throw new Error('代理配置返回格式异常');
+        }
+        if (
+            proxyData.data.proxy_port != null
+            && !Number.isFinite(Number(proxyData.data.proxy_port))
+        ) {
+            throw new Error('代理配置返回格式异常');
+        }
+        if (
+            proxyData.data.proxy_user != null
+            && typeof proxyData.data.proxy_user !== 'string'
+        ) {
+            throw new Error('代理配置返回格式异常');
+        }
+        if (
+            proxyData.data.proxy_pass != null
+            && typeof proxyData.data.proxy_pass !== 'string'
+        ) {
+            throw new Error('代理配置返回格式异常');
         }
         if (proxyData && proxyData.data) {
             document.getElementById('editProxyType').value = proxyData.data.proxy_type || 'none';
@@ -6666,6 +8327,9 @@ async function toggleAccountStatus(accountId, enabled) {
         ) {
             return null;
         }
+        if (hasMalformedAccountToggleMutationResult(result, 'enabled')) {
+            throw new Error('账号状态更新结果返回格式异常');
+        }
         showToast(result.message || `账号 "${accountId}" 已${enabled ? '启用' : '禁用'}`, 'success');
 
         // 清除相关缓存，确保数据一致性
@@ -6797,12 +8461,15 @@ async function toggleAutoConfirm(accountId, enabled) {
     }
 
     if (response.ok) {
-        const result = await response.json();
+        const result = await response.json().catch(() => ({}));
         if (
             actionRequestSequence !== accountMutationActionRequestSequence
             || !document.getElementById('accounts-section')?.classList.contains('active')
         ) {
             return null;
+        }
+        if (hasMalformedAccountToggleMutationResult(result, 'auto_confirm')) {
+            throw new Error('自动确认发货更新结果返回格式异常');
         }
         showToast(result.message, 'success');
 
@@ -6901,12 +8568,15 @@ async function toggleAutoComment(accountId, enabled) {
         }
 
         if (response.ok) {
-            const result = await response.json();
+            const result = await response.json().catch(() => ({}));
             if (
                 actionRequestSequence !== accountMutationActionRequestSequence
                 || !document.getElementById('accounts-section')?.classList.contains('active')
             ) {
                 return null;
+            }
+            if (hasMalformedAccountToggleMutationResult(result, 'auto_comment')) {
+                throw new Error('自动好评更新结果返回格式异常');
             }
             showToast(result.message, 'success');
 
@@ -7019,14 +8689,20 @@ async function showCommentTemplates(accountId) {
             throw new Error(errorMessage);
         }
         
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             requestSequence !== commentTemplatesRequestSequence
             || !document.getElementById('accounts-section')?.classList.contains('active')
         ) {
             return null;
         }
-        const templates = data.templates || [];
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            throw new Error('好评模板列表返回格式异常');
+        }
+        if (!Object.prototype.hasOwnProperty.call(data, 'templates') || !Array.isArray(data.templates)) {
+            throw new Error('好评模板列表返回格式异常');
+        }
+        const templates = data.templates;
         
         // 生成模板列表HTML
         let templatesHtml = '';
@@ -7266,12 +8942,16 @@ async function addCommentTemplate() {
         }
         
         if (response.ok) {
+            const result = await response.json().catch(() => ({}));
             if (
                 requestedAccountId !== currentCommentTemplateAccountId
                 || actionRequestSequence !== commentTemplateActionRequestSequence
                 || !document.getElementById('accounts-section')?.classList.contains('active')
             ) {
                 return null;
+            }
+            if (hasMalformedCommentTemplateMutationResult(result, true)) {
+                throw new Error('添加好评模板结果返回格式异常');
             }
             const templatesLoaded = await showCommentTemplates(currentCommentTemplateAccountId);
             if (
@@ -7371,12 +9051,16 @@ async function saveEditCommentTemplate() {
         }
         
         if (response.ok) {
+            const result = await response.json().catch(() => ({}));
             if (
                 requestedAccountId !== currentCommentTemplateAccountId
                 || actionRequestSequence !== commentTemplateActionRequestSequence
                 || !document.getElementById('accounts-section')?.classList.contains('active')
             ) {
                 return null;
+            }
+            if (hasMalformedCommentTemplateMutationResult(result)) {
+                throw new Error('更新好评模板结果返回格式异常');
             }
             const templatesLoaded = await showCommentTemplates(currentCommentTemplateAccountId);
             if (
@@ -7448,12 +9132,16 @@ async function deleteCommentTemplate(accountId, templateId) {
         }
         
         if (response.ok) {
+            const result = await response.json().catch(() => ({}));
             if (
                 requestedAccountId !== currentCommentTemplateAccountId
                 || actionRequestSequence !== commentTemplateActionRequestSequence
                 || !document.getElementById('accounts-section')?.classList.contains('active')
             ) {
                 return null;
+            }
+            if (hasMalformedCommentTemplateMutationResult(result)) {
+                throw new Error('删除好评模板结果返回格式异常');
             }
             const templatesLoaded = await showCommentTemplates(accountId);
             if (
@@ -7521,12 +9209,16 @@ async function activateCommentTemplate(accountId, templateId) {
         }
         
         if (response.ok) {
+            const result = await response.json().catch(() => ({}));
             if (
                 requestedAccountId !== currentCommentTemplateAccountId
                 || actionRequestSequence !== commentTemplateActionRequestSequence
                 || !document.getElementById('accounts-section')?.classList.contains('active')
             ) {
                 return null;
+            }
+            if (hasMalformedCommentTemplateMutationResult(result)) {
+                throw new Error('切换好评模板结果返回格式异常');
             }
             const templatesLoaded = await showCommentTemplates(accountId);
             if (
@@ -7684,7 +9376,18 @@ async function checkAuth() {
         'Authorization': `Bearer ${authToken}`
         }
     });
-    const result = await response.json();
+    if (handleUnauthorizedApiResponse(response)) {
+        localStorage.removeItem('user_info');
+        return false;
+    }
+    if (!response.ok) {
+        const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+        throw new Error(errorMessage);
+    }
+    const result = await response.json().catch(() => ({}));
+    if (hasMalformedVerifyResult(result)) {
+        throw new Error('认证信息返回格式异常');
+    }
 
     if (!result.authenticated) {
         localStorage.removeItem('auth_token');
@@ -7753,8 +9456,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     initAboutDiagnosticsEvents();
     // 加载防抖延迟设置
     loadDebounceDelay();
-    // 启动验证会话监控
-    startCaptchaSessionMonitor();
     // 添加Cookie表单提交
     document.getElementById('addForm').addEventListener('submit', handleManualCookieImport);
 
@@ -7926,7 +9627,7 @@ async function loadDefaultReplies() {
         throw new Error(accountsErrorMessage);
     }
 
-    const accounts = await accountsResponse.json();
+    const accounts = await accountsResponse.json().catch(() => ({}));
     if (
     requestSequence !== defaultRepliesLoadRequestSequence
     || !document.getElementById('accounts-section')?.classList.contains('active')
@@ -7934,6 +9635,9 @@ async function loadDefaultReplies() {
     return null;
     }
     if (!Array.isArray(accounts)) {
+        throw new Error('账号列表返回格式异常');
+    }
+    if (accounts.some(accountId => typeof accountId !== 'string' || !accountId.trim() || accountId.trim() !== accountId)) {
         throw new Error('账号列表返回格式异常');
     }
 
@@ -7947,7 +9651,7 @@ async function loadDefaultReplies() {
         }
         throw new Error(repliesErrorMessage);
     }
-    const defaultReplies = await repliesResponse.json();
+    const defaultReplies = await repliesResponse.json().catch(() => ({}));
     if (
     requestSequence !== defaultRepliesLoadRequestSequence
     || !document.getElementById('accounts-section')?.classList.contains('active')
@@ -7955,6 +9659,9 @@ async function loadDefaultReplies() {
     return null;
     }
     if (!defaultReplies || typeof defaultReplies !== 'object' || Array.isArray(defaultReplies)) {
+        throw new Error('默认回复配置返回格式异常');
+    }
+    if (Object.values(defaultReplies).some(replySettings => hasMalformedDefaultReplySettings(replySettings))) {
         throw new Error('默认回复配置返回格式异常');
     }
 
@@ -8091,19 +9798,15 @@ async function editDefaultReply(accountId) {
         throw new Error(errorMessage);
     }
 
-    const settings = await response.json();
+    const settings = await response.json().catch(() => ({}));
     if (
         requestSequence !== defaultReplyEditorRequestSequence
         || !document.getElementById('accounts-section')?.classList.contains('active')
     ) {
         return null;
     }
-
-    if (
-        requestSequence !== defaultReplyEditorRequestSequence
-        || !document.getElementById('accounts-section')?.classList.contains('active')
-    ) {
-        return null;
+    if (hasMalformedDefaultReplySettings(settings)) {
+        throw new Error('默认回复设置返回格式异常');
     }
 
     // 填充编辑表单
@@ -8180,11 +9883,15 @@ async function saveDefaultReply() {
     }
 
     if (response.ok) {
+        const result = await response.json().catch(() => ({}));
         if (
         requestSequence !== defaultReplyEditorRequestSequence
         || !document.getElementById('accounts-section')?.classList.contains('active')
         ) {
         return null;
+        }
+        if (hasMalformedDefaultReplyMutationResult(result)) {
+        throw new Error('默认回复保存结果返回格式异常');
         }
         const modalElement = document.getElementById('editDefaultReplyModal');
         const modal = bootstrap.Modal.getInstance(modalElement);
@@ -8263,6 +9970,16 @@ async function clearDefaultReplyRecords(accountId) {
             return null;
         }
         if (response.ok) {
+            const result = await response.json().catch(() => ({}));
+            if (
+                actionRequestSequence !== accountMutationActionRequestSequence
+                || !document.getElementById('accounts-section')?.classList.contains('active')
+            ) {
+                return null;
+            }
+            if (hasMalformedDefaultReplyMutationResult(result)) {
+                throw new Error('默认回复记录清空结果返回格式异常');
+            }
             const repliesLoaded = await loadDefaultReplies();
             if (
                 actionRequestSequence !== accountMutationActionRequestSequence
@@ -8333,6 +10050,9 @@ async function configAIReply(accountId) {
         || !document.getElementById('accounts-section')?.classList.contains('active')
     ) {
         return null;
+    }
+    if (hasMalformedAiReplySettings(settings)) {
+        throw new Error('AI回复设置返回格式异常');
     }
 
     // 填充表单
@@ -8532,11 +10252,15 @@ async function saveAIReplyConfig() {
     }
 
     if (response.ok) {
+        const result = await response.json().catch(() => ({}));
         if (
         requestSequence !== aiReplyConfigRequestSequence
         || !document.getElementById('accounts-section')?.classList.contains('active')
         ) {
         return null;
+        }
+        if (hasMalformedAiReplyMutationResult(result)) {
+        throw new Error('AI回复配置保存结果返回格式异常');
         }
         const modalElement = document.getElementById('aiReplyConfigModal');
         const modal = bootstrap.Modal.getInstance(modalElement);
@@ -8633,17 +10357,20 @@ async function testAIReply() {
         return null;
     }
 
-    if (response.ok) {
-        const result = await response.json();
-        if (
+        if (response.ok) {
+            const result = await response.json().catch(() => ({}));
+            if (
         requestSequence !== aiReplyConfigRequestSequence
         || !document.getElementById('accounts-section')?.classList.contains('active')
-        ) {
+            ) {
         return null;
-        }
-        const safeReply = escapeHtml(result.reply || '').replace(/\n/g, '<br>');
-        testReplyContent.innerHTML = safeReply;
-        showToast('AI回复测试成功', 'success');
+            }
+            if (hasMalformedAiReplyTestResult(result)) {
+        throw new Error('AI回复测试结果返回格式异常');
+            }
+            const safeReply = escapeHtml(result.reply || '').replace(/\n/g, '<br>');
+            testReplyContent.innerHTML = safeReply;
+            showToast('AI回复测试成功', 'success');
     } else {
         const error = await readResponseErrorMessage(response, `HTTP ${response.status}`);
         if (
@@ -8734,7 +10461,10 @@ async function loadAIPresets(requestSequence = 0) {
         ) {
             return null;
         }
-        _aiPresets = presets || [];
+        if (!Array.isArray(presets)) {
+            throw new Error('AI预设列表返回格式异常');
+        }
+        _aiPresets = presets;
         if (!select || !deleteBtn) {
             return false;
         }
@@ -8872,6 +10602,9 @@ async function saveCurrentAsPreset() {
         ) {
             return null;
         }
+        if (hasMalformedAiPresetMutationResult(saveResult, true)) {
+            throw new Error('AI预设保存结果返回格式异常');
+        }
         const presetsLoaded = await loadAIPresets(requestSequence);
         if (
             requestSequence !== aiReplyConfigRequestSequence
@@ -8939,6 +10672,9 @@ async function deleteSelectedPreset() {
             || !document.getElementById('accounts-section')?.classList.contains('active')
         ) {
             return null;
+        }
+        if (hasMalformedAiPresetMutationResult(deleteResult)) {
+            throw new Error('AI预设删除结果返回格式异常');
         }
         const presetsLoaded = await loadAIPresets(requestSequence);
         if (
@@ -9463,12 +11199,16 @@ async function saveNotificationChannel() {
     }
 
     if (response.ok) {
+        const result = await response.json().catch(() => ({}));
         if (
         actionRequestSequence !== notificationChannelMutationActionRequestSequence
         || requestSequence !== notificationChannelAddRequestSequence
         || !document.getElementById('notification-channels-section')?.classList.contains('active')
         ) {
         return null;
+        }
+        if (hasMalformedNotificationChannelMutationResult(result, true)) {
+        throw new Error('通知渠道添加结果返回格式异常');
         }
         if (
         requestSequence !== notificationChannelAddRequestSequence
@@ -9480,11 +11220,13 @@ async function saveNotificationChannel() {
         if (!document.getElementById('notification-channels-section')?.classList.contains('active')) {
         return null;
         }
-        const modal = bootstrap.Modal.getInstance(modalElement);
+        const modal = modalElement ? (bootstrap.Modal.getInstance(modalElement) || new bootstrap.Modal(modalElement)) : null;
         if (modalElement) {
         modalElement.dataset.notificationChannelAddIgnoreNextHidden = 'true';
         }
+        if (modal) {
         modal.hide();
+        }
         const channelsLoaded = await loadNotificationChannels();
         if (
         actionRequestSequence !== notificationChannelMutationActionRequestSequence
@@ -9579,7 +11321,7 @@ async function loadNotificationChannels() {
         throw new Error(errorMessage);
     }
 
-    const channels = await response.json();
+    const channels = await response.json().catch(() => null);
     if (
         requestSequence !== notificationChannelsRequestSequence
         || !document.getElementById('notification-channels-section')?.classList.contains('active')
@@ -9776,11 +11518,15 @@ async function deleteNotificationChannel(channelId) {
     }
 
     if (response.ok) {
+        const result = await response.json().catch(() => ({}));
         if (
         actionRequestSequence !== notificationChannelMutationActionRequestSequence
         || !document.getElementById('notification-channels-section')?.classList.contains('active')
         ) {
         return null;
+        }
+        if (hasMalformedNotificationChannelMutationResult(result)) {
+        throw new Error('通知渠道删除结果返回格式异常');
         }
         const channelsLoaded = await loadNotificationChannels();
         if (
@@ -9869,23 +11615,14 @@ async function editNotificationChannel(channelId) {
         throw new Error(errorMessage);
     }
 
-    const channel = await response.json();
+    const channel = await response.json().catch(() => ({}));
     if (
         requestSequence !== notificationChannelEditRequestSequence
         || !document.getElementById('notification-channels-section')?.classList.contains('active')
     ) {
         return null;
     }
-    if (
-        !channel
-        || typeof channel !== 'object'
-        || Array.isArray(channel)
-        || !Number.isFinite(Number(channel.id))
-        || typeof channel.name !== 'string'
-        || !String(channel.type || '').trim()
-        || typeof channel.enabled !== 'boolean'
-        || typeof channel.config !== 'string'
-    ) {
+    if (hasMalformedNotificationChannelDetails(channel)) {
         throw new Error('通知渠道详情返回格式异常');
     }
 
@@ -10054,12 +11791,16 @@ async function updateNotificationChannel() {
     }
 
     if (response.ok) {
+        const result = await response.json().catch(() => ({}));
         if (
         actionRequestSequence !== notificationChannelMutationActionRequestSequence
         || requestSequence !== notificationChannelEditRequestSequence
         || !document.getElementById('notification-channels-section')?.classList.contains('active')
         ) {
         return null;
+        }
+        if (hasMalformedNotificationChannelMutationResult(result)) {
+        throw new Error('通知渠道更新结果返回格式异常');
         }
         if (
         requestSequence !== notificationChannelEditRequestSequence
@@ -10068,11 +11809,13 @@ async function updateNotificationChannel() {
         return null;
         }
         const modalElement = document.getElementById('editChannelModal');
-        const modal = bootstrap.Modal.getInstance(document.getElementById('editChannelModal'));
+        const modal = modalElement ? (bootstrap.Modal.getInstance(modalElement) || new bootstrap.Modal(modalElement)) : null;
         if (modalElement) {
         modalElement.dataset.notificationChannelEditIgnoreNextHidden = 'true';
         }
+        if (modal) {
         modal.hide();
+        }
         const channelsLoaded = await loadNotificationChannels();
         if (
         actionRequestSequence !== notificationChannelMutationActionRequestSequence
@@ -10278,7 +12021,7 @@ async function loadNotificationTemplates() {
             throw new Error(errorMessage);
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             requestSequence !== notificationTemplateRequestSequence
             || !document.getElementById('message-notifications-section')?.classList.contains('active')
@@ -10383,7 +12126,7 @@ async function loadDefaultTemplate(templateType, requestSequence = null) {
         }
 
         if (response.ok) {
-            const data = await response.json();
+            const data = await response.json().catch(() => ({}));
             if (
                 requestSequence !== null
                 && (
@@ -10464,11 +12207,15 @@ async function saveNotificationTemplate(templateType) {
             throw new Error(errorMessage);
         }
 
+        const result = await response.json().catch(() => ({}));
         if (
             requestSequence !== notificationTemplateActionRequestSequence
             || !document.getElementById('message-notifications-section')?.classList.contains('active')
         ) {
             return null;
+        }
+        if (hasMalformedNotificationTemplateSaveResult(result)) {
+            throw new Error('保存通知模板结果返回格式异常');
         }
         showToast('模板保存成功', 'success');
         return true;
@@ -10520,26 +12267,14 @@ async function resetNotificationTemplate(templateType) {
             throw new Error(errorMessage);
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             requestSequence !== notificationTemplateActionRequestSequence
             || !document.getElementById('message-notifications-section')?.classList.contains('active')
         ) {
             return null;
         }
-        if (
-            !data
-            || typeof data !== 'object'
-            || Array.isArray(data)
-            || !data.template
-            || typeof data.template !== 'object'
-            || Array.isArray(data.template)
-            || (
-                Object.prototype.hasOwnProperty.call(data.template, 'type')
-                && String(data.template.type || '').trim() !== templateType
-            )
-            || typeof data.template.template !== 'string'
-        ) {
+        if (hasMalformedNotificationTemplateResetResult(data, templateType)) {
             throw new Error('通知模板重置结果返回格式异常');
         }
         const editor = document.getElementById(`${templateType}-template-editor`);
@@ -10655,17 +12390,14 @@ async function testNotificationTemplate(templateType) {
             return false;
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             requestSequence !== notificationTemplateActionRequestSequence
             || !document.getElementById('message-notifications-section')?.classList.contains('active')
         ) {
             return null;
         }
-        if (!data || typeof data !== 'object' || Array.isArray(data)) {
-            throw new Error('通知模板测试结果返回格式异常');
-        }
-        if (data.failed_channels != null && !Array.isArray(data.failed_channels)) {
+        if (hasMalformedNotificationTemplateTestResult(data)) {
             throw new Error('通知模板测试结果返回格式异常');
         }
 
@@ -10738,7 +12470,7 @@ async function loadMessageNotifications() {
         throw new Error(accountsErrorMessage);
     }
 
-    const accounts = await accountsResponse.json();
+    const accounts = await accountsResponse.json().catch(() => ({}));
     if (
         requestSequence !== messageNotificationsRequestSequence
         || !document.getElementById('message-notifications-section')?.classList.contains('active')
@@ -10765,7 +12497,7 @@ async function loadMessageNotifications() {
         }
         throw new Error(notificationsErrorMessage);
     }
-    const notifications = await notificationsResponse.json();
+    const notifications = await notificationsResponse.json().catch(() => ({}));
     if (
         requestSequence !== messageNotificationsRequestSequence
         || !document.getElementById('message-notifications-section')?.classList.contains('active')
@@ -11083,11 +12815,15 @@ async function deleteAccountNotification(accountId) {
     }
 
     if (response.ok) {
+        const result = await response.json().catch(() => ({}));
         if (
         actionRequestSequence !== messageNotificationMutationActionRequestSequence
         || !document.getElementById('message-notifications-section')?.classList.contains('active')
         ) {
         return null;
+        }
+        if (hasMalformedMessageNotificationMutationResult(result)) {
+        throw new Error('通知配置删除结果返回格式异常');
         }
         const notificationsLoaded = await loadMessageNotifications();
         if (
@@ -11202,6 +12938,10 @@ async function saveAccountNotification() {
     ) {
     return null;
     }
+    const result = await response.json().catch(() => ({}));
+    if (hasMalformedMessageNotificationMutationResult(result)) {
+    throw new Error('通知配置保存结果返回格式异常');
+    }
     if (
     requestSequence !== accountNotificationConfigRequestSequence
     || !document.getElementById('message-notifications-section')?.classList.contains('active')
@@ -11209,11 +12949,13 @@ async function saveAccountNotification() {
     return null;
     }
     const modalElement = document.getElementById('configNotificationModal');
-    const modal = bootstrap.Modal.getInstance(document.getElementById('configNotificationModal'));
+    const modal = modalElement ? (bootstrap.Modal.getInstance(modalElement) || new bootstrap.Modal(modalElement)) : null;
     if (modalElement) {
     modalElement.dataset.accountNotificationConfigIgnoreNextHidden = 'true';
     }
+    if (modal) {
     modal.hide();
+    }
     const notificationsLoaded = await loadMessageNotifications();
     if (
     actionRequestSequence !== messageNotificationMutationActionRequestSequence
@@ -11309,7 +13051,7 @@ async function loadCards() {
         return null;
     }
 
-    const cards = await response.json();
+    const cards = await response.json().catch(() => null);
     if (
         requestSequence !== cardsRequestSequence
         || !document.getElementById('cards-section')?.classList.contains('active')
@@ -11317,6 +13059,9 @@ async function loadCards() {
         return null;
     }
     if (!Array.isArray(cards)) {
+        throw new Error('卡券列表返回格式异常');
+    }
+    if (hasMalformedCardListEntries(cards)) {
         throw new Error('卡券列表返回格式异常');
     }
     renderCardsList(cards);
@@ -11336,11 +13081,63 @@ async function loadCards() {
     }
 }
 
+function hasMalformedCardListEntries(cards) {
+    return cards.some(card => {
+        if (!card || typeof card !== 'object' || Array.isArray(card)) {
+            return true;
+        }
+        if (!Number.isFinite(Number(card.id))) {
+            return true;
+        }
+        if (typeof card.name !== 'string' || !card.name.trim()) {
+            return true;
+        }
+        if (typeof card.type !== 'string' || !card.type.trim()) {
+            return true;
+        }
+        if (card.description != null && typeof card.description !== 'string') {
+            return true;
+        }
+        if (typeof card.enabled !== 'boolean') {
+            return true;
+        }
+        if (!Number.isFinite(Number(card.delay_seconds))) {
+            return true;
+        }
+        if (typeof card.is_multi_spec !== 'boolean') {
+            return true;
+        }
+        if (card.spec_name != null && typeof card.spec_name !== 'string') {
+            return true;
+        }
+        if (card.spec_value != null && typeof card.spec_value !== 'string') {
+            return true;
+        }
+        if (card.spec_name_2 != null && typeof card.spec_name_2 !== 'string') {
+            return true;
+        }
+        if (card.spec_value_2 != null && typeof card.spec_value_2 !== 'string') {
+            return true;
+        }
+        if (card.created_at != null && typeof card.created_at !== 'string') {
+            return true;
+        }
+        if (card.data_count != null && (!Number.isFinite(Number(card.data_count)) || Number(card.data_count) < 0)) {
+            return true;
+        }
+        return false;
+    });
+}
+
 // 渲染卡券列表
 function renderCardsList(cards) {
     const tbody = document.getElementById('cardsTableBody');
 
-    const normalizedCards = Array.isArray(cards) ? cards : [];
+    if (!Array.isArray(cards) || hasMalformedCardListEntries(cards)) {
+        throw new Error('卡券列表返回格式异常');
+    }
+
+    const normalizedCards = cards;
 
     if (normalizedCards.length === 0) {
     tbody.innerHTML = `
@@ -12122,7 +13919,7 @@ async function saveCard() {
         ) {
             return null;
         }
-        const result = await response.json();
+        const result = await response.json().catch(() => ({}));
         if (
             actionRequestSequence !== cardMutationActionRequestSequence
             || requestSequence !== cardCreateRequestSequence
@@ -12130,14 +13927,19 @@ async function saveCard() {
         ) {
             return null;
         }
+        if (hasMalformedCardMutationResult(result, true)) {
+            throw new Error('卡券保存结果返回格式异常');
+        }
         const deliveryRuleGenerationFailed = result?.delivery_rule_generated === false;
         const deliveryRuleErrorMessage = result?.delivery_rule_error || '对应发货规则生成失败，请稍后在自动发货中手动创建';
         const modalElement = document.getElementById('addCardModal');
-        const modal = bootstrap.Modal.getInstance(modalElement);
+        const modal = modalElement ? (bootstrap.Modal.getInstance(modalElement) || new bootstrap.Modal(modalElement)) : null;
         if (modalElement) {
             modalElement.dataset.cardCreateIgnoreNextHidden = 'true';
         }
-        modal.hide();
+        if (modal) {
+            modal.hide();
+        }
         clearAddCardForm();
         const cardsLoaded = await loadCards();
         if (
@@ -12271,7 +14073,7 @@ async function loadDeliveryRules() {
         return null;
     }
 
-    const rules = await response.json();
+    const rules = await response.json().catch(() => null);
     if (
         requestSequence !== deliveryRulesRequestSequence
         || !document.getElementById('auto-delivery-section')?.classList.contains('active')
@@ -12279,6 +14081,9 @@ async function loadDeliveryRules() {
         return null;
     }
     if (!Array.isArray(rules)) {
+        throw new Error('发货规则列表返回格式异常');
+    }
+    if (hasMalformedDeliveryRuleListEntries(rules)) {
         throw new Error('发货规则列表返回格式异常');
     }
     renderDeliveryRulesList(rules);
@@ -12313,11 +14118,66 @@ async function loadDeliveryRules() {
     }
 }
 
+function hasMalformedDeliveryRuleListEntries(rules) {
+    return rules.some(rule => {
+        if (!rule || typeof rule !== 'object' || Array.isArray(rule)) {
+            return true;
+        }
+        if (!Number.isFinite(Number(rule.id))) {
+            return true;
+        }
+        if (typeof rule.keyword !== 'string' || !rule.keyword.trim()) {
+            return true;
+        }
+        if (rule.card_id != null && !Number.isFinite(Number(rule.card_id))) {
+            return true;
+        }
+        if (typeof rule.enabled !== 'boolean') {
+            return true;
+        }
+        if (rule.description != null && typeof rule.description !== 'string') {
+            return true;
+        }
+        if (!Number.isFinite(Number(rule.delivery_times))) {
+            return true;
+        }
+        if (rule.card_name != null && typeof rule.card_name !== 'string') {
+            return true;
+        }
+        if (rule.card_type != null && typeof rule.card_type !== 'string') {
+            return true;
+        }
+        if (rule.card_enabled != null && typeof rule.card_enabled !== 'boolean') {
+            return true;
+        }
+        if (rule.is_multi_spec != null && typeof rule.is_multi_spec !== 'boolean') {
+            return true;
+        }
+        if (rule.spec_name != null && typeof rule.spec_name !== 'string') {
+            return true;
+        }
+        if (rule.spec_value != null && typeof rule.spec_value !== 'string') {
+            return true;
+        }
+        if (rule.spec_name_2 != null && typeof rule.spec_name_2 !== 'string') {
+            return true;
+        }
+        if (rule.spec_value_2 != null && typeof rule.spec_value_2 !== 'string') {
+            return true;
+        }
+        return false;
+    });
+}
+
 // 渲染发货规则列表
 function renderDeliveryRulesList(rules) {
     const tbody = document.getElementById('deliveryRulesTableBody');
 
-    const normalizedRules = Array.isArray(rules) ? rules : [];
+    if (!Array.isArray(rules) || hasMalformedDeliveryRuleListEntries(rules)) {
+        throw new Error('发货规则列表返回格式异常');
+    }
+
+    const normalizedRules = rules;
 
     if (normalizedRules.length === 0) {
     tbody.innerHTML = `
@@ -12484,8 +14344,8 @@ async function refreshTodayDeliveryCount(requestSequence = 0) {
         if (handleUnauthorizedApiResponse(response)) {
             return null;
         }
-        if (response.ok) {
-            const stats = await response.json();
+        if (!response.ok) {
+            const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
             if (
                 requestSequence !== 0
                 && (
@@ -12501,7 +14361,26 @@ async function refreshTodayDeliveryCount(requestSequence = 0) {
             ) {
                 return null;
             }
-            if (!stats || typeof stats !== 'object') {
+            throw new Error(errorMessage);
+        }
+        if (response.ok) {
+            const stats = await response.json().catch(() => ({}));
+            if (
+                requestSequence !== 0
+                && (
+                    requestSequence !== deliveryRulesRequestSequence
+                    || !document.getElementById('auto-delivery-section')?.classList.contains('active')
+                )
+            ) {
+                return null;
+            }
+            if (
+                requestSequence === 0
+                && !document.getElementById('auto-delivery-section')?.classList.contains('active')
+            ) {
+                return null;
+            }
+            if (hasMalformedDeliveryStatsResult(stats)) {
                 throw new Error('发货统计返回格式异常');
             }
             const todayEl = document.getElementById('todayDeliveries');
@@ -12529,6 +14408,9 @@ async function refreshTodayDeliveryCount(requestSequence = 0) {
             return null;
         }
         console.error('获取今日发货统计失败:', error);
+        if (document.getElementById('auto-delivery-section')?.classList.contains('active')) {
+            showToast(`获取今日发货统计失败: ${error.message || '请稍后重试'}`, 'warning');
+        }
     }
     return false;
 }
@@ -12598,7 +14480,7 @@ async function loadCardsForSelect(requestSequence = 0, requestSequenceType = 'cr
         return null;
     }
 
-    const cards = await response.json();
+    const cards = await response.json().catch(() => null);
     if (
         requestSequence !== 0
         && (
@@ -12609,7 +14491,7 @@ async function loadCardsForSelect(requestSequence = 0, requestSequenceType = 'cr
     ) {
         return null;
     }
-    if (!Array.isArray(cards)) {
+    if (!Array.isArray(cards) || hasMalformedCardListEntries(cards)) {
         throw new Error('卡券列表返回格式异常');
     }
 
@@ -12750,12 +14632,25 @@ async function saveDeliveryRule() {
         ) {
             return null;
         }
+        const result = await response.json().catch(() => ({}));
+        if (
+            actionRequestSequence !== deliveryRuleMutationActionRequestSequence
+            || requestSequence !== deliveryRuleCreateRequestSequence
+            || !document.getElementById('auto-delivery-section')?.classList.contains('active')
+        ) {
+            return null;
+        }
+        if (hasMalformedDeliveryRuleMutationResult(result, true)) {
+            throw new Error('发货规则保存结果返回格式异常');
+        }
         const modalElement = document.getElementById('addDeliveryRuleModal');
-        const modal = bootstrap.Modal.getInstance(modalElement);
+        const modal = modalElement ? (bootstrap.Modal.getInstance(modalElement) || new bootstrap.Modal(modalElement)) : null;
         if (modalElement) {
             modalElement.dataset.deliveryRuleCreateIgnoreNextHidden = 'true';
         }
-        modal.hide();
+        if (modal) {
+            modal.hide();
+        }
         const rulesLoaded = await loadDeliveryRules();
         if (
             actionRequestSequence !== deliveryRuleMutationActionRequestSequence
@@ -12871,12 +14766,15 @@ async function editCard(cardId) {
     ) {
         return null;
     }
-    const card = await response.json();
+    const card = await response.json().catch(() => ({}));
     if (
         requestSequence !== cardEditRequestSequence
         || !document.getElementById('cards-section')?.classList.contains('active')
     ) {
         return null;
+    }
+    if (hasMalformedCardDetails(card)) {
+        throw new Error('卡券详情返回格式异常');
     }
 
     // 填充编辑表单
@@ -13168,6 +15066,17 @@ async function updateCard() {
         ) {
         return null;
         }
+        const result = await response.json().catch(() => ({}));
+        if (
+        actionRequestSequence !== cardMutationActionRequestSequence
+        || requestSequence !== cardEditRequestSequence
+        || !document.getElementById('cards-section')?.classList.contains('active')
+        ) {
+        return null;
+        }
+        if (hasMalformedCardMutationResult(result)) {
+        throw new Error('卡券更新结果返回格式异常');
+        }
         const modalElement = document.getElementById('editCardModal');
         const modal = bootstrap.Modal.getInstance(modalElement);
         if (modalElement) {
@@ -13285,6 +15194,17 @@ async function updateCardWithImage(cardId, cardData, imageFile, actionRequestSeq
             ) {
                 return null;
             }
+            const result = await response.json().catch(() => ({}));
+            if (
+                actionRequestSequence !== cardMutationActionRequestSequence
+                || requestSequence !== cardEditRequestSequence
+                || !document.getElementById('cards-section')?.classList.contains('active')
+            ) {
+                return null;
+            }
+            if (hasMalformedCardMutationResult(result)) {
+                throw new Error('卡券更新结果返回格式异常');
+            }
             const modalElement = document.getElementById('editCardModal');
             const modal = bootstrap.Modal.getInstance(modalElement);
             if (modalElement) {
@@ -13379,6 +15299,16 @@ async function deleteCard(cardId) {
         ) {
             return null;
         }
+        const result = await response.json().catch(() => ({}));
+        if (
+            actionRequestSequence !== cardMutationActionRequestSequence
+            || !document.getElementById('cards-section')?.classList.contains('active')
+        ) {
+            return null;
+        }
+        if (hasMalformedCardMutationResult(result)) {
+            throw new Error('卡券删除结果返回格式异常');
+        }
         const cardsLoaded = await loadCards();
         if (
             actionRequestSequence !== cardMutationActionRequestSequence
@@ -13466,14 +15396,14 @@ async function editDeliveryRule(ruleId) {
     ) {
         return null;
     }
-    const rule = await response.json();
+    const rule = await response.json().catch(() => ({}));
     if (
         requestSequence !== deliveryRuleEditRequestSequence
         || !document.getElementById('auto-delivery-section')?.classList.contains('active')
     ) {
         return null;
     }
-    if (!rule || typeof rule !== 'object') {
+    if (hasMalformedDeliveryRuleDetails(rule)) {
         throw new Error('发货规则详情返回格式异常');
     }
 
@@ -13564,7 +15494,7 @@ async function loadCardsForEditSelect(selectedCard = null, requestSequence = 0) 
         return null;
     }
 
-    const cards = await response.json();
+    const cards = await response.json().catch(() => null);
     if (
         requestSequence !== 0
         && (
@@ -13574,7 +15504,7 @@ async function loadCardsForEditSelect(selectedCard = null, requestSequence = 0) 
     ) {
         return null;
     }
-    if (!Array.isArray(cards)) {
+    if (!Array.isArray(cards) || hasMalformedCardListEntries(cards)) {
         throw new Error('卡券列表返回格式异常');
     }
 
@@ -13728,12 +15658,25 @@ async function updateDeliveryRule() {
         ) {
         return null;
         }
+        const result = await response.json().catch(() => ({}));
+        if (
+        actionRequestSequence !== deliveryRuleMutationActionRequestSequence
+        || requestSequence !== deliveryRuleEditRequestSequence
+        || !document.getElementById('auto-delivery-section')?.classList.contains('active')
+        ) {
+        return null;
+        }
+        if (hasMalformedDeliveryRuleMutationResult(result)) {
+        throw new Error('发货规则更新结果返回格式异常');
+        }
         const modalElement = document.getElementById('editDeliveryRuleModal');
-        const modal = bootstrap.Modal.getInstance(modalElement);
+        const modal = modalElement ? (bootstrap.Modal.getInstance(modalElement) || new bootstrap.Modal(modalElement)) : null;
         if (modalElement) {
         modalElement.dataset.deliveryRuleEditIgnoreNextHidden = 'true';
         }
+        if (modal) {
         modal.hide();
+        }
         const rulesLoaded = await loadDeliveryRules();
         if (
         actionRequestSequence !== deliveryRuleMutationActionRequestSequence
@@ -13817,6 +15760,16 @@ async function deleteDeliveryRule(ruleId) {
             || !document.getElementById('auto-delivery-section')?.classList.contains('active')
         ) {
             return null;
+        }
+        const result = await response.json().catch(() => ({}));
+        if (
+            actionRequestSequence !== deliveryRuleMutationActionRequestSequence
+            || !document.getElementById('auto-delivery-section')?.classList.contains('active')
+        ) {
+            return null;
+        }
+        if (hasMalformedDeliveryRuleMutationResult(result)) {
+            throw new Error('发货规则删除结果返回格式异常');
         }
         const rulesLoaded = await loadDeliveryRules();
         if (
@@ -13905,12 +15858,15 @@ async function loadUserSettings() {
             throw new Error(errorMessage);
         }
 
-        const settings = await response.json();
+        const settings = await response.json().catch(() => ({}));
         if (
             requestSequence !== userSettingsLoadRequestSequence
             || actionRequestSequence !== systemSettingsMutationActionRequestSequence
         ) {
             return null;
+        }
+        if (hasMalformedUserSettingsLoadResult(settings)) {
+            throw new Error('用户设置返回格式异常');
         }
 
         // 设置主题颜色
@@ -14038,6 +15994,20 @@ async function saveThemeSettings(event) {
             || !isSystemSettingsSectionActive()
         ) {
             return null;
+        }
+        const result = await response.json().catch(() => ({}));
+        if (
+            actionRequestSequence !== systemSettingsMutationActionRequestSequence
+            || !isSystemSettingsSectionActive()
+        ) {
+            return null;
+        }
+        if (
+            hasMalformedUserSettingMutationResult(result, true, true)
+            || result.key !== 'theme_color'
+            || result.value !== normalizedThemeColor
+        ) {
+            throw new Error('主题设置保存结果返回格式异常');
         }
         applyThemeColor(normalizedThemeColor);
         showToast('主题设置保存成功', 'success');
@@ -14266,6 +16236,16 @@ async function saveMenuSettings() {
         if (actionRequestSequence !== menuSettingsActionRequestSequence) {
             return null;
         }
+        const result = await response.json().catch(() => ({}));
+        if (actionRequestSequence !== menuSettingsActionRequestSequence) {
+            return null;
+        }
+        if (hasMalformedMenuSettingsMutationResult(result)) {
+            if (!isSystemSettingsSectionActive()) {
+                return null;
+            }
+            throw new Error('菜单设置保存结果返回格式异常');
+        }
         menuSettings = visibility;
         menuOrder = order;
         menuSettingsUiReady = true;
@@ -14322,6 +16302,16 @@ async function resetMenuSettings() {
 
         if (actionRequestSequence !== menuSettingsActionRequestSequence) {
             return null;
+        }
+        const result = await response.json().catch(() => ({}));
+        if (actionRequestSequence !== menuSettingsActionRequestSequence) {
+            return null;
+        }
+        if (hasMalformedMenuSettingsMutationResult(result)) {
+            if (!isSystemSettingsSectionActive()) {
+                return null;
+            }
+            throw new Error('菜单设置重置结果返回格式异常');
         }
         menuSettings = {};
         menuOrder = [];
@@ -14433,12 +16423,15 @@ async function loadMenuSettings() {
             throw new Error(errorMessage);
         }
 
-        const settings = await response.json();
+        const settings = await response.json().catch(() => ({}));
         if (
             requestSequence !== menuSettingsLoadRequestSequence
             || actionRequestSequence !== menuSettingsActionRequestSequence
         ) {
             return null;
+        }
+        if (hasMalformedUserSettingsLoadResult(settings)) {
+            throw new Error('菜单设置返回格式异常');
         }
 
         // 加载显示设置
@@ -14590,12 +16583,15 @@ document.addEventListener('DOMContentLoaded', function() {
         }
 
         if (response.ok) {
-            const result = await response.json();
+            const result = await response.json().catch(() => ({}));
             if (
                 actionRequestSequence !== systemSettingsMutationActionRequestSequence
                 || !isSystemSettingsSectionActive()
             ) {
                 return null;
+            }
+            if (hasMalformedSystemSettingsMutationResult(result, '', true)) {
+                throw new Error('密码更新结果返回格式异常');
             }
             if (result.success) {
             showToast('密码更新成功，请重新登录', 'success');
@@ -14775,14 +16771,21 @@ async function uploadDatabaseBackup() {
     }
 
     if (response.ok) {
-        const result = await response.json();
+        const result = await response.json().catch(() => ({}));
         if (
         actionRequestSequence !== backupManagementActionRequestSequence
         || !isSystemSettingsSectionActive()
         ) {
         return null;
         }
+        if (hasMalformedBackupMutationResult(result, true)) {
+        throw new Error('数据库恢复结果返回格式异常');
+        }
+        if (result.warning) {
+        showToast(result.warning, 'warning');
+        } else {
         showToast(`数据库恢复成功！包含 ${result.user_count} 个用户`, 'success');
+        }
 
         // 清空文件选择
         fileInput.value = '';
@@ -14845,12 +16848,15 @@ async function exportBackup() {
     }
 
     if (response.ok) {
-        const backupData = await response.json();
+        const backupData = await response.json().catch(() => ({}));
         if (
         actionRequestSequence !== backupManagementActionRequestSequence
         || !isSystemSettingsSectionActive()
         ) {
         return null;
+        }
+        if (hasMalformedBackupExportData(backupData)) {
+        throw new Error('备份导出数据返回格式异常');
         }
 
         // 生成文件名
@@ -14951,14 +16957,20 @@ async function importBackup() {
     }
 
     if (response.ok) {
+        const result = await response.json().catch(() => ({}));
         if (
         actionRequestSequence !== backupManagementActionRequestSequence
         || !isBackupImportFollowupTargetActive()
         ) {
         return null;
         }
+        if (hasMalformedBackupMutationResult(result)) {
+        throw new Error('备份导入结果返回格式异常');
+        }
         if (!isSystemSettingsSectionActive()) {
         // 用户已切到其他页面，继续静默刷新相关数据，但不再跨页弹 toast
+        } else if (result.warning) {
+        showToast(result.warning, 'warning');
         } else {
         showToast('备份导入成功！正在刷新数据...', 'success');
         }
@@ -15025,7 +17037,11 @@ async function importBackup() {
             ) {
                 return null;
             }
-            showToast('备份导入成功，请按需刷新相关页面查看最新数据', 'success');
+            if (result.warning) {
+                showToast(result.warning, 'warning');
+            } else {
+                showToast('备份导入成功，请按需刷新相关页面查看最新数据', 'success');
+            }
             } else if (reloadSucceeded) {
             if (
                 actionRequestSequence !== backupManagementActionRequestSequence
@@ -15033,7 +17049,11 @@ async function importBackup() {
             ) {
                 return null;
             }
-            showToast('数据刷新完成！', 'success');
+            if (result.warning) {
+                showToast(result.warning, 'warning');
+            } else {
+                showToast('数据刷新完成！', 'success');
+            }
             } else {
             if (
                 actionRequestSequence !== backupManagementActionRequestSequence
@@ -15099,9 +17119,11 @@ async function reloadSystemCache() {
     ) {
         return null;
     }
-
     if (!response.ok || !result || result.success === false) {
         throw new Error(result?.detail || result?.message || `HTTP ${response.status}`);
+    }
+    if (hasMalformedSystemSettingsMutationResult(result, '', true)) {
+        throw new Error('刷新系统缓存结果返回格式异常');
     }
 
     // 清除前端缓存
@@ -15273,6 +17295,9 @@ async function toggleItemMultiSpec(accountId, itemId, isMultiSpec) {
         is_multi_spec: isMultiSpec
         })
     });
+    if (handleUnauthorizedApiResponse(response)) {
+        return null;
+    }
     if (
         actionRequestSequence !== itemMutationActionRequestSequence
         || !document.getElementById('items-section')?.classList.contains('active')
@@ -15281,6 +17306,16 @@ async function toggleItemMultiSpec(accountId, itemId, isMultiSpec) {
     }
 
     if (response.ok) {
+        const result = await response.json().catch(() => ({}));
+        if (
+            actionRequestSequence !== itemMutationActionRequestSequence
+            || !document.getElementById('items-section')?.classList.contains('active')
+        ) {
+            return null;
+        }
+        if (hasMalformedItemToggleMutationResult(result)) {
+            throw new Error('商品多规格切换结果返回格式异常');
+        }
         // 刷新商品列表
         const itemsLoaded = await refreshItemsData();
         if (
@@ -15295,14 +17330,14 @@ async function toggleItemMultiSpec(accountId, itemId, isMultiSpec) {
         showToast('商品列表刷新失败，请稍后手动刷新', 'warning');
         }
     } else {
-        const errorData = await response.json();
+        const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
         if (
             actionRequestSequence !== itemMutationActionRequestSequence
             || !document.getElementById('items-section')?.classList.contains('active')
         ) {
             return null;
         }
-        throw new Error(errorData.error || '操作失败');
+        throw new Error(errorMessage || '操作失败');
     }
     } catch (error) {
     if (
@@ -15330,6 +17365,9 @@ async function toggleItemMultiQuantityDelivery(accountId, itemId, multiQuantityD
         multi_quantity_delivery: multiQuantityDelivery
         })
     });
+    if (handleUnauthorizedApiResponse(response)) {
+        return null;
+    }
     if (
         actionRequestSequence !== itemMutationActionRequestSequence
         || !document.getElementById('items-section')?.classList.contains('active')
@@ -15338,6 +17376,16 @@ async function toggleItemMultiQuantityDelivery(accountId, itemId, multiQuantityD
     }
 
     if (response.ok) {
+        const result = await response.json().catch(() => ({}));
+        if (
+            actionRequestSequence !== itemMutationActionRequestSequence
+            || !document.getElementById('items-section')?.classList.contains('active')
+        ) {
+            return null;
+        }
+        if (hasMalformedItemToggleMutationResult(result)) {
+            throw new Error('商品多数量发货切换结果返回格式异常');
+        }
         // 刷新商品列表
         const itemsLoaded = await refreshItemsData();
         if (
@@ -15352,14 +17400,14 @@ async function toggleItemMultiQuantityDelivery(accountId, itemId, multiQuantityD
         showToast('商品列表刷新失败，请稍后手动刷新', 'warning');
         }
     } else {
-        const errorData = await response.json();
+        const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
         if (
             actionRequestSequence !== itemMutationActionRequestSequence
             || !document.getElementById('items-section')?.classList.contains('active')
         ) {
             return null;
         }
-        throw new Error(errorData.error || '操作失败');
+        throw new Error(errorMessage || '操作失败');
     }
     } catch (error) {
     if (
@@ -15490,7 +17538,13 @@ async function loadAccountOptions(id, emptyLabel = '所有账号') {
         return null;
     }
 
-    const accounts = await response.json();
+    const accounts = await response.json().catch(() => ({}));
+    if (!Array.isArray(accounts)) {
+        throw new Error('账号列表返回格式异常');
+    }
+    if (hasMalformedCookieDetailsAccounts(accounts)) {
+        throw new Error('账号列表返回格式异常');
+    }
     if (
         requestSequence !== accountOptionsRequestSequences[id]
         || ownerSectionId && !document.getElementById(ownerSectionId)?.classList.contains('active')
@@ -15602,7 +17656,7 @@ async function loadAllItems(options = {}) {
         ) {
             return null;
         }
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             requestSequence !== itemsRequestSequence
             || !document.getElementById('items-section')?.classList.contains('active')
@@ -15678,7 +17732,7 @@ async function loadItemsByAccount(options = {}) {
         ) {
             return null;
         }
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             requestSequence !== itemsRequestSequence
             || !document.getElementById('items-section')?.classList.contains('active')
@@ -16123,6 +18177,8 @@ async function getAllItemsFromAccount(event) {
     const button = event?.currentTarget || event?.target;
     const originalText = button ? button.innerHTML : '';
     const actionRequestSequence = ++itemMutationActionRequestSequence;
+    let controller = null;
+    controller = resetItemSyncAbortController();
     if (button) {
         button.innerHTML = '<i class="bi bi-hourglass-split me-1"></i>同步中...';
         button.disabled = true;
@@ -16135,6 +18191,7 @@ async function getAllItemsFromAccount(event) {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${authToken}`
         },
+        signal: controller.signal,
         body: JSON.stringify({
         account_id: selectedAccountId,
         page_number: pageNumber,
@@ -16152,12 +18209,15 @@ async function getAllItemsFromAccount(event) {
     }
 
     if (response.ok) {
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
         actionRequestSequence !== itemMutationActionRequestSequence
         || !document.getElementById('items-section')?.classList.contains('active')
         ) {
         return null;
+        }
+        if (hasMalformedItemSyncMutationResult(data, true)) {
+        throw new Error('商品同步结果返回格式异常');
         }
         if (data.success) {
         // 刷新商品列表（保持筛选器选择）
@@ -16189,9 +18249,19 @@ async function getAllItemsFromAccount(event) {
         showToast(data.message || '同步商品信息失败', 'danger');
         }
     } else {
-        throw new Error(`HTTP ${response.status}`);
+        const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+        if (
+        actionRequestSequence !== itemMutationActionRequestSequence
+        || !document.getElementById('items-section')?.classList.contains('active')
+        ) {
+        return null;
+        }
+        throw new Error(errorMessage || '同步商品信息失败');
     }
     } catch (error) {
+    if (controller?.signal.aborted || error?.name === 'AbortError') {
+    return null;
+    }
     if (
     actionRequestSequence !== itemMutationActionRequestSequence
     || !document.getElementById('items-section')?.classList.contains('active')
@@ -16199,8 +18269,11 @@ async function getAllItemsFromAccount(event) {
     return null;
     }
     console.error('同步商品信息失败:', error);
-    showToast('同步商品信息失败', 'danger');
+    showToast(error.message || '同步商品信息失败', 'danger');
     } finally {
+    if (itemSyncAbortController === controller) {
+        itemSyncAbortController = null;
+    }
     // 恢复按钮状态
     if (
         !button
@@ -16228,6 +18301,8 @@ async function getAllItemsFromAccountAll(event) {
     const button = event?.currentTarget || event?.target;
     const originalText = button ? button.innerHTML : '';
     const actionRequestSequence = ++itemMutationActionRequestSequence;
+    let controller = null;
+    controller = resetItemSyncAbortController();
     if (button) {
         button.innerHTML = '<i class="bi bi-hourglass-split me-1"></i>同步中...';
         button.disabled = true;
@@ -16240,6 +18315,7 @@ async function getAllItemsFromAccountAll(event) {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${authToken}`
         },
+        signal: controller.signal,
         body: JSON.stringify({
         account_id: selectedAccountId
         })
@@ -16255,12 +18331,15 @@ async function getAllItemsFromAccountAll(event) {
     }
 
     if (response.ok) {
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
         actionRequestSequence !== itemMutationActionRequestSequence
         || !document.getElementById('items-section')?.classList.contains('active')
         ) {
         return null;
+        }
+        if (hasMalformedItemSyncMutationResult(data, false, true, true)) {
+        throw new Error('商品同步结果返回格式异常');
         }
         if (data.success) {
         // 刷新商品列表（保持筛选器选择）
@@ -16296,9 +18375,19 @@ async function getAllItemsFromAccountAll(event) {
         showToast(data.message || '同步商品信息失败', 'danger');
         }
     } else {
-        throw new Error(`HTTP ${response.status}`);
+        const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+        if (
+        actionRequestSequence !== itemMutationActionRequestSequence
+        || !document.getElementById('items-section')?.classList.contains('active')
+        ) {
+        return null;
+        }
+        throw new Error(errorMessage || '同步商品信息失败');
     }
     } catch (error) {
+    if (controller?.signal.aborted || error?.name === 'AbortError') {
+    return null;
+    }
     if (
     actionRequestSequence !== itemMutationActionRequestSequence
     || !document.getElementById('items-section')?.classList.contains('active')
@@ -16306,8 +18395,11 @@ async function getAllItemsFromAccountAll(event) {
     return null;
     }
     console.error('同步商品信息失败:', error);
-    showToast('同步商品信息失败', 'danger');
+    showToast(error.message || '同步商品信息失败', 'danger');
     } finally {
+    if (itemSyncAbortController === controller) {
+        itemSyncAbortController = null;
+    }
     // 恢复按钮状态
     if (
         !button
@@ -16359,7 +18451,7 @@ async function editItem(accountId, itemId) {
         ) {
             return null;
         }
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             requestSequence !== itemEditorRequestSequence
             || !document.getElementById('items-section')?.classList.contains('active')
@@ -16438,12 +18530,16 @@ async function saveItemDetail() {
     }
 
     if (response.ok) {
+        const result = await response.json().catch(() => ({}));
         if (
         requestSequence !== itemEditorRequestSequence
         || actionRequestSequence !== itemMutationActionRequestSequence
         || !document.getElementById('items-section')?.classList.contains('active')
         ) {
         return null;
+        }
+        if (hasMalformedItemMessageMutationResult(result)) {
+        throw new Error('商品详情更新结果返回格式异常');
         }
         // 关闭模态框
         const modal = modalElement ? bootstrap.Modal.getInstance(modalElement) : null;
@@ -16512,12 +18608,16 @@ async function deleteItem(accountId, itemId, itemTitle) {
     }
 
     if (response.ok) {
+        const result = await response.json().catch(() => ({}));
         // 刷新列表（保持筛选器选择）
         if (
         actionRequestSequence !== itemMutationActionRequestSequence
         || !document.getElementById('items-section')?.classList.contains('active')
         ) {
         return null;
+        }
+        if (hasMalformedItemMessageMutationResult(result)) {
+        throw new Error('商品信息删除结果返回格式异常');
         }
         const itemsLoaded = await refreshItemsData();
         if (
@@ -16591,7 +18691,16 @@ async function batchDeleteItems() {
     }
 
     if (response.ok) {
-        const result = await response.json();
+        const result = await response.json().catch(() => ({}));
+        if (
+        actionRequestSequence !== itemMutationActionRequestSequence
+        || !document.getElementById('items-section')?.classList.contains('active')
+        ) {
+        return null;
+        }
+        if (hasMalformedItemBatchDeleteResult(result, true)) {
+        throw new Error('批量删除商品结果返回格式异常');
+        }
         const successCount = Number(result.success_count || 0);
         const failedCount = Number(result.failed_count || 0);
         // 刷新列表（保持筛选器选择）
@@ -16890,7 +18999,7 @@ async function loadAllItemReplays() {
         ) {
             return null;
         }
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             requestSequence !== itemReplaysRequestSequence
             || !document.getElementById('items-reply-section')?.classList.contains('active')
@@ -16957,7 +19066,7 @@ async function loadItemsReplayByAccount() {
         ) {
             return null;
         }
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             requestSequence !== itemReplaysRequestSequence
             || !document.getElementById('items-reply-section')?.classList.contains('active')
@@ -17131,7 +19240,7 @@ async function onAccountChangeForReply() {
         }
 
        if (response.ok) {
-            const data = await response.json();
+            const data = await response.json().catch(() => ({}));
             if (
                 requestSequence !== itemReplyAccountItemsRequestSequence
                 || accountSelect.value !== requestedAccountId
@@ -17221,7 +19330,7 @@ async function editItemReply(accountId, itemId) {
       return null;
     }
     if (response.ok) {
-      const data = await response.json();
+      const data = await response.json().catch(() => ({}));
       if (
         requestSequence !== itemReplyEditorRequestSequence
         || !document.getElementById('items-reply-section')?.classList.contains('active')
@@ -17335,12 +19444,16 @@ async function saveItemReply() {
     }
 
     if (response.ok) {
+      const result = await response.json().catch(() => ({}));
       if (
         requestSequence !== itemReplyEditorRequestSequence
         || actionRequestSequence !== itemReplyMutationActionRequestSequence
         || !document.getElementById('items-reply-section')?.classList.contains('active')
       ) {
         return null;
+      }
+      if (hasMalformedItemMessageMutationResult(result)) {
+        throw new Error('商品回复保存结果返回格式异常');
       }
       // 关闭模态框
       const modal = modalElement ? bootstrap.Modal.getInstance(modalElement) : null;
@@ -17407,11 +19520,15 @@ async function deleteItemReply(accountId, itemId, itemTitle) {
     }
 
     if (response.ok) {
+      const result = await response.json().catch(() => ({}));
       if (
         actionRequestSequence !== itemReplyMutationActionRequestSequence
         || !document.getElementById('items-reply-section')?.classList.contains('active')
       ) {
         return null;
+      }
+      if (hasMalformedItemMessageMutationResult(result)) {
+        throw new Error('商品回复删除结果返回格式异常');
       }
       const itemRepliesLoaded = await refreshItemsReplayData();
       if (
@@ -17478,7 +19595,16 @@ async function batchDeleteItemReplies() {
     }
 
     if (response.ok) {
-        const result = await response.json();
+        const result = await response.json().catch(() => ({}));
+        if (
+        actionRequestSequence !== itemReplyMutationActionRequestSequence
+        || !document.getElementById('items-reply-section')?.classList.contains('active')
+        ) {
+        return null;
+      }
+        if (hasMalformedItemBatchDeleteResult(result)) {
+        throw new Error('批量删除商品回复结果返回格式异常');
+      }
         const successCount = Number(result.success_count || 0);
         const failedCount = Number(result.failed_count || 0);
         if (
@@ -17626,7 +19752,7 @@ async function importKeywords() {
     progressBar.style.width = '70%';
 
     if (response.ok) {
-        const result = await response.json();
+        const result = await response.json().catch(() => ({}));
         if (
         requestedAccountId !== currentAccountId
         || actionRequestSequence !== autoReplyKeywordActionRequestSequence
@@ -17634,6 +19760,9 @@ async function importKeywords() {
         || !document.getElementById('auto-reply-section')?.classList.contains('active')
         ) {
         return null;
+        }
+        if (hasMalformedKeywordImportResult(result)) {
+        throw new Error('关键词导入结果返回格式异常');
         }
         progressBar.style.width = '100%';
 
@@ -17713,8 +19842,16 @@ async function importKeywords() {
 
 // ========================= 账号添加相关函数 =========================
 
+function createAccountVerificationSessionId(prefix = 'acct') {
+    const normalizedPrefix = String(prefix || 'acct').replace(/[^A-Za-z0-9_-]/g, '') || 'acct';
+    const randomPart = (typeof crypto !== 'undefined' && crypto.randomUUID)
+        ? crypto.randomUUID().replace(/-/g, '')
+        : `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
+    return `${normalizedPrefix}_${randomPart}`.slice(0, 96);
+}
+
 function stopActiveManualCookieImportSession() {
-    const activeSessionId = manualCookieImportPollingState.sessionId;
+    const activeSessionId = manualCookieImportPollingState.sessionId || manualCookieImportStartupSessionId;
     const shouldCancel = Boolean(activeSessionId) && !manualCookieImportPollingState.completed;
     manualCookieImportSubmitRequestSequence += 1;
     manualCookieImportPollingState.inFlight = false;
@@ -17725,7 +19862,7 @@ function stopActiveManualCookieImportSession() {
 }
 
 function stopActivePasswordLoginSession() {
-    const activeSessionId = passwordLoginPollingState.sessionId;
+    const activeSessionId = passwordLoginPollingState.sessionId || passwordLoginStartupSessionId;
     const shouldCancel = Boolean(activeSessionId) && !passwordLoginPollingState.completed;
     passwordLoginSubmitRequestSequence += 1;
     passwordLoginPollingState.inFlight = false;
@@ -17736,7 +19873,7 @@ function stopActivePasswordLoginSession() {
 }
 
 function stopActiveRefreshCookieSession() {
-    const activeSessionId = refreshCookiePollingState.sessionId;
+    const activeSessionId = refreshCookiePollingState.sessionId || refreshCookieStartupSessionId;
     const shouldCancel = Boolean(activeSessionId) && !refreshCookiePollingState.completed;
     refreshCookieSubmitRequestSequence += 1;
     stopRefreshCookiePolling(activeSessionId);
@@ -17775,7 +19912,9 @@ function toggleManualInput() {
 
 let manualCookieImportCheckInterval = null;
 let manualCookieImportSessionId = null;
-let manualCookieImportCancelInFlight = false;
+let manualCookieImportCheckAbortController = null;
+let manualCookieImportStartupSessionId = null;
+let manualCookieImportCancelInFlightSessionIds = new Set();
 let manualCookieImportSubmitRequestSequence = 0;
 let manualCookieImportPollingState = {
     sessionId: null,
@@ -17797,6 +19936,13 @@ async function handleManualCookieImport(event) {
     const submitBtn = event.target.querySelector('button[type="submit"]');
     const originalText = submitBtn.innerHTML;
     const submitRequestSequence = ++manualCookieImportSubmitRequestSequence;
+    const clientSessionId = createAccountVerificationSessionId('manual');
+    manualCookieImportStartupSessionId = clientSessionId;
+    const clearStartupSession = () => {
+        if (manualCookieImportStartupSessionId === clientSessionId) {
+            manualCookieImportStartupSessionId = null;
+        }
+    };
     submitBtn.disabled = true;
     submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>验证中...';
 
@@ -17809,38 +19955,68 @@ async function handleManualCookieImport(event) {
             },
             body: JSON.stringify({
                 account_id: selectedAccountId,
-                cookie: cookieValue
+                cookie: cookieValue,
+                session_id: clientSessionId
             })
         });
 
         if (handleUnauthorizedApiResponse(response)) {
+            clearStartupSession();
             return null;
         }
         if (!response.ok) {
             if (submitRequestSequence !== manualCookieImportSubmitRequestSequence) {
+                clearStartupSession();
+                void cancelManualCookieImportSession(clientSessionId);
                 return null;
             }
             const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
             if (submitRequestSequence !== manualCookieImportSubmitRequestSequence) {
+                clearStartupSession();
+                void cancelManualCookieImportSession(clientSessionId);
                 return null;
             }
             if (
                 !document.getElementById('accounts-section')?.classList.contains('active')
                 || document.getElementById('manualInputForm')?.style.display === 'none'
             ) {
+                clearStartupSession();
                 resetManualCookieImportForm();
                 return null;
             }
+            clearStartupSession();
             showToast(errorMessage || 'Cookie 导入验证失败', 'danger');
             submitBtn.disabled = false;
             submitBtn.innerHTML = originalText;
             return;
         }
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
+        const responseSessionId = typeof data.session_id === 'string' && data.session_id.trim() ? data.session_id : null;
         if (response.ok && data.success && data.session_id) {
             if (submitRequestSequence !== manualCookieImportSubmitRequestSequence) {
+                clearStartupSession();
+                void cancelManualCookieImportSession(responseSessionId || clientSessionId);
                 return null;
             }
+            if (
+                !document.getElementById('accounts-section')?.classList.contains('active')
+                || document.getElementById('manualInputForm')?.style.display === 'none'
+            ) {
+                clearStartupSession();
+                void cancelManualCookieImportSession(responseSessionId || clientSessionId);
+                resetManualCookieImportForm();
+                return null;
+            }
+            clearStartupSession();
+            manualCookieImportSessionId = data.session_id;
+            startManualCookieImportCheck(originalText);
+        } else {
+            if (submitRequestSequence !== manualCookieImportSubmitRequestSequence) {
+                clearStartupSession();
+                void cancelManualCookieImportSession(responseSessionId || clientSessionId);
+                return null;
+            }
+            clearStartupSession();
             if (
                 !document.getElementById('accounts-section')?.classList.contains('active')
                 || document.getElementById('manualInputForm')?.style.display === 'none'
@@ -17848,16 +20024,7 @@ async function handleManualCookieImport(event) {
                 resetManualCookieImportForm();
                 return null;
             }
-            manualCookieImportSessionId = data.session_id;
-            startManualCookieImportCheck(originalText);
-        } else {
-            if (submitRequestSequence !== manualCookieImportSubmitRequestSequence) {
-                return null;
-            }
-            if (
-                !document.getElementById('accounts-section')?.classList.contains('active')
-                || document.getElementById('manualInputForm')?.style.display === 'none'
-            ) {
+            if (data.status === 'cancelled') {
                 resetManualCookieImportForm();
                 return null;
             }
@@ -17867,8 +20034,11 @@ async function handleManualCookieImport(event) {
         }
     } catch (error) {
         if (submitRequestSequence !== manualCookieImportSubmitRequestSequence) {
+            clearStartupSession();
+            void cancelManualCookieImportSession(clientSessionId);
             return null;
         }
+        clearStartupSession();
         if (
             !document.getElementById('accounts-section')?.classList.contains('active')
             || document.getElementById('manualInputForm')?.style.display === 'none'
@@ -17888,10 +20058,25 @@ function clearManualCookieImportCheck() {
         clearInterval(manualCookieImportCheckInterval);
         manualCookieImportCheckInterval = null;
     }
+    stopManualCookieImportCheckRequest();
+}
+
+function stopManualCookieImportCheckRequest() {
+    if (manualCookieImportCheckAbortController) {
+        manualCookieImportCheckAbortController.abort();
+        manualCookieImportCheckAbortController = null;
+    }
+}
+
+function resetManualCookieImportCheckAbortController() {
+    stopManualCookieImportCheckRequest();
+    manualCookieImportCheckAbortController = new AbortController();
+    return manualCookieImportCheckAbortController;
 }
 
 function resetManualCookieImportForm() {
     manualCookieImportSessionId = null;
+    manualCookieImportStartupSessionId = null;
     clearManualCookieImportCheck();
     manualCookieImportPollingState = {
         sessionId: null,
@@ -17969,9 +20154,11 @@ async function checkManualCookieImportStatus() {
 
     const sessionId = manualCookieImportSessionId;
     manualCookieImportPollingState.inFlight = true;
+    const controller = resetManualCookieImportCheckAbortController();
 
     try {
         const response = await fetch(`${apiBase}/manual-cookie-import/check/${sessionId}`, {
+            signal: controller.signal,
             headers: {
                 'Authorization': `Bearer ${authToken}`
             }
@@ -17981,7 +20168,7 @@ async function checkManualCookieImportStatus() {
             return null;
         }
         if (response.ok) {
-            const data = await response.json();
+            const data = await response.json().catch(() => ({}));
             if (manualCookieImportPollingState.sessionId !== sessionId || manualCookieImportPollingState.completed) {
                 return;
             }
@@ -18041,6 +20228,9 @@ async function checkManualCookieImportStatus() {
             resetManualCookieImportForm();
         }
     } catch (error) {
+        if (error?.name === 'AbortError') {
+            return null;
+        }
         console.error('检查手动导入 Cookie 状态失败:', error);
         manualCookieImportPollingState.completed = true;
         clearManualCookieImportCheck();
@@ -18052,6 +20242,9 @@ async function checkManualCookieImportStatus() {
         showToast('网络错误，请重试', 'danger');
         resetManualCookieImportForm();
     } finally {
+        if (manualCookieImportCheckAbortController === controller) {
+            manualCookieImportCheckAbortController = null;
+        }
         if (manualCookieImportPollingState.sessionId === sessionId) {
             manualCookieImportPollingState.inFlight = false;
         }
@@ -18148,7 +20341,7 @@ async function loadRefreshCookieAccountList() {
             }
             throw new Error(errorMessage);
         }
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             requestSequence !== refreshCookieAccountListRequestSequence
             || refreshForm && refreshForm.style.display === 'none'
@@ -18233,9 +20426,24 @@ async function handleRefreshCookie(event) {
         return;
     }
 
+    const existingRefreshSessionId = refreshCookiePollingState.sessionId || refreshCookieStartupSessionId;
+    if (existingRefreshSessionId && !refreshCookiePollingState.completed) {
+        refreshCookieSubmitRequestSequence += 1;
+        stopRefreshCookiePolling(existingRefreshSessionId);
+        refreshCookieStartupSessionId = null;
+        void cancelPasswordLoginSession(existingRefreshSessionId, '刷新Cookie');
+    }
+
     // 显示loading
     toggleLoading(true);
     const submitRequestSequence = ++refreshCookieSubmitRequestSequence;
+    const clientSessionId = createAccountVerificationSessionId('refresh');
+    refreshCookieStartupSessionId = clientSessionId;
+    const clearStartupSession = () => {
+        if (refreshCookieStartupSessionId === clientSessionId) {
+            refreshCookieStartupSessionId = null;
+        }
+    };
 
     try {
         // 调用密码登录API刷新Cookie
@@ -18247,19 +20455,25 @@ async function handleRefreshCookie(event) {
             },
             body: JSON.stringify({
                 account_id: accountId,
+                session_id: clientSessionId,
                 refresh_mode: true  // 标记为刷新模式
             })
         });
 
         if (handleUnauthorizedApiResponse(response)) {
+            clearStartupSession();
             return null;
         }
         if (!response.ok) {
             if (submitRequestSequence !== refreshCookieSubmitRequestSequence) {
+                clearStartupSession();
+                void cancelPasswordLoginSession(clientSessionId, '刷新Cookie');
                 return null;
             }
             const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
             if (submitRequestSequence !== refreshCookieSubmitRequestSequence) {
+                clearStartupSession();
+                void cancelPasswordLoginSession(clientSessionId, '刷新Cookie');
                 return null;
             }
             toggleLoading(false);
@@ -18267,44 +20481,61 @@ async function handleRefreshCookie(event) {
                 !document.getElementById('accounts-section')?.classList.contains('active')
                 || document.getElementById('refreshCookieForm')?.style.display === 'none'
             ) {
+                clearStartupSession();
                 return null;
             }
+            clearStartupSession();
             showToast(errorMessage || '启动刷新失败', 'danger');
             return;
         }
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
+        const responseSessionId = typeof data.session_id === 'string' && data.session_id.trim() ? data.session_id : null;
 
         if (response.ok && data.session_id) {
             if (submitRequestSequence !== refreshCookieSubmitRequestSequence) {
+                clearStartupSession();
+                void cancelPasswordLoginSession(responseSessionId || clientSessionId, '刷新Cookie');
                 return null;
             }
             if (
                 !document.getElementById('accounts-section')?.classList.contains('active')
                 || document.getElementById('refreshCookieForm')?.style.display === 'none'
             ) {
+                clearStartupSession();
+                void cancelPasswordLoginSession(responseSessionId || clientSessionId, '刷新Cookie');
                 toggleLoading(false);
                 return null;
             }
+            clearStartupSession();
             // 开始轮询检查登录状态
             showToast('正在验证账号并刷新Cookie，请稍候...', 'info');
             startRefreshCookiePolling(data.session_id, accountId);
         } else {
             if (submitRequestSequence !== refreshCookieSubmitRequestSequence) {
+                clearStartupSession();
+                void cancelPasswordLoginSession(responseSessionId || clientSessionId, '刷新Cookie');
                 return null;
             }
+            clearStartupSession();
             toggleLoading(false);
             if (
                 !document.getElementById('accounts-section')?.classList.contains('active')
                 || document.getElementById('refreshCookieForm')?.style.display === 'none'
             ) {
+                return null;
+            }
+            if (data.status === 'cancelled') {
                 return null;
             }
             showToast(data.message || '启动刷新失败', 'danger');
         }
     } catch (error) {
         if (submitRequestSequence !== refreshCookieSubmitRequestSequence) {
+            clearStartupSession();
+            void cancelPasswordLoginSession(clientSessionId, '刷新Cookie');
             return null;
         }
+        clearStartupSession();
         toggleLoading(false);
         if (
             !document.getElementById('accounts-section')?.classList.contains('active')
@@ -18328,6 +20559,8 @@ function updateRefreshCookieStatus(message) {
 
 // 轮询检查刷新Cookie状态
 let refreshCookieCheckInterval = null;
+let refreshCookieCheckAbortController = null;
+let refreshCookieStartupSessionId = null;
 let refreshCookieSubmitRequestSequence = 0;
 let refreshCookiePollingState = {
     sessionId: null,
@@ -18345,8 +20578,25 @@ function stopRefreshCookiePolling(sessionId = refreshCookiePollingState.sessionI
         clearInterval(refreshCookieCheckInterval);
         refreshCookieCheckInterval = null;
     }
+    stopRefreshCookieCheckRequest();
 
+    if (!sessionId || refreshCookieStartupSessionId === sessionId) {
+        refreshCookieStartupSessionId = null;
+    }
     refreshCookiePollingState.completed = true;
+}
+
+function stopRefreshCookieCheckRequest() {
+    if (refreshCookieCheckAbortController) {
+        refreshCookieCheckAbortController.abort();
+        refreshCookieCheckAbortController = null;
+    }
+}
+
+function resetRefreshCookieCheckAbortController() {
+    stopRefreshCookieCheckRequest();
+    refreshCookieCheckAbortController = new AbortController();
+    return refreshCookieCheckAbortController;
 }
 
 function startRefreshCookiePolling(sessionId, accountId) {
@@ -18384,8 +20634,10 @@ function startRefreshCookiePolling(sessionId, accountId) {
             return;
         }
 
+        const controller = resetRefreshCookieCheckAbortController();
         try {
             const response = await fetch(`${apiBase}/password-login/check/${sessionId}`, {
+                signal: controller.signal,
                 headers: {
                     'Authorization': `Bearer ${authToken}`
                 }
@@ -18407,7 +20659,7 @@ function startRefreshCookiePolling(sessionId, accountId) {
                 showToast(errorMessage || '刷新检查失败', 'danger');
                 return;
             }
-            const data = await response.json();
+            const data = await response.json().catch(() => ({}));
 
             if (refreshCookiePollingState.sessionId !== sessionId || refreshCookiePollingState.completed) {
                 return;
@@ -18484,8 +20736,14 @@ function startRefreshCookiePolling(sessionId, accountId) {
                     break;
             }
         } catch (error) {
+            if (error?.name === 'AbortError') {
+                return null;
+            }
             console.error('检查刷新状态失败:', error);
         } finally {
+            if (refreshCookieCheckAbortController === controller) {
+                refreshCookieCheckAbortController = null;
+            }
             if (refreshCookiePollingState.sessionId === sessionId) {
                 refreshCookiePollingState.inFlight = false;
             }
@@ -18500,6 +20758,8 @@ function startRefreshCookiePolling(sessionId, accountId) {
 
 let passwordLoginCheckInterval = null;
 let passwordLoginSessionId = null;
+let passwordLoginCheckAbortController = null;
+let passwordLoginStartupSessionId = null;
 let passwordLoginSubmitRequestSequence = 0;
 let passwordLoginPollingState = {
     sessionId: null,
@@ -18509,7 +20769,7 @@ let passwordLoginPollingState = {
 let passwordLoginQRModalEventsBound = false;
 let passwordLoginQRModalState = {
     systemClosing: false,
-    cancelInFlight: false,
+    cancelInFlightSessionIds: new Set(),
     mode: 'session'
 };
 
@@ -18530,6 +20790,13 @@ async function handlePasswordLogin(event) {
     const submitBtn = event.target.querySelector('button[type="submit"]');
     const originalText = submitBtn.innerHTML;
     const submitRequestSequence = ++passwordLoginSubmitRequestSequence;
+    const clientSessionId = createAccountVerificationSessionId('password');
+    passwordLoginStartupSessionId = clientSessionId;
+    const clearStartupSession = () => {
+        if (passwordLoginStartupSessionId === clientSessionId) {
+            passwordLoginStartupSessionId = null;
+        }
+    };
     submitBtn.disabled = true;
     submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>登录中...';
     
@@ -18543,39 +20810,70 @@ async function handlePasswordLogin(event) {
             body: JSON.stringify({
                 account_id: accountId,
                 account: account,
-                password: password
+                password: password,
+                session_id: clientSessionId
             })
         });
         
         if (handleUnauthorizedApiResponse(response)) {
+            clearStartupSession();
             return null;
         }
         if (!response.ok) {
             if (submitRequestSequence !== passwordLoginSubmitRequestSequence) {
+                clearStartupSession();
+                void cancelPasswordLoginSession(clientSessionId, '登录');
                 return null;
             }
             const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
             if (submitRequestSequence !== passwordLoginSubmitRequestSequence) {
+                clearStartupSession();
+                void cancelPasswordLoginSession(clientSessionId, '登录');
                 return null;
             }
             if (
                 !document.getElementById('accounts-section')?.classList.contains('active')
                 || document.getElementById('passwordLoginForm')?.style.display === 'none'
             ) {
+                clearStartupSession();
                 resetPasswordLoginForm();
                 return null;
             }
+            clearStartupSession();
             showToast(errorMessage || '登录失败，请检查账号密码是否正确', 'danger');
             submitBtn.disabled = false;
             submitBtn.innerHTML = originalText;
             return;
         }
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
+        const responseSessionId = typeof data.session_id === 'string' && data.session_id.trim() ? data.session_id : null;
         
         if (response.ok && data.success && data.session_id) {
             if (submitRequestSequence !== passwordLoginSubmitRequestSequence) {
+                clearStartupSession();
+                void cancelPasswordLoginSession(responseSessionId || clientSessionId, '登录');
                 return null;
             }
+            if (
+                !document.getElementById('accounts-section')?.classList.contains('active')
+                || document.getElementById('passwordLoginForm')?.style.display === 'none'
+            ) {
+                clearStartupSession();
+                void cancelPasswordLoginSession(responseSessionId || clientSessionId, '登录');
+                resetPasswordLoginForm();
+                return null;
+            }
+            clearStartupSession();
+            passwordLoginSessionId = data.session_id;
+            // 开始轮询检查登录状态
+            startPasswordLoginCheck();
+        } else {
+            if (submitRequestSequence !== passwordLoginSubmitRequestSequence) {
+                clearStartupSession();
+                void cancelPasswordLoginSession(responseSessionId || clientSessionId, '登录');
+                return null;
+            }
+            clearStartupSession();
             if (
                 !document.getElementById('accounts-section')?.classList.contains('active')
                 || document.getElementById('passwordLoginForm')?.style.display === 'none'
@@ -18583,17 +20881,7 @@ async function handlePasswordLogin(event) {
                 resetPasswordLoginForm();
                 return null;
             }
-            passwordLoginSessionId = data.session_id;
-            // 开始轮询检查登录状态
-            startPasswordLoginCheck();
-        } else {
-            if (submitRequestSequence !== passwordLoginSubmitRequestSequence) {
-                return null;
-            }
-            if (
-                !document.getElementById('accounts-section')?.classList.contains('active')
-                || document.getElementById('passwordLoginForm')?.style.display === 'none'
-            ) {
+            if (data.status === 'cancelled') {
                 resetPasswordLoginForm();
                 return null;
             }
@@ -18603,8 +20891,11 @@ async function handlePasswordLogin(event) {
         }
     } catch (error) {
         if (submitRequestSequence !== passwordLoginSubmitRequestSequence) {
+            clearStartupSession();
+            void cancelPasswordLoginSession(clientSessionId, '登录');
             return null;
         }
+        clearStartupSession();
         if (
             !document.getElementById('accounts-section')?.classList.contains('active')
             || document.getElementById('passwordLoginForm')?.style.display === 'none'
@@ -18639,9 +20930,11 @@ async function checkPasswordLoginStatus() {
 
     const sessionId = passwordLoginSessionId;
     passwordLoginPollingState.inFlight = true;
+    const controller = resetPasswordLoginCheckAbortController();
     
     try {
         const response = await fetch(`${apiBase}/password-login/check/${sessionId}`, {
+            signal: controller.signal,
             headers: {
                 'Authorization': `Bearer ${authToken}`
             }
@@ -18651,7 +20944,7 @@ async function checkPasswordLoginStatus() {
         }
         
         if (response.ok) {
-            const data = await response.json();
+            const data = await response.json().catch(() => ({}));
 
             if (passwordLoginPollingState.sessionId !== sessionId || passwordLoginPollingState.completed) {
                 return;
@@ -18730,6 +21023,9 @@ async function checkPasswordLoginStatus() {
             resetPasswordLoginForm();
         }
     } catch (error) {
+        if (error?.name === 'AbortError') {
+            return null;
+        }
         console.error('检查账号密码登录状态失败:', error);
         passwordLoginPollingState.completed = true;
         clearPasswordLoginCheck();
@@ -18741,6 +21037,9 @@ async function checkPasswordLoginStatus() {
         showToast('网络错误，请重试', 'danger');
         resetPasswordLoginForm();
     } finally {
+        if (passwordLoginCheckAbortController === controller) {
+            passwordLoginCheckAbortController = null;
+        }
         if (passwordLoginPollingState.sessionId === sessionId) {
             passwordLoginPollingState.inFlight = false;
         }
@@ -18759,13 +21058,14 @@ function getPasswordLoginVerificationTypeLabel(verificationType) {
 }
 
 async function cancelManualCookieImportSession(sessionId) {
-    if (!sessionId || manualCookieImportCancelInFlight) {
+    const normalizedSessionId = String(sessionId || '').trim();
+    if (!normalizedSessionId || manualCookieImportCancelInFlightSessionIds.has(normalizedSessionId)) {
         return;
     }
 
-    manualCookieImportCancelInFlight = true;
+    manualCookieImportCancelInFlightSessionIds.add(normalizedSessionId);
     try {
-        const response = await fetch(`${apiBase}/manual-cookie-import/cancel/${encodeURIComponent(sessionId)}`, {
+        const response = await fetch(`${apiBase}/manual-cookie-import/cancel/${encodeURIComponent(normalizedSessionId)}`, {
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${authToken}`
@@ -18800,18 +21100,19 @@ async function cancelManualCookieImportSession(sessionId) {
         console.error('取消手动导入 Cookie 会话失败:', error);
         showToast('已停止当前导入验证流程，请稍后重试', 'warning');
     } finally {
-        manualCookieImportCancelInFlight = false;
+        manualCookieImportCancelInFlightSessionIds.delete(normalizedSessionId);
     }
 }
 
 async function cancelPasswordLoginSession(sessionId, flowLabel = '登录') {
-    if (!sessionId || passwordLoginQRModalState.cancelInFlight) {
+    const normalizedSessionId = String(sessionId || '').trim();
+    if (!normalizedSessionId || passwordLoginQRModalState.cancelInFlightSessionIds.has(normalizedSessionId)) {
         return;
     }
 
-    passwordLoginQRModalState.cancelInFlight = true;
+    passwordLoginQRModalState.cancelInFlightSessionIds.add(normalizedSessionId);
     try {
-        const response = await fetch(`${apiBase}/password-login/cancel/${encodeURIComponent(sessionId)}`, {
+        const response = await fetch(`${apiBase}/password-login/cancel/${encodeURIComponent(normalizedSessionId)}`, {
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${authToken}`
@@ -18846,7 +21147,7 @@ async function cancelPasswordLoginSession(sessionId, flowLabel = '登录') {
         console.error(`取消${flowLabel}会话失败:`, error);
         showToast(`已停止当前${flowLabel}轮询，请稍后重试`, 'warning');
     } finally {
-        passwordLoginQRModalState.cancelInFlight = false;
+        passwordLoginQRModalState.cancelInFlightSessionIds.delete(normalizedSessionId);
     }
 }
 
@@ -19192,11 +21493,26 @@ function clearPasswordLoginCheck() {
         clearInterval(passwordLoginCheckInterval);
         passwordLoginCheckInterval = null;
     }
+    stopPasswordLoginCheckRequest();
+}
+
+function stopPasswordLoginCheckRequest() {
+    if (passwordLoginCheckAbortController) {
+        passwordLoginCheckAbortController.abort();
+        passwordLoginCheckAbortController = null;
+    }
+}
+
+function resetPasswordLoginCheckAbortController() {
+    stopPasswordLoginCheckRequest();
+    passwordLoginCheckAbortController = new AbortController();
+    return passwordLoginCheckAbortController;
 }
 
 // 重置账号密码登录表单
 function resetPasswordLoginForm() {
     passwordLoginSessionId = null;
+    passwordLoginStartupSessionId = null;
     clearPasswordLoginCheck();
     passwordLoginPollingState = {
         sessionId: null,
@@ -19211,10 +21527,85 @@ function resetPasswordLoginForm() {
     }
 }
 
+function cancelAccountVerificationSessionOnPageHide(endpointPath) {
+    const normalizedEndpointPath = String(endpointPath || '').trim();
+    const token = localStorage.getItem('auth_token') || authToken;
+    if (!normalizedEndpointPath || !token) {
+        return;
+    }
+
+    try {
+        fetch(`${apiBase}/${normalizedEndpointPath}`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`
+            },
+            keepalive: true
+        });
+    } catch (error) {
+        console.warn('页面卸载时取消账号验证会话失败:', error);
+    }
+}
+
+function stopAccountVerificationSessionsOnPageHide() {
+    const manualActiveSessionId = manualCookieImportPollingState.sessionId || manualCookieImportStartupSessionId;
+    const passwordActiveSessionId = passwordLoginPollingState.sessionId || passwordLoginStartupSessionId;
+    const refreshActiveSessionId = refreshCookiePollingState.sessionId || refreshCookieStartupSessionId;
+    const qrActiveSessionId = qrCodeSessionId || qrCodeVerificationState.activeSessionId || qrCodeStartupSessionId;
+
+    manualCookieImportSubmitRequestSequence += 1;
+    passwordLoginSubmitRequestSequence += 1;
+    refreshCookieSubmitRequestSequence += 1;
+    qrCodeLoginRequestSequence += 1;
+
+    if (manualActiveSessionId && !manualCookieImportPollingState.completed) {
+        clearManualCookieImportCheck();
+        manualCookieImportSessionId = null;
+        manualCookieImportStartupSessionId = null;
+        manualCookieImportPollingState.completed = true;
+        manualCookieImportPollingState.inFlight = false;
+        cancelAccountVerificationSessionOnPageHide(
+            `manual-cookie-import/cancel/${encodeURIComponent(manualActiveSessionId)}`
+        );
+    }
+
+    if (passwordActiveSessionId && !passwordLoginPollingState.completed) {
+        clearPasswordLoginCheck();
+        passwordLoginSessionId = null;
+        passwordLoginStartupSessionId = null;
+        passwordLoginPollingState.completed = true;
+        passwordLoginPollingState.inFlight = false;
+        cancelAccountVerificationSessionOnPageHide(
+            `password-login/cancel/${encodeURIComponent(passwordActiveSessionId)}`
+        );
+    }
+
+    if (refreshActiveSessionId && !refreshCookiePollingState.completed) {
+        stopRefreshCookiePolling(refreshActiveSessionId);
+        refreshCookieStartupSessionId = null;
+        refreshCookiePollingState.inFlight = false;
+        toggleLoading(false);
+        cancelAccountVerificationSessionOnPageHide(
+            `password-login/cancel/${encodeURIComponent(refreshActiveSessionId)}`
+        );
+    }
+
+    if (qrActiveSessionId && !qrCodeVerificationState.completed) {
+        clearQRCodeCheck();
+        cancelAccountVerificationSessionOnPageHide(
+            `qr-login/cancel/${encodeURIComponent(qrActiveSessionId)}`
+        );
+    }
+}
+
+window.addEventListener('pagehide', stopAccountVerificationSessionsOnPageHide);
+
 // ========================= 扫码登录相关函数 =========================
 
 let qrCodeCheckInterval = null;
+let qrCodeCheckAbortController = null;
 let qrCodeSessionId = null;
+let qrCodeStartupSessionId = null;
 let qrCodeModalEventsBound = false;
 let qrCodeLoginRequestSequence = 0;
 let qrCodeVerificationState = {
@@ -19241,6 +21632,38 @@ function resetQRCodeVerificationState() {
     qrCodeVerificationState.inFlight = false;
     qrCodeVerificationState.completed = false;
     qrCodeVerificationState.activeSessionId = null;
+}
+
+async function cancelQRCodeLoginSession(sessionId) {
+    if (!sessionId) {
+        return null;
+    }
+
+    try {
+        const response = await fetch(`${apiBase}/qr-login/cancel/${encodeURIComponent(sessionId)}`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+        if (handleUnauthorizedApiResponse(response)) {
+            return null;
+        }
+        if (!response.ok) {
+            const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+            console.warn('扫码登录取消请求返回异常:', errorMessage);
+            return null;
+        }
+        const data = await response.json().catch(() => ({}));
+        if (data.success === false) {
+            console.warn('扫码登录取消请求返回异常:', data);
+            return null;
+        }
+        return data;
+    } catch (error) {
+        console.warn('取消扫码登录会话失败:', error);
+        return null;
+    }
 }
 
 function closeQRCodeLoginModal(delay = 3000) {
@@ -19278,7 +21701,12 @@ function initializeQRCodeLoginModal() {
     });
 
     modalElement.addEventListener('hidden.bs.modal', function () {
+        const activeSessionId = qrCodeSessionId || qrCodeVerificationState.activeSessionId || qrCodeStartupSessionId;
+        const shouldCancel = Boolean(activeSessionId) && !qrCodeVerificationState.completed;
         clearQRCodeCheck();
+        if (shouldCancel) {
+            void cancelQRCodeLoginSession(activeSessionId);
+        }
     });
 
     qrCodeModalEventsBound = true;
@@ -19305,6 +21733,8 @@ function getQRCodeLoginAccountId() {
 // 生成二维码
 async function generateQRCode() {
     const requestSequence = ++qrCodeLoginRequestSequence;
+    let clientSessionId = null;
+    let clearStartupSession = () => {};
     try {
     resetQRCodeVerificationState();
     showQRCodeLoading();
@@ -19315,16 +21745,28 @@ async function generateQRCode() {
         return;
     }
 
+    clientSessionId = createAccountVerificationSessionId('qr');
+    qrCodeStartupSessionId = clientSessionId;
+    clearStartupSession = () => {
+        if (qrCodeStartupSessionId === clientSessionId) {
+            qrCodeStartupSessionId = null;
+        }
+    };
+
     const response = await fetch(`${apiBase}/qr-login/generate`, {
         method: 'POST',
         headers: {
         'Authorization': `Bearer ${authToken}`,
         'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ account_id: accountId })
+        body: JSON.stringify({
+        account_id: accountId,
+        session_id: clientSessionId
+        })
     });
 
     if (handleUnauthorizedApiResponse(response)) {
+        clearStartupSession();
         return null;
     }
 
@@ -19335,26 +21777,40 @@ async function generateQRCode() {
             || !document.getElementById('accounts-section')?.classList.contains('active')
             || !document.getElementById('qrCodeLoginModal')?.classList.contains('show')
         ) {
+            clearStartupSession();
+            void cancelQRCodeLoginSession(clientSessionId);
             return null;
         }
+        clearStartupSession();
         showQRCodeError(errorMessage || '生成二维码失败');
         return;
     }
 
-    const data = await response.json();
+    const data = await response.json().catch(() => ({}));
+    if (hasMalformedQrLoginGenerateResult(data)) {
+        throw new Error('二维码生成返回格式异常');
+    }
+    const responseSessionId = data.success === true ? data.session_id : null;
     if (
         requestSequence !== qrCodeLoginRequestSequence
         || !document.getElementById('accounts-section')?.classList.contains('active')
         || !document.getElementById('qrCodeLoginModal')?.classList.contains('show')
     ) {
+        clearStartupSession();
+        void cancelQRCodeLoginSession(responseSessionId || clientSessionId);
         return null;
     }
     if (data.success) {
+        clearStartupSession();
         qrCodeSessionId = data.session_id;
         qrCodeVerificationState.activeSessionId = data.session_id;
         showQRCodeImage(data.qr_code_url);
         startQRCodeCheck();
     } else {
+        clearStartupSession();
+        if (data.status === 'cancelled') {
+            return null;
+        }
         showQRCodeError(data.message || '生成二维码失败');
     }
     } catch (error) {
@@ -19363,8 +21819,13 @@ async function generateQRCode() {
         || !document.getElementById('accounts-section')?.classList.contains('active')
         || !document.getElementById('qrCodeLoginModal')?.classList.contains('show')
     ) {
+        clearStartupSession();
+        if (clientSessionId) {
+            void cancelQRCodeLoginSession(clientSessionId);
+        }
         return null;
     }
+    clearStartupSession();
     console.error('生成二维码失败:', error);
     showQRCodeError('网络错误，请重试');
     }
@@ -19427,9 +21888,11 @@ async function checkQRCodeStatus() {
     const requestSessionId = qrCodeSessionId;
     const requestSequence = qrCodeLoginRequestSequence;
     qrCodeVerificationState.inFlight = true;
+    const controller = resetQRCodeCheckAbortController();
 
     try {
     const response = await fetch(`${apiBase}/qr-login/check/${requestSessionId}`, {
+        signal: controller.signal,
         headers: {
         'Authorization': `Bearer ${authToken}`
         }
@@ -19448,7 +21911,7 @@ async function checkQRCodeStatus() {
     }
 
     if (response.ok) {
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
 
         if (
             requestSequence !== qrCodeLoginRequestSequence
@@ -19456,6 +21919,9 @@ async function checkQRCodeStatus() {
             || qrCodeVerificationState.completed
         ) {
         return;
+        }
+        if (hasMalformedQrLoginStatusResult(data)) {
+            throw new Error('扫码登录状态返回格式异常');
         }
 
         switch (data.status) {
@@ -19475,6 +21941,7 @@ async function checkQRCodeStatus() {
             clearQRCodeCheck();
             handleQRCodeSuccess(data);
             break;
+        case 'failed':
         case 'error':
             qrCodeVerificationState.completed = true;
             document.getElementById('statusText').textContent = '登录失败';
@@ -19483,7 +21950,7 @@ async function checkQRCodeStatus() {
             if (!document.getElementById('accounts-section')?.classList.contains('active')) {
                 return null;
             }
-            showToast(data.message || '扫码登录失败', 'danger');
+            showToast(data.message || data.error || '扫码登录失败', 'danger');
             break;
         case 'expired':
             document.getElementById('statusText').textContent = '二维码已过期';
@@ -19535,8 +22002,14 @@ async function checkQRCodeStatus() {
         showToast(errorMessage || '扫码登录失败', 'danger');
     }
     } catch (error) {
+    if (error?.name === 'AbortError') {
+        return null;
+    }
     console.error('检查二维码状态失败:', error);
     } finally {
+    if (qrCodeCheckAbortController === controller) {
+        qrCodeCheckAbortController = null;
+    }
     if (
         requestSequence === qrCodeLoginRequestSequence
         && requestSessionId === qrCodeVerificationState.activeSessionId
@@ -19757,8 +22230,23 @@ function clearQRCodeCheck() {
     clearInterval(qrCodeCheckInterval);
     qrCodeCheckInterval = null;
     }
+    stopQRCodeCheckRequest();
     qrCodeSessionId = null;
+    qrCodeStartupSessionId = null;
     resetQRCodeVerificationState();
+}
+
+function stopQRCodeCheckRequest() {
+    if (qrCodeCheckAbortController) {
+        qrCodeCheckAbortController.abort();
+        qrCodeCheckAbortController = null;
+    }
+}
+
+function resetQRCodeCheckAbortController() {
+    stopQRCodeCheckRequest();
+    qrCodeCheckAbortController = new AbortController();
+    return qrCodeCheckAbortController;
 }
 
 // 刷新二维码
@@ -19841,7 +22329,7 @@ async function loadItemsListForImageKeyword() {
         }
 
         if (response.ok) {
-            const data = await response.json();
+            const data = await response.json().catch(() => ({}));
             if (
                 requestSequence !== imageKeywordItemsRequestSequence
                 || currentAccountId !== requestedAccountId
@@ -19849,7 +22337,10 @@ async function loadItemsListForImageKeyword() {
             ) {
                 return null;
             }
-            const items = data.items || [];
+            if (!data || typeof data !== 'object' || !Array.isArray(data.items)) {
+                throw new Error('商品列表返回格式异常');
+            }
+            const items = data.items;
 
             // 更新商品选择下拉框
             if (selectElement) {
@@ -20473,6 +22964,15 @@ function editRemark(accountId, currentRemark) {
         if (isProcessing) return; // 防止重复调用
 
         const newRemark = input.value.trim();
+        const safeRemarkForJs = escapeInlineJsSingleQuotedString(newRemark);
+        const safeRemarkHtml = escapeHtml(newRemark);
+        const safeAccountIdForJs = escapeInlineJsSingleQuotedString(accountId);
+        const emptyRemarkHtml = '<i class="bi bi-plus-circle text-muted"></i> 添加备注';
+        const renderedNewRemarkDisplay = `
+            <span class="remark-display" onclick="editRemark('${safeAccountIdForJs}', '${safeRemarkForJs}')" title="点击编辑备注" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;">
+                ${newRemark ? safeRemarkHtml : emptyRemarkHtml}
+            </span>
+        `;
 
         // 如果没有变化，直接恢复显示
         if (!hasChanged || newRemark === originalValue) {
@@ -20497,15 +22997,18 @@ function editRemark(accountId, currentRemark) {
             }
 
             if (response.ok) {
+                const result = await response.json().catch(() => ({}));
                 if (!document.getElementById('accounts-section')?.classList.contains('active')) {
                     return null;
                 }
-                // 更新显示
-                const safeRemarkForJs = escapeInlineJsSingleQuotedString(newRemark);
-                const safeRemarkHtml = escapeHtml(newRemark);
-                void safeRemarkForJs;
-                void safeRemarkHtml;
-                remarkCell.innerHTML = renderAccountRemarkDisplay(accountId, newRemark);
+                if (hasMalformedAccountInlineEditResult(result, 'remark')) {
+                    throw new Error('备注更新结果返回格式异常');
+                }
+                if (result.remark === newRemark) {
+                    remarkCell.innerHTML = renderedNewRemarkDisplay;
+                } else {
+                    remarkCell.innerHTML = renderAccountRemarkDisplay(accountId, result.remark);
+                }
                 showToast('备注更新成功', 'success');
             } else {
                 const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
@@ -20520,8 +23023,9 @@ function editRemark(accountId, currentRemark) {
             if (!document.getElementById('accounts-section')?.classList.contains('active')) {
                 return null;
             }
+            const errorMessage = error?.message || '请稍后重试';
             console.error('更新备注失败:', error);
-            showToast('备注更新失败', 'danger');
+            showToast(`备注更新失败: ${errorMessage}`, 'danger');
             // 恢复原始内容
             remarkCell.innerHTML = originalContent;
         } finally {
@@ -20629,11 +23133,14 @@ function editPauseDuration(accountId, currentDuration) {
             }
 
             if (response.ok) {
+                const result = await response.json().catch(() => ({}));
                 if (!document.getElementById('accounts-section')?.classList.contains('active')) {
                     return null;
                 }
-                // 更新显示
-                pauseCell.innerHTML = renderAccountPauseDurationDisplay(accountId, newDuration);
+                if (hasMalformedAccountInlineEditResult(result, '', 'pause_duration', 0, 60)) {
+                    throw new Error('暂停时间更新结果返回格式异常');
+                }
+                pauseCell.innerHTML = renderAccountPauseDurationDisplay(accountId, result.pause_duration);
                 showToast('暂停时间更新成功', 'success');
             } else {
                 const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
@@ -20648,8 +23155,9 @@ function editPauseDuration(accountId, currentDuration) {
             if (!document.getElementById('accounts-section')?.classList.contains('active')) {
                 return null;
             }
+            const errorMessage = error?.message || '请稍后重试';
             console.error('更新暂停时间失败:', error);
-            showToast('暂停时间更新失败', 'danger');
+            showToast(`暂停时间更新失败: ${errorMessage}`, 'danger');
             // 恢复原始内容
             pauseCell.innerHTML = originalContent;
         } finally {
@@ -20778,11 +23286,20 @@ async function loadSystemSettings() {
             throw new Error(errorMessage);
         }
 
-        const result = await response.json();
+        const result = await response.json().catch(() => ({}));
         if (
             requestSequence !== systemSettingsLoadRequestSequence
             || !isSystemSettingsSectionActive()
         ) {
+            return null;
+        }
+        if (hasMalformedVerifyResult(result)) {
+            throw new Error('权限验证结果返回格式异常');
+        }
+        if (!result.authenticated) {
+            localStorage.removeItem('auth_token');
+            localStorage.removeItem('user_info');
+            window.location.href = '/';
             return null;
         }
         const isAdmin = result.is_admin === true;
@@ -20909,7 +23426,7 @@ async function loadAPISecuritySettings(requestSequence = null, actionRequestSequ
             throw new Error(errorMessage);
         }
 
-        const settings = await response.json();
+        const settings = await response.json().catch(() => ({}));
         if (requestSequence !== null && (
             requestSequence !== systemSettingsLoadRequestSequence
             || !isSystemSettingsSectionActive()
@@ -20921,6 +23438,9 @@ async function loadAPISecuritySettings(requestSequence = null, actionRequestSequ
             || !isSystemSettingsSectionActive()
         )) {
             return null;
+        }
+        if (hasMalformedSystemSettingsLoadResult(settings)) {
+            throw new Error('API安全设置返回格式异常');
         }
 
         // 加载QQ回复消息秘钥
@@ -21011,7 +23531,7 @@ async function loadDebounceDelay(requestSequence = null, actionRequestSequence =
             throw new Error(errorMessage);
         }
 
-        const settings = await response.json();
+        const settings = await response.json().catch(() => ({}));
         if (requestSequence !== null && (
             requestSequence !== systemSettingsLoadRequestSequence
             || !isSystemSettingsSectionActive()
@@ -21023,6 +23543,9 @@ async function loadDebounceDelay(requestSequence = null, actionRequestSequence =
             || !isSystemSettingsSectionActive()
         )) {
             return null;
+        }
+        if (hasMalformedSystemSettingsLoadResult(settings)) {
+            throw new Error('防抖延迟设置返回格式异常');
         }
         const val = settings.message_debounce_delay;
         const input = document.getElementById('debounceDelay');
@@ -21098,6 +23621,16 @@ async function saveDebounceDelay() {
             || !isSystemSettingsSectionActive()
         ) {
             return null;
+        }
+        const result = await response.json().catch(() => ({}));
+        if (
+            actionRequestSequence !== systemSettingsMutationActionRequestSequence
+            || !isSystemSettingsSectionActive()
+        ) {
+            return null;
+        }
+        if (hasMalformedSystemSettingsMutationResult(result)) {
+            throw new Error('防抖延迟保存结果返回格式异常');
         }
         showToast('防抖延迟已保存', 'success');
         return true;
@@ -21213,6 +23746,16 @@ async function updateQQReplySecretKey() {
         ) {
             return null;
         }
+        const result = await response.json().catch(() => ({}));
+        if (
+            actionRequestSequence !== systemSettingsMutationActionRequestSequence
+            || !isSystemSettingsSectionActive()
+        ) {
+            return null;
+        }
+        if (hasMalformedSystemSettingsMutationResult(result)) {
+            throw new Error('更新QQ回复消息API秘钥结果返回格式异常');
+        }
         showToast('QQ回复消息API秘钥更新成功', 'success');
 
         // 显示状态信息
@@ -21303,7 +23846,7 @@ async function loadOutgoingConfigs(requestSequence = null, actionRequestSequence
             throw new Error(errorMessage);
         }
 
-        const settings = await response.json();
+        const settings = await response.json().catch(() => ({}));
         if (requestSequence !== null && (
             requestSequence !== systemSettingsLoadRequestSequence
             || !isSystemSettingsSectionActive()
@@ -21315,6 +23858,9 @@ async function loadOutgoingConfigs(requestSequence = null, actionRequestSequence
             || !isSystemSettingsSectionActive()
         )) {
             return null;
+        }
+        if (hasMalformedSystemSettingsLoadResult(settings)) {
+            throw new Error('外发配置返回格式异常');
         }
 
         // 渲染外发配置界面
@@ -21494,6 +24040,16 @@ async function saveOutgoingConfigs(event) {
                 }
                 throw new Error(errorMessage);
             }
+            const result = await response.json().catch(() => ({}));
+            if (
+                actionRequestSequence !== systemSettingsMutationActionRequestSequence
+                || !isSystemSettingsSectionActive()
+            ) {
+                return null;
+            }
+            if (hasMalformedSystemSettingsMutationResult(result)) {
+                throw new Error('外发配置保存结果返回格式异常');
+            }
         }
 
         // 重新加载配置
@@ -21576,7 +24132,7 @@ async function loadRegistrationSettings(requestSequence = null, actionRequestSeq
             throw new Error(errorMessage);
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (requestSequence !== null && (
             requestSequence !== systemSettingsLoadRequestSequence
             || !isSystemSettingsSectionActive()
@@ -21588,6 +24144,9 @@ async function loadRegistrationSettings(requestSequence = null, actionRequestSeq
             || !isSystemSettingsSectionActive()
         )) {
             return null;
+        }
+        if (hasMalformedRegistrationStatusResult(data)) {
+            throw new Error('注册设置返回格式异常');
         }
         const checkbox = document.getElementById('registrationEnabled');
         if (checkbox) {
@@ -21692,7 +24251,7 @@ async function loadLoginInfoSettings(requestSequence = null, actionRequestSequen
             throw new Error(errorMessage);
         }
 
-        const settings = await response.json();
+        const settings = await response.json().catch(() => ({}));
         if (requestSequence !== null && (
             requestSequence !== systemSettingsLoadRequestSequence
             || !isSystemSettingsSectionActive()
@@ -21704,6 +24263,9 @@ async function loadLoginInfoSettings(requestSequence = null, actionRequestSequen
             || !isSystemSettingsSectionActive()
         )) {
             return null;
+        }
+        if (hasMalformedSystemSettingsLoadResult(settings)) {
+            throw new Error('登录信息设置返回格式异常');
         }
         const checkbox = document.getElementById('showDefaultLoginInfo');
         const captchaCheckbox = document.getElementById('loginCaptchaEnabled');
@@ -21784,11 +24346,21 @@ async function updateLoginInfoSettings() {
             }
 
             if (regResponse.ok) {
+                const regResult = await regResponse.json().catch(() => ({}));
                 if (
                     actionRequestSequence !== systemSettingsMutationActionRequestSequence
                     || !isSystemSettingsSectionActive()
                 ) {
                     return null;
+                }
+                if (hasMalformedSystemSettingsMutationResult(regResult, 'enabled', true)) {
+                    throw new Error('更新注册设置结果返回格式异常');
+                }
+                if (regResult && typeof regResult === 'object' && regResult.success === false) {
+                    await loadRegistrationSettings(null, actionRequestSequence);
+                    await loadLoginInfoSettings(null, actionRequestSequence);
+                    showToast(`更新注册设置失败: ${regResult.message || '请稍后重试'}`, 'danger');
+                    return false;
                 }
                 messages.push(regEnabled ? '用户注册已开启' : '用户注册已关闭');
             } else {
@@ -21828,11 +24400,21 @@ async function updateLoginInfoSettings() {
             }
 
             if (response.ok) {
+                const result = await response.json().catch(() => ({}));
                 if (
                     actionRequestSequence !== systemSettingsMutationActionRequestSequence
                     || !isSystemSettingsSectionActive()
                 ) {
                     return null;
+                }
+                if (hasMalformedSystemSettingsMutationResult(result, 'enabled', true)) {
+                    throw new Error('更新默认登录信息设置结果返回格式异常');
+                }
+                if (result && typeof result === 'object' && result.success === false) {
+                    await loadRegistrationSettings(null, actionRequestSequence);
+                    await loadLoginInfoSettings(null, actionRequestSequence);
+                    showToast(`更新默认登录信息设置失败: ${result.message || '请稍后重试'}`, 'danger');
+                    return false;
                 }
                 messages.push(enabled ? '默认登录信息显示已开启' : '默认登录信息显示已关闭');
             } else {
@@ -21872,11 +24454,21 @@ async function updateLoginInfoSettings() {
             }
 
             if (captchaResponse.ok) {
+                const captchaResult = await captchaResponse.json().catch(() => ({}));
                 if (
                     actionRequestSequence !== systemSettingsMutationActionRequestSequence
                     || !isSystemSettingsSectionActive()
                 ) {
                     return null;
+                }
+                if (hasMalformedSystemSettingsMutationResult(captchaResult, 'enabled', true)) {
+                    throw new Error('更新登录验证码设置结果返回格式异常');
+                }
+                if (captchaResult && typeof captchaResult === 'object' && captchaResult.success === false) {
+                    await loadRegistrationSettings(null, actionRequestSequence);
+                    await loadLoginInfoSettings(null, actionRequestSequence);
+                    showToast(`更新登录验证码设置失败: ${captchaResult.message || '请稍后重试'}`, 'danger');
+                    return false;
                 }
                 messages.push(captchaEnabled ? '登录验证码已开启' : '登录验证码已关闭');
             } else {
@@ -21961,6 +24553,21 @@ function stopOrdersStream() {
 }
 
 window.addEventListener('pagehide', stopOrdersStream);
+
+function stopOrderRuntimeActionRequests() {
+    if (orderRuntimeActionAbortController) {
+        orderRuntimeActionAbortController.abort();
+        orderRuntimeActionAbortController = null;
+    }
+}
+
+function resetOrderRuntimeActionAbortController() {
+    stopOrderRuntimeActionRequests();
+    orderRuntimeActionAbortController = new AbortController();
+    return orderRuntimeActionAbortController;
+}
+
+window.addEventListener('pagehide', stopOrderRuntimeActionRequests);
 
 function scheduleOrdersStreamReconnect() {
     if (!ordersStreamShouldRun || !isOrdersSectionActive()) return;
@@ -22080,6 +24687,7 @@ async function startOrdersStream() {
         });
 
         if (handleUnauthorizedApiResponse(response)) {
+            ordersStreamShouldRun = false;
             return null;
         }
 
@@ -22272,7 +24880,7 @@ async function loadAllOrders(options = {}) {
             throw new Error(errorMessage);
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             requestSequence !== ordersListRequestSequence
             || !document.getElementById('orders-section')?.classList.contains('active')
@@ -22282,11 +24890,20 @@ async function loadAllOrders(options = {}) {
         if (!data || typeof data !== 'object' || Array.isArray(data)) {
             throw new Error('订单列表返回格式异常');
         }
-        if (data.success === true && data.data != null && !Array.isArray(data.data)) {
+        if (
+            typeof data.success !== 'boolean'
+            || (data.message != null && typeof data.message !== 'string')
+        ) {
+            throw new Error('订单列表返回格式异常');
+        }
+        if (data.success === true && !Array.isArray(data.data)) {
+            throw new Error('订单列表返回格式异常');
+        }
+        if (data.success === true && hasMalformedOrderListEntries(data.data)) {
             throw new Error('订单列表返回格式异常');
         }
         if (data.success) {
-            allOrdersData = data.data || [];
+            allOrdersData = data.data;
             // 历史同步后优先按平台下单时间排序，回退到入库时间
             allOrdersData.sort((a, b) => {
                 const bTime = parseUtcDateTime(getOrderPrimarySortTime(b))?.getTime() || 0;
@@ -22724,7 +25341,7 @@ async function fetchOrderSyncAccounts(forceRefresh = false) {
         throw new Error(errorMessage);
     }
 
-    const accounts = await response.json();
+    const accounts = await response.json().catch(() => ({}));
     if (!Array.isArray(accounts)) {
         throw new Error('订单账号列表返回格式异常');
     }
@@ -22822,6 +25439,40 @@ function stopOrderHistorySyncPolling() {
     }
 }
 
+function isOrderHistorySyncJobActiveStatus(status) {
+    return ['pending', 'running'].includes(String(status || '').toLowerCase());
+}
+
+function cancelActiveOrderHistorySyncJobSilently(options = {}) {
+    if (!activeOrderHistorySyncJobId || !isOrderHistorySyncJobActiveStatus(activeOrderHistorySyncJobStatus)) {
+        return;
+    }
+
+    const jobId = String(activeOrderHistorySyncJobId || '').trim();
+    const token = localStorage.getItem('auth_token') || authToken;
+    activeOrderHistorySyncJobStatus = 'cancelled';
+    stopOrderHistorySyncPolling();
+    if (!jobId || !token) {
+        return;
+    }
+
+    fetch(`${apiBase}/api/orders/history-sync/${encodeURIComponent(jobId)}/cancel`, {
+        method: 'POST',
+        keepalive: Boolean(options.keepalive),
+        headers: {
+            'Authorization': `Bearer ${token}`
+        }
+    }).catch(error => {
+        console.warn('静默取消历史订单同步失败:', error);
+    });
+}
+
+function cancelActiveOrderHistorySyncJobOnPageHide() {
+    cancelActiveOrderHistorySyncJobSilently({ keepalive: true });
+}
+
+window.addEventListener('pagehide', cancelActiveOrderHistorySyncJobOnPageHide);
+
 function scheduleOrderHistorySyncPolling(jobId) {
     stopOrderHistorySyncPolling();
     const modalRequestSequence = orderHistorySyncModalRequestSequence;
@@ -22836,7 +25487,9 @@ function scheduleOrderHistorySyncPolling(jobId) {
         fetchOrderHistorySyncStatus(jobId).catch(error => {
             console.error('轮询历史订单同步状态失败:', error);
             if (activeOrderHistorySyncJobId && activeOrderHistorySyncJobId === jobId && isOrdersSectionActive()) {
-                scheduleOrderHistorySyncPolling(jobId);
+                if (isOrderHistorySyncJobActiveStatus(activeOrderHistorySyncJobStatus)) {
+                    scheduleOrderHistorySyncPolling(jobId);
+                }
             }
         });
     }, 2000);
@@ -22867,6 +25520,8 @@ function renderOrderHistorySyncJob(job) {
     const ordersProcessed = Number(job?.orders_processed || 0);
     const ordersSkipped = Number(job?.orders_skipped || 0);
     const warnings = Array.isArray(job?.warnings) ? job.warnings : [];
+    const status = String(job?.status || '').toLowerCase();
+    activeOrderHistorySyncJobStatus = status;
 
     const statusText = document.getElementById('orderHistorySyncStatusText');
     const messageText = document.getElementById('orderHistorySyncMessageText');
@@ -22916,7 +25571,6 @@ function renderOrderHistorySyncJob(job) {
     }
 
     let progressPercent = 0;
-    const status = String(job?.status || '').toLowerCase();
     if (status === 'completed' || status === 'failed' || status === 'cancelled') {
         progressPercent = 100;
     } else if (accountsTotal > 0) {
@@ -23710,7 +26364,7 @@ async function loadItemDetailForOrder(itemId, accountId) {
         if (!content) return;
 
         if (response.ok) {
-            const data = await response.json();
+            const data = await response.json().catch(() => ({}));
             if (requestSequence !== orderDetailItemRequestSequence) {
                 return;
             }
@@ -23822,6 +26476,16 @@ async function deleteOrder(orderId, accountId) {
         }
 
         if (response.ok) {
+            const result = await response.json().catch(() => ({}));
+            if (actionRequestSequence !== orderMutationActionRequestSequence) {
+                return null;
+            }
+            if (!isOrdersSectionActive()) {
+                return null;
+            }
+            if (hasMalformedOrderDeleteMutationResult(result)) {
+                throw new Error('订单删除结果返回格式异常');
+            }
             // 刷新列表
             const ordersLoaded = await refreshOrdersData();
             if (actionRequestSequence !== orderMutationActionRequestSequence) {
@@ -23904,7 +26568,24 @@ async function batchDeleteOrders() {
                 }
 
                 if (response.ok) {
-                    successCount++;
+                    const result = await response.json().catch(() => ({}));
+                    if (actionRequestSequence !== orderMutationActionRequestSequence) {
+                        return null;
+                    }
+                    if (!isOrdersSectionActive()) {
+                        return null;
+                    }
+                    if (hasMalformedOrderDeleteMutationResult(result)) {
+                        throw new Error('订单删除结果返回格式异常');
+                    }
+                    if (result.success === false) {
+                        failCount++;
+                        if (!firstFailureMessage) {
+                            firstFailureMessage = result.message || '请稍后重试';
+                        }
+                    } else {
+                        successCount++;
+                    }
                 } else {
                     const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
                     if (actionRequestSequence !== orderMutationActionRequestSequence) {
@@ -23971,12 +26652,14 @@ async function batchDeleteOrders() {
 // 手动发货订单
 async function manualDeliverOrder(orderId, accountId) {
     let actionRequestSequence = 0;
+    let controller = null;
     try {
         const confirmed = confirm(`确定要手动发货此订单吗？\n\n订单ID: ${orderId}\n\n系统将根据发货规则自动匹配发货内容并发送给买家。`);
         if (!confirmed) {
             return;
         }
         actionRequestSequence = ++orderMutationActionRequestSequence;
+        controller = resetOrderRuntimeActionAbortController();
 
         showToast('正在执行发货...', 'info');
 
@@ -23986,7 +26669,8 @@ async function manualDeliverOrder(orderId, accountId) {
             headers: {
                 'Authorization': `Bearer ${authToken}`,
                 'Content-Type': 'application/json'
-            }
+            },
+            signal: controller.signal
         });
         if (handleUnauthorizedApiResponse(response)) {
             return null;
@@ -24003,16 +26687,22 @@ async function manualDeliverOrder(orderId, accountId) {
             return;
         }
 
-        const result = await response.json();
+        const result = await response.json().catch(() => ({}));
         if (actionRequestSequence !== orderMutationActionRequestSequence) {
             return null;
         }
         if (!isOrdersSectionActive()) {
             return null;
         }
+        if (hasMalformedOrderDeliveryMutationResult(result)) {
+            throw new Error('手动发货结果返回格式异常');
+        }
 
         if (response.ok) {
             if (result.delivered) {
+                const deliveryResultState = String(result.result_state || '').toLowerCase();
+                const deliveryToastType = deliveryResultState === 'warning' ? 'warning' : 'success';
+                const deliverySuccessPrefix = deliveryToastType === 'warning' ? '发货已执行，但仍有后续处理需要关注！' : '发货成功！';
                 // 刷新今日发货统计
                 refreshTodayDeliveryCount();
                 const ordersLoaded = await refreshOrdersData();
@@ -24023,7 +26713,7 @@ async function manualDeliverOrder(orderId, accountId) {
                     return null;
                 }
                 if (ordersLoaded) {
-                    showToast(`发货成功！\n${result.message}`, 'success');
+                    showToast(`${deliverySuccessPrefix}\n${result.message}`, deliveryToastType);
                 } else {
                     showToast('发货成功，但订单列表刷新失败，请稍后手动刷新', 'warning');
                 }
@@ -24043,6 +26733,9 @@ async function manualDeliverOrder(orderId, accountId) {
             }
         }
     } catch (error) {
+        if (controller?.signal.aborted || error?.name === 'AbortError') {
+            return null;
+        }
         if (actionRequestSequence && actionRequestSequence !== orderMutationActionRequestSequence) {
             return null;
         }
@@ -24051,14 +26744,20 @@ async function manualDeliverOrder(orderId, accountId) {
         }
         console.error('手动发货失败:', error);
         showToast('手动发货失败: ' + error.message, 'danger');
+    } finally {
+        if (orderRuntimeActionAbortController === controller) {
+            orderRuntimeActionAbortController = null;
+        }
     }
 }
 
 // 刷新订单状态
 async function refreshOrderStatus(orderId, accountId) {
     let actionRequestSequence = 0;
+    let controller = null;
     try {
         actionRequestSequence = ++orderMutationActionRequestSequence;
+        controller = resetOrderRuntimeActionAbortController();
         showToast('正在刷新订单状态...', 'info');
 
         const scopedUrl = `${apiBase}/api/orders/${orderId}/refresh?account_id=${encodeURIComponent(accountId)}`;
@@ -24067,7 +26766,8 @@ async function refreshOrderStatus(orderId, accountId) {
             headers: {
                 'Authorization': `Bearer ${authToken}`,
                 'Content-Type': 'application/json'
-            }
+            },
+            signal: controller.signal
         });
         if (handleUnauthorizedApiResponse(response)) {
             return null;
@@ -24084,16 +26784,32 @@ async function refreshOrderStatus(orderId, accountId) {
             return;
         }
 
-        const result = await response.json();
+        const result = await response.json().catch(() => ({}));
         if (actionRequestSequence !== orderMutationActionRequestSequence) {
             return null;
         }
         if (!isOrdersSectionActive()) {
             return null;
         }
+        if (hasMalformedOrderRefreshMutationResult(result)) {
+            throw new Error('刷新订单状态结果返回格式异常');
+        }
 
         if (response.ok) {
-            if (result.updated) {
+            if (result && typeof result === 'object' && result.success === false) {
+                const ordersLoaded = await refreshOrdersData();
+                if (actionRequestSequence !== orderMutationActionRequestSequence) {
+                    return null;
+                }
+                if (!isOrdersSectionActive()) {
+                    return null;
+                }
+                if (ordersLoaded === false) {
+                    showToast(`刷新失败: ${result.message || '请稍后重试'}，但订单列表刷新失败，请稍后手动刷新`, 'warning');
+                } else {
+                    showToast(`刷新失败: ${result.message || '请稍后重试'}`, 'warning');
+                }
+            } else if (result.updated) {
                 const ordersLoaded = await refreshOrdersData();
                 if (actionRequestSequence !== orderMutationActionRequestSequence) {
                     return null;
@@ -24122,6 +26838,9 @@ async function refreshOrderStatus(orderId, accountId) {
             }
         }
     } catch (error) {
+        if (controller?.signal.aborted || error?.name === 'AbortError') {
+            return null;
+        }
         if (actionRequestSequence && actionRequestSequence !== orderMutationActionRequestSequence) {
             return null;
         }
@@ -24130,6 +26849,10 @@ async function refreshOrderStatus(orderId, accountId) {
         }
         console.error('刷新订单状态失败:', error);
         showToast('刷新订单状态失败: ' + error.message, 'danger');
+    } finally {
+        if (orderRuntimeActionAbortController === controller) {
+            orderRuntimeActionAbortController = null;
+        }
     }
 }
 
@@ -24178,106 +26901,121 @@ async function batchRefreshOrders() {
 
     showToast(`正在刷新 ${orderIds.length} 个订单状态...`, 'info');
 
+    let controller = null;
     let actionRequestSequence = ++orderMutationActionRequestSequence;
+    controller = resetOrderRuntimeActionAbortController();
     let successCount = 0;
     let failCount = 0;
     let firstFailureMessage = '';
 
-    for (const { orderId, accountId } of selectedOrders) {
-        try {
-            if (actionRequestSequence !== orderMutationActionRequestSequence) {
-                return null;
-            }
-            const scopedUrl = `${apiBase}/api/orders/${orderId}/refresh?account_id=${encodeURIComponent(accountId)}`;
-            const response = await fetch(scopedUrl, {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${authToken}`,
-                    'Content-Type': 'application/json'
+    try {
+        for (const { orderId, accountId } of selectedOrders) {
+            try {
+                if (actionRequestSequence !== orderMutationActionRequestSequence) {
+                    return null;
                 }
-            });
-            if (handleUnauthorizedApiResponse(response)) {
-                return null;
-            }
-            if (actionRequestSequence !== orderMutationActionRequestSequence) {
-                return null;
-            }
-            if (!isOrdersSectionActive()) {
-                return null;
-            }
-
-            if (response.ok) {
-                const result = await response.json();
+                const scopedUrl = `${apiBase}/api/orders/${orderId}/refresh?account_id=${encodeURIComponent(accountId)}`;
+                const response = await fetch(scopedUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${authToken}`,
+                        'Content-Type': 'application/json'
+                    },
+                    signal: controller.signal
+                });
+                if (handleUnauthorizedApiResponse(response)) {
+                    return null;
+                }
                 if (actionRequestSequence !== orderMutationActionRequestSequence) {
                     return null;
                 }
                 if (!isOrdersSectionActive()) {
                     return null;
                 }
-                if (result.success === false) {
-                    failCount++;
-                    if (!firstFailureMessage) {
-                        firstFailureMessage = result.message || '请稍后重试';
+
+                if (response.ok) {
+                    const result = await response.json().catch(() => ({}));
+                    if (actionRequestSequence !== orderMutationActionRequestSequence) {
+                        return null;
+                    }
+                    if (!isOrdersSectionActive()) {
+                        return null;
+                    }
+                    if (hasMalformedOrderRefreshMutationResult(result)) {
+                        throw new Error('刷新订单状态结果返回格式异常');
+                    }
+                    if (result.success === false) {
+                        failCount++;
+                        if (!firstFailureMessage) {
+                            firstFailureMessage = result.message || '请稍后重试';
+                        }
+                    } else {
+                        successCount++;
                     }
                 } else {
-                    successCount++;
+                    const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+                    if (actionRequestSequence !== orderMutationActionRequestSequence) {
+                        return null;
+                    }
+                    if (!isOrdersSectionActive()) {
+                        return null;
+                    }
+                    failCount++;
+                    if (!firstFailureMessage) {
+                        firstFailureMessage = errorMessage || `HTTP ${response.status}`;
+                    }
                 }
-            } else {
-                const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
+            } catch (error) {
+                if (controller?.signal.aborted || error?.name === 'AbortError') {
+                    return null;
+                }
                 if (actionRequestSequence !== orderMutationActionRequestSequence) {
                     return null;
                 }
                 if (!isOrdersSectionActive()) {
                     return null;
                 }
+                console.error(`刷新订单 ${orderId} 失败:`, error);
                 failCount++;
                 if (!firstFailureMessage) {
-                    firstFailureMessage = errorMessage || `HTTP ${response.status}`;
+                    firstFailureMessage = error.message || '请稍后重试';
                 }
             }
-        } catch (error) {
-            if (actionRequestSequence !== orderMutationActionRequestSequence) {
-                return null;
+        }
+
+        if (actionRequestSequence !== orderMutationActionRequestSequence) {
+            return null;
+        }
+        if (!isOrdersSectionActive()) {
+            return null;
+        }
+        // 刷新订单列表
+        const ordersLoaded = await refreshOrdersData();
+        if (actionRequestSequence !== orderMutationActionRequestSequence) {
+            return null;
+        }
+        if (!isOrdersSectionActive()) {
+            return null;
+        }
+
+        if (ordersLoaded) {
+            if (failCount === 0) {
+                showToast(`成功刷新 ${successCount} 个订单状态`, 'success');
+            } else if (successCount === 0) {
+                showToast(`批量刷新失败: ${firstFailureMessage || '请稍后重试'}`, 'danger');
+            } else {
+                showToast(`刷新完成: ${successCount} 成功, ${failCount} 失败`, 'warning');
             }
-            if (!isOrdersSectionActive()) {
-                return null;
-            }
-            console.error(`刷新订单 ${orderId} 失败:`, error);
-            failCount++;
-            if (!firstFailureMessage) {
-                firstFailureMessage = error.message || '请稍后重试';
+        } else if (ordersLoaded === false) {
+            if (successCount === 0) {
+                showToast(`批量刷新失败: ${firstFailureMessage || '请稍后重试'}，且订单列表刷新失败，请稍后手动刷新`, 'warning');
+            } else {
+                showToast('订单列表刷新失败，请稍后手动刷新', 'warning');
             }
         }
-    }
-
-    if (actionRequestSequence !== orderMutationActionRequestSequence) {
-        return null;
-    }
-    if (!isOrdersSectionActive()) {
-        return null;
-    }
-    // 刷新订单列表
-    const ordersLoaded = await refreshOrdersData();
-    if (actionRequestSequence !== orderMutationActionRequestSequence) {
-        return null;
-    }
-    if (!isOrdersSectionActive()) {
-        return null;
-    }
-
-    if (ordersLoaded) {
-        if (failCount === 0) {
-            showToast(`成功刷新 ${successCount} 个订单状态`, 'success');
-        } else if (successCount === 0) {
-            showToast(`批量刷新失败: ${firstFailureMessage || '请稍后重试'}`, 'danger');
-        } else {
-            showToast(`刷新完成: ${successCount} 成功, ${failCount} 失败`, 'warning');
-        }
-    } else if (ordersLoaded === false) {
-        if (successCount === 0) {
-            showToast(`批量刷新失败: ${firstFailureMessage || '请稍后重试'}，且订单列表刷新失败，请稍后手动刷新`, 'warning');
-        } else {
-            showToast('订单列表刷新失败，请稍后手动刷新', 'warning');
+    } finally {
+        if (orderRuntimeActionAbortController === controller) {
+            orderRuntimeActionAbortController = null;
         }
     }
 }
@@ -24293,6 +27031,7 @@ document.addEventListener('DOMContentLoaded', function() {
         if (orderHistorySyncModal) {
             orderHistorySyncModal.addEventListener('hidden.bs.modal', () => {
                 orderHistorySyncModalRequestSequence += 1;
+                cancelActiveOrderHistorySyncJobSilently();
                 stopOrderHistorySyncPolling();
             });
         }
@@ -24390,20 +27129,7 @@ async function loadUserManagement() {
             return null;
         }
 
-        if (response.ok) {
-            const result = await response.json();
-            if (
-                requestSequence !== userManagementLoadRequestSequence
-                || !document.getElementById('user-management-section')?.classList.contains('active')
-            ) {
-                return null;
-            }
-            if (!result.is_admin) {
-                showToast('您没有权限访问用户管理功能', 'danger');
-                showSection('dashboard'); // 跳转回仪表盘
-                return;
-            }
-        } else {
+        if (!response.ok) {
             const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
             if (
                 requestSequence !== userManagementLoadRequestSequence
@@ -24412,6 +27138,27 @@ async function loadUserManagement() {
                 return null;
             }
             throw new Error(errorMessage);
+        }
+        const result = await response.json().catch(() => ({}));
+        if (
+            requestSequence !== userManagementLoadRequestSequence
+            || !document.getElementById('user-management-section')?.classList.contains('active')
+        ) {
+            return null;
+        }
+        if (hasMalformedVerifyResult(result)) {
+            throw new Error('权限验证结果返回格式异常');
+        }
+        if (!result.authenticated) {
+            localStorage.removeItem('auth_token');
+            localStorage.removeItem('user_info');
+            window.location.href = '/';
+            return null;
+        }
+        if (!result.is_admin) {
+            showToast('您没有权限访问用户管理功能', 'danger');
+            showSection('dashboard'); // 跳转回仪表盘
+            return;
         }
     } catch (error) {
         if (
@@ -24531,7 +27278,7 @@ async function loadUsers() {
             throw new Error(errorMessage);
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             requestSequence !== userManagementListRequestSequence
             || !document.getElementById('user-management-section')?.classList.contains('active')
@@ -24679,11 +27426,18 @@ async function toggleUserAdmin(userId, username, setAdmin) {
         }
 
         if (response.ok) {
-            const data = await response.json();
+            const data = await response.json().catch(() => ({}));
             if (
                 actionRequestSequence !== userManagementMutationActionRequestSequence
                 || !document.getElementById('user-management-section')?.classList.contains('active')
             ) {
+                return null;
+            }
+            if (hasMalformedUserManagementMutationResult(data, true)) {
+                throw new Error('用户权限更新结果返回格式异常');
+            }
+            if (data && typeof data === 'object' && data.success === false) {
+                showToast(`操作失败: ${data.message || '请稍后重试'}`, 'danger');
                 return null;
             }
             const usersLoaded = await loadUsers();
@@ -24790,12 +27544,19 @@ async function confirmDeleteUser() {
         }
 
         if (response.ok) {
-            const data = await response.json();
+            const data = await response.json().catch(() => ({}));
             if (
                 actionRequestSequence !== userManagementMutationActionRequestSequence
                 || requestSequence !== userDeleteModalRequestSequence
                 || !document.getElementById('user-management-section')?.classList.contains('active')
             ) {
+                return null;
+            }
+            if (hasMalformedUserManagementMutationResult(data)) {
+                throw new Error('删除用户结果返回格式异常');
+            }
+            if (data && typeof data === 'object' && data.success === false) {
+                showToast(`删除失败: ${data.message || '请稍后重试'}`, 'danger');
                 return null;
             }
             const deleteUserModalElement = document.getElementById('deleteUserModal');
@@ -24933,20 +27694,7 @@ async function loadDataManagement() {
             return null;
         }
 
-        if (response.ok) {
-            const result = await response.json();
-            if (
-                requestSequence !== dataManagementLoadRequestSequence
-                || !document.getElementById('data-management-section')?.classList.contains('active')
-            ) {
-                return null;
-            }
-            if (!result.is_admin) {
-                showToast('您没有权限访问数据管理功能', 'danger');
-                showSection('dashboard'); // 跳转回仪表盘
-                return;
-            }
-        } else {
+        if (!response.ok) {
             const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);
             if (
                 requestSequence !== dataManagementLoadRequestSequence
@@ -24955,6 +27703,27 @@ async function loadDataManagement() {
                 return null;
             }
             throw new Error(errorMessage);
+        }
+        const result = await response.json().catch(() => ({}));
+        if (
+            requestSequence !== dataManagementLoadRequestSequence
+            || !document.getElementById('data-management-section')?.classList.contains('active')
+        ) {
+            return null;
+        }
+        if (hasMalformedVerifyResult(result)) {
+            throw new Error('权限验证结果返回格式异常');
+        }
+        if (!result.authenticated) {
+            localStorage.removeItem('auth_token');
+            localStorage.removeItem('user_info');
+            window.location.href = '/';
+            return null;
+        }
+        if (!result.is_admin) {
+            showToast('您没有权限访问数据管理功能', 'danger');
+            showSection('dashboard'); // 跳转回仪表盘
+            return;
         }
     } catch (error) {
         if (
@@ -25097,17 +27866,26 @@ async function loadTableData() {
             throw new Error(errorMessage);
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (requestSequence !== dataTableRequestSequence || tableSelect.value !== selectedTable) {
             return false;
         }
         if (!document.getElementById('data-management-section')?.classList.contains('active')) {
             return false;
         }
-        if (!data || typeof data !== 'object') {
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            throw new Error('数据表返回格式异常');
+        }
+        if (
+            typeof data.success !== 'boolean'
+            || (data.message != null && typeof data.message !== 'string')
+        ) {
             throw new Error('数据表返回格式异常');
         }
         if (data.success && (!Array.isArray(data.data) || !Array.isArray(data.columns))) {
+            throw new Error('数据表返回格式异常');
+        }
+        if (data.success && (hasMalformedDataTableColumns(data.columns) || hasMalformedDataTableRows(data.data))) {
             throw new Error('数据表返回格式异常');
         }
 
@@ -25135,8 +27913,25 @@ async function loadTableData() {
     }
 }
 
+function hasMalformedDataTableColumns(columns) {
+    return columns.some(column => typeof column !== 'string' || !column.trim());
+}
+
+function hasMalformedDataTableRows(rows) {
+    return rows.some(row => !row || typeof row !== 'object' || Array.isArray(row));
+}
+
 // 显示表格数据
 function displayTableData(data, columns) {
+    if (
+        !Array.isArray(data)
+        || !Array.isArray(columns)
+        || hasMalformedDataTableColumns(columns)
+        || hasMalformedDataTableRows(data)
+    ) {
+        throw new Error('数据表返回格式异常');
+    }
+
     if (!data || data.length === 0) {
         showNoData();
         return;
@@ -25340,13 +28135,16 @@ async function clearTableData() {
         }
 
         if (response.ok) {
-            const data = await response.json();
+            const data = await response.json().catch(() => ({}));
             if (
                 actionRequestSequence !== dataManagementMutationActionRequestSequence
                 || currentTable !== clearTable
                 || !document.getElementById('data-management-section')?.classList.contains('active')
             ) {
                 return null;
+            }
+            if (hasMalformedDataManagementMutationResult(data)) {
+                throw new Error('数据清空结果返回格式异常');
             }
             // 重新加载数据
             const loaded = await loadTableData();
@@ -25358,7 +28156,11 @@ async function clearTableData() {
                 return null;
             }
             if (loaded) {
-                showToast(data.message || '数据清空成功', 'success');
+                if (data.warning) {
+                    showToast(data.warning, 'warning');
+                } else {
+                    showToast(data.message || '数据清空成功', 'success');
+                }
             } else {
                 showToast('数据清空成功，但表格刷新失败，请稍后手动刷新', 'warning');
             }
@@ -25495,7 +28297,7 @@ async function confirmDeleteRecord() {
         }
 
         if (response.ok) {
-            const data = await response.json();
+            const data = await response.json().catch(() => ({}));
             if (
                 actionRequestSequence !== dataManagementMutationActionRequestSequence
                 || requestSequence !== dataDeleteModalRequestSequence
@@ -25503,6 +28305,9 @@ async function confirmDeleteRecord() {
                 || !document.getElementById('data-management-section')?.classList.contains('active')
             ) {
                 return null;
+            }
+            if (hasMalformedDataManagementMutationResult(data)) {
+                throw new Error('删除记录结果返回格式异常');
             }
             const deleteRecordModalElement = document.getElementById('deleteRecordModal');
             if (deleteRecordModalElement) {
@@ -25520,7 +28325,11 @@ async function confirmDeleteRecord() {
                 return null;
             }
             if (loaded) {
-                showToast(data.message || '删除成功', 'success');
+                if (data.warning) {
+                    showToast(data.warning, 'warning');
+                } else {
+                    showToast(data.message || '删除成功', 'success');
+                }
             } else {
                 showToast('删除成功，但表格刷新失败，请稍后手动刷新', 'warning');
             }
@@ -25671,14 +28480,22 @@ async function loadSystemLogs() {
             throw new Error(errorMessage);
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             requestSequence !== systemLogRequestSequence
             || !document.getElementById('logs-section')?.classList.contains('active')
         ) {
             return;
         }
-        if (!data || typeof data !== 'object' || (data.logs != null && !Array.isArray(data.logs))) {
+        if (!data || typeof data !== 'object' || Array.isArray(data) || (data.logs != null && !Array.isArray(data.logs))) {
+            throw new Error('日志数据返回格式异常');
+        }
+        if (
+            (data.success != null && typeof data.success !== 'boolean')
+            || (data.log_file != null && typeof data.log_file !== 'string')
+            || (data.total_lines != null && (!Number.isInteger(data.total_lines) || data.total_lines < 0))
+            || (Array.isArray(data.logs) && data.logs.some(log => typeof log !== 'string'))
+        ) {
             throw new Error('日志数据返回格式异常');
         }
         if (data.success === false) {
@@ -25895,7 +28712,7 @@ async function loadLogFileList() {
             return;
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             requestSequence !== logFileListRequestSequence
             || modalRequestSequence !== logFileModalRequestSequence
@@ -25906,7 +28723,11 @@ async function loadLogFileList() {
         if (!data || typeof data !== 'object' || Array.isArray(data)) {
             throw new Error('日志文件列表返回格式异常');
         }
-        if (data.success === true && data.files != null && !Array.isArray(data.files)) {
+        if (
+            typeof data.success !== 'boolean'
+            || (data.message != null && typeof data.message !== 'string')
+            || (data.success === true && !Array.isArray(data.files))
+        ) {
             throw new Error('日志文件列表返回格式异常');
         }
         if (!data.success) {
@@ -25915,13 +28736,25 @@ async function loadLogFileList() {
             return;
         }
 
-        const files = Array.isArray(data.files) ? data.files : [];
+        const files = data.files;
+        if (files.some(file =>
+            !file
+            || typeof file !== 'object'
+            || Array.isArray(file)
+            || typeof file.name !== 'string'
+            || !file.name.trim()
+            || (file.size != null && (!Number.isFinite(file.size) || file.size < 0))
+            || (file.modified_at != null && typeof file.modified_at !== 'string')
+        )) {
+            throw new Error('日志文件列表返回格式异常');
+        }
         if (files.length === 0) {
             empty.classList.remove('d-none');
             return;
         }
 
         files.forEach(file => {
+            const normalizedFileName = file.name.trim();
             const item = document.createElement('div');
             item.className = 'list-group-item d-flex justify-content-between align-items-start flex-wrap gap-3';
 
@@ -25930,7 +28763,7 @@ async function loadLogFileList() {
 
             const title = document.createElement('div');
             title.className = 'fw-semibold';
-            title.textContent = file.name || '未知文件';
+            title.textContent = normalizedFileName;
 
             const meta = document.createElement('div');
             meta.className = 'small text-muted';
@@ -25948,7 +28781,7 @@ async function loadLogFileList() {
             downloadBtn.type = 'button';
             downloadBtn.className = 'btn btn-sm btn-outline-primary';
             downloadBtn.innerHTML = '<i class="bi bi-download me-1"></i>下载';
-            downloadBtn.onclick = () => downloadLogFile(file.name, downloadBtn);
+            downloadBtn.onclick = () => downloadLogFile(normalizedFileName, downloadBtn);
 
             actions.appendChild(downloadBtn);
 
@@ -26186,6 +29019,64 @@ function setRiskControlSliderStatsError(scopeLabel = '全部账号', message = '
     if (recentFailureElement) recentFailureElement.textContent = '--';
 }
 
+function hasMalformedRiskControlSliderStatsData(stats) {
+    if (!stats || typeof stats !== 'object' || Array.isArray(stats)) {
+        return true;
+    }
+
+    const nonNegativeNumericFields = [
+        'total_sessions',
+        'total_attempts',
+        'success_count',
+        'failure_count',
+        'processing_count',
+        'completed_sessions',
+        'accounts_with_sessions',
+        'accounts_with_failures',
+    ];
+    if (nonNegativeNumericFields.some(field => !Number.isFinite(Number(stats[field])) || Number(stats[field]) < 0)) {
+        return true;
+    }
+
+    if (
+        !Number.isFinite(Number(stats.success_rate))
+        || Number(stats.success_rate) < 0
+        || Number(stats.success_rate) > 100
+    ) {
+        return true;
+    }
+
+    if (stats.has_data != null && typeof stats.has_data !== 'boolean') {
+        return true;
+    }
+    if (stats.recent_success != null && typeof stats.recent_success !== 'string') {
+        return true;
+    }
+    if (stats.recent_failure != null && typeof stats.recent_failure !== 'string') {
+        return true;
+    }
+    if (stats.summary_text != null && typeof stats.summary_text !== 'string') {
+        return true;
+    }
+    if (stats.selected_range != null && typeof stats.selected_range !== 'string') {
+        return true;
+    }
+    if (stats.range_label != null && typeof stats.range_label !== 'string') {
+        return true;
+    }
+    if (stats.scope_label != null && typeof stats.scope_label !== 'string') {
+        return true;
+    }
+    if (stats.selected_account_id != null && typeof stats.selected_account_id !== 'string') {
+        return true;
+    }
+    if (stats.stats_mode != null && typeof stats.stats_mode !== 'string') {
+        return true;
+    }
+
+    return false;
+}
+
 function renderRiskControlSliderStats(stats = {}) {
     const scopeElement = document.getElementById('riskSliderScope');
     const successRateElement = document.getElementById('riskSliderSuccessRate');
@@ -26270,7 +29161,7 @@ async function loadRiskControlSliderStats(accountId = '') {
             return;
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (requestId !== currentRiskSliderStatsRequestId) {
             return;
         }
@@ -26280,7 +29171,14 @@ async function loadRiskControlSliderStats(accountId = '') {
         if (!data || typeof data !== 'object' || Array.isArray(data)) {
             throw new Error('滑块验证统计返回格式异常');
         }
-        if (data.success === true && (!data.data || typeof data.data !== 'object' || Array.isArray(data.data))) {
+        if (
+            typeof data.success !== 'boolean'
+            || (data.message != null && typeof data.message !== 'string')
+            || (data.detail != null && typeof data.detail !== 'string')
+        ) {
+            throw new Error('滑块验证统计返回格式异常');
+        }
+        if (data.success === true && hasMalformedRiskControlSliderStatsData(data.data)) {
             throw new Error('滑块验证统计返回格式异常');
         }
 
@@ -26289,7 +29187,7 @@ async function loadRiskControlSliderStats(accountId = '') {
             return;
         }
 
-        renderRiskControlSliderStats(data.data || {});
+        renderRiskControlSliderStats(data.data);
     } catch (error) {
         console.error('加载滑块验证统计失败:', error);
         if (requestId !== currentRiskSliderStatsRequestId) {
@@ -26385,7 +29283,11 @@ async function fetchRiskControlLogsPage(token, {
         };
     }
 
-    return response.json();
+    const data = await response.json().catch(() => ({}));
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        throw new Error('风控日志返回格式异常');
+    }
+    return data;
 }
 
 function needsClientSideRiskLogFilter(logs, processingStatus) {
@@ -26480,6 +29382,63 @@ async function fetchRiskControlLogsWithClientFilter(token, {
     };
 }
 
+function hasMalformedRiskControlLogEntries(logs) {
+    return logs.some(log => {
+        if (!log || typeof log !== 'object' || Array.isArray(log)) {
+            return true;
+        }
+        if (log.id != null && typeof log.id !== 'string' && typeof log.id !== 'number') {
+            return true;
+        }
+        if (log.created_at != null && typeof log.created_at !== 'string') {
+            return true;
+        }
+        if (log.account_id != null && typeof log.account_id !== 'string') {
+            return true;
+        }
+        if (log.event_type != null && typeof log.event_type !== 'string') {
+            return true;
+        }
+        if (log.trigger_scene != null && typeof log.trigger_scene !== 'string') {
+            return true;
+        }
+        if (log.processing_status != null && typeof log.processing_status !== 'string') {
+            return true;
+        }
+        if (log.event_description != null && typeof log.event_description !== 'string') {
+            return true;
+        }
+        if (log.event_description_display != null && typeof log.event_description_display !== 'string') {
+            return true;
+        }
+        if (log.processing_result != null && typeof log.processing_result !== 'string') {
+            return true;
+        }
+        if (log.processing_result_display != null && typeof log.processing_result_display !== 'string') {
+            return true;
+        }
+        if (log.error_message != null && typeof log.error_message !== 'string') {
+            return true;
+        }
+        if (log.error_message_display != null && typeof log.error_message_display !== 'string') {
+            return true;
+        }
+        if (log.result_code != null && typeof log.result_code !== 'string') {
+            return true;
+        }
+        if (log.session_id != null && typeof log.session_id !== 'string') {
+            return true;
+        }
+        if (log.session_display != null && typeof log.session_display !== 'string') {
+            return true;
+        }
+        if (log.duration_ms != null && (typeof log.duration_ms !== 'number' || !Number.isFinite(log.duration_ms) || log.duration_ms < 0)) {
+            return true;
+        }
+        return false;
+    });
+}
+
 function renderRiskControlLogsEmptyState(message = '暂无风控日志数据') {
     const logContainer = document.getElementById('riskLogContainer');
     const noLogsDiv = document.getElementById('noRiskLogs');
@@ -26565,6 +29524,23 @@ async function loadRiskControlLogs(offset = 0) {
         }
         if (!document.getElementById('risk-control-logs-section')?.classList.contains('active')) {
             return false;
+        }
+        if (
+            !data
+            || typeof data !== 'object'
+            || Array.isArray(data)
+            || (data.success != null && typeof data.success !== 'boolean')
+            || (data.message != null && typeof data.message !== 'string')
+            || (data.detail != null && typeof data.detail !== 'string')
+            || (data.success === true && !Array.isArray(data.data))
+            || (data.success === true && !Number.isInteger(data.total))
+            || (data.limit != null && !Number.isInteger(data.limit))
+            || (data.offset != null && !Number.isInteger(data.offset))
+        ) {
+            throw new Error('风控日志返回格式异常');
+        }
+        if (data.success === true && hasMalformedRiskControlLogEntries(data.data)) {
+            throw new Error('风控日志返回格式异常');
         }
 
         loadingDiv.style.display = 'none';
@@ -26730,6 +29706,10 @@ function renderRiskLogOutcomeCell(log) {
 }
 
 function displayRiskControlLogs(logs) {
+    if (!Array.isArray(logs) || hasMalformedRiskControlLogEntries(logs)) {
+        throw new Error('风控日志返回格式异常');
+    }
+
     const tableBody = document.getElementById('riskLogTableBody');
     tableBody.innerHTML = '';
 
@@ -26931,7 +29911,7 @@ async function loadRiskLogAccountFilterOptions() {
         }
 
         if (response.ok) {
-            const data = await response.json();
+            const data = await response.json().catch(() => ({}));
             if (
                 requestSequence !== riskLogAccountFilterRequestSequence
                 || !document.getElementById('risk-control-logs-section')?.classList.contains('active')
@@ -26941,17 +29921,36 @@ async function loadRiskLogAccountFilterOptions() {
             if (!data || typeof data !== 'object' || Array.isArray(data)) {
                 throw new Error('账号选项返回格式异常');
             }
+            if (
+                typeof data.success !== 'boolean'
+                || (data.message != null && typeof data.message !== 'string')
+                || (data.detail != null && typeof data.detail !== 'string')
+            ) {
+                throw new Error('账号选项返回格式异常');
+            }
             if (data.success === true && !Array.isArray(data.accounts)) {
+                throw new Error('账号选项返回格式异常');
+            }
+            if (data.success === true && data.accounts.some(account =>
+                !account
+                || typeof account !== 'object'
+                || Array.isArray(account)
+                || typeof account.account_id !== 'string'
+                || !account.account_id.trim()
+                || (account.nickname != null && typeof account.nickname !== 'string')
+                || (account.username != null && typeof account.username !== 'string')
+            )) {
                 throw new Error('账号选项返回格式异常');
             }
 
             if (data.success && data.accounts) {
                 data.accounts.forEach(account => {
+                    const normalizedAccountId = account.account_id.trim();
                     const option = document.createElement('option');
-                    option.value = account.account_id;
+                    option.value = normalizedAccountId;
                     // 优先显示备注，其次显示用户名，都没有则不显示括号
-                    const displayName = account.nickname || account.username || '';
-                    option.textContent = displayName ? `${account.account_id} (${displayName})` : account.account_id;
+                    const displayName = String(account.nickname || account.username || '').trim();
+                    option.textContent = displayName ? `${normalizedAccountId} (${displayName})` : normalizedAccountId;
                     select.appendChild(option);
                 });
 
@@ -27040,12 +30039,15 @@ async function deleteRiskControlLog(logId) {
             return null;
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             actionRequestSequence !== riskControlLogMutationActionRequestSequence
             || !document.getElementById('risk-control-logs-section')?.classList.contains('active')
         ) {
             return null;
+        }
+        if (hasMalformedRiskControlLogMutationResult(data)) {
+            throw new Error('风控日志删除结果返回格式异常');
         }
 
         if (data.success) {
@@ -27116,15 +30118,18 @@ async function clearRiskControlLogs() {
             return null;
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             actionRequestSequence !== riskControlLogMutationActionRequestSequence
             || !document.getElementById('risk-control-logs-section')?.classList.contains('active')
         ) {
             return null;
         }
+        if (hasMalformedDataManagementMutationResult(data)) {
+            throw new Error('风控日志清空结果返回格式异常');
+        }
 
-        if (data.success !== false) {
+        if (data && typeof data === 'object' && data.success === true) {
             const loaded = await loadRiskControlLogs(0);
             if (
                 actionRequestSequence !== riskControlLogMutationActionRequestSequence
@@ -27138,7 +30143,7 @@ async function clearRiskControlLogs() {
                 showToast('风控日志已清空，但风控日志列表刷新失败，请稍后手动刷新', 'warning');
             }
         } else {
-            showToast(data.detail || data.message || '清空失败', 'danger');
+            showToast(data?.detail || data?.message || '清空失败', 'danger');
         }
     } catch (error) {
         if (
@@ -27160,6 +30165,148 @@ let currentSearchPage = 1;
 let searchPageSize = 20;
 let totalSearchPages = 0;
 let itemSearchRequestSequence = 0;
+
+function hasMalformedItemSearchAccountPrecheckResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (typeof result.hasValidAccounts !== 'boolean') {
+        return true;
+    }
+    if (!Number.isFinite(Number(result.validAccountCount)) || Number(result.validAccountCount) < 0) {
+        return true;
+    }
+    if (!Number.isFinite(Number(result.enabledAccountCount)) || Number(result.enabledAccountCount) < 0) {
+        return true;
+    }
+    if (!Number.isFinite(Number(result.totalAccountCount)) || Number(result.totalAccountCount) < 0) {
+        return true;
+    }
+    if (result.checkedAccountId != null && (typeof result.checkedAccountId !== 'string' || !result.checkedAccountId.trim())) {
+        return true;
+    }
+    if (result.checkedAccountEnabled != null && typeof result.checkedAccountEnabled !== 'boolean') {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedCaptchaSessionListEntries(sessions) {
+    return sessions.some(session => {
+        if (!session || typeof session !== 'object' || Array.isArray(session)) {
+            return true;
+        }
+        if (typeof session.session_id !== 'string' || !session.session_id.trim()) {
+            return true;
+        }
+        if (typeof session.completed !== 'boolean') {
+            return true;
+        }
+        if (typeof session.has_websocket !== 'boolean') {
+            return true;
+        }
+        return false;
+    });
+}
+
+function hasMalformedCaptchaSessionListResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (!Number.isFinite(Number(result.count)) || Number(result.count) < 0) {
+        return true;
+    }
+    if (!Array.isArray(result.sessions)) {
+        return true;
+    }
+    if (hasMalformedCaptchaSessionListEntries(result.sessions)) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedCaptchaCompletionStatusResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (result.success != null && typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (result.completed != null && typeof result.completed !== 'boolean') {
+        return true;
+    }
+    if (result.session_exists != null && typeof result.session_exists !== 'boolean') {
+        return true;
+    }
+    if (result.message != null && typeof result.message !== 'string') {
+        return true;
+    }
+    const hasCompletedFlag = typeof result.completed === 'boolean';
+    const hasSessionExistenceFlags = typeof result.session_exists === 'boolean' && typeof result.success === 'boolean';
+    if (!hasCompletedFlag && !hasSessionExistenceFlags) {
+        return true;
+    }
+    return false;
+}
+
+function hasMalformedItemSearchResultItems(items) {
+    return items.some(item => {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) {
+            return true;
+        }
+        if (item.title != null && typeof item.title !== 'string') {
+            return true;
+        }
+        if (
+            item.price != null
+            && typeof item.price !== 'string'
+            && (typeof item.price !== 'number' || !Number.isFinite(item.price))
+        ) {
+            return true;
+        }
+        if (item.seller_name != null && typeof item.seller_name !== 'string') {
+            return true;
+        }
+        if (item.item_url != null && typeof item.item_url !== 'string') {
+            return true;
+        }
+        if (item.url != null && typeof item.url !== 'string') {
+            return true;
+        }
+        if (item.main_image != null && typeof item.main_image !== 'string') {
+            return true;
+        }
+        if (item.image_url != null && typeof item.image_url !== 'string') {
+            return true;
+        }
+        if (
+            item.want_count != null
+            && typeof item.want_count !== 'string'
+            && (typeof item.want_count !== 'number' || !Number.isFinite(item.want_count) || item.want_count < 0)
+        ) {
+            return true;
+        }
+        return false;
+    });
+}
+
+function stopItemSearchRequests() {
+    if (itemSearchAbortController) {
+        itemSearchAbortController.abort();
+        itemSearchAbortController = null;
+    }
+}
+
+function resetItemSearchAbortController() {
+    stopItemSearchRequests();
+    itemSearchAbortController = new AbortController();
+    return itemSearchAbortController;
+}
+
+window.addEventListener('pagehide', stopItemSearchRequests);
 
 // 初始化商品搜索功能
 function initItemSearch() {
@@ -27227,6 +30374,8 @@ async function handleItemSearch(event) {
         return null;
     }
 
+    const controller = resetItemSearchAbortController();
+
     // 显示搜索状态
     showSearchStatus(true);
     hideSearchResults();
@@ -27263,11 +30412,27 @@ async function handleItemSearch(event) {
         }
 
         if (accountsCheckResponse.ok) {
-            const accountsData = await accountsCheckResponse.json();
+            const accountsData = await accountsCheckResponse.json().catch(() => ({}));
             if (
                 requestSequence !== itemSearchRequestSequence
                 || !document.getElementById('item-search-section')?.classList.contains('active')
             ) {
+                return null;
+            }
+            if (hasMalformedItemSearchAccountPrecheckResult(accountsData)) {
+                throw new Error('商品搜索账号预检返回格式异常');
+            }
+            if (accountsData.success === false) {
+                const precheckBusinessErrorMessage = String(accountsData.message || accountsData.detail || '检查账号状态失败，请稍后重试').trim() || '检查账号状态失败，请稍后重试';
+                if (
+                    requestSequence !== itemSearchRequestSequence
+                    || !document.getElementById('item-search-section')?.classList.contains('active')
+                ) {
+                    return null;
+                }
+                showToast(`搜索前检查账号状态失败: ${precheckBusinessErrorMessage}`, 'danger');
+                showSearchStatus(false);
+                showNoSearchResults();
                 return null;
             }
             if (!accountsData.hasValidAccounts) {
@@ -27300,17 +30465,18 @@ async function handleItemSearch(event) {
             }
 
             if (initialCaptchaSessionsResponse.ok) {
-                const initialCaptchaSessionsData = await initialCaptchaSessionsResponse.json();
+                const initialCaptchaSessionsData = await initialCaptchaSessionsResponse.json().catch(() => ({}));
                 if (
                     requestSequence !== itemSearchRequestSequence
                     || !document.getElementById('item-search-section')?.classList.contains('active')
                 ) {
                     return null;
                 }
+                if (hasMalformedCaptchaSessionListResult(initialCaptchaSessionsData)) {
+                    throw new Error('验证码会话列表返回格式异常');
+                }
 
-                const initialCaptchaSessions = Array.isArray(initialCaptchaSessionsData.sessions)
-                    ? initialCaptchaSessionsData.sessions
-                    : [];
+                const initialCaptchaSessions = initialCaptchaSessionsData.sessions;
                 initialCaptchaSessions.forEach(session => {
                     if (session?.session_id) {
                         existingCaptchaSessionIds.add(session.session_id);
@@ -27377,7 +30543,7 @@ async function handleItemSearch(event) {
                     }
                     throw new Error(checkErrorMessage);
                 }
-                const checkData = await checkResponse.json();
+                const checkData = await checkResponse.json().catch(() => ({}));
                 if (
                     requestSequence !== itemSearchRequestSequence
                     || !document.getElementById('item-search-section')?.classList.contains('active')
@@ -27388,8 +30554,11 @@ async function handleItemSearch(event) {
                     }
                     return;
                 }
-                
-                if (checkData.sessions && checkData.sessions.length > 0) {
+                if (hasMalformedCaptchaSessionListResult(checkData)) {
+                    throw new Error('验证码会话列表返回格式异常');
+                }
+
+                if (checkData.sessions.length > 0) {
                     for (const session of checkData.sessions) {
                         if (!session?.session_id || existingCaptchaSessionIds.has(session.session_id)) {
                             continue;
@@ -27453,6 +30622,7 @@ async function handleItemSearch(event) {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${token}`
             },
+            signal: controller.signal,
             body: JSON.stringify({
                 account_id: accountId,
                 keyword: keyword,
@@ -27467,7 +30637,7 @@ async function handleItemSearch(event) {
                 clearInterval(sessionChecker);
                 sessionChecker = null;
             }
-        });
+        }).catch(() => {});
 
         const response = await fetchPromise;
         if (handleUnauthorizedApiResponse(response)) {
@@ -27493,11 +30663,30 @@ async function handleItemSearch(event) {
             return null;
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (
             requestSequence !== itemSearchRequestSequence
             || !document.getElementById('item-search-section')?.classList.contains('active')
         ) {
+            return null;
+        }
+        if (!data || typeof data !== 'object' || (data.data != null && !Array.isArray(data.data))) {
+            throw new Error('商品搜索结果返回格式异常');
+        }
+        if (Array.isArray(data.data) && hasMalformedItemSearchResultItems(data.data)) {
+            throw new Error('商品搜索结果返回格式异常');
+        }
+        if (data.success === false) {
+            const businessErrorMessage = String(data.message || data.detail || '商品搜索失败，请稍后重试').trim() || '商品搜索失败，请稍后重试';
+            if (
+                requestSequence !== itemSearchRequestSequence
+                || !document.getElementById('item-search-section')?.classList.contains('active')
+            ) {
+                return null;
+            }
+            showSearchStatus(false);
+            showToast(`搜索失败: ${businessErrorMessage}`, 'danger');
+            showNoSearchResults();
             return null;
         }
 
@@ -27533,6 +30722,7 @@ async function handleItemSearch(event) {
                         'Content-Type': 'application/json',
                         'Authorization': `Bearer ${token}`
                     },
+                    signal: controller.signal,
                     body: JSON.stringify({
                         account_id: accountId,
                         keyword: keyword,
@@ -27562,11 +30752,30 @@ async function handleItemSearch(event) {
                     return null;
                 }
 
-                const retryData = await retryResponse.json();
+                const retryData = await retryResponse.json().catch(() => ({}));
                 if (
                     requestSequence !== itemSearchRequestSequence
                     || !document.getElementById('item-search-section')?.classList.contains('active')
                 ) {
+                    return null;
+                }
+                if (!retryData || typeof retryData !== 'object' || (retryData.data != null && !Array.isArray(retryData.data))) {
+                    throw new Error('商品搜索结果返回格式异常');
+                }
+                if (Array.isArray(retryData.data) && hasMalformedItemSearchResultItems(retryData.data)) {
+                    throw new Error('商品搜索结果返回格式异常');
+                }
+                if (retryData.success === false) {
+                    const retryBusinessErrorMessage = String(retryData.message || retryData.detail || '商品搜索失败，请稍后重试').trim() || '商品搜索失败，请稍后重试';
+                    if (
+                        requestSequence !== itemSearchRequestSequence
+                        || !document.getElementById('item-search-section')?.classList.contains('active')
+                    ) {
+                        return null;
+                    }
+                    showSearchStatus(false);
+                    showToast(`验证后搜索失败: ${retryBusinessErrorMessage}`, 'danger');
+                    showNoSearchResults();
                     return null;
                 }
 
@@ -27590,8 +30799,11 @@ async function handleItemSearch(event) {
                 ) {
                     return null;
                 }
+                if (!Array.isArray(retryData.data)) {
+                    throw new Error('商品搜索结果返回格式异常');
+                }
                 // 处理搜索结果
-                searchResultsData = retryData.data || [];
+                searchResultsData = retryData.data;
 
                 searchPageSize = pageSize;
                 currentSearchPage = 1;
@@ -27622,6 +30834,9 @@ async function handleItemSearch(event) {
                     showNoSearchResults();
                 }
             } catch (error) {
+                if (controller.signal.aborted || error?.name === 'AbortError') {
+                    return null;
+                }
                 console.error('滑块验证失败:', error);
                 if (
                     requestSequence !== itemSearchRequestSequence
@@ -27644,7 +30859,10 @@ async function handleItemSearch(event) {
         ) {
             return null;
         }
-        searchResultsData = data.data || [];
+        if (!Array.isArray(data.data)) {
+            throw new Error('商品搜索结果返回格式异常');
+        }
+        searchResultsData = data.data;
 
         searchPageSize = pageSize;
         currentSearchPage = 1;
@@ -27677,6 +30895,9 @@ async function handleItemSearch(event) {
             showNoSearchResults();
         }
     } catch (error) {
+        if (controller.signal.aborted || error?.name === 'AbortError') {
+            return null;
+        }
         console.error('搜索商品失败:', error);
         if (
             requestSequence !== itemSearchRequestSequence
@@ -27687,6 +30908,10 @@ async function handleItemSearch(event) {
         showSearchStatus(false);
         showToast(`搜索商品失败: ${error.message || '请稍后重试'}`, 'danger');
         showNoSearchResults();
+    } finally {
+        if (itemSearchAbortController === controller) {
+            itemSearchAbortController = null;
+        }
     }
 }
 
@@ -27912,6 +31137,28 @@ let activeCaptchaSessionId = '';
 let queuedCaptchaSessionIds = [];
 let monitoredSessions = new Set();
 
+function closeRemoteCaptchaSession(sessionId, options = {}) {
+    const normalizedSessionId = String(sessionId || '').trim();
+    if (!normalizedSessionId) {
+        return null;
+    }
+    return fetch(`/api/captcha/session/${encodeURIComponent(normalizedSessionId)}`, {
+        method: 'DELETE',
+        keepalive: Boolean(options.keepalive)
+    }).catch(() => null);
+}
+
+function clearCaptchaVerificationIframe() {
+    const iframe = document.getElementById('captchaIframe');
+    if (iframe) {
+        iframe.src = 'about:blank';
+    }
+}
+
+function isItemSearchSectionActive() {
+    return Boolean(document.getElementById('item-search-section')?.classList.contains('active'));
+}
+
 function enqueueCaptchaSession(sessionId) {
     if (!sessionId || queuedCaptchaSessionIds.includes(sessionId)) {
         return;
@@ -27948,16 +31195,32 @@ function showNextQueuedCaptchaSession() {
 
 // 开始监控验证会话
 function startCaptchaSessionMonitor() {
+    if (!isItemSearchSectionActive()) {
+        stopCaptchaSessionMonitor();
+        return null;
+    }
+
     if (captchaSessionMonitor) {
         return; // 已经在监控中
     }
 
     let checkCount = 0;
     captchaSessionMonitor = setInterval(async () => {
+        if (!isItemSearchSectionActive()) {
+            stopCaptchaSessionMonitor();
+            return null;
+        }
+
         try {
             checkCount++;
             const response = await fetch('/api/captcha/sessions');
-            const data = await response.json();
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            const data = await response.json().catch(() => ({}));
+            if (hasMalformedCaptchaSessionListResult(data)) {
+                throw new Error('验证码会话列表返回格式异常');
+            }
 
             if (data.sessions && data.sessions.length > 0) {
                 for (const session of data.sessions) {
@@ -27979,6 +31242,10 @@ function startCaptchaSessionMonitor() {
                         }
 
                         // 自动弹出验证窗口
+                        if (!isItemSearchSectionActive()) {
+                            stopCaptchaSessionMonitor();
+                            return null;
+                        }
                         showCaptchaVerificationModal(session.session_id);
                         showToast('🎨 检测到滑块验证，请完成验证', 'warning');
                     }
@@ -28005,11 +31272,36 @@ function stopCaptchaSessionMonitor() {
     queuedCaptchaSessionIds = [];
 }
 
+function stopActiveCaptchaVerificationSessionOnPageHide() {
+    const sessionId = activeCaptchaSessionId;
+    const modalElement = document.getElementById('captchaVerifyModal');
+    const closeReason = modalElement?.dataset.captchaCloseReason || '';
+
+    if (sessionId && closeReason !== 'completed') {
+        closeRemoteCaptchaSession(sessionId, { keepalive: true });
+    }
+
+    stopCaptchaSessionMonitor();
+    activeCaptchaModal = null;
+    activeCaptchaSessionId = '';
+    queuedCaptchaSessionIds = [];
+    monitoredSessions.clear();
+    clearCaptchaVerificationIframe();
+}
+
+window.addEventListener('pagehide', stopActiveCaptchaVerificationSessionOnPageHide);
+
 // 手动测试会话监控（用于调试）
 async function testCaptchaSessionMonitor() {
     try {
         const response = await fetch('/api/captcha/sessions');
-        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        const data = await response.json().catch(() => ({}));
+        if (hasMalformedCaptchaSessionListResult(data)) {
+            throw new Error('验证码会话列表返回格式异常');
+        }
         return data;
     } catch (error) {
         console.error('❌ 测试失败:', error);
@@ -28081,6 +31373,11 @@ function showCaptchaVerificationModal(sessionId = 'default') {
     
     // 监听模态框关闭事件
     modalElement.addEventListener('hidden.bs.modal', () => {
+        const closeReason = modalElement.dataset.captchaCloseReason || '';
+        if (closeReason !== 'completed') {
+            closeRemoteCaptchaSession(sessionId);
+        }
+        clearCaptchaVerificationIframe();
         activeCaptchaModal = null;
         if (activeCaptchaSessionId === sessionId) {
             activeCaptchaSessionId = '';
@@ -28136,13 +31433,31 @@ function startCheckCaptchaCompletion(modal, sessionId) {
         }
         modal.hide();
         activeCaptchaModal = null;
+        if (!isItemSearchSectionActive()) {
+            return null;
+        }
         showToast('✅ 滑块验证成功！', 'success');
     };
     
     checkInterval = setInterval(async () => {
+        if (!isItemSearchSectionActive()) {
+            if (checkInterval) {
+                clearInterval(checkInterval);
+                checkInterval = null;
+            }
+            isClosed = true;
+            return null;
+        }
+
         try {
             const response = await fetch(`/api/captcha/status/${sessionId}`);
-            const data = await response.json();
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            const data = await response.json().catch(() => ({}));
+            if (hasMalformedCaptchaCompletionStatusResult(data)) {
+                throw new Error('验证码状态返回格式异常');
+            }
 
             // 如果验证完成，或者会话不存在（已关闭），都视为完成
             if (data.completed || (data.session_exists === false && data.success)) {
@@ -28169,6 +31484,9 @@ function startCheckCaptchaCompletion(modal, sessionId) {
                 }
                 modal.hide();
                 activeCaptchaModal = null;
+                if (!isItemSearchSectionActive()) {
+                    return null;
+                }
                 showToast('❌ 验证超时，请重试', 'danger');
             }
         }
@@ -28223,7 +31541,13 @@ async function checkCaptchaCompletion(modal, sessionId) {
         const checkInterval = setInterval(async () => {
             try {
                 const response = await fetch(`/api/captcha/status/${sessionId}`);
-                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const data = await response.json().catch(() => ({}));
+                if (hasMalformedCaptchaCompletionStatusResult(data)) {
+                    throw new Error('验证码状态返回格式异常');
+                }
                 
                 if (data.completed || (data.session_exists === false && data.success)) {
                     if (settled) {
@@ -28254,6 +31578,19 @@ async function checkCaptchaCompletion(modal, sessionId) {
 }
 
 // ========================= 验证截图相关功能 =========================
+
+function hasMalformedFaceVerificationScreenshot(screenshot) {
+    if (!screenshot || typeof screenshot !== 'object' || Array.isArray(screenshot)) {
+        return true;
+    }
+    if (screenshot.path != null && typeof screenshot.path !== 'string') {
+        return true;
+    }
+    if (screenshot.created_time_str != null && typeof screenshot.created_time_str !== 'string') {
+        return true;
+    }
+    return false;
+}
 
 // 显示验证截图
 async function showFaceVerification(accountId) {
@@ -28290,13 +31627,26 @@ async function showFaceVerification(accountId) {
             throw new Error(errorMessage);
         }
         
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (!document.getElementById('accounts-section')?.classList.contains('active')) {
             toggleLoading(false);
             return null;
         }
         if (requestSequence !== faceVerificationRequestSequence) {
             return null;
+        }
+
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            throw new Error('验证截图返回格式异常');
+        }
+        if (data.success != null && typeof data.success !== 'boolean') {
+            throw new Error('验证截图返回格式异常');
+        }
+        if (data.message != null && typeof data.message !== 'string') {
+            throw new Error('验证截图返回格式异常');
+        }
+        if (data.success === true && hasMalformedFaceVerificationScreenshot(data.screenshot)) {
+            throw new Error('验证截图返回格式异常');
         }
         
         toggleLoading(false);
@@ -28478,7 +31828,7 @@ async function loadImAccountList() {
         ) {
             return;
         }
-        imAccountsData = (data || [])
+        imAccountsData = data
             .map(accountId => ({
                 account_id: String(accountId || '').trim(),
                 username: '',
@@ -29158,6 +32508,67 @@ function loadOnlineIm() {
 
 const POLISH_SCHEDULE_RANDOM_MINUTES = 10;
 
+function hasMalformedScheduledTaskEntries(tasks) {
+    return tasks.some(task => {
+        if (!task || typeof task !== 'object' || Array.isArray(task)) {
+            return true;
+        }
+        if (!Number.isFinite(Number(task.id))) {
+            return true;
+        }
+        if (typeof task.account_id !== 'string' || !task.account_id.trim()) {
+            return true;
+        }
+        if (typeof task.task_type !== 'string' || !task.task_type.trim()) {
+            return true;
+        }
+        if (typeof task.enabled !== 'boolean') {
+            return true;
+        }
+        if (!Number.isFinite(Number(task.delay_minutes))) {
+            return true;
+        }
+        if (task.interval_hours != null && (!Number.isFinite(Number(task.interval_hours)) || Number(task.interval_hours) <= 0)) {
+            return true;
+        }
+        if (task.random_delay_max != null && (!Number.isFinite(Number(task.random_delay_max)) || Number(task.random_delay_max) < 0)) {
+            return true;
+        }
+        if (task.next_run_at != null && typeof task.next_run_at !== 'string') {
+            return true;
+        }
+        if (task.last_run_at != null && typeof task.last_run_at !== 'string') {
+            return true;
+        }
+        if (task.last_run_result != null && typeof task.last_run_result !== 'string') {
+            return true;
+        }
+        return false;
+    });
+}
+
+function hasMalformedScheduledTaskMutationResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return true;
+    }
+    if (typeof result.success !== 'boolean') {
+        return true;
+    }
+    if (typeof result.message !== 'string') {
+        return true;
+    }
+    if (result.task_id != null && !Number.isFinite(Number(result.task_id))) {
+        return true;
+    }
+    if (result.enabled != null && typeof result.enabled !== 'boolean') {
+        return true;
+    }
+    if (result.task != null && hasMalformedScheduledTaskEntries([result.task])) {
+        return true;
+    }
+    return false;
+}
+
 async function loadScheduledTasks(requestSequence = null) {
     try {
         const data = await fetchJSON(`${apiBase}/scheduled-tasks`, {
@@ -29166,8 +32577,17 @@ async function loadScheduledTasks(requestSequence = null) {
         if (data == null) {
             return null;
         }
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            throw new Error('定时任务列表返回格式异常');
+        }
         if (data.success) {
-            return data.tasks || [];
+            if (!Array.isArray(data.tasks)) {
+                throw new Error('定时任务列表返回格式异常');
+            }
+            if (hasMalformedScheduledTaskEntries(data.tasks)) {
+                throw new Error('定时任务列表返回格式异常');
+            }
+            return data.tasks;
         }
         if (requestSequence !== null && (
             requestSequence !== polishScheduleModalRequestSequence
@@ -29435,6 +32855,9 @@ async function savePolishSchedule() {
             || !document.getElementById('accounts-section')?.classList.contains('active')
         ) {
             return null;
+        }
+        if (hasMalformedScheduledTaskMutationResult(data)) {
+            throw new Error('定时擦亮保存结果返回格式异常');
         }
         if (!data.success) {
             showToast(`保存失败: ${data.message || '未知错误'}`, 'danger');

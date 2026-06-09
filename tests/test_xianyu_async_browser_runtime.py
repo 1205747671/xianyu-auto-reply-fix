@@ -3,7 +3,9 @@ import asyncio
 import base64
 import json
 import os
+import queue
 import sys
+import threading
 import time
 import types
 import unittest
@@ -231,6 +233,136 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(seeded_again)
         self.assertEqual(live.last_cookie_refresh_time, 1234.5)
+
+    async def test_get_browser_owner_lock_serializes_across_event_loops(self):
+        account_id = "owner-lock-cross-loop"
+        XianyuLive._browser_owner_locks.pop(account_id, None)
+        owner_lock = XianyuLive._get_browser_owner_lock(account_id)
+
+        ready_queue = queue.Queue()
+        finished = threading.Event()
+
+        def _hold_lock_in_other_loop():
+            async def _runner():
+                other_lock = XianyuLive._get_browser_owner_lock(account_id)
+                await other_lock.acquire()
+                ready_queue.put(other_lock)
+                await asyncio.sleep(0.3)
+                other_lock.release()
+
+            asyncio.run(_runner())
+            finished.set()
+
+        worker = threading.Thread(target=_hold_lock_in_other_loop, daemon=True)
+        worker.start()
+        foreign_lock = ready_queue.get(timeout=2.0)
+
+        try:
+            self.assertIs(owner_lock, foreign_lock)
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(owner_lock.acquire(), timeout=0.05)
+        finally:
+            worker.join(timeout=2.0)
+            self.assertTrue(finished.is_set())
+
+        await asyncio.wait_for(owner_lock.acquire(), timeout=0.5)
+        self.assertTrue(owner_lock.locked())
+        owner_lock.release()
+        self.assertFalse(owner_lock.locked())
+
+    async def test_get_browser_owner_lock_allows_reentrant_acquire_within_same_task(self):
+        account_id = "owner-lock-reentrant"
+        XianyuLive._browser_owner_locks.pop(account_id, None)
+        owner_lock = XianyuLive._get_browser_owner_lock(account_id)
+
+        await asyncio.wait_for(owner_lock.acquire(), timeout=0.1)
+        await asyncio.wait_for(owner_lock.acquire(), timeout=0.1)
+
+        self.assertTrue(owner_lock.locked())
+
+        owner_lock.release()
+        self.assertTrue(owner_lock.locked())
+
+        owner_lock.release()
+        self.assertFalse(owner_lock.locked())
+
+    async def test_get_browser_owner_lock_supports_release_by_captured_owner_token_from_other_task(self):
+        account_id = "owner-lock-cross-task-release"
+        XianyuLive._browser_owner_locks.pop(account_id, None)
+        owner_lock = XianyuLive._get_browser_owner_lock(account_id)
+
+        await asyncio.wait_for(owner_lock.acquire(), timeout=0.1)
+        owner_token = owner_lock.capture_owner_token()
+
+        self.assertIsNotNone(owner_token)
+        self.assertTrue(owner_lock.locked())
+
+        async def _release_in_cleanup_task():
+            await asyncio.sleep(0)
+            owner_lock.release_by_token(owner_token)
+
+        await asyncio.create_task(_release_in_cleanup_task())
+
+        self.assertFalse(owner_lock.locked())
+        await asyncio.wait_for(owner_lock.acquire(), timeout=0.1)
+        owner_lock.release()
+
+    async def test_release_browser_recovery_runtime_ignores_stale_owner_token_after_lock_reacquired(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "owner-lock-stale-release"
+        live._legacy_cookie_id = "legacy-owner-lock-stale-release"
+        live._safe_str = str
+        live._async_close_browser = mock.AsyncMock()
+
+        owner_lock = XianyuLive._get_browser_owner_lock(live.account_id)
+        await asyncio.wait_for(owner_lock.acquire(), timeout=0.1)
+        stale_token = owner_lock.capture_owner_token()
+        owner_lock.release_by_token(stale_token)
+
+        current_owner_ready = asyncio.Event()
+        current_owner_done = asyncio.Event()
+        current_owner_tokens = {}
+
+        async def _hold_lock_as_current_owner():
+            await owner_lock.acquire()
+            current_owner_tokens["token"] = owner_lock.capture_owner_token()
+            current_owner_ready.set()
+            await current_owner_done.wait()
+            owner_lock.release_by_token(current_owner_tokens["token"])
+
+        current_owner_task = asyncio.create_task(_hold_lock_as_current_owner())
+        await asyncio.wait_for(current_owner_ready.wait(), timeout=0.5)
+        current_token = current_owner_tokens["token"]
+        self.assertIsNot(current_token, stale_token)
+        lease = types.SimpleNamespace(
+            account_id=live.account_id,
+            _owner_lock=owner_lock,
+            _owner_lock_acquired=True,
+            _owner_lock_token=stale_token,
+        )
+        runtime_manager = types.SimpleNamespace(
+            release_runtime=mock.AsyncMock(return_value=None),
+        )
+
+        try:
+            with mock.patch.object(
+                XianyuAutoAsync,
+                "account_browser_runtime_manager",
+                new=runtime_manager,
+            ):
+                await live._release_browser_recovery_runtime(
+                    lease,
+                    reason="stale_owner_token_release",
+                )
+
+            self.assertTrue(owner_lock.locked())
+            self.assertIs(owner_lock.capture_owner_token(), current_token)
+        finally:
+            current_owner_done.set()
+            await asyncio.wait_for(current_owner_task, timeout=0.5)
+            if owner_lock.locked():
+                owner_lock.release_by_token(current_token)
+            XianyuLive._browser_owner_locks.pop(live.account_id, None)
 
     def test_resolve_websocket_open_timeout_reads_env_override(self):
         from XianyuAutoAsync import _resolve_websocket_open_timeout
@@ -1452,6 +1584,45 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(close_order, ["page.close"])
         page.close.assert_awaited_once_with()
+
+    async def test_async_close_browser_waits_for_page_close_when_cancelled(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "async-close-cancel-test"
+        live._safe_str = str
+        close_started = asyncio.Event()
+        close_can_finish = asyncio.Event()
+
+        class BlockingPage:
+            async def close(self):
+                close_started.set()
+                await close_can_finish.wait()
+                self.closed = True
+
+        page = BlockingPage()
+        page.closed = False
+
+        task = asyncio.create_task(
+            live._async_close_browser(
+                browser=None,
+                context=None,
+                page=page,
+                close_browser=False,
+                close_context=False,
+                close_page=True,
+            )
+        )
+        await close_started.wait()
+
+        task.cancel()
+        await asyncio.sleep(0)
+
+        self.assertFalse(task.done())
+
+        close_can_finish.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertTrue(page.closed)
 
     def test_record_delivery_log_prefers_account_id_alias(self):
         live = XianyuLive.__new__(XianyuLive)
@@ -3403,6 +3574,55 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("legacy-cookie-name", logged_accounts)
         live.send_token_refresh_notification.assert_not_awaited()
 
+    def test_run_slider_verification_with_managed_runtime_preserves_success_when_release_fails(self):
+        captured = {}
+        page = mock.Mock()
+        context = mock.Mock()
+        context.browser = mock.Mock()
+        lease = self._build_runtime_lease(
+            "release-fail-captcha",
+            browser=context.browser,
+            context=context,
+        )
+        runtime_manager = types.SimpleNamespace(
+            acquire_runtime_sync=mock.Mock(return_value=lease),
+            get_fresh_page_sync=mock.Mock(return_value=(page, context)),
+            release_runtime_sync=mock.Mock(side_effect=RuntimeError("release exploded")),
+        )
+
+        class _FakeSlider:
+            def build_managed_runtime_request(self, **kwargs):
+                captured["request_kwargs"] = kwargs
+                return {"profile_id": "release-fail-profile"}
+
+            def attach_managed_runtime(self, **kwargs):
+                captured["attach_kwargs"] = kwargs
+
+            def run(self, verification_url, **kwargs):
+                captured["run_kwargs"] = kwargs
+                return True, {"cookie2": "fresh"}
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "release-fail-captcha"
+
+        with mock.patch.object(XianyuAutoAsync, "account_browser_runtime_manager", new=runtime_manager), \
+             mock.patch.object(XianyuAutoAsync, "logger") as mock_logger:
+            result = live._run_slider_verification_with_managed_runtime_sync(
+                slider=_FakeSlider(),
+                verification_url="https://verify.example.com/slider",
+                purpose="token_refresh_slider",
+                release_reason="token_refresh_slider_completed",
+                attach_failure_reason="token_refresh_slider_attach_failed",
+            )
+
+        self.assertEqual((True, {"cookie2": "fresh"}), result)
+        runtime_manager.release_runtime_sync.assert_called_once_with(
+            lease,
+            reason="token_refresh_slider_completed",
+        )
+        self.assertTrue(captured["run_kwargs"]["require_managed_runtime"])
+        mock_logger.warning.assert_called()
+
     async def test_handle_captcha_verification_rejects_blank_canonical_account_id_before_manual_gate(self):
         live = XianyuLive.__new__(XianyuLive)
         live._legacy_cookie_id = "legacy-cookie-name"
@@ -5043,6 +5263,39 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 fake_db.get_active_comment_template.assert_not_called()
                 live._call_comment_api.assert_not_awaited()
 
+    async def test_call_comment_api_masks_unexpected_internal_errors_but_keeps_known_messages(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "acc-auto-comment-api-1"
+        live._safe_str = str
+        live.cookies_str = "cookie_a=1"
+        live._normalize_auto_comment_failure_message = (
+            XianyuLive._normalize_auto_comment_failure_message.__get__(live, XianyuLive)
+        )
+
+        with mock.patch("db_manager.db_manager.get_system_setting", return_value="https://comment.example.com/api"), \
+             mock.patch("aiohttp.ClientSession", side_effect=RuntimeError("comment service internal exploded")):
+            masked_result = await live._call_comment_api("order-1", "nice")
+
+        self.assertEqual(
+            masked_result,
+            {
+                "success": False,
+                "message": "调用自动好评服务失败，请稍后重试",
+            },
+        )
+        self.assertEqual(
+            live._normalize_auto_comment_failure_message("未配置自动好评辅助API地址"),
+            "未配置自动好评辅助API地址",
+        )
+        self.assertEqual(
+            live._normalize_auto_comment_failure_message("请求超时"),
+            "请求超时",
+        )
+        self.assertEqual(
+            live._normalize_auto_comment_failure_message("接口返回错误: 500"),
+            "接口返回错误: 500",
+        )
+
     async def test_update_keyword_image_url_prefers_account_id_alias(self):
         live = XianyuLive.__new__(XianyuLive)
         live._legacy_cookie_id = "legacy-cookie-name"
@@ -6327,12 +6580,9 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             "order_status_source": "structured",
         }
 
+        live.with_account_browser_runtime = mock.AsyncMock(return_value=detail_result)
+
         with mock.patch("db_manager.db_manager", fake_db), \
-             mock.patch(
-                 "utils.order_detail_fetcher.fetch_order_detail_simple",
-                 new=mock.AsyncMock(return_value=detail_result),
-                 create=True,
-             ) as fetch_order_detail_simple, \
              mock.patch("builtins.print"):
             result = await live.fetch_order_detail_info(
                 "order-detail-1",
@@ -6351,13 +6601,10 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["buyer_nick"], "Buyer Detail")
         self.assertEqual(result["sid"], "sid-detail-1")
         self.assertEqual(result["account_id"], "acc-order-detail-1")
-        fetch_order_detail_simple.assert_awaited_once_with(
-            "order-detail-1",
-            "unb=user1; cookie2=v2",
-            headless=True,
-            force_refresh=False,
-            account_id="acc-order-detail-1",
-        )
+        live.with_account_browser_runtime.assert_awaited_once()
+        runtime_request = live.with_account_browser_runtime.await_args.kwargs["runtime_request"]
+        self.assertEqual(runtime_request["account_id"], "acc-order-detail-1")
+        self.assertEqual(runtime_request["purpose"], "order_detail_fetch")
         fake_db.get_cookie_by_id.assert_called_once_with("acc-order-detail-1")
         fake_db.insert_or_update_order.assert_called_once_with(
             order_id="order-detail-1",
@@ -6405,19 +6652,15 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 live._select_buyer_identity_for_order_write = mock.Mock(
                     return_value=("buyer-detail-1", "Buyer Detail", False)
                 )
+                live.with_account_browser_runtime = mock.AsyncMock(
+                    side_effect=AssertionError(
+                        "missing canonical account_id should not fetch order detail via browser runtime"
+                    )
+                )
 
                 fake_db = mock.Mock()
 
-                with mock.patch("db_manager.db_manager", fake_db), \
-                     mock.patch(
-                         "utils.order_detail_fetcher.fetch_order_detail_simple",
-                         new=mock.AsyncMock(
-                             side_effect=AssertionError(
-                                 "missing canonical account_id should not fetch order detail via browser runtime"
-                             )
-                         ),
-                         create=True,
-                     ) as fetch_order_detail_simple:
+                with mock.patch("db_manager.db_manager", fake_db):
                     result = await live.fetch_order_detail_info(
                         "order-detail-blocked-1",
                         item_id="item-detail-1",
@@ -6429,7 +6672,7 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
                 self.assertIsNone(result)
                 self.assertEqual(live._order_detail_lock_times, {"preexisting": 1.0})
-                fetch_order_detail_simple.assert_not_awaited()
+                live.with_account_browser_runtime.assert_not_awaited()
                 fake_db.get_item_info.assert_not_called()
                 fake_db.get_order_by_id.assert_not_called()
                 fake_db.get_cookie_by_id.assert_not_called()
@@ -6475,12 +6718,9 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 raise UnicodeEncodeError("gbk", message, 0, 1, "illegal multibyte sequence")
             return None
 
+        live.with_account_browser_runtime = mock.AsyncMock(return_value=detail_result)
+
         with mock.patch("db_manager.db_manager", fake_db), \
-             mock.patch(
-                 "utils.order_detail_fetcher.fetch_order_detail_simple",
-                 new=mock.AsyncMock(return_value=detail_result),
-                 create=True,
-             ), \
              mock.patch("builtins.print", side_effect=fake_print):
             result = await live.fetch_order_detail_info(
                 "order-detail-console-1",
@@ -6534,12 +6774,10 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             "order_status_source": "structured",
         }
 
+        live_a.with_account_browser_runtime = mock.AsyncMock(return_value=dict(detail_result))
+        live_b.with_account_browser_runtime = mock.AsyncMock(return_value=dict(detail_result))
+
         with mock.patch("db_manager.db_manager", fake_db), \
-             mock.patch(
-                 "utils.order_detail_fetcher.fetch_order_detail_simple",
-                 new=mock.AsyncMock(return_value=detail_result),
-                 create=True,
-             ), \
              mock.patch("builtins.print"):
             await live_a.fetch_order_detail_info("order-detail-shared", item_id="item-a", buyer_id="buyer-a")
             await live_b.fetch_order_detail_info("order-detail-shared", item_id="item-b", buyer_id="buyer-b")
@@ -6600,13 +6838,27 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             "order_status": "pending_ship",
             "order_status_source": "structured",
         }
+        fetcher_instance = mock.Mock()
+        fetcher_instance.attach_managed_runtime = mock.Mock()
+        fetcher_instance.fetch_order_detail = mock.AsyncMock(return_value=detail_result)
+        fetcher_instance.close = mock.AsyncMock()
+
+        async def fake_with_account_browser_runtime(*, purpose, runtime_request, callback, exclusive=False, busy_timeout=None):
+            self.assertEqual(purpose, "order_detail_fetch")
+            self.assertEqual(runtime_request["account_id"], "acc-order-detail-cancel")
+            self.assertFalse(exclusive)
+            self.assertEqual(busy_timeout, 20)
+            return await callback(
+                lease="lease",
+                browser="browser",
+                context="context",
+                page="page",
+            )
+
+        live.with_account_browser_runtime = mock.AsyncMock(side_effect=fake_with_account_browser_runtime)
 
         with mock.patch("db_manager.db_manager", fake_db), \
-             mock.patch(
-                 "utils.order_detail_fetcher.fetch_order_detail_simple",
-                 new=mock.AsyncMock(return_value=detail_result),
-                 create=True,
-             ), \
+             mock.patch("utils.order_detail_fetcher.OrderDetailFetcher", return_value=fetcher_instance), \
              mock.patch("builtins.print"):
             result = await live.fetch_order_detail_info(
                 "order-detail-cancel-1",
@@ -6615,6 +6867,18 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result, detail_result)
+        live.with_account_browser_runtime.assert_awaited_once()
+        fetcher_instance.attach_managed_runtime.assert_called_once_with(
+            lease="lease",
+            browser="browser",
+            context="context",
+            page="page",
+        )
+        fetcher_instance.fetch_order_detail.assert_awaited_once_with(
+            "order-detail-cancel-1",
+            force_refresh=False,
+        )
+        fetcher_instance.close.assert_awaited_once()
         current_retry_task.cancel.assert_called_once_with()
         self.assertNotIn(current_scope, live.order_detail_retry_tasks)
         self.assertIn(foreign_scope, live.order_detail_retry_tasks)
@@ -8439,6 +8703,44 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(active_scope, live._lock_hold_info)
         active_task.cancel.assert_not_called()
 
+    async def test_activate_delivery_lock_uses_tracked_task_registry(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "acc-lock-track-1"
+        live._lock_hold_info = {}
+
+        fake_task = mock.Mock()
+
+        def create_tracked_task(coro):
+            coro.close()
+            return fake_task
+
+        live._create_tracked_task = mock.Mock(side_effect=create_tracked_task)
+
+        live._activate_delivery_lock("lock-scope-1", delay_minutes=3)
+
+        live._create_tracked_task.assert_called_once()
+        self.assertIs(live._lock_hold_info["lock-scope-1"]["task"], fake_task)
+
+    async def test_delayed_lock_release_clears_task_reference_after_finish(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "acc-lock-release-finish-1"
+        live._safe_str = str
+        live._lock_hold_info = {
+            "lock-scope-1": {
+                "locked": True,
+                "lock_time": 1.0,
+                "release_time": None,
+                "task": None,
+            }
+        }
+
+        task = asyncio.create_task(live._delayed_lock_release("lock-scope-1", delay_minutes=0))
+        live._lock_hold_info["lock-scope-1"]["task"] = task
+        await task
+
+        self.assertIsNone(live._lock_hold_info["lock-scope-1"]["task"])
+        self.assertIsNotNone(live._lock_hold_info["lock-scope-1"]["release_time"])
+
     async def test_background_loops_prefer_account_id_alias_for_cookie_status_gate(self):
         loop_cases = (
             "message_stream_watchdog_loop",
@@ -8716,6 +9018,188 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         live._is_current_account_enabled.assert_not_called()
         live.is_manual_refresh_active.assert_not_called()
         create_task.assert_not_called()
+
+    async def test_cookie_refresh_loop_tracks_refresh_execution_task(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live._legacy_cookie_id = "legacy-cookie-name"
+        live.account_id = "acc-cookie-refresh-track-1"
+        live._safe_str = str
+        live.cookie_refresh_enabled = True
+        live.last_cookie_refresh_time = 0
+        live.cookie_refresh_interval = 1
+        live.last_message_received_time = 0
+        live.message_cookie_refresh_cooldown = 0
+        live.cookie_refresh_lock = asyncio.Lock()
+        live.cookie_refresh_execution_task = None
+        live.is_manual_refresh_active = mock.Mock(return_value=False)
+        live._is_current_account_enabled = mock.Mock(side_effect=[True, False])
+
+        fake_task = mock.Mock()
+        fake_task.done.return_value = False
+
+        def create_tracked_task(coro):
+            coro.close()
+            return fake_task
+
+        live._create_tracked_task = mock.Mock(side_effect=create_tracked_task)
+
+        async def stop_after_first_tick(_seconds):
+            return None
+
+        live._interruptible_sleep = mock.AsyncMock(side_effect=stop_after_first_tick)
+
+        await live.cookie_refresh_loop()
+
+        live._create_tracked_task.assert_called_once()
+        self.assertIs(live.cookie_refresh_execution_task, fake_task)
+
+    async def test_cancel_background_tasks_cancels_cookie_refresh_execution_task(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "acc-cookie-refresh-cancel-1"
+        live.background_tasks = set()
+        live.heartbeat_task = None
+        live.token_refresh_task = None
+        live.cleanup_task = None
+        live.cookie_refresh_task = None
+        live.stream_watchdog_task = None
+        live.cookie_refresh_execution_task = asyncio.create_task(asyncio.sleep(60))
+
+        await live._cancel_background_tasks()
+
+        self.assertIsNone(live.cookie_refresh_execution_task)
+
+    async def test_cancel_background_tasks_cancels_tracked_background_tasks_without_explicit_refs(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "acc-background-task-cancel-1"
+        live.background_tasks = set()
+        live.heartbeat_task = None
+        live.token_refresh_task = None
+        live.cleanup_task = None
+        live.cookie_refresh_task = None
+        live.stream_watchdog_task = None
+        live.cookie_refresh_execution_task = None
+
+        tracked_task = live._create_tracked_task(asyncio.sleep(60))
+
+        await live._cancel_background_tasks()
+        await asyncio.sleep(0)
+
+        self.assertTrue(tracked_task.done())
+        self.assertTrue(tracked_task.cancelled())
+        self.assertEqual(set(), live.background_tasks)
+
+    async def test_execute_cookie_refresh_clears_execution_task_reference_after_finish(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live._legacy_cookie_id = "legacy-cookie-name"
+        live.account_id = "acc-cookie-refresh-finish-1"
+        live._safe_str = str
+        live.cookie_refresh_lock = asyncio.Lock()
+        live.is_manual_refresh_active = mock.Mock(return_value=False)
+        live._refresh_cookies_via_browser = mock.AsyncMock(return_value=False)
+        live.ws = None
+        live.heartbeat_task = None
+        live.last_message_received_time = 5
+        live.last_cookie_refresh_time = 0
+
+        task = asyncio.create_task(live._execute_cookie_refresh(current_time=123.0))
+        live.cookie_refresh_execution_task = task
+        await task
+
+        self.assertIsNone(live.cookie_refresh_execution_task)
+
+    async def test_stop_message_queue_workers_drains_stale_messages_before_next_connection(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live._legacy_cookie_id = "legacy-msg-queue-stop-1"
+        live.account_id = "acc-msg-queue-stop-1"
+        live._safe_str = str
+        live.message_queue_running = True
+        live.message_workers = []
+        live.message_queue = asyncio.PriorityQueue()
+        live.message_queue_counter = 3
+        live.queue_stats = {
+            "received": 3,
+            "processed": 1,
+            "dropped_full": 0,
+            "dropped_expired": 0,
+            "errors": 0,
+            "last_stats_time": 1.0,
+        }
+
+        await live.message_queue.put((1, 1, {"msg_id": "old-1"}))
+        await live.message_queue.put((2, 2, {"msg_id": "old-2"}))
+
+        await live._stop_message_queue_workers()
+
+        self.assertFalse(live.message_queue_running)
+        self.assertEqual(0, live.message_queue.qsize())
+        self.assertEqual([], live.message_workers)
+        self.assertEqual(0, live.message_queue_counter)
+        self.assertGreater(live.queue_stats["last_stats_time"], 1.0)
+
+    async def test_stop_message_queue_workers_cancels_queue_stats_monitor_task(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live._legacy_cookie_id = "legacy-msg-monitor-stop-1"
+        live.account_id = "acc-msg-monitor-stop-1"
+        live._safe_str = str
+        live.message_queue_running = True
+        live.message_workers = []
+        live.message_queue = asyncio.PriorityQueue()
+        live.message_queue_counter = 0
+        live.queue_stats = {
+            "received": 0,
+            "processed": 0,
+            "dropped_full": 0,
+            "dropped_expired": 0,
+            "errors": 0,
+            "last_stats_time": 1.0,
+        }
+        monitor_task = asyncio.create_task(asyncio.sleep(60))
+        live.message_queue_monitor_task = monitor_task
+
+        await live._stop_message_queue_workers()
+
+        self.assertTrue(monitor_task.done())
+        self.assertTrue(monitor_task.cancelled())
+        self.assertIsNone(live.message_queue_monitor_task)
+
+    async def test_start_message_queue_workers_cancels_stale_queue_stats_monitor_before_restarting(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live._legacy_cookie_id = "legacy-msg-monitor-start-1"
+        live.account_id = "acc-msg-monitor-start-1"
+        live._safe_str = str
+        live.message_queue_enabled = True
+        live.message_queue_workers = 0
+        live.message_workers = []
+        live.message_queue = asyncio.PriorityQueue()
+        live.message_queue_running = False
+        live.message_queue_monitor_task = asyncio.create_task(asyncio.sleep(60))
+        live.queue_stats = {
+            "received": 0,
+            "processed": 0,
+            "dropped_full": 0,
+            "dropped_expired": 0,
+            "errors": 0,
+            "last_stats_time": 1.0,
+        }
+
+        stale_monitor_task = live.message_queue_monitor_task
+        new_monitor_task = mock.Mock()
+
+        def create_tracked_task(coro):
+            coro.close()
+            return new_monitor_task
+
+        live._create_tracked_task = mock.Mock(side_effect=create_tracked_task)
+
+        await live._start_message_queue_workers()
+
+        self.assertTrue(stale_monitor_task.done())
+        self.assertTrue(stale_monitor_task.cancelled())
+        live._create_tracked_task.assert_called_once()
+        self.assertIs(live.message_queue_monitor_task, new_monitor_task)
+        self.assertTrue(live.message_queue_running)
+        self.assertEqual([], live.message_workers)
+        self.assertGreater(live.queue_stats["last_stats_time"], 1.0)
 
     async def test_execute_cookie_refresh_manual_refresh_gate_prefers_account_id_alias(self):
         live = XianyuLive.__new__(XianyuLive)
@@ -9287,7 +9771,274 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             lease,
             reason="recovery_context_missing",
         )
+        self.assertFalse(XianyuLive._get_browser_owner_lock("account-context-missing").locked())
         launch_browser_safe.assert_not_awaited()
+
+    async def test_open_browser_recovery_context_releases_runtime_when_attach_metadata_access_raises(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live._legacy_cookie_id = "legacy-context-attach-fail"
+        live.account_id = "account-context-attach-fail"
+        live._safe_str = str
+        live.get_qr_login_grace = mock.Mock(return_value=None)
+        live.get_manual_refresh_state = mock.Mock(return_value=None)
+        live._has_recent_slider_success = mock.Mock(return_value=False)
+
+        class _ExplodingRuntime:
+            @property
+            def context(self):
+                raise RuntimeError("runtime context accessor exploded")
+
+        lease = types.SimpleNamespace(
+            account_id="account-context-attach-fail",
+            runtime=_ExplodingRuntime(),
+        )
+        runtime_manager = types.SimpleNamespace(
+            acquire_runtime=mock.AsyncMock(return_value=lease),
+            release_runtime=mock.AsyncMock(return_value=None),
+            resolve_profile_dir=mock.Mock(
+                return_value=os.path.join(os.getcwd(), "browser_data", "user_account-context-attach-fail")
+            ),
+        )
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "account_browser_runtime_manager",
+            new=runtime_manager,
+        ), \
+             mock.patch.object(
+                 XianyuAutoAsync,
+                 "_launch_browser_safe",
+                 new=mock.AsyncMock(side_effect=AssertionError("should not launch clean browser")),
+                 create=True,
+             ) as launch_browser_safe:
+            lease_result, browser, context, reused_profile = await live._open_browser_recovery_context(
+                "浏览器恢复测试",
+                target_account_id="account-context-attach-fail",
+            )
+
+        self.assertIsNone(lease_result)
+        self.assertIsNone(browser)
+        self.assertIsNone(context)
+        self.assertFalse(reused_profile)
+        runtime_manager.acquire_runtime.assert_awaited_once()
+        runtime_manager.release_runtime.assert_awaited_once_with(
+            lease,
+            reason="recovery_context_attach_failed",
+        )
+        self.assertFalse(XianyuLive._get_browser_owner_lock("account-context-attach-fail").locked())
+        launch_browser_safe.assert_not_awaited()
+
+    async def test_open_browser_recovery_context_releases_runtime_when_cancelled_after_runtime_acquire(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live._legacy_cookie_id = "legacy-context-cancel"
+        live.account_id = "account-context-cancel"
+        live._safe_str = str
+        live.get_qr_login_grace = mock.Mock(return_value=None)
+        live.get_manual_refresh_state = mock.Mock(return_value=None)
+        live._has_recent_slider_success = mock.Mock(return_value=False)
+
+        class _CancellingRuntime:
+            @property
+            def context(self):
+                raise asyncio.CancelledError()
+
+        lease = types.SimpleNamespace(
+            account_id="account-context-cancel",
+            runtime=_CancellingRuntime(),
+        )
+        runtime_manager = types.SimpleNamespace(
+            acquire_runtime=mock.AsyncMock(return_value=lease),
+            release_runtime=mock.AsyncMock(return_value=None),
+            resolve_profile_dir=mock.Mock(
+                return_value=os.path.join(os.getcwd(), "browser_data", "user_account-context-cancel")
+            ),
+        )
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "account_browser_runtime_manager",
+            new=runtime_manager,
+        ), \
+             mock.patch.object(
+                 XianyuAutoAsync,
+                 "_launch_browser_safe",
+                 new=mock.AsyncMock(side_effect=AssertionError("should not launch clean browser")),
+                 create=True,
+             ) as launch_browser_safe:
+            with self.assertRaises(asyncio.CancelledError):
+                await live._open_browser_recovery_context(
+                    "浏览器恢复测试",
+                    target_account_id="account-context-cancel",
+                )
+
+        runtime_manager.acquire_runtime.assert_awaited_once()
+        runtime_manager.release_runtime.assert_awaited_once_with(
+            lease,
+            reason="recovery_context_cancelled",
+        )
+        self.assertFalse(XianyuLive._get_browser_owner_lock("account-context-cancel").locked())
+        launch_browser_safe.assert_not_awaited()
+
+    async def test_open_browser_recovery_context_binds_owner_lock_to_runtime_lease_and_release_unlocks(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live._legacy_cookie_id = "legacy-owner-lock-runtime"
+        live.account_id = "account-owner-lock-runtime"
+        live._safe_str = str
+        live.get_qr_login_grace = mock.Mock(return_value=None)
+        live.get_manual_refresh_state = mock.Mock(return_value=None)
+        live._has_recent_slider_success = mock.Mock(return_value=False)
+        live._async_close_browser = mock.AsyncMock()
+
+        context = mock.Mock()
+        context.browser = mock.Mock()
+        lease = self._build_runtime_lease(
+            "account-owner-lock-runtime",
+            browser=context.browser,
+            context=context,
+        )
+        runtime_manager = types.SimpleNamespace(
+            acquire_runtime=mock.AsyncMock(return_value=lease),
+            release_runtime=mock.AsyncMock(return_value=None),
+            resolve_profile_dir=mock.Mock(
+                return_value=os.path.join(
+                    os.getcwd(),
+                    "browser_data",
+                    "user_account-owner-lock-runtime",
+                )
+            ),
+        )
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "account_browser_runtime_manager",
+            new=runtime_manager,
+        ), \
+             mock.patch.object(
+                 XianyuAutoAsync,
+                 "_launch_browser_safe",
+                 new=mock.AsyncMock(side_effect=AssertionError("should not launch clean browser")),
+                 create=True,
+             ):
+            lease_result, browser, context_result, reused_profile = await live._open_browser_recovery_context(
+                "浏览器恢复测试",
+            )
+            owner_lock = getattr(lease_result, "_owner_lock", None)
+            self.assertTrue(reused_profile)
+            self.assertIs(lease_result, lease)
+            self.assertIs(browser, context.browser)
+            self.assertIs(context_result, context)
+            self.assertIsNotNone(owner_lock)
+            self.assertTrue(getattr(lease_result, "_owner_lock_acquired", False))
+            self.assertTrue(owner_lock.locked())
+
+            await live._release_browser_recovery_runtime(
+                lease_result,
+                browser=browser,
+                context=context_result,
+                reason="owner_lock_runtime_release",
+            )
+
+        runtime_manager.release_runtime.assert_awaited_once_with(
+            lease,
+            reason="owner_lock_runtime_release",
+        )
+        self.assertFalse(owner_lock.locked())
+
+    async def test_open_browser_recovery_context_times_out_when_owner_lock_is_busy(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live._legacy_cookie_id = "legacy-owner-lock-busy"
+        live.account_id = "account-owner-lock-busy"
+        live._safe_str = str
+        live.get_qr_login_grace = mock.Mock(return_value=None)
+        live.get_manual_refresh_state = mock.Mock(return_value=None)
+        live._has_recent_slider_success = mock.Mock(return_value=False)
+
+        busy_lock = asyncio.Lock()
+        await busy_lock.acquire()
+        original_lock = XianyuLive._browser_owner_locks.get("account-owner-lock-busy")
+        XianyuLive._browser_owner_locks["account-owner-lock-busy"] = busy_lock
+        self.addCleanup(
+            lambda: (
+                XianyuLive._browser_owner_locks.pop("account-owner-lock-busy", None)
+                if original_lock is None
+                else XianyuLive._browser_owner_locks.__setitem__("account-owner-lock-busy", original_lock)
+            )
+        )
+        self.addCleanup(lambda: busy_lock.release() if busy_lock.locked() else None)
+
+        runtime_manager = types.SimpleNamespace(
+            acquire_runtime=mock.AsyncMock(
+                side_effect=AssertionError("busy owner lock should fail before runtime acquire")
+            ),
+            resolve_profile_dir=mock.Mock(
+                side_effect=AssertionError("busy owner lock should fail before resolving profile dir")
+            ),
+        )
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "account_browser_runtime_manager",
+            new=runtime_manager,
+        ), \
+             mock.patch.object(
+                 XianyuAutoAsync,
+                 "_launch_browser_safe",
+                 new=mock.AsyncMock(side_effect=AssertionError("should not launch clean browser")),
+                 create=True,
+             ):
+            with self.assertRaises(RuntimeError) as raised:
+                await live._open_browser_recovery_context(
+                    "浏览器恢复测试",
+                    busy_timeout=0.01,
+                )
+
+        self.assertIn("当前有其他浏览器任务正在执行", str(raised.exception))
+        runtime_manager.acquire_runtime.assert_not_awaited()
+
+    async def test_release_browser_recovery_runtime_skips_invalidate_when_runtime_manager_lacks_method(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "account-release-skip-invalidate"
+        live._legacy_cookie_id = "account-release-skip-invalidate"
+        live._safe_str = str
+        live._async_close_browser = mock.AsyncMock()
+
+        context = mock.Mock()
+        context.browser = mock.Mock()
+        lease = self._build_runtime_lease(
+            "account-release-skip-invalidate",
+            browser=context.browser,
+            context=context,
+        )
+        owner_lock = asyncio.Lock()
+        await owner_lock.acquire()
+        lease._owner_lock = owner_lock
+        lease._owner_lock_acquired = True
+
+        runtime_manager = types.SimpleNamespace(
+            release_runtime=mock.AsyncMock(return_value=None),
+        )
+        mock_logger = mock.Mock()
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "account_browser_runtime_manager",
+            new=runtime_manager,
+        ), mock.patch.object(XianyuAutoAsync, "logger", mock_logger):
+            await live._release_browser_recovery_runtime(
+                lease,
+                browser=context.browser,
+                context=context,
+                reason="release_skip_invalidate",
+                invalidate_after_release=True,
+            )
+
+        runtime_manager.release_runtime.assert_awaited_once_with(
+            lease,
+            reason="release_skip_invalidate",
+        )
+        self.assertFalse(owner_lock.locked())
+        warning_messages = " ".join(str(call.args[0]) for call in mock_logger.warning.call_args_list if call.args)
+        self.assertNotIn("尝试立即失效缓存实例失败", warning_messages)
 
     async def test_open_browser_recovery_context_rejects_legacy_target_cookie_id_contract(self):
         context = mock.Mock()
@@ -11158,6 +11909,57 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(captured["login_kwargs"]["force_clean_context"])
         self.assertTrue(captured["login_kwargs"]["require_managed_runtime"])
 
+    def test_run_password_login_with_managed_runtime_preserves_success_when_release_fails(self):
+        captured = {}
+        page = mock.Mock()
+        context = mock.Mock()
+        context.browser = mock.Mock()
+        lease = self._build_runtime_lease(
+            "password-release-fail",
+            browser=context.browser,
+            context=context,
+        )
+        runtime_manager = types.SimpleNamespace(
+            acquire_runtime_sync=mock.Mock(return_value=lease),
+            get_fresh_page_sync=mock.Mock(return_value=(page, context)),
+            release_runtime_sync=mock.Mock(side_effect=RuntimeError("release exploded")),
+        )
+
+        class _FakeSlider:
+            def build_managed_runtime_request(self, **kwargs):
+                captured["request_kwargs"] = kwargs
+                return {"profile_id": "password-release-fail-profile"}
+
+            def attach_managed_runtime(self, **kwargs):
+                captured["attach_kwargs"] = kwargs
+
+            def login_with_password_browser(self, *args, **kwargs):
+                captured["login_kwargs"] = kwargs
+                return {"cookie2": "fresh"}
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "password-release-fail"
+
+        with mock.patch.object(XianyuAutoAsync, "account_browser_runtime_manager", new=runtime_manager), \
+             mock.patch.object(XianyuAutoAsync, "logger") as mock_logger:
+            result = live._run_password_login_with_managed_runtime(
+                slider=_FakeSlider(),
+                resolved_account_id="password-release-fail",
+                account="user@example.com",
+                password="secret",
+                show_browser=False,
+                notification_callback=None,
+                force_clean_context=False,
+            )
+
+        self.assertEqual({"cookie2": "fresh"}, result)
+        runtime_manager.release_runtime_sync.assert_called_once_with(
+            lease,
+            reason="password_login_refresh_completed",
+        )
+        self.assertTrue(captured["login_kwargs"]["require_managed_runtime"])
+        mock_logger.warning.assert_called()
+
     def test_run_password_login_with_managed_runtime_rejects_missing_canonical_account_id(self):
         class _FakeSlider:
             def build_managed_runtime_request(self, **kwargs):
@@ -11316,6 +12118,111 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             lease,
             reason="password_login_refresh_attach_failed",
         )
+
+    async def test_try_password_login_refresh_closes_preflight_temp_session_after_password_login_success(self):
+        captured = {}
+        merged_cookies = {
+            "unb": "new-unb",
+            "cookie2": "new-cookie2",
+            "_m_h5_tk": "new-token_123",
+            "_m_h5_tk_enc": "new-enc",
+            "sgcookie": "new-sg",
+            "t": "new-t",
+            "cna": "new-cna",
+        }
+        expected_cookie_string = "; ".join([f"{k}={v}" for k, v in merged_cookies.items()])
+        preflight_instances = []
+
+        class _FakeSlider:
+            def __init__(self, *args, **kwargs):
+                captured["init_kwargs"] = kwargs
+
+            async def _run_sync_method_on_fresh_thread(self, func, **kwargs):
+                captured["run_kwargs"] = kwargs
+                return dict(merged_cookies)
+
+        def _fake_preflight_init(
+            self,
+            cookies_str=None,
+            account_id=None,
+            user_id=None,
+            register_instance=False,
+            **_kwargs,
+        ):
+            self.cookies_str = cookies_str
+            self.account_id = account_id
+            self.user_id = user_id
+            self.register_instance = register_instance
+            self.current_token = None
+            self.close_session = mock.AsyncMock()
+            preflight_instances.append(self)
+
+        async def _fake_preflight_password_login(self):
+            self.cookies_str = expected_cookie_string
+            return "preflight-token"
+
+        live = XianyuLive.__new__(XianyuLive)
+        live._legacy_cookie_id = "legacy-preflight-close"
+        live.account_id = "account-preflight-close"
+        live.user_id = 7
+        live.cookies = dict(merged_cookies)
+        live.cookies_str = "unb=old; cookie2=old; _m_h5_tk=old_123; _m_h5_tk_enc=oldenc; sgcookie=oldsg; t=oldt; cna=old-cna"
+        live.proxy_config = {}
+        live.last_token_refresh_error_message = None
+        live._safe_str = str
+        live._normalize_risk_trigger_scene = XianyuLive._normalize_risk_trigger_scene.__get__(live, XianyuLive)
+        live._new_risk_session_id = mock.Mock(return_value="risk-session")
+        live._build_risk_event_meta = mock.Mock(return_value={})
+        live._create_risk_log = mock.Mock(return_value=None)
+        live._update_risk_log = mock.Mock()
+        live.send_token_refresh_notification = mock.AsyncMock()
+        live.get_qr_login_grace = mock.Mock(return_value=None)
+        live.get_manual_refresh_state = mock.Mock(return_value=None)
+        live._has_recent_slider_success = mock.Mock(return_value=False)
+        live.protected_merge_cookie_dicts = mock.Mock(
+            return_value={
+                "merged_cookies_dict": dict(merged_cookies),
+                "updated_fields": [],
+                "changed_fields": [],
+                "new_fields": [],
+                "preserved_fields": [],
+                "preserved_protected_fields": [],
+                "would_remove_fields": [],
+                "removed_fields": [],
+                "missing_protected_fields": [],
+                "missing_required_fields": [],
+                "incoming_missing_protected_fields": [],
+                "account_switched": False,
+            }
+        )
+        live._log_protected_merge_event = mock.Mock()
+        live._log_cookie_merge_summary = mock.Mock()
+        live._summarize_cookie_string = mock.Mock(return_value="cookie-summary")
+        live._update_cookies_and_restart = mock.AsyncMock(return_value=True)
+
+        with mock.patch.object(XianyuAutoAsync, "log_captcha_event", mock.Mock()), \
+             mock.patch.object(XianyuAutoAsync.db_manager, "mark_stale_risk_control_logs_failed", return_value=0), \
+             mock.patch.object(XianyuAutoAsync.db_manager, "get_cookie_details", return_value={
+                 "cookie_value": live.cookies_str,
+                 "username": "user@example.com",
+                 "password": "secret",
+                 "show_browser": False,
+             }), \
+             mock.patch.object(XianyuLive, "acquire_auth_recovery_lock", return_value=(True, None)), \
+             mock.patch.object(XianyuLive, "release_auth_recovery_lock"), \
+             mock.patch.object(XianyuLive, "clear_password_login_failure_backoff"), \
+             mock.patch.object(XianyuLive, "__init__", new=_fake_preflight_init), \
+             mock.patch.object(XianyuLive, "preflight_token_after_password_login", new=_fake_preflight_password_login), \
+             mock.patch.object(XianyuAutoAsync.os, "getenv", return_value=""), \
+             mock.patch.dict(sys.modules, {
+                 "utils.xianyu_slider_stealth": types.SimpleNamespace(XianyuSliderStealth=_FakeSlider),
+             }):
+            success = await live._try_password_login_refresh("密码登录成功后关闭预检临时会话", trigger_scene="token_refresh")
+
+        self.assertTrue(success)
+        self.assertEqual(1, len(preflight_instances))
+        preflight_instances[0].close_session.assert_awaited_once()
+        live._update_cookies_and_restart.assert_awaited_once_with(expected_cookie_string)
 
     async def test_refresh_cookies_from_qr_login_falls_back_when_managed_runtime_lease_scope_is_foreign(self):
         foreign_runtime = mock.Mock()
@@ -12296,6 +13203,97 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(sleep_mock.await_count, 3)
         live._set_runtime_cookie_state.assert_called_once()
 
+    async def test_refresh_cookies_from_qr_login_replaces_closed_managed_page_with_fresh_lease_page(self):
+        managed_runtime = mock.Mock()
+        managed_runtime.close = mock.AsyncMock()
+
+        closed_page = mock.Mock()
+        closed_page.is_closed.return_value = True
+        closed_page.goto = mock.AsyncMock(
+            side_effect=AssertionError("closed managed_page should not be reused")
+        )
+        closed_page.reload = mock.AsyncMock(
+            side_effect=AssertionError("closed managed_page should not be reloaded")
+        )
+
+        fresh_page = mock.Mock()
+        fresh_page.goto = mock.AsyncMock()
+        fresh_page.reload = mock.AsyncMock()
+
+        context = mock.Mock()
+        context.add_cookies = mock.AsyncMock()
+        context.new_page = mock.AsyncMock(side_effect=AssertionError("should request page through runtime manager"))
+        context.cookies = mock.AsyncMock(
+            return_value=[
+                {"name": "unb", "value": "new-unb"},
+                {"name": "sgcookie", "value": "new-sg"},
+                {"name": "cookie2", "value": "new-cookie2"},
+                {"name": "_m_h5_tk", "value": "new-token_123"},
+                {"name": "_m_h5_tk_enc", "value": "new-enc"},
+                {"name": "t", "value": "new-t"},
+                {"name": "cna", "value": "new-cna"},
+            ]
+        )
+        context.close = mock.AsyncMock()
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "managed-page-test"
+        live._legacy_cookie_id = "managed-page-test"
+        live.user_id = 7
+        live.qr_cookie_refresh_cooldown = 180
+        live.last_qr_cookie_refresh_time = 0
+        live._safe_str = str
+        live._extract_cookie_value = lambda cookie_record: (cookie_record or {}).get("cookie")
+        live._summarize_cookie_string = lambda cookie_string: cookie_string
+        live._set_runtime_cookie_state = mock.Mock()
+        live.protected_merge_cookie_dicts = lambda existing, incoming: self._build_merge_result(incoming)
+
+        qr_cookies_str = (
+            "unb=qr-unb; sgcookie=qr-sg; cookie2=qr-cookie2; "
+            "_m_h5_tk=qr-token_123; _m_h5_tk_enc=qr-enc; t=qr-t"
+        )
+        lease = self._build_runtime_lease("managed-page-test", browser=managed_runtime, context=context)
+        lease.pages.append(closed_page)
+        runtime_manager = types.SimpleNamespace(
+            get_fresh_page=mock.AsyncMock(return_value=(fresh_page, context)),
+            release_runtime=mock.AsyncMock(return_value=None),
+        )
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "account_browser_runtime_manager",
+            new=runtime_manager,
+        ), \
+             mock.patch("XianyuAutoAsync.asyncio.sleep", new=mock.AsyncMock()), \
+             mock.patch("XianyuAutoAsync.db_manager.get_cookie_details", return_value={"cookie": qr_cookies_str}), \
+             mock.patch("XianyuAutoAsync.db_manager.update_cookie_account_info", return_value=True):
+            result = await live.refresh_cookies_from_qr_login(
+                qr_cookies_str,
+                managed_runtime_lease=lease,
+                managed_runtime=managed_runtime,
+                managed_context=context,
+                managed_page=closed_page,
+            )
+
+        self.assertTrue(result)
+        closed_page.goto.assert_not_awaited()
+        closed_page.reload.assert_not_awaited()
+        context.new_page.assert_not_awaited()
+        runtime_manager.get_fresh_page.assert_awaited_once_with(lease)
+        fresh_page.goto.assert_awaited_once_with(
+            "https://www.goofish.com/im",
+            wait_until="domcontentloaded",
+            timeout=15000,
+        )
+        fresh_page.reload.assert_awaited_once_with(
+            wait_until="domcontentloaded",
+            timeout=12000,
+        )
+        runtime_manager.release_runtime.assert_awaited_once_with(
+            lease,
+            reason="qr_cookie_refresh_completed",
+        )
+
     async def test_refresh_cookies_from_qr_login_ignores_foreign_managed_context_even_when_lease_scope_matches(self):
         managed_runtime = mock.Mock()
         managed_runtime.close = mock.AsyncMock()
@@ -13022,6 +14020,81 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
         live._build_browser_refresh_context_options.assert_not_called()
         live._async_close_browser.assert_not_awaited()
 
+    async def test_search_items_via_browser_runtime_keeps_numeric_page_argument(self):
+        runtime_page = object()
+        captured = {}
+
+        class _FakeSearcher:
+            def __init__(self, account_id, cookie_value):
+                captured["init"] = {
+                    "account_id": account_id,
+                    "cookie_value": cookie_value,
+                }
+
+            def attach_managed_runtime(self, **kwargs):
+                captured["attach"] = kwargs
+
+            async def search_items(self, keyword, page, page_size):
+                captured["search_items"] = {
+                    "keyword": keyword,
+                    "page": page,
+                    "page_size": page_size,
+                }
+                return {"items": [], "page": page}
+
+            async def search_multiple_pages(self, keyword, total_pages):
+                raise AssertionError("single-page search should not call search_multiple_pages")
+
+            async def close_browser(self):
+                captured["closed"] = True
+
+        async def fake_with_account_browser_runtime(*, purpose, runtime_request, callback, exclusive=False, busy_timeout=None):
+            self.assertEqual("item_search", purpose)
+            self.assertEqual("acc-search-runtime-1", runtime_request["account_id"])
+            self.assertFalse(exclusive)
+            self.assertEqual(15, busy_timeout)
+            return await callback(
+                lease="lease",
+                browser="browser",
+                context="context",
+                page=runtime_page,
+            )
+
+        live = XianyuLive.__new__(XianyuLive)
+        live.account_id = "acc-search-runtime-1"
+        live._legacy_cookie_id = "acc-search-runtime-1"
+        live.cookies_str = "unb=user1; cookie2=v2"
+        live.with_account_browser_runtime = mock.AsyncMock(side_effect=fake_with_account_browser_runtime)
+        live._build_browser_refresh_launch_args = mock.Mock(return_value=["--managed"])
+        live._build_browser_refresh_context_options = mock.Mock(return_value={})
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "account_browser_runtime_manager",
+            new=types.SimpleNamespace(
+                resolve_profile_dir=mock.Mock(
+                    return_value=os.path.join(os.getcwd(), "browser_data", "user_acc-search-runtime-1")
+                )
+            ),
+        ), mock.patch(
+            "utils.item_search.XianyuSearcher",
+            _FakeSearcher,
+        ):
+            result = await live.search_items_via_browser_runtime(
+                keyword="手机",
+                page=3,
+                page_size=17,
+                total_pages=1,
+            )
+
+        self.assertEqual({"items": [], "page": 3}, result)
+        self.assertEqual("acc-search-runtime-1", captured["init"]["account_id"])
+        self.assertEqual("手机", captured["search_items"]["keyword"])
+        self.assertEqual(3, captured["search_items"]["page"])
+        self.assertEqual(17, captured["search_items"]["page_size"])
+        self.assertIs(runtime_page, captured["attach"]["page"])
+        self.assertTrue(captured.get("closed"))
+
     async def test_refresh_cookies_via_browser_reuses_persistent_profile_after_recent_slider_success(self):
         page = mock.Mock()
         page.goto = mock.AsyncMock()
@@ -13555,6 +14628,59 @@ class XianyuAsyncBrowserRuntimeTest(unittest.IsolatedAsyncioTestCase):
             "account-release-runtime-invalidate-1",
             reason="unit_test_release_invalidate_post_release_invalidate",
         )
+        live._async_close_browser.assert_not_awaited()
+
+    async def test_release_browser_recovery_runtime_waits_for_release_when_cancelled(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live._legacy_cookie_id = "legacy-release-runtime-cancel-1"
+        live.account_id = "account-release-runtime-cancel-1"
+        live._safe_str = str
+        live._async_close_browser = mock.AsyncMock()
+        runtime_lease = self._build_runtime_lease("account-release-runtime-cancel-1")
+        owner_lock = asyncio.Lock()
+        await owner_lock.acquire()
+        runtime_lease._owner_lock = owner_lock
+        runtime_lease._owner_lock_acquired = True
+        release_started = asyncio.Event()
+        release_can_finish = asyncio.Event()
+        release_finished = False
+
+        async def fake_release_runtime(_lease, *, reason):
+            nonlocal release_finished
+            self.assertIs(_lease, runtime_lease)
+            self.assertEqual("unit_test_release_cancel", reason)
+            release_started.set()
+            await release_can_finish.wait()
+            release_finished = True
+
+        with mock.patch.object(
+            XianyuAutoAsync.account_browser_runtime_manager,
+            "release_runtime",
+            new=mock.AsyncMock(side_effect=fake_release_runtime),
+        ):
+            task = asyncio.create_task(
+                live._release_browser_recovery_runtime(
+                    runtime_lease,
+                    browser=object(),
+                    context=object(),
+                    page=object(),
+                    reason="unit_test_release_cancel",
+                )
+            )
+            await release_started.wait()
+
+            task.cancel()
+            await asyncio.sleep(0)
+
+            self.assertFalse(task.done())
+            self.assertTrue(owner_lock.locked())
+
+            release_can_finish.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertTrue(release_finished)
+        self.assertFalse(owner_lock.locked())
         live._async_close_browser.assert_not_awaited()
 
     async def test_release_browser_recovery_runtime_missing_lease_account_id_avoids_stale_cookie_id_fallback(self):

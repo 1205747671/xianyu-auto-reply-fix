@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import importlib
 import json
 import os
 import smtplib
@@ -97,6 +98,30 @@ def _safe_str(value: Any) -> str:
         return str(value)
     except Exception:
         return repr(value)
+
+
+def _get_aiohttp_module():
+    bound_aiohttp = aiohttp
+    try:
+        imported_aiohttp = importlib.import_module("aiohttp")
+    except Exception:
+        imported_aiohttp = None
+    if imported_aiohttp is None or imported_aiohttp is bound_aiohttp:
+        return bound_aiohttp
+
+    bound_client_session = getattr(bound_aiohttp, "ClientSession", None)
+    bound_client_session_name = getattr(bound_client_session, "__name__", "")
+    if bound_client_session is object or bound_client_session_name in {"_ClientSession", "object"}:
+        return imported_aiohttp
+    return bound_aiohttp
+
+
+def _create_client_session(*args: Any, **kwargs: Any):
+    aiohttp_module = _get_aiohttp_module()
+    client_session_cls = getattr(aiohttp_module, "ClientSession", None)
+    if client_session_cls is None:
+        raise RuntimeError("aiohttp.ClientSession is unavailable")
+    return client_session_cls(*args, **kwargs)
 
 
 def normalize_channel_type(channel_type: Any) -> str:
@@ -296,7 +321,7 @@ async def _send_qq_notification(config_data: Dict[str, Any], message: str, *, ac
 
     params = {'qq': qq_number, 'msg': message}
 
-    async with aiohttp.ClientSession() as session:
+    async with _create_client_session() as session:
         async with session.get(api_url, params=params, timeout=10) as response:
             if response.status in (200, 502):
                 logger.info(f"【{account_id}】QQ通知发送成功")
@@ -327,7 +352,7 @@ async def _send_dingtalk_notification(config_data: Dict[str, Any], message: str,
         },
     }
 
-    async with aiohttp.ClientSession() as session:
+    async with _create_client_session() as session:
         async with session.post(webhook_url, json=data, timeout=10) as response:
             if response.status == 200:
                 logger.info(f"【{account_id}】钉钉通知发送成功")
@@ -354,7 +379,7 @@ async def _send_feishu_notification(config_data: Dict[str, Any], message: str, *
         hmac_code = hmac.new(secret.encode('utf-8'), string_to_sign.encode('utf-8'), digestmod=hashlib.sha256).digest()
         data['sign'] = base64.b64encode(hmac_code).decode('utf-8')
 
-    async with aiohttp.ClientSession() as session:
+    async with _create_client_session() as session:
         async with session.post(webhook_url, json=data, timeout=10) as response:
             response_text = await response.text()
             if response.status != 200:
@@ -390,7 +415,7 @@ async def _send_bark_notification(config_data: Dict[str, Any], message: str, *, 
     if config_data.get('url'):
         data['url'] = config_data['url']
 
-    async with aiohttp.ClientSession() as session:
+    async with _create_client_session() as session:
         async with session.post(f'{server_url}/push', json=data, timeout=10) as response:
             response_text = await response.text()
             if response.status != 200:
@@ -503,7 +528,7 @@ async def _send_webhook_notification(config_data: Dict[str, Any], message: str, 
         'source': 'xianyu-auto-reply',
     }
 
-    async with aiohttp.ClientSession() as session:
+    async with _create_client_session() as session:
         request = session.post if http_method == 'POST' else session.put if http_method == 'PUT' else None
         if request is None:
             logger.warning(f"【{account_id}】不支持的Webhook方法: {http_method}")
@@ -523,7 +548,7 @@ async def _send_wechat_notification(config_data: Dict[str, Any], message: str, *
         return False
 
     data = {'msgtype': 'text', 'text': {'content': message}}
-    async with aiohttp.ClientSession() as session:
+    async with _create_client_session() as session:
         async with session.post(webhook_url, json=data, timeout=10) as response:
             if response.status == 200:
                 logger.info(f"【{account_id}】微信通知发送成功")
@@ -541,7 +566,7 @@ async def _send_telegram_notification(config_data: Dict[str, Any], message: str,
 
     api_url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
     data = {'chat_id': chat_id, 'text': message, 'parse_mode': 'HTML'}
-    async with aiohttp.ClientSession() as session:
+    async with _create_client_session() as session:
         async with session.post(api_url, json=data, timeout=10) as response:
             if response.status == 200:
                 logger.info(f"【{account_id}】Telegram通知发送成功")

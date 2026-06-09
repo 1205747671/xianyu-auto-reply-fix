@@ -212,23 +212,22 @@ def _start_api_server():
     """后台线程启动 FastAPI 服务"""
     api_conf = AUTO_REPLY.get('api', {})
 
-    # 优先使用环境变量配置
-    host = os.getenv('API_HOST', '0.0.0.0')  # 默认绑定所有接口
-    port = int(os.getenv('API_PORT', '8090'))  # 默认端口8090
-
-    # 如果配置文件中有特定配置，则使用配置文件
-    if 'host' in api_conf:
-        host = api_conf['host']
-    if 'port' in api_conf:
-        port = api_conf['port']
+    env_host = os.getenv('API_HOST')
+    env_port = os.getenv('API_PORT')
+    config_host = api_conf.get('host')
+    config_port = api_conf.get('port')
 
     # 兼容旧的URL配置方式
-    if 'url' in api_conf and 'host' not in api_conf and 'port' not in api_conf:
+    if 'url' in api_conf and not config_host and not config_port:
         url = api_conf.get('url', 'http://0.0.0.0:8090/xianyu/reply')
         parsed = urlparse(url)
         if parsed.hostname and parsed.hostname != 'localhost':
-            host = parsed.hostname
-        port = parsed.port or 8090
+            config_host = parsed.hostname
+        config_port = parsed.port or 8090
+
+    # 环境变量必须最终兜底覆盖配置，方便容器/烟测临时改端口。
+    host = env_host or config_host or '0.0.0.0'
+    port = int(env_port or config_port or 8090)
 
     logger.info(f"启动Web服务器: http://{host}:{port}")
     # 在后台线程中创建独立事件循环并直接运行 server.serve()

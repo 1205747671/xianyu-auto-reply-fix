@@ -1117,6 +1117,14 @@ def _get_xianyu_live_class():
     _CACHED_XIANYU_LIVE_CLASS = live_class
     return live_class
 
+
+def _is_account_persistent_profile_requested(instance: Any) -> bool:
+    resolver = getattr(instance, "_should_use_account_persistent_profile", None)
+    if callable(resolver):
+        return bool(resolver())
+    return bool(getattr(instance, "use_account_persistent_profile", False))
+
+
 class XianyuSliderStealth:
     
     def __init__(self, user_id: str = "default", enable_learning: bool = True, headless: bool = True,
@@ -2647,6 +2655,12 @@ class XianyuSliderStealth:
     def _should_use_account_persistent_profile(self) -> bool:
         return bool(getattr(self, "use_account_persistent_profile", False))
 
+    def _is_account_persistent_profile_requested(self) -> bool:
+        return _is_account_persistent_profile_requested(self)
+
+    def _missing_managed_runtime_message(self, scene: str = "account-scoped browser flow") -> str:
+        return f"missing managed runtime binding for {scene}"
+
     def _resolve_account_persistent_profile_dir(self) -> str:
         profile_dir = str(getattr(self, "account_persistent_profile_dir", None) or "").strip()
         if not profile_dir:
@@ -2912,6 +2926,24 @@ class XianyuSliderStealth:
         """初始化浏览器 - 增强反检测版本"""
         user_label = getattr(self, "pure_user_id", "unknown")
         try:
+            managed_runtime_binding = getattr(self, "_managed_runtime_binding", None) or {}
+            if managed_runtime_binding:
+                context = managed_runtime_binding.get("context")
+                page = managed_runtime_binding.get("page")
+                if page is None and context is not None:
+                    pages = list(getattr(context, "pages", []) or [])
+                    page = pages[0] if pages else None
+                if context is None or page is None:
+                    raise RuntimeError("managed runtime binding is incomplete for account-scoped verification flow")
+                self.browser = managed_runtime_binding.get("browser") or getattr(context, "browser", None)
+                self.context = context
+                self.page = page
+                self.playwright = managed_runtime_binding.get("playwright")
+                return self.page
+
+            if _is_account_persistent_profile_requested(self):
+                raise RuntimeError(self._missing_managed_runtime_message("account-scoped verification flow"))
+
             if self._should_prefer_project_browser_for_playwright():
                 self._ensure_project_playwright_browser()
 
@@ -2999,6 +3031,14 @@ class XianyuSliderStealth:
     
     def _cleanup_on_init_failure(self):
         """初始化失败时的清理"""
+        if getattr(self, "_managed_runtime_binding", None):
+            logger.warning(
+                f"【{getattr(self, 'pure_user_id', 'unknown')}】初始化失败时检测到受管 runtime，"
+                "仅解绑本实例 handles，避免误关闭 runtime manager 持有的浏览器资源"
+            )
+            self._detach_managed_runtime()
+            return
+
         try:
             if hasattr(self, 'page') and self.page:
                 self.page.close()
@@ -5761,6 +5801,8 @@ class XianyuSliderStealth:
             return active_page, login_frame, True, matched_selector, False
 
         if reopen_fresh_page and context:
+            fresh_page = None
+            keep_fresh_page = False
             try:
                 fresh_page = context.new_page()
                 fresh_page.goto("https://www.goofish.com/im", wait_until="domcontentloaded", timeout=30000)
@@ -5772,13 +5814,16 @@ class XianyuSliderStealth:
                 )
                 if found_login_form:
                     logger.info(f"【{self.pure_user_id}】✓ 新建页面后找到登录表单")
+                    keep_fresh_page = True
                     return fresh_page, login_frame, True, matched_selector, True
-                try:
-                    fresh_page.close()
-                except Exception:
-                    pass
             except Exception as fresh_page_error:
                 logger.warning(f"【{self.pure_user_id}】新建页面重新探测登录表单失败: {fresh_page_error}")
+            finally:
+                if fresh_page and not keep_fresh_page:
+                    try:
+                        fresh_page.close()
+                    except Exception:
+                        pass
 
         return active_page, None, False, None, False
 
@@ -6110,6 +6155,7 @@ class XianyuSliderStealth:
                 return True, monitor_page, cookie_dict
 
         probe_page = None
+        keep_probe_page = False
         try:
             probe_page = context.new_page()
             probe_page.goto('https://www.goofish.com/im', wait_until='domcontentloaded', timeout=30000)
@@ -6129,6 +6175,7 @@ class XianyuSliderStealth:
                 not probe_pending_identity_markers
             ):
                 logger.success(f"【{self.pure_user_id}】✅ 通过探测页面确认登录成功")
+                keep_probe_page = True
                 return True, probe_page, probe_cookies
 
             probe_has_slider = self._page_has_slider(probe_page)
@@ -6142,11 +6189,12 @@ class XianyuSliderStealth:
                 not probe_pending_identity_markers
             ):
                 logger.success(f"【{self.pure_user_id}】✅ 通过探测页面URL和Cookie确认登录成功")
+                keep_probe_page = True
                 return True, probe_page, probe_cookies
         except Exception as e:
             logger.debug(f"【{self.pure_user_id}】探测上下文登录状态失败: {e}")
         finally:
-            if probe_page:
+            if probe_page and not keep_probe_page:
                 try:
                     probe_page.close()
                 except Exception:
@@ -11766,7 +11814,14 @@ class XianyuSliderStealth:
         resolved_context_options = dict(context_options or self._build_browser_context_options(browser_features))
         resolved_context_options.setdefault('accept_downloads', True)
         resolved_context_options.setdefault('ignore_https_errors', True)
-        context = browser.new_context(**resolved_context_options)
+        try:
+            context = browser.new_context(**resolved_context_options)
+        except Exception:
+            try:
+                browser.close()
+            except Exception:
+                pass
+            raise
         try:
             cookies_to_inject = self._build_initial_cookie_payload()
             cookie_str = ''
@@ -11847,6 +11902,43 @@ class XianyuSliderStealth:
             if not account or not password:
                 logger.error(f"【{self.pure_user_id}】账号或密码不能为空")
                 return self._fail_login("账号或密码不能为空")
+
+            managed_runtime_binding = getattr(self, "_managed_runtime_binding", None) or {}
+            using_managed_runtime = bool(managed_runtime_binding)
+            if require_managed_runtime and not using_managed_runtime:
+                logger.error(
+                    f"【{self.pure_user_id}】当前密码登录流程要求使用 managed runtime，"
+                    "拒绝降级到匿名浏览器上下文"
+                )
+                return self._fail_login(self._missing_managed_runtime_message("account-scoped password login"))
+            if using_managed_runtime:
+                managed_context = managed_runtime_binding.get("context")
+                managed_page = managed_runtime_binding.get("page")
+                if managed_page is None and managed_context is not None:
+                    managed_pages = list(getattr(managed_context, "pages", []) or [])
+                    managed_page = managed_pages[0] if managed_pages else None
+                    if managed_page is not None:
+                        managed_runtime_binding["page"] = managed_page
+                if managed_context is None or managed_page is None:
+                    logger.error(
+                        f"【{self.pure_user_id}】managed runtime binding 缺少 context/page，"
+                        "拒绝在受管上下文内直接创建未跟踪页面"
+                    )
+                    return self._fail_login(
+                        self._missing_managed_runtime_message("account-scoped password login")
+                    )
+            if _is_account_persistent_profile_requested(self) and not using_managed_runtime:
+                logger.error(
+                    f"【{self.pure_user_id}】账号级 persistent profile 必须通过 managed runtime/owner 申请，"
+                    "拒绝直接启动浏览器"
+                )
+                return self._fail_login(self._missing_managed_runtime_message("account-scoped password login"))
+            if not using_managed_runtime and not force_clean_context:
+                logger.error(
+                    f"【{self.pure_user_id}】账号级密码登录浏览器必须通过 managed runtime/owner 申请，"
+                    "拒绝直接启动 persistent profile"
+                )
+                return self._fail_login(self._missing_managed_runtime_message("account-scoped password login"))
             
             browser_mode = "有头" if show_browser else "无头"
             notification_scene = "手动刷新Cookie" if force_clean_context else "账号密码登录"
@@ -11906,14 +11998,6 @@ class XianyuSliderStealth:
             if self._should_prefer_project_browser_for_playwright():
                 self._ensure_project_playwright_browser()
 
-            managed_runtime_binding = getattr(self, "_managed_runtime_binding", None) or {}
-            using_managed_runtime = bool(managed_runtime_binding)
-            if require_managed_runtime and not using_managed_runtime:
-                logger.error(
-                    f"【{self.pure_user_id}】当前密码登录流程要求使用 managed runtime，"
-                    "拒绝降级到匿名浏览器上下文"
-                )
-                return self._fail_login("missing managed runtime binding for account-scoped password login")
             playwright = managed_runtime_binding.get("playwright") if using_managed_runtime else None
             browser = managed_runtime_binding.get("browser") if using_managed_runtime else None
             context = managed_runtime_binding.get("context") if using_managed_runtime else None
@@ -12374,6 +12458,7 @@ class XianyuSliderStealth:
                         # 注入旧 Cookie 可能让前端显示"已登录"，但服务端 session 已过期
                         if effective_clean_context:
                             logger.info(f"【{self.pure_user_id}】刷新模式：验证服务端Session是否有效...")
+                            verify_page = None
                             try:
                                 verify_page = context.new_page()
                                 verify_resp = verify_page.goto(
@@ -12382,7 +12467,6 @@ class XianyuSliderStealth:
                                     timeout=10000
                                 )
                                 verify_text = verify_page.content()
-                                verify_page.close()
 
                                 if "FAIL_SYS_SESSION_EXPIRED" in verify_text or "FAIL_SYS_USER_VALIDATE" in verify_text:
                                     logger.warning(
@@ -12428,6 +12512,12 @@ class XianyuSliderStealth:
                                     return self._fail_login("Session验证异常且清理会话状态后未找到登录表单")
                                 if reopened_fresh_page:
                                     logger.info(f"【{self.pure_user_id}】Session异常后已切换到新页面继续账密登录")
+                            finally:
+                                if verify_page:
+                                    try:
+                                        verify_page.close()
+                                    except Exception:
+                                        pass
                         else:
                             # 非刷新模式，直接返回Cookie
                             return self._finalize_logged_in_cookies(
@@ -12911,9 +13001,9 @@ class XianyuSliderStealth:
                 # 关闭浏览器。这里不能无限阻塞，否则上层会话会一直卡在 processing。
                 try:
                     if using_managed_runtime:
-                        # managed runtime 不归这里真正关闭，但账号级滑块槽位和临时目录
-                        # 仍然必须统一释放。
-                        self.close_browser()
+                        # 密码登录成功后上层还会复用同一个 managed runtime 做 Cookie 稳定化；
+                        # 这里只释放并发槽位，不能提前 detach page/context。
+                        logger.debug(f"【{self.pure_user_id}】密码登录保留 managed runtime handles 供上层稳定化复用")
                     else:
                         close_errors = []
                         # sync Playwright 的 page/context/browser 需要在创建它们的同一线程关闭，
@@ -13098,10 +13188,17 @@ class XianyuSliderStealth:
         using_managed_runtime = bool(getattr(self, "_managed_runtime_binding", None))
         try:
             if require_managed_runtime and not using_managed_runtime:
-                self.last_login_error = "missing managed runtime binding for account-scoped verification flow"
+                self.last_login_error = self._missing_managed_runtime_message("account-scoped verification flow")
                 logger.error(
                     f"【{self.pure_user_id}】当前验证流程要求使用 managed runtime，"
                     "拒绝降级到匿名浏览器上下文"
+                )
+                return False, None
+            if _is_account_persistent_profile_requested(self) and not using_managed_runtime:
+                self.last_login_error = self._missing_managed_runtime_message("account-scoped verification flow")
+                logger.error(
+                    f"【{self.pure_user_id}】账号级 persistent profile 必须通过 managed runtime/owner 申请，"
+                    "拒绝直接启动浏览器"
                 )
                 return False, None
             # 检查日期有效性

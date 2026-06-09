@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
@@ -209,7 +210,11 @@ class CookieManager:
 
         if hasattr(self.loop, "is_running") and self.loop.is_running():
             future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
-            return future.result(timeout=timeout)
+            try:
+                return future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                raise
 
         if current_loop is not None:
             raise RuntimeError("CookieManager 事件循环未运行，无法跨事件循环同步调度任务")

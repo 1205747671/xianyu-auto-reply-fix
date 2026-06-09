@@ -13,7 +13,11 @@ import re
 import json
 from threading import Lock
 from collections import defaultdict
-from utils.account_browser_runtime import account_browser_runtime_manager
+from utils.account_browser_runtime import (
+    account_browser_runtime_manager,
+    capture_owner_lock_token,
+    release_owner_lock_if_owned,
+)
 from utils.browser_provider import BrowserContextLike, BrowserLike, PageLike
 from utils.time_utils import parse_local_datetime_text_to_db_utc
 
@@ -34,6 +38,54 @@ if os.getenv('DOCKER_ENV'):
             asyncio.set_event_loop(loop)
     except Exception as e:
         logger.warning(f"设置SelectorEventLoop失败: {e}")
+
+
+def _get_account_browser_owner_lock(account_id: str):
+    from XianyuAutoAsync import XianyuLive
+
+    return XianyuLive._get_browser_owner_lock(account_id)
+
+
+def _bind_runtime_owner_lock(lease: Any, owner_lock: Any, acquired: bool) -> None:
+    if lease is None:
+        return
+    try:
+        setattr(lease, "_owner_lock", owner_lock)
+        setattr(lease, "_owner_lock_acquired", bool(acquired))
+        setattr(lease, "_owner_lock_token", capture_owner_lock_token(owner_lock))
+    except Exception:
+        pass
+
+
+async def _release_runtime_owner_lock(lease: Any) -> None:
+    if lease is None:
+        return
+    owner_lock = getattr(lease, "_owner_lock", None)
+    owner_lock_acquired = bool(getattr(lease, "_owner_lock_acquired", False))
+    owner_lock_token = getattr(lease, "_owner_lock_token", None)
+    if owner_lock_acquired and owner_lock is not None:
+        release_owner_lock_if_owned(owner_lock, owner_lock_token)
+    try:
+        setattr(lease, "_owner_lock_acquired", False)
+        setattr(lease, "_owner_lock_token", None)
+    except Exception:
+        pass
+
+
+async def _release_account_runtime_shielded(lease: Any, *, reason: str, log_prefix: str) -> None:
+    release_task = asyncio.create_task(
+        account_browser_runtime_manager.release_runtime(lease, reason=reason)
+    )
+    try:
+        await asyncio.shield(release_task)
+    except asyncio.CancelledError:
+        try:
+            await release_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as release_error:
+            logger.warning(f"{log_prefix}取消收尾释放失败，保留取消语义: {release_error}")
+        raise
 
 
 def _normalize_cached_amount(amount: Any) -> Optional[float]:
@@ -96,9 +148,27 @@ class OrderDetailFetcher:
         self._response_handler = None
         self._runtime_lease = None
         self._runtime_handles_managed = False
+        self._runtime_lease_owned = False
 
         # Cookie配置 - 支持动态传入
         self.cookie = cookie_string
+
+    def attach_managed_runtime(
+        self,
+        *,
+        lease: Any,
+        browser: Any = None,
+        context: Any = None,
+        page: Any = None,
+    ) -> None:
+        """绑定上游已申请好的账号级 runtime。"""
+        self._runtime_lease = lease
+        self._runtime_handles_managed = True
+        self._runtime_lease_owned = False
+        runtime = getattr(lease, "runtime", None) if lease is not None else None
+        self.browser = browser or getattr(runtime, "browser", None)
+        self.context = context or getattr(runtime, "context", None)
+        self.page = page or getattr(runtime, "page", None)
 
     def _resolve_account_id(self) -> str:
         return str(self.account_id or "").strip()
@@ -107,6 +177,7 @@ class OrderDetailFetcher:
         lease = self._runtime_lease
         self._runtime_lease = None
         self._runtime_handles_managed = False
+        self._runtime_lease_owned = False
         self.browser = None
         self.context = None
         self.page = None
@@ -116,13 +187,43 @@ class OrderDetailFetcher:
             return
 
         try:
-            await account_browser_runtime_manager.release_runtime(lease, reason=reason)
+            await _release_account_runtime_shielded(
+                lease,
+                reason=reason,
+                log_prefix="订单详情 runtime",
+            )
         except Exception as e:
             logger.warning(f"释放订单详情 runtime 失败: {e}")
+        finally:
+            await _release_runtime_owner_lock(lease)
+
+    async def _release_init_runtime_lease(self, lease: Any, *, reason: str) -> None:
+        if lease is None:
+            return
+        if self._runtime_lease is lease:
+            await self._release_runtime_lease(reason=reason)
+            return
+        try:
+            await _release_account_runtime_shielded(
+                lease,
+                reason=reason,
+                log_prefix="订单详情初始化 runtime",
+            )
+        except Exception as e:
+            logger.warning(f"释放订单详情初始化 runtime 失败: {e}")
+        finally:
+            await _release_runtime_owner_lock(lease)
 
     async def init_browser(self, headless: bool = None):
         """初始化浏览器"""
+        if self._runtime_lease is not None and self.context is not None and self.page is not None:
+            logger.info("订单详情抓取复用上游已绑定的账号级 runtime")
+            return await self._set_cookies()
+
         lease = None
+        owner_lock = None
+        lock_acquired = False
+        owner_lock_token = None
         try:
             # 如果没有传入headless参数，使用实例的设置
             if headless is None:
@@ -134,6 +235,10 @@ class OrderDetailFetcher:
                 return False
 
             await self._release_runtime_lease(reason="refresh_order_detail_page")
+            owner_lock = _get_account_browser_owner_lock(account_id)
+            await asyncio.wait_for(owner_lock.acquire(), timeout=20.0)
+            lock_acquired = True
+            owner_lock_token = capture_owner_lock_token(owner_lock)
             logger.info(f"开始初始化浏览器，headless模式: {headless}")
             lease = await account_browser_runtime_manager.acquire_runtime(
                 account_id,
@@ -145,39 +250,58 @@ class OrderDetailFetcher:
                     "account_id": account_id,
                 },
             )
+            _bind_runtime_owner_lock(lease, owner_lock, lock_acquired)
             self.page, self.context = await account_browser_runtime_manager.get_fresh_page(lease)
             self._runtime_lease = lease
             self._runtime_handles_managed = True
+            self._runtime_lease_owned = True
             lease_runtime = getattr(lease, "runtime", None)
             self.browser = getattr(lease_runtime, "browser", None)
 
             logger.info("页面创建成功，设置Cookie...")
 
             # 设置Cookie
-            await self._set_cookies()
+            if not await self._set_cookies():
+                raise RuntimeError("订单详情抓取设置 Cookie 失败")
 
             logger.info("浏览器初始化成功")
             return True
-            
+        except asyncio.TimeoutError:
+            logger.error(f"订单详情抓取账号 {self._resolve_account_id()} 当前有其他浏览器任务正在执行，请稍后再试")
+            return False
+        except asyncio.CancelledError:
+            await self._release_init_runtime_lease(
+                lease,
+                reason="order_detail_init_cancelled",
+            )
+            raise
         except Exception as e:
-            if lease is not None and self._runtime_lease is None:
-                try:
-                    await account_browser_runtime_manager.release_runtime(lease, reason="order_detail_init_failed")
-                except Exception:
-                    pass
+            await self._release_init_runtime_lease(
+                lease,
+                reason="order_detail_init_failed",
+            )
             logger.error(f"浏览器初始化失败: {e}")
             return False
+        finally:
+            if (
+                lock_acquired
+                and owner_lock is not None
+                and not bool(getattr(lease, "_owner_lock_acquired", False))
+            ):
+                release_owner_lock_if_owned(owner_lock, owner_lock_token)
 
     def _detach_managed_runtime_handles_without_close(self, reason: str) -> bool:
         if not self._runtime_handles_managed:
             return False
 
         logger.warning(f"检测到受管 runtime handles 缺少 lease，跳过 direct close: {reason}")
+        self._runtime_lease = None
         self.page = None
         self.context = None
         self.browser = None
         self._active_order_id = ''
         self._runtime_handles_managed = False
+        self._runtime_lease_owned = False
         return True
 
     async def _set_cookies(self):
@@ -198,9 +322,11 @@ class OrderDetailFetcher:
             # 添加Cookie到上下文
             await self.context.add_cookies(cookies)
             logger.info(f"已设置 {len(cookies)} 个Cookie")
+            return True
             
         except Exception as e:
             logger.error(f"设置Cookie失败: {e}")
+            return False
 
     async def fetch_order_detail(self, order_id: str, timeout: int = 30, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
         """
@@ -634,14 +760,28 @@ class OrderDetailFetcher:
         self._response_handler = _response_handler
         self.page.on('response', _response_handler)
 
-    async def _wait_for_response_capture_tasks(self, timeout: float = 1.5) -> None:
+    async def _wait_for_response_capture_tasks(self, timeout: float = 1.5, cancel_pending: bool = False) -> None:
         if not self._pending_response_tasks:
             return
 
+        pending_tasks = list(self._pending_response_tasks)
+        pending = set()
         try:
-            await asyncio.wait(list(self._pending_response_tasks), timeout=timeout)
+            _, pending = await asyncio.wait(pending_tasks, timeout=timeout)
         except Exception as e:
             logger.debug(f"等待订单详情响应解析任务失败: {e}")
+            pending = {task for task in pending_tasks if not task.done()}
+
+        if cancel_pending and pending:
+            for task in pending:
+                task.cancel()
+            try:
+                await asyncio.gather(*pending, return_exceptions=True)
+            except Exception as e:
+                logger.debug(f"取消订单详情响应解析任务失败: {e}")
+            finally:
+                for task in pending:
+                    self._pending_response_tasks.discard(task)
 
     def _try_parse_json_text(self, text: str) -> Optional[Any]:
         if not text:
@@ -2546,9 +2686,11 @@ class OrderDetailFetcher:
     async def _force_close_browser(self):
         """强制关闭浏览器，忽略所有错误"""
         try:
-            await self._wait_for_response_capture_tasks(timeout=0.2)
             self._clear_response_capture_handler()
-            if self._runtime_lease is not None:
+            await self._wait_for_response_capture_tasks(timeout=0.2, cancel_pending=True)
+            if self._runtime_lease is not None and (
+                self._runtime_lease_owned or not self._runtime_handles_managed
+            ):
                 await self._release_runtime_lease(reason="force_close_order_detail_page")
                 return
             if self._detach_managed_runtime_handles_without_close("force_close_order_detail_page"):
@@ -2583,9 +2725,11 @@ class OrderDetailFetcher:
     async def close(self):
         """关闭浏览器"""
         try:
-            await self._wait_for_response_capture_tasks(timeout=0.2)
             self._clear_response_capture_handler()
-            if self._runtime_lease is not None:
+            await self._wait_for_response_capture_tasks(timeout=0.2, cancel_pending=True)
+            if self._runtime_lease is not None and (
+                self._runtime_lease_owned or not self._runtime_handles_managed
+            ):
                 await self._release_runtime_lease(reason="close_order_detail_page")
                 logger.info("浏览器已关闭")
                 return

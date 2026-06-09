@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 import types
@@ -120,6 +121,7 @@ class BrowserSidecarsProviderMigrationTest(unittest.IsolatedAsyncioTestCase):
         )
 
         with mock.patch.object(item_search, "PLAYWRIGHT_AVAILABLE", True), \
+             mock.patch("utils.item_search._get_account_browser_owner_lock", return_value=asyncio.Lock()), \
              mock.patch.object(
                  item_search.account_browser_runtime_manager,
                  "resolve_profile_dir",
@@ -159,6 +161,77 @@ class BrowserSidecarsProviderMigrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("--lang=zh-CN", launch_options["args"])
         self.assertFalse(any(arg.startswith("--accept-lang=") for arg in launch_options["args"]))
 
+    async def test_item_search_search_items_fails_fast_when_init_browser_returns_false(self):
+        searcher = item_search.XianyuSearcher(
+            account_id="search_account",
+            cookie_value="cookie2=unit",
+        )
+
+        with mock.patch.object(item_search, "PLAYWRIGHT_AVAILABLE", True), \
+             mock.patch.object(searcher, "init_browser", new=mock.AsyncMock(return_value=False)):
+            result = await searcher.search_items("switch", page=1, page_size=20)
+
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["total"], 0)
+        self.assertIn("浏览器启动失败", result["error"])
+
+    async def test_item_search_close_browser_detaches_attached_runtime_without_releasing_outer_lease(self):
+        searcher = item_search.XianyuSearcher(
+            account_id="search_account",
+            cookie_value="cookie2=unit",
+        )
+        lease = types.SimpleNamespace(account_id="search_account", released=False, pages=[])
+        page = mock.Mock(close=mock.AsyncMock())
+        context = mock.Mock(close=mock.AsyncMock())
+        browser = mock.Mock(close=mock.AsyncMock())
+        searcher.attach_managed_runtime(
+            lease=lease,
+            browser=browser,
+            context=context,
+            page=page,
+        )
+        runtime_manager = mock.Mock(release_runtime=mock.AsyncMock())
+
+        with mock.patch.object(item_search, "account_browser_runtime_manager", runtime_manager):
+            await searcher.close_browser()
+
+        runtime_manager.release_runtime.assert_not_awaited()
+        page.close.assert_not_awaited()
+        context.close.assert_not_awaited()
+        browser.close.assert_not_awaited()
+        self.assertIsNone(searcher._runtime_lease)
+        self.assertFalse(searcher._runtime_lease_owned)
+        self.assertFalse(searcher._runtime_handles_managed)
+
+    async def test_item_search_close_browser_removes_response_handler_from_attached_runtime_page(self):
+        searcher = item_search.XianyuSearcher(
+            account_id="search_account",
+            cookie_value="cookie2=unit",
+        )
+        lease = types.SimpleNamespace(account_id="search_account", released=False, pages=[])
+        response_handler = mock.Mock()
+        page = mock.Mock(
+            close=mock.AsyncMock(),
+            remove_listener=mock.Mock(),
+        )
+        context = mock.Mock(close=mock.AsyncMock())
+        browser = mock.Mock(close=mock.AsyncMock())
+        searcher.attach_managed_runtime(
+            lease=lease,
+            browser=browser,
+            context=context,
+            page=page,
+        )
+        searcher._response_handler = response_handler
+        runtime_manager = mock.Mock(release_runtime=mock.AsyncMock())
+
+        with mock.patch.object(item_search, "account_browser_runtime_manager", runtime_manager):
+            await searcher.close_browser()
+
+        page.remove_listener.assert_called_once_with("response", response_handler)
+        runtime_manager.release_runtime.assert_not_awaited()
+        self.assertIsNone(searcher._response_handler)
+
     async def test_order_detail_fetcher_init_browser_uses_provider_launcher(self):
         fake_page = mock.Mock()
         fake_browser = mock.Mock()
@@ -173,6 +246,10 @@ class BrowserSidecarsProviderMigrationTest(unittest.IsolatedAsyncioTestCase):
         )
 
         with mock.patch.object(
+            order_detail_fetcher,
+            "_get_account_browser_owner_lock",
+            return_value=asyncio.Lock(),
+        ), mock.patch.object(
             order_detail_fetcher.account_browser_runtime_manager,
             "acquire_runtime",
             new=mock.AsyncMock(return_value=fake_lease),
@@ -211,6 +288,10 @@ class BrowserSidecarsProviderMigrationTest(unittest.IsolatedAsyncioTestCase):
         )
 
         with mock.patch.object(
+            order_detail_fetcher,
+            "_get_account_browser_owner_lock",
+            return_value=asyncio.Lock(),
+        ), mock.patch.object(
             order_detail_fetcher.account_browser_runtime_manager,
             "acquire_runtime",
             new=mock.AsyncMock(return_value=fake_lease),
@@ -294,6 +375,10 @@ class BrowserSidecarsProviderMigrationTest(unittest.IsolatedAsyncioTestCase):
             "account_browser_runtime_manager",
             new=runtime_manager,
         ), \
+             mock.patch(
+                 "utils.qr_login._get_account_browser_owner_lock",
+                 return_value=asyncio.Lock(),
+             ), \
              mock.patch.object(
                  manager,
                  "_should_show_verification_browser",
@@ -402,6 +487,10 @@ class BrowserSidecarsProviderMigrationTest(unittest.IsolatedAsyncioTestCase):
             "account_browser_runtime_manager",
             new=runtime_manager,
         ), \
+             mock.patch(
+                 "utils.qr_login._get_account_browser_owner_lock",
+                 return_value=asyncio.Lock(),
+             ), \
              mock.patch.object(
                  manager,
                  "_should_show_verification_browser",
@@ -816,6 +905,7 @@ class BrowserSidecarsProviderMigrationTest(unittest.IsolatedAsyncioTestCase):
             return False
 
         with mock.patch.object(qr_login, "account_browser_runtime_manager", new=runtime_manager), \
+             mock.patch("utils.qr_login._get_account_browser_owner_lock", return_value=asyncio.Lock()), \
              mock.patch.object(manager, "_should_show_verification_browser", return_value=False), \
              mock.patch.object(manager, "_probe_browser_login_success", new=mock.AsyncMock(side_effect=fail_verification)), \
              mock.patch("utils.qr_login.image_manager.save_image", return_value="saved.png"):

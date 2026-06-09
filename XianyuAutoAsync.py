@@ -1,14 +1,15 @@
 import asyncio
-import json
-import re
-import time
 import base64
 import hashlib
+import importlib
+import json
 import os
 import random
+import re
 import secrets
 import sys
 import threading
+import time
 from enum import Enum
 from urllib.parse import parse_qs, urlparse
 from loguru import logger
@@ -26,7 +27,7 @@ from config import (
 )
 import aiohttp
 from collections import defaultdict, deque
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from db_manager import db_manager
 from utils.notification_dispatcher import (
     dispatch_account_notifications,
@@ -37,6 +38,8 @@ from utils.notification_dispatcher import (
 )
 from utils.account_browser_runtime import (
     account_browser_runtime_manager,
+    capture_owner_lock_token,
+    release_owner_lock_if_owned,
     resolve_runtime_attach_metadata,
 )
 
@@ -67,6 +70,19 @@ PROTECTED_SESSION_COOKIE_FIELDS = (
     'havana_lgc2_77',
     '_tb_token_',
 )
+
+
+def _get_order_history_sync_module():
+    try:
+        from utils import order_history_sync as order_history_sync_module
+
+        if order_history_sync_module is not None:
+            return order_history_sync_module
+    except Exception:
+        pass
+    return importlib.import_module("utils.order_history_sync")
+
+
 REQUIRED_SESSION_COOKIE_FIELDS = (
     'unb',
     'sgcookie',
@@ -89,6 +105,74 @@ class ConnectionState(Enum):
 
 class InitAuthError(Exception):
     pass
+
+
+class _CrossLoopAsyncLock:
+    """可跨事件循环/线程复用的轻量异步锁。"""
+
+    def __init__(self, *, poll_interval: float = 0.05):
+        self._guard = threading.Lock()
+        self._owner_identity = None
+        self._depth = 0
+        self._poll_interval = max(0.01, float(poll_interval))
+
+    @staticmethod
+    def _current_owner_identity():
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        if current_task is not None:
+            return ("task", current_task)
+        return ("thread", threading.get_ident())
+
+    async def acquire(self) -> bool:
+        current_owner_identity = self._current_owner_identity()
+        while True:
+            with self._guard:
+                if self._owner_identity is None:
+                    self._owner_identity = current_owner_identity
+                    self._depth = 1
+                    return True
+                if self._owner_identity == current_owner_identity:
+                    self._depth += 1
+                    return True
+            await asyncio.sleep(self._poll_interval)
+
+    def capture_owner_token(self):
+        with self._guard:
+            if self._owner_identity is None or self._depth <= 0:
+                return None
+            return self._owner_identity
+
+    def release(self) -> None:
+        current_owner_identity = self._current_owner_identity()
+        self.release_by_token(current_owner_identity)
+
+    def release_by_token(self, owner_token) -> None:
+        with self._guard:
+            if self._owner_identity is None or self._depth <= 0:
+                raise RuntimeError("cross-loop async lock is not acquired")
+            if self._owner_identity != owner_token:
+                raise RuntimeError("cross-loop async lock is owned by another task")
+            self._depth -= 1
+            if self._depth == 0:
+                self._owner_identity = None
+
+    def release_by_token_if_owner(self, owner_token) -> bool:
+        with self._guard:
+            if self._owner_identity is None or self._depth <= 0:
+                return False
+            if self._owner_identity != owner_token:
+                return False
+            self._depth -= 1
+            if self._depth == 0:
+                self._owner_identity = None
+            return True
+
+    def locked(self) -> bool:
+        with self._guard:
+            return self._owner_identity is not None
 
 
 class AutoReplyPauseManager:
@@ -237,6 +321,8 @@ class XianyuLive:
     _item_detail_cache_lock = asyncio.Lock()
     _item_detail_cache_max_size = 1000
     _item_detail_cache_ttl = 24 * 60 * 60
+    _browser_owner_locks = {}
+    _browser_owner_locks_guard = threading.Lock()
 
     _instances = {}
     _instances_lock = asyncio.Lock()
@@ -273,6 +359,18 @@ class XianyuLive:
         if normalized:
             return normalized
         return ""
+
+    @classmethod
+    def _get_browser_owner_lock(cls, account_id: str = None) -> _CrossLoopAsyncLock:
+        resolved_account_id = cls._normalize_account_scope(account_id)
+        if not resolved_account_id:
+            raise ValueError("browser owner lock requires non-empty account_id")
+        with cls._browser_owner_locks_guard:
+            lock = cls._browser_owner_locks.get(resolved_account_id)
+            if lock is None:
+                lock = _CrossLoopAsyncLock()
+                cls._browser_owner_locks[resolved_account_id] = lock
+            return lock
 
     @classmethod
     def _normalize_manual_refresh_account_scope(cls, account_id: Any = None) -> str:
@@ -869,6 +967,23 @@ class XianyuLive:
             except Exception:
                 return "未知错误"
 
+    def _normalize_auto_comment_failure_message(
+        self,
+        message,
+        *,
+        default_message: str = "调用自动好评服务失败，请稍后重试",
+    ) -> str:
+        normalized = self._safe_str(message).strip()
+        if not normalized:
+            return default_message
+        if normalized == "未配置自动好评辅助API地址":
+            return normalized
+        if normalized == "请求超时":
+            return normalized
+        if normalized.startswith("接口返回错误:"):
+            return normalized
+        return default_message
+
     def _mask_secret_value(self, value: str, head: int = 6, tail: int = 4) -> str:
         text = str(value or '')
         if not text:
@@ -1276,6 +1391,10 @@ class XianyuLive:
         if self.cookie_refresh_task:
             status = "已完成" if self.cookie_refresh_task.done() else "运行中"
             other_tasks_status.append(f"Cookie刷新任务({status})")
+        cookie_refresh_execution_task = getattr(self, "cookie_refresh_execution_task", None)
+        if cookie_refresh_execution_task:
+            status = "已完成" if cookie_refresh_execution_task.done() else "运行中"
+            other_tasks_status.append(f"Cookie刷新执行任务({status})")
         if self.stream_watchdog_task:
             status = "已完成" if self.stream_watchdog_task.done() else "运行中"
             other_tasks_status.append(f"业务流看门狗({status})")
@@ -1315,11 +1434,32 @@ class XianyuLive:
                 else:
                     logger.debug(f"【{self.account_id}】Cookie刷新任务已完成，跳过")
 
+            cookie_refresh_execution_task = getattr(self, "cookie_refresh_execution_task", None)
+            if cookie_refresh_execution_task:
+                if not cookie_refresh_execution_task.done():
+                    tasks_to_cancel.append(("Cookie刷新执行任务", cookie_refresh_execution_task))
+                else:
+                    logger.debug(f"【{self.account_id}】Cookie刷新执行任务已完成，跳过")
+
             if self.stream_watchdog_task:
                 if not self.stream_watchdog_task.done():
                     tasks_to_cancel.append(("业务流看门狗", self.stream_watchdog_task))
                 else:
                     logger.debug(f"【{self.account_id}】业务流看门狗已完成，跳过")
+
+            known_task_ids = {id(task) for _, task in tasks_to_cancel}
+            current_task = asyncio.current_task()
+            for tracked_task in list(getattr(self, "background_tasks", set()) or ()):
+                if tracked_task is None or tracked_task is current_task:
+                    continue
+                if tracked_task.done() or id(tracked_task) in known_task_ids:
+                    continue
+                try:
+                    coro = tracked_task.get_coro()
+                    coro_name = getattr(coro, "__qualname__", None) or getattr(coro, "__name__", None)
+                except Exception:
+                    coro_name = None
+                tasks_to_cancel.append((f"后台跟踪任务({coro_name or 'unknown'})", tracked_task))
 
             if not tasks_to_cancel:
                 logger.info(f"【{self.account_id}】没有后台任务需要取消（所有任务已完成或不存在）")
@@ -1327,6 +1467,7 @@ class XianyuLive:
                 self.token_refresh_task = None
                 self.cleanup_task = None
                 self.cookie_refresh_task = None
+                self.cookie_refresh_execution_task = None
                 self.stream_watchdog_task = None
                 return
 
@@ -1447,6 +1588,7 @@ class XianyuLive:
             self.token_refresh_task = None
             self.cleanup_task = None
             self.cookie_refresh_task = None
+            self.cookie_refresh_execution_task = None
             self.stream_watchdog_task = None
             logger.info(f"【{self.account_id}】后台任务引用已全部重置")
 
@@ -1728,6 +1870,7 @@ class XianyuLive:
         self.cleanup_task = None
 
         self.cookie_refresh_task = None
+        self.cookie_refresh_execution_task = None
         self.cookie_refresh_interval = 10800
         self.last_cookie_refresh_time = 0
         self.cookie_refresh_lock = asyncio.Lock()
@@ -1769,6 +1912,7 @@ class XianyuLive:
         self.message_queue_lock = asyncio.Lock()
 
         self.message_workers = []
+        self.message_queue_monitor_task = None
         self.message_queue_running = False
         self.queue_stats = {
             'received': 0,
@@ -2877,6 +3021,12 @@ class XianyuLive:
             logger.info(f"【{self.account_id}】消息队列系统已禁用，使用传统处理模式")
             return
 
+        existing_monitor_task = getattr(self, "message_queue_monitor_task", None)
+        if existing_monitor_task is not None and not existing_monitor_task.done():
+            existing_monitor_task.cancel()
+            await asyncio.gather(existing_monitor_task, return_exceptions=True)
+
+        self.queue_stats['last_stats_time'] = time.time()
         self.message_queue_running = True
         self.message_workers = []
 
@@ -2884,7 +3034,7 @@ class XianyuLive:
             worker_task = self._create_tracked_task(self._message_worker(i))
             self.message_workers.append(worker_task)
 
-        self._create_tracked_task(self._queue_stats_monitor())
+        self.message_queue_monitor_task = self._create_tracked_task(self._queue_stats_monitor())
 
         logger.info(f"【{self.account_id}】🚀 消息队列系统已启动，{self.message_queue_workers}个工作协程")
 
@@ -2898,44 +3048,69 @@ class XianyuLive:
         if self.message_workers:
             await asyncio.gather(*self.message_workers, return_exceptions=True)
 
+        monitor_task = getattr(self, "message_queue_monitor_task", None)
+        if monitor_task is not None and not monitor_task.done():
+            monitor_task.cancel()
+            await asyncio.gather(monitor_task, return_exceptions=True)
+
+        drained_count = 0
+        while True:
+            try:
+                self.message_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                drained_count += 1
+                self.message_queue.task_done()
+
         self.message_workers = []
+        self.message_queue_monitor_task = None
+        self.message_queue_counter = 0
+        self.queue_stats['last_stats_time'] = time.time()
+        if drained_count > 0:
+            logger.warning(f"【{self.account_id}】🧹 停止消息队列时丢弃 {drained_count} 条残留消息，避免新连接继续消费旧消息")
         logger.info(f"【{self.account_id}】🛑 消息队列系统已停止")
 
     async def _queue_stats_monitor(self):
-        while self.message_queue_running:
-            try:
-                await asyncio.sleep(60)
-                if not self.message_queue_running:
-                    break
+        current_task = asyncio.current_task()
+        try:
+            while self.message_queue_running:
+                try:
+                    await asyncio.sleep(60)
+                    if not self.message_queue_running:
+                        break
 
-                stats = self.queue_stats
-                elapsed = time.time() - stats['last_stats_time']
+                    stats = self.queue_stats
+                    elapsed = time.time() - stats['last_stats_time']
 
-                if stats['received'] > 0:
-                    process_rate = stats['processed'] / elapsed if elapsed > 0 else 0
-                    drop_rate = (stats['dropped_full'] + stats['dropped_expired']) / stats['received'] * 100
+                    if stats['received'] > 0:
+                        process_rate = stats['processed'] / elapsed if elapsed > 0 else 0
+                        drop_rate = (stats['dropped_full'] + stats['dropped_expired']) / stats['received'] * 100
 
-                    logger.info(
-                        f"【{self.account_id}】📊 消息队列统计 - "
-                        f"队列大小: {self.message_queue.qsize()}/{self.message_queue_max_size} | "
-                        f"收到: {stats['received']} | "
-                        f"处理: {stats['processed']} | "
-                        f"丢弃(满): {stats['dropped_full']} | "
-                        f"丢弃(过期): {stats['dropped_expired']} | "
-                        f"错误: {stats['errors']} | "
-                        f"处理速率: {process_rate:.1f}/s | "
-                        f"丢弃率: {drop_rate:.1f}%"
-                    )
+                        logger.info(
+                            f"【{self.account_id}】📊 消息队列统计 - "
+                            f"队列大小: {self.message_queue.qsize()}/{self.message_queue_max_size} | "
+                            f"收到: {stats['received']} | "
+                            f"处理: {stats['processed']} | "
+                            f"丢弃(满): {stats['dropped_full']} | "
+                            f"丢弃(过期): {stats['dropped_expired']} | "
+                            f"错误: {stats['errors']} | "
+                            f"处理速率: {process_rate:.1f}/s | "
+                            f"丢弃率: {drop_rate:.1f}%"
+                        )
 
-                    if drop_rate > 10:
-                        logger.warning(f"【{self.account_id}】⚠️ 消息丢弃率过高({drop_rate:.1f}%)，建议增加工作协程数量或检查消息处理效率")
+                        if drop_rate > 10:
+                            logger.warning(f"【{self.account_id}】⚠️ 消息丢弃率过高({drop_rate:.1f}%)，建议增加工作协程数量或检查消息处理效率")
 
-                stats['last_stats_time'] = time.time()
+                    stats['last_stats_time'] = time.time()
 
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"【{self.account_id}】队列监控异常: {self._safe_str(e)}")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"【{self.account_id}】队列监控异常: {self._safe_str(e)}")
+        finally:
+            if getattr(self, "message_queue_monitor_task", None) is current_task:
+                self.message_queue_monitor_task = None
 
     def is_auto_confirm_enabled(self) -> bool:
         try:
@@ -3071,7 +3246,7 @@ class XianyuLive:
             logger.error(f"【{self.account_id}】调用好评接口异常: {self._safe_str(e)}")
             return {
                 "success": False,
-                "message": str(e)
+                "message": self._normalize_auto_comment_failure_message(e)
             }
 
     def can_auto_delivery(self, order_id: str) -> bool:
@@ -3157,7 +3332,9 @@ class XianyuLive:
             'release_time': None,
             'task': None
         }
-        delay_task = asyncio.create_task(self._delayed_lock_release(lock_key, delay_minutes=delay_minutes))
+        delay_task = self._create_tracked_task(
+            self._delayed_lock_release(lock_key, delay_minutes=delay_minutes)
+        )
         self._lock_hold_info[lock_key]['task'] = delay_task
 
     def _record_delivery_log(self, order_id: str = None, item_id: str = None, buyer_id: str = None,
@@ -3705,6 +3882,7 @@ class XianyuLive:
         return summary
 
     async def _delayed_lock_release(self, lock_key: str, delay_minutes: int = 10):
+        current_task = asyncio.current_task()
         try:
             delay_seconds = delay_minutes * 60
             logger.info(f"【{self.account_id}】订单锁 {lock_key} 将在 {delay_minutes} 分钟后释放")
@@ -3723,6 +3901,10 @@ class XianyuLive:
             raise
         except Exception as e:
             logger.error(f"【{self.account_id}】订单锁 {lock_key} 延迟释放失败: {self._safe_str(e)}")
+        finally:
+            lock_info = self._lock_hold_info.get(lock_key)
+            if isinstance(lock_info, dict) and lock_info.get('task') is current_task:
+                lock_info['task'] = None
 
     def is_lock_held(self, lock_key: str) -> bool:
         if lock_key not in self._lock_hold_info:
@@ -6790,10 +6972,16 @@ class XianyuLive:
                         detach_managed_runtime()
                     except Exception:
                         pass
-            account_browser_runtime_manager.release_runtime_sync(
-                lease,
-                reason=current_release_reason,
-            )
+            try:
+                account_browser_runtime_manager.release_runtime_sync(
+                    lease,
+                    reason=current_release_reason,
+                )
+            except Exception as release_error:
+                logger.warning(
+                    f"【{canonical_account_id}】释放滑块验证账号级浏览器 runtime 失败，"
+                    f"保留原始流程结果继续返回: {self._safe_str(release_error)}"
+                )
 
     async def _handle_captcha_verification(self, res_json: dict) -> str:
         try:
@@ -7536,10 +7724,9 @@ class XianyuLive:
                 logger.info(f"【{log_account_id}】Cookie字段数: {len(result)}")
                 logger.info(f"【{log_account_id}】Cookie字段列表:")
                 for i, (key, value) in enumerate(result.items(), 1):
-                    if len(str(value)) > 50:
-                        logger.info(f"【{log_account_id}】  {i:2d}. {key}: {str(value)[:30]}...{str(value)[-20:]} (长度: {len(str(value))})")
-                    else:
-                        logger.info(f"【{log_account_id}】  {i:2d}. {key}: {value}")
+                    cookie_value = str(value or "")
+                    display_value = self._mask_secret_value(cookie_value, head=4, tail=2)
+                    logger.info(f"【{log_account_id}】  {i:2d}. {key}: {display_value} (长度: {len(cookie_value)})")
 
                 important_keys = list(REQUIRED_SESSION_COOKIE_FIELDS) + list(OBSERVED_SESSION_COOKIE_FIELDS)
                 logger.info(f"【{log_account_id}】关键字段检查:")
@@ -7554,6 +7741,7 @@ class XianyuLive:
                 new_cookies_str = '; '.join([f"{k}={v}" for k, v in result.items()])
                 logger.info(f"【{log_account_id}】Cookie字符串摘要: {self._summarize_cookie_string(new_cookies_str)}")
 
+                preflight_xianyu = None
                 try:
                     preflight_xianyu = XianyuLive(
                         cookies_str=new_cookies_str,
@@ -7584,6 +7772,14 @@ class XianyuLive:
                             event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
                         )
                     return False
+                finally:
+                    if preflight_xianyu is not None:
+                        try:
+                            await preflight_xianyu.close_session()
+                        except Exception as close_err:
+                            logger.warning(
+                                f"【{log_account_id}】关闭密码登录Token预检临时会话失败: {self._safe_str(close_err)}"
+                            )
 
                 logger.warning(f"【{log_account_id}】已记录密码登录时间，冷却期 {XianyuLive._password_login_cooldown} 秒")
 
@@ -7749,10 +7945,16 @@ class XianyuLive:
                         detach_managed_runtime()
                     except Exception:
                         pass
-            account_browser_runtime_manager.release_runtime_sync(
-                lease,
-                reason=release_reason,
-            )
+            try:
+                account_browser_runtime_manager.release_runtime_sync(
+                    lease,
+                    reason=release_reason,
+                )
+            except Exception as release_error:
+                logger.warning(
+                    f"【{resolved_account_id}】释放密码登录刷新账号级浏览器 runtime 失败，"
+                    f"保留原始流程结果继续返回: {self._safe_str(release_error)}"
+                )
 
     async def _verify_cookie_validity(self) -> dict:
         logger.info(f"【{self.account_id}】开始验证Cookie有效性（使用真实API调用）...")
@@ -8218,11 +8420,6 @@ class XianyuLive:
             raise
 
     async def _fetch_item_detail_from_browser(self, item_id: str) -> str:
-        browser = None
-        context = None
-        page = None
-        runtime_lease = None
-        release_reason = "item_detail_fetch_failed"
         try:
             logger.info(f"开始使用浏览器获取商品详情: {item_id}")
 
@@ -8231,95 +8428,141 @@ class XianyuLive:
                 logger.error(f"商品详情抓取缺少 account_id，无法申请账号级 runtime: {item_id}")
                 return ""
 
-            profile_dir = account_browser_runtime_manager.resolve_profile_dir(current_account_id)
             browser_args = self._build_browser_refresh_launch_args()
             context_options = dict(self._build_browser_refresh_context_options())
-            runtime_lease = await account_browser_runtime_manager.acquire_runtime(
-                current_account_id,
-                "item_detail_fetch",
-                exclusive=False,
-                runtime_request={
-                    "account_id": current_account_id,
-                    "purpose": "item_detail_fetch",
+            runtime_request = {
+                "account_id": current_account_id,
+                "purpose": "item_detail_fetch",
+                "headless": True,
+                "use_persistent_context": True,
+                "profile_dir": account_browser_runtime_manager.resolve_profile_dir(current_account_id),
+                "launch_options": {
                     "headless": True,
-                    "use_persistent_context": True,
-                    "profile_dir": profile_dir,
-                    "launch_options": {
-                        "headless": True,
-                        "args": browser_args,
-                    },
-                    "context_options": context_options,
+                    "args": browser_args,
                 },
-            )
-            page, context = await account_browser_runtime_manager.get_fresh_page(runtime_lease)
-            runtime = getattr(runtime_lease, "runtime", None)
-            browser = getattr(runtime, "browser", None) or getattr(context, "browser", None)
+                "context_options": context_options,
+            }
 
-            item_url = f"https://www.goofish.com/item?id={item_id}"
-            logger.info(f"访问商品页面: {item_url}")
+            async def _run_item_detail_fetch(**runtime_handles):
+                page = runtime_handles.get("page")
+                item_url = f"https://www.goofish.com/item?id={item_id}"
+                logger.info(f"访问商品页面: {item_url}")
 
-            await page.goto(item_url, wait_until='domcontentloaded', timeout=30000)
+                await page.goto(item_url, wait_until='domcontentloaded', timeout=30000)
+                await asyncio.sleep(2)
 
-            await asyncio.sleep(2)
-
-            detail_text = ""
-            try:
-                selectors = [
-                    '.detailDesc--descText--1FMDTCm',
-                    'span.rax-text-v2.detailDesc--descText--1FMDTCm',
-                    '[class*="detailDesc--descText"]',
-                    '[class*="descText"]',
-                    '.desc--GaIUKUQY',
-                    '.detail-desc',
-                    '.item-desc',
-                    '[class*="desc"]',
+                detail_text = ""
+                try:
+                    selectors = [
+                        '.detailDesc--descText--1FMDTCm',
+                        'span.rax-text-v2.detailDesc--descText--1FMDTCm',
+                        '[class*="detailDesc--descText"]',
+                        '[class*="descText"]',
+                        '.desc--GaIUKUQY',
+                        '.detail-desc',
+                        '.item-desc',
+                        '[class*="desc"]',
                     ]
 
-                for selector in selectors:
-                    try:
-                        await page.wait_for_selector(selector, timeout=3000)
-                        detail_element = await page.query_selector(selector)
-                        if detail_element:
-                            detail_text = await detail_element.inner_text()
-                            if detail_text and len(detail_text.strip()) > 0:
-                                logger.info(f"成功获取商品详情（选择器: {selector}）: {item_id}, 长度: {len(detail_text)}")
-                                release_reason = "item_detail_fetch_completed"
-                                return detail_text.strip()
-                    except Exception as e:
-                        logger.debug(f"选择器 {selector} 未找到: {self._safe_str(e)}")
-                        continue
+                    for selector in selectors:
+                        try:
+                            await page.wait_for_selector(selector, timeout=3000)
+                            detail_element = await page.query_selector(selector)
+                            if detail_element:
+                                detail_text = await detail_element.inner_text()
+                                if detail_text and len(detail_text.strip()) > 0:
+                                    logger.info(f"成功获取商品详情（选择器: {selector}）: {item_id}, 长度: {len(detail_text)}")
+                                    return detail_text.strip()
+                        except Exception as e:
+                            logger.debug(f"选择器 {selector} 未找到: {self._safe_str(e)}")
+                            continue
 
-                logger.warning(f"未找到特定详情元素，尝试获取整个页面内容: {item_id}")
-                body_text = await page.inner_text('body')
-                if body_text:
-                    logger.info(f"获取到页面整体内容: {item_id}, 长度: {len(body_text)}")
-                    release_reason = "item_detail_fetch_completed"
-                    return body_text.strip()
-                else:
+                    logger.warning(f"未找到特定详情元素，尝试获取整个页面内容: {item_id}")
+                    body_text = await page.inner_text('body')
+                    if body_text:
+                        logger.info(f"获取到页面整体内容: {item_id}, 长度: {len(body_text)}")
+                        return body_text.strip()
                     logger.warning(f"未找到商品详情元素: {item_id}")
+                except Exception as e:
+                    logger.warning(f"获取商品详情元素失败: {item_id}, 错误: {self._safe_str(e)}")
 
-            except Exception as e:
-                logger.warning(f"获取商品详情元素失败: {item_id}, 错误: {self._safe_str(e)}")
+                return ""
 
-            release_reason = "item_detail_fetch_completed"
-            return ""
+            return await self.with_account_browser_runtime(
+                purpose="item_detail_fetch",
+                runtime_request=runtime_request,
+                callback=_run_item_detail_fetch,
+                exclusive=False,
+                busy_timeout=20,
+            )
 
         except Exception as e:
             logger.error(f"浏览器获取商品详情异常: {item_id}, 错误: {self._safe_str(e)}")
             return ""
-        finally:
+
+    async def search_items_via_browser_runtime(
+        self,
+        *,
+        keyword: str,
+        page: int = 1,
+        page_size: int = 20,
+        total_pages: int = 1,
+    ) -> Dict[str, Any]:
+        current_account_id = self._canonical_account_id()
+        if not current_account_id:
+            raise RuntimeError("商品搜索缺少 canonical account_id，无法复用账号级浏览器 runtime")
+        if not str(self.cookies_str or "").strip():
+            raise RuntimeError(f"账号 {current_account_id} 缺少可用 Cookie，无法执行商品搜索")
+
+        from utils.item_search import XianyuSearcher
+
+        profile_dir = account_browser_runtime_manager.resolve_profile_dir(current_account_id)
+        browser_args = self._build_browser_refresh_launch_args()
+        context_options = dict(self._build_browser_refresh_context_options())
+        runtime_request = {
+            "account_id": current_account_id,
+            "purpose": "item_search",
+            "headless": True,
+            "use_persistent_context": True,
+            "profile_dir": profile_dir,
+            "launch_options": {
+                "headless": True,
+                "args": browser_args,
+            },
+            "context_options": context_options,
+        }
+
+        async def _run_search(**runtime_handles):
+            searcher = XianyuSearcher(
+                account_id=current_account_id,
+                cookie_value=self.cookies_str,
+            )
+            runtime_page = runtime_handles.get("page")
+            searcher.attach_managed_runtime(
+                lease=runtime_handles.get("lease"),
+                browser=runtime_handles.get("browser"),
+                context=runtime_handles.get("context"),
+                page=runtime_page,
+            )
             try:
-                if runtime_lease is not None or browser or context or page:
-                    await self._release_browser_recovery_runtime(
-                        runtime_lease,
-                        browser=browser,
-                        context=context,
-                        page=page,
-                        reason=release_reason,
+                if int(total_pages or 1) > 1:
+                    return await searcher.search_multiple_pages(keyword, total_pages)
+                return await searcher.search_items(keyword, page, page_size)
+            finally:
+                try:
+                    await searcher.close_browser()
+                except Exception as close_error:
+                    logger.warning(
+                        f"【{current_account_id}】商品搜索收尾释放 runtime 失败: {self._safe_str(close_error)}"
                     )
-                    logger.warning(f"浏览器资源已关闭: {item_id}")
-            except Exception as e:
-                logger.warning(f"关闭浏览器资源时出错: {self._safe_str(e)}")
+
+        return await self.with_account_browser_runtime(
+            purpose="item_search",
+            runtime_request=runtime_request,
+            callback=_run_search,
+            exclusive=False,
+            busy_timeout=15,
+        )
 
 
     async def save_items_list_to_db(self, items_list, sync_item_details=False):
@@ -9898,9 +10141,10 @@ class XianyuLive:
 
         history_fetcher = None
         try:
-            from utils.order_history_sync import ORDER_LIST_REFERER, OrderHistoryPageFetcher
+            order_history_sync_module = _get_order_history_sync_module()
+            order_list_referer = order_history_sync_module.ORDER_LIST_REFERER
 
-            history_fetcher = OrderHistoryPageFetcher(
+            history_fetcher = order_history_sync_module.OrderHistoryPageFetcher(
                 self.cookies_str,
                 account_id=current_account_id,
                 headless=True,
@@ -9939,7 +10183,7 @@ class XianyuLive:
                             await add_cookies(cookie_payload)
 
                     page, context = await account_browser_runtime_manager.get_fresh_page(runtime_lease)
-                    await page.goto(ORDER_LIST_REFERER, wait_until='domcontentloaded', timeout=30000)
+                    await page.goto(order_list_referer, wait_until='domcontentloaded', timeout=30000)
                     fetch_result = await history_fetcher.fetch_recent_orders_via_browser(
                         page,
                         context=context,
@@ -10012,7 +10256,7 @@ class XianyuLive:
             try:
                 logger.info(f"【{self.account_id}】开始获取订单详情: {order_id}, sid={sid}")
 
-                from utils.order_detail_fetcher import fetch_order_detail_simple
+                from utils.order_detail_fetcher import OrderDetailFetcher
                 from db_manager import db_manager
 
                 cookie_string = self.cookies_str
@@ -10022,12 +10266,35 @@ class XianyuLive:
                 if not headless_mode:
                     logger.info(f"【{self.account_id}】🖥️ 启用有头模式进行调试")
 
-                result = await fetch_order_detail_simple(
-                    order_id,
+                fetcher = OrderDetailFetcher(
                     cookie_string,
                     headless=headless_mode,
-                    force_refresh=force_refresh,
                     account_id=current_account_id,
+                )
+                runtime_request = {
+                    "account_id": current_account_id,
+                    "purpose": "order_detail_fetch",
+                    "headless": bool(headless_mode),
+                }
+
+                async def _run_order_detail_fetch(**runtime_handles):
+                    fetcher.attach_managed_runtime(
+                        lease=runtime_handles.get("lease"),
+                        browser=runtime_handles.get("browser"),
+                        context=runtime_handles.get("context"),
+                        page=runtime_handles.get("page"),
+                    )
+                    try:
+                        return await fetcher.fetch_order_detail(order_id, force_refresh=force_refresh)
+                    finally:
+                        await fetcher.close()
+
+                result = await self.with_account_browser_runtime(
+                    purpose="order_detail_fetch",
+                    runtime_request=runtime_request,
+                    callback=_run_order_detail_fetch,
+                    exclusive=False,
+                    busy_timeout=20,
                 )
 
                 if result:
@@ -12087,6 +12354,9 @@ class XianyuLive:
 
                     current_time = time.time()
                     if current_time - self.last_cookie_refresh_time >= self.cookie_refresh_interval:
+                        cookie_refresh_execution_task = getattr(self, "cookie_refresh_execution_task", None)
+                        if cookie_refresh_execution_task and cookie_refresh_execution_task.done():
+                            self.cookie_refresh_execution_task = None
                         time_since_last_message = current_time - self.last_message_received_time
                         if time_since_last_message < self.message_cookie_refresh_cooldown:
                             remaining_time = self.message_cookie_refresh_cooldown - time_since_last_message
@@ -12095,9 +12365,13 @@ class XianyuLive:
                             logger.warning(f"【{self.account_id}】收到消息后冷却中，还需等待 {remaining_minutes}分{remaining_seconds}秒 才能执行Cookie刷新")
                         elif self.cookie_refresh_lock.locked():
                             logger.warning(f"【{self.account_id}】Cookie刷新任务已在执行中，跳过本次触发")
+                        elif cookie_refresh_execution_task and not cookie_refresh_execution_task.done():
+                            logger.warning(f"【{self.account_id}】Cookie刷新执行任务仍在运行，跳过本次触发")
                         else:
                             logger.info(f"【{self.account_id}】开始执行Cookie刷新任务...")
-                            asyncio.create_task(self._execute_cookie_refresh(current_time))
+                            self.cookie_refresh_execution_task = self._create_tracked_task(
+                                self._execute_cookie_refresh(current_time)
+                            )
 
                     await self._interruptible_sleep(60)
                 except asyncio.CancelledError:
@@ -12127,7 +12401,11 @@ class XianyuLive:
         return True
 
     async def _execute_cookie_refresh(self, current_time):
-
+        current_refresh_task = None
+        try:
+            current_refresh_task = asyncio.current_task()
+        except RuntimeError:
+            current_refresh_task = None
         async with self.cookie_refresh_lock:
             clear_message_received_flag = False
             refresh_flow_entered = False
@@ -12226,6 +12504,9 @@ class XianyuLive:
                 else:
                     logger.warning(f"【{self.account_id}】Cookie刷新未确认恢复可用，保留消息接收标志")
 
+                if getattr(self, "cookie_refresh_execution_task", None) is current_refresh_task:
+                    self.cookie_refresh_execution_task = None
+
 
 
     def enable_cookie_refresh(self, enabled: bool = True):
@@ -12311,9 +12592,10 @@ class XianyuLive:
                         "先释放失效 handoff lease，再重新申请同账号 runtime"
                     )
                     try:
-                        await account_browser_runtime_manager.release_runtime(
+                        await self._release_account_browser_runtime_shielded(
                             runtime_lease,
                             reason="qr_cookie_refresh_invalid_handoff_lease",
+                            log_account_id=target_account_id,
                         )
                     except Exception as release_error:
                         logger.warning(
@@ -12347,6 +12629,20 @@ class XianyuLive:
                                 "改为向同账号 lease 申请 fresh page"
                             )
                             page = None
+                        else:
+                            try:
+                                page_closed = (
+                                    page.is_closed() is True
+                                    if callable(getattr(page, "is_closed", None)) else False
+                                )
+                            except Exception:
+                                page_closed = True
+                            if page_closed:
+                                logger.warning(
+                                    f"【{target_account_id}】扫码登录Cookie刷新收到已关闭的 managed_page，"
+                                    "改为向同账号 lease 申请 fresh page"
+                                )
+                                page = None
         elif context is not None:
             logger.warning(
                 f"【{target_account_id}】扫码登录Cookie刷新传入 managed_context 但缺少 managed_runtime_lease，"
@@ -12555,10 +12851,9 @@ class XianyuLive:
             logger.info(f"【{target_account_id}】Cookie字段数: {len(real_cookies_dict)}")
             logger.info(f"【{target_account_id}】Cookie字段列表:")
             for i, (key, value) in enumerate(real_cookies_dict.items(), 1):
-                if len(str(value)) > 50:
-                    logger.info(f"【{target_account_id}】  {i:2d}. {key}: {str(value)[:30]}...{str(value)[-20:]} (长度: {len(str(value))})")
-                else:
-                    logger.info(f"【{target_account_id}】  {i:2d}. {key}: {value}")
+                cookie_value = str(value or "")
+                display_value = self._mask_secret_value(cookie_value, head=4, tail=2)
+                logger.info(f"【{target_account_id}】  {i:2d}. {key}: {display_value} (长度: {len(cookie_value)})")
 
             important_keys = list(REQUIRED_SESSION_COOKIE_FIELDS) + list(OBSERVED_SESSION_COOKIE_FIELDS)
             logger.info(f"【{target_account_id}】关键字段检查:")
@@ -12576,10 +12871,7 @@ class XianyuLive:
 
             logger.info(f"【{target_account_id}】=== Cookie字段详细信息 ===")
             for i, (name, value) in enumerate(real_cookies_dict.items(), 1):
-                if len(value) > 50:
-                    display_value = f"{value[:20]}...{value[-20:]}"
-                else:
-                    display_value = value
+                display_value = self._mask_secret_value(value, head=4, tail=2)
                 logger.info(f"【{target_account_id}】{i:2d}. {name}: {display_value}")
 
             logger.info(f"【{target_account_id}】=== 扫码Cookie对比 ===")
@@ -12879,6 +13171,7 @@ class XianyuLive:
         profile_key: Optional[str] = None,
         target_account_id: Optional[str] = None,
         runtime_purpose: str = "verification_recovery",
+        busy_timeout: Optional[float] = 20.0,
     ) -> Tuple[Any, Any, Any, bool]:
         browser_args = self._build_browser_refresh_launch_args()
         context_options = dict(self._build_browser_refresh_context_options())
@@ -12903,11 +13196,31 @@ class XianyuLive:
                 return None, None, None, False
 
         resolved_account_id = canonical_account_id
+        lock_acquired = False
+        owner_lock_token = None
 
         if prefer_persistent_profile:
             if not resolved_account_id:
                 logger.error(f"【default】{recovery_label}缺少 account_id，无法申请账号级浏览器 runtime")
                 return None, None, None, False
+            owner_lock = self._get_browser_owner_lock(resolved_account_id)
+            lock_timeout = None
+            if busy_timeout is not None:
+                try:
+                    lock_timeout = max(0.1, float(busy_timeout))
+                except (TypeError, ValueError):
+                    lock_timeout = None
+            try:
+                if lock_timeout is not None:
+                    await asyncio.wait_for(owner_lock.acquire(), timeout=lock_timeout)
+                else:
+                    await owner_lock.acquire()
+                lock_acquired = True
+                owner_lock_token = capture_owner_lock_token(owner_lock)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"账号 {resolved_account_id} 当前有其他浏览器任务正在执行，请稍后再试"
+                ) from exc
             profile_dir = account_browser_runtime_manager.resolve_profile_dir(resolved_account_id)
             persistent_context_options = dict(context_options)
             persistent_context_options.setdefault('accept_downloads', True)
@@ -12923,6 +13236,25 @@ class XianyuLive:
                 },
                 "persistent_context_options": persistent_context_options,
             }
+            lease = None
+
+            async def _release_failed_recovery_runtime(reason: str) -> None:
+                nonlocal lease, lock_acquired, owner_lock_token
+                if lease is not None:
+                    release_lease = lease
+                    lease = None
+                    lock_acquired = False
+                    owner_lock_token = None
+                    await self._release_browser_recovery_runtime(
+                        release_lease,
+                        reason=reason,
+                    )
+                    return
+                if lock_acquired:
+                    release_owner_lock_if_owned(owner_lock, owner_lock_token)
+                    lock_acquired = False
+                    owner_lock_token = None
+
             try:
                 lease = await account_browser_runtime_manager.acquire_runtime(
                     resolved_account_id,
@@ -12930,12 +13262,18 @@ class XianyuLive:
                     exclusive=True,
                     runtime_request=runtime_request,
                 )
+                try:
+                    setattr(lease, "_owner_lock", owner_lock)
+                    setattr(lease, "_owner_lock_acquired", lock_acquired)
+                    setattr(lease, "_owner_lock_token", owner_lock_token)
+                except Exception:
+                    pass
                 lease_account_id = self._normalize_account_scope(
                     getattr(lease, "account_id", None)
                 )
                 if lease_account_id != resolved_account_id:
                     try:
-                        await account_browser_runtime_manager.release_runtime(
+                        await self._release_browser_recovery_runtime(
                             lease,
                             reason="recovery_context_account_mismatch",
                         )
@@ -12953,7 +13291,7 @@ class XianyuLive:
                 context = getattr(runtime, "context", None)
                 browser = getattr(context, 'browser', None) or getattr(runtime, "browser", None)
                 if context is None:
-                    await account_browser_runtime_manager.release_runtime(
+                    await self._release_browser_recovery_runtime(
                         lease,
                         reason="recovery_context_missing",
                     )
@@ -12967,7 +13305,23 @@ class XianyuLive:
                     f"（原因: {reuse_reason}）"
                 )
                 return lease, browser, context, True
+            except asyncio.CancelledError:
+                try:
+                    await _release_failed_recovery_runtime("recovery_context_cancelled")
+                except Exception as release_error:
+                    logger.warning(
+                        f"【{resolved_account_id}】{recovery_label}持久化画像取消收尾释放失败: "
+                        f"{self._safe_str(release_error)}"
+                    )
+                raise
             except Exception as persistent_launch_error:
+                try:
+                    await _release_failed_recovery_runtime("recovery_context_attach_failed")
+                except Exception as release_error:
+                    logger.warning(
+                        f"【{resolved_account_id}】{recovery_label}持久化画像异常收尾释放失败: "
+                        f"{self._safe_str(release_error)}"
+                    )
                 logger.error(
                     f"【{resolved_account_id or 'default'}】{recovery_label}持久化画像启动失败，不再降级到匿名临时上下文: "
                     f"{self._safe_str(persistent_launch_error)}"
@@ -12976,6 +13330,30 @@ class XianyuLive:
 
         logger.error(f"【{resolved_account_id or 'default'}】{recovery_label}未命中任何账号级浏览器恢复上下文策略")
         return None, None, None, False
+
+    async def _release_account_browser_runtime_shielded(
+        self,
+        lease,
+        *,
+        reason: str,
+        log_account_id: str,
+    ) -> None:
+        release_task = asyncio.create_task(
+            account_browser_runtime_manager.release_runtime(lease, reason=reason)
+        )
+        try:
+            await asyncio.shield(release_task)
+        except asyncio.CancelledError:
+            try:
+                await release_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as release_error:
+                logger.warning(
+                    f"【{log_account_id}】账号级浏览器 runtime 取消收尾释放失败，保留取消语义: "
+                    f"{self._safe_str(release_error)}"
+                )
+            raise
 
     async def _release_browser_recovery_runtime(
         self,
@@ -12998,20 +13376,29 @@ class XianyuLive:
             ).strip()
             or "default"
         )
+        owner_lock = getattr(lease, "_owner_lock", None) if lease is not None else None
+        owner_lock_acquired = bool(getattr(lease, "_owner_lock_acquired", False)) if lease is not None else False
+        owner_lock_token = getattr(lease, "_owner_lock_token", None) if lease is not None else None
         if lease is not None:
             try:
-                await account_browser_runtime_manager.release_runtime(lease, reason=reason)
+                await self._release_account_browser_runtime_shielded(
+                    lease,
+                    reason=reason,
+                    log_account_id=release_account_id,
+                )
                 if invalidate_after_release and release_account_id != "default":
-                    try:
-                        await account_browser_runtime_manager.invalidate_runtime(
-                            release_account_id,
-                            reason=f"{reason}_post_release_invalidate",
-                        )
-                    except Exception as invalidate_error:
-                        logger.warning(
-                            f"【{release_account_id}】释放账号级浏览器 runtime 后尝试立即失效缓存实例失败，"
-                            f"将回退到 runtime manager 后续空闲回收: {self._safe_str(invalidate_error)}"
-                        )
+                    invalidate_runtime = getattr(account_browser_runtime_manager, "invalidate_runtime", None)
+                    if callable(invalidate_runtime):
+                        try:
+                            await invalidate_runtime(
+                                release_account_id,
+                                reason=f"{reason}_post_release_invalidate",
+                            )
+                        except Exception as invalidate_error:
+                            logger.warning(
+                                f"【{release_account_id}】释放账号级浏览器 runtime 后尝试立即失效缓存实例失败，"
+                                f"将回退到 runtime manager 后续空闲回收: {self._safe_str(invalidate_error)}"
+                            )
                 return
             except Exception as release_error:
                 logger.warning(
@@ -13019,6 +13406,15 @@ class XianyuLive:
                     f"{self._safe_str(release_error)}"
                 )
                 return
+            finally:
+                if owner_lock_acquired and owner_lock is not None:
+                    release_owner_lock_if_owned(owner_lock, owner_lock_token)
+                if lease is not None:
+                    try:
+                        setattr(lease, "_owner_lock_acquired", False)
+                        setattr(lease, "_owner_lock_token", None)
+                    except Exception:
+                        pass
         if browser or context or page:
             await self._async_close_browser(
                 browser=browser,
@@ -13028,6 +13424,83 @@ class XianyuLive:
                 close_context=close_context,
                 close_page=close_page,
             )
+
+    async def with_account_browser_runtime(
+        self,
+        *,
+        purpose: str,
+        runtime_request: Dict[str, Any],
+        callback: Callable[..., Awaitable[Any]],
+        exclusive: bool = False,
+        busy_timeout: Optional[float] = None,
+    ) -> Any:
+        """统一通过账号级 owner 锁借用浏览器 runtime，避免同账号链路互相抢 profile。"""
+        current_account_id = self._canonical_account_id()
+        if not current_account_id:
+            raise RuntimeError("当前账号缺少 canonical account_id，无法借用账号级浏览器 runtime")
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+
+        owner_lock = self._get_browser_owner_lock(current_account_id)
+        lock_timeout = None
+        if busy_timeout is not None:
+            try:
+                lock_timeout = max(0.1, float(busy_timeout))
+            except (TypeError, ValueError):
+                lock_timeout = None
+
+        lock_acquired = False
+        owner_lock_token = None
+        if lock_timeout is not None:
+            try:
+                await asyncio.wait_for(owner_lock.acquire(), timeout=lock_timeout)
+                lock_acquired = True
+                owner_lock_token = capture_owner_lock_token(owner_lock)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(f"账号 {current_account_id} 当前有其他浏览器任务正在执行，请稍后再试") from exc
+        else:
+            await owner_lock.acquire()
+            lock_acquired = True
+            owner_lock_token = capture_owner_lock_token(owner_lock)
+
+        lease = None
+        browser = None
+        context = None
+        page = None
+        release_reason = f"{purpose}_completed"
+        try:
+            lease = await account_browser_runtime_manager.acquire_runtime(
+                current_account_id,
+                purpose,
+                exclusive=bool(exclusive),
+                runtime_request=runtime_request,
+            )
+            page, context = await account_browser_runtime_manager.get_fresh_page(lease)
+            runtime = getattr(lease, "runtime", None)
+            browser = getattr(runtime, "browser", None) or getattr(context, "browser", None)
+            return await callback(
+                lease=lease,
+                runtime=runtime,
+                browser=browser,
+                context=context,
+                page=page,
+            )
+        except BaseException:
+            release_reason = f"{purpose}_failed"
+            raise
+        finally:
+            try:
+                if lease is not None or browser or context or page:
+                    await self._release_browser_recovery_runtime(
+                        lease,
+                        browser=browser,
+                        context=context,
+                        page=page,
+                        reason=release_reason,
+                    )
+            finally:
+                if lock_acquired:
+                    release_owner_lock_if_owned(owner_lock, owner_lock_token)
 
     @staticmethod
     def _normalize_browser_cookie_items(cookie_items) -> Dict[str, str]:
@@ -13975,10 +14448,7 @@ class XianyuLive:
             for cookie_name in important_cookies:
                 if cookie_name in new_cookies_dict:
                     cookie_value = new_cookies_dict[cookie_name]
-                    if len(cookie_value) > 20:
-                        display_value = f"{cookie_value[:8]}...{cookie_value[-8:]}"
-                    else:
-                        display_value = cookie_value
+                    display_value = self._mask_secret_value(cookie_value, head=4, tail=2)
 
                     change_mark = " [已变化]" if cookie_name in changed_cookies else " [新增]" if cookie_name in new_cookies else ""
                     logger.info(f"【{log_account_id}】 {cookie_name}: {display_value}{change_mark}")
@@ -14055,18 +14525,13 @@ class XianyuLive:
                 timeout=10.0
             )
             if close_browser and browser and (context is not None or page is not None):
-                try:
-                    await asyncio.wait_for(browser.close(), timeout=5.0)
+                closed = await self._close_browser_resource_with_timeout(
+                    browser,
+                    resource_name="浏览器",
+                    timeout=5.0,
+                )
+                if closed:
                     logger.info(f"【{self.account_id}】浏览器关闭完成")
-                except asyncio.TimeoutError:
-                    logger.warning(f"【{self.account_id}】浏览器关闭超时，尝试强制关闭")
-                    try:
-                        if hasattr(browser, '_connection'):
-                            browser._connection.dispose()
-                    except Exception:
-                        pass
-                except Exception as e:
-                    logger.warning(f"【{self.account_id}】关闭浏览器时出错: {self._safe_str(e)}")
             logger.info(f"【{self.account_id}】浏览器正常关闭完成")
         except asyncio.TimeoutError:
             logger.warning(f"【{self.account_id}】正常关闭超时，开始强制关闭...")
@@ -14089,6 +14554,43 @@ class XianyuLive:
                 close_page=close_page,
             )
 
+    async def _close_browser_resource_with_timeout(self, resource, *, resource_name: str, timeout: float) -> bool:
+        close_method = getattr(resource, "close", None)
+        if not callable(close_method):
+            return False
+
+        close_result = close_method()
+
+        async def _await_close_result():
+            if hasattr(close_result, "__await__"):
+                await close_result
+
+        close_task = asyncio.create_task(_await_close_result())
+        try:
+            await asyncio.wait_for(asyncio.shield(close_task), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(f"【{self.account_id}】{resource_name}关闭超时，尝试强制关闭")
+            try:
+                if hasattr(resource, '_connection'):
+                    resource._connection.dispose()
+            except Exception:
+                pass
+            return False
+        except asyncio.CancelledError:
+            try:
+                await close_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as close_error:
+                logger.warning(
+                    f"【{self.account_id}】{resource_name}取消收尾关闭失败: {self._safe_str(close_error)}"
+                )
+            raise
+        except Exception as close_error:
+            logger.warning(f"【{self.account_id}】关闭{resource_name}时出错: {self._safe_str(close_error)}")
+            return False
+
     async def _normal_close_resources(
         self,
         browser,
@@ -14100,45 +14602,30 @@ class XianyuLive:
     ):
         try:
             if close_page and page:
-                try:
-                    await asyncio.wait_for(page.close(), timeout=5.0)
+                closed = await self._close_browser_resource_with_timeout(
+                    page,
+                    resource_name="页面",
+                    timeout=5.0,
+                )
+                if closed:
                     logger.info(f"【{self.account_id}】页面关闭完成")
-                except asyncio.TimeoutError:
-                    logger.warning(f"【{self.account_id}】页面关闭超时，尝试强制关闭")
-                    try:
-                        if hasattr(page, '_connection'):
-                            page._connection.dispose()
-                    except Exception:
-                        pass
-                except Exception as e:
-                    logger.warning(f"【{self.account_id}】关闭页面时出错: {self._safe_str(e)}")
 
             if close_context and context:
-                try:
-                    await asyncio.wait_for(context.close(), timeout=5.0)
+                closed = await self._close_browser_resource_with_timeout(
+                    context,
+                    resource_name="浏览器上下文",
+                    timeout=5.0,
+                )
+                if closed:
                     logger.info(f"【{self.account_id}】浏览器上下文关闭完成")
-                except asyncio.TimeoutError:
-                    logger.warning(f"【{self.account_id}】浏览器上下文关闭超时，尝试强制关闭")
-                    try:
-                        if hasattr(context, '_connection'):
-                            context._connection.dispose()
-                    except Exception:
-                        pass
-                except Exception as e:
-                    logger.warning(f"【{self.account_id}】关闭浏览器上下文时出错: {self._safe_str(e)}")
             elif close_browser and browser and context is None and page is None:
-                try:
-                    await asyncio.wait_for(browser.close(), timeout=5.0)
+                closed = await self._close_browser_resource_with_timeout(
+                    browser,
+                    resource_name="浏览器",
+                    timeout=5.0,
+                )
+                if closed:
                     logger.info(f"【{self.account_id}】浏览器关闭完成")
-                except asyncio.TimeoutError:
-                    logger.warning(f"【{self.account_id}】浏览器关闭超时，尝试强制关闭")
-                    try:
-                        if hasattr(browser, '_connection'):
-                            browser._connection.dispose()
-                    except Exception:
-                        pass
-                except Exception as e:
-                    logger.warning(f"【{self.account_id}】关闭浏览器时出错: {self._safe_str(e)}")
         except Exception as e:
             logger.error(f"【{self.account_id}】正常关闭时出现异常: {self._safe_str(e)}")
             raise
@@ -14168,7 +14655,11 @@ class XianyuLive:
 
             for resource_name, resource in resources:
                 try:
-                    await asyncio.wait_for(resource.close(), timeout=3.0)
+                    await self._close_browser_resource_with_timeout(
+                        resource,
+                        resource_name=resource_name,
+                        timeout=3.0,
+                    )
                 except Exception:
                     logger.warning(f"【{self.account_id}】{resource_name}强制关闭失败，尝试直接清理连接")
                     try:
@@ -16322,6 +16813,7 @@ class XianyuLive:
                         self.token_refresh_task = None
                         self.cleanup_task = None
                         self.cookie_refresh_task = None
+                        self.cookie_refresh_execution_task = None
                         self.stream_watchdog_task = None
                         logger.warning(f"【{self.account_id}】清理失败，已强制重置所有任务引用")
                         logger.info(f"【{self.account_id}】清理失败后开始等待 {retry_delay} 秒...")
@@ -16363,6 +16855,12 @@ class XianyuLive:
                 self.cookie_refresh_task and not self.cookie_refresh_task.done(),
                 self.stream_watchdog_task and not self.stream_watchdog_task.done()
             ])
+            if not has_pending_tasks:
+                current_task = asyncio.current_task()
+                has_pending_tasks = any(
+                    task is not None and task is not current_task and not task.done()
+                    for task in (getattr(self, "background_tasks", set()) or ())
+                )
 
             if has_pending_tasks:
                 logger.info(f"【{self.account_id}】检测到未完成的后台任务，执行清理...")
@@ -16380,6 +16878,7 @@ class XianyuLive:
                     self.token_refresh_task = None
                     self.cleanup_task = None
                     self.cookie_refresh_task = None
+                    self.cookie_refresh_execution_task = None
                     self.stream_watchdog_task = None
             else:
                 logger.info(f"【{self.account_id}】所有后台任务已清理完成，跳过重复清理")
@@ -16387,6 +16886,7 @@ class XianyuLive:
                 self.token_refresh_task = None
                 self.cleanup_task = None
                 self.cookie_refresh_task = None
+                self.cookie_refresh_execution_task = None
                 self.stream_watchdog_task = None
 
             if self.background_tasks:
@@ -16575,7 +17075,16 @@ class XianyuLive:
 
             if not result.get("success"):
                 logger.error(f"获取第{page_number} 页失败 {result}")
-                break
+                error_message = str(result.get("error") or "获取商品信息失败")
+                return {
+                    "success": False,
+                    "error": error_message,
+                    "failed_page": page_number,
+                    "total_pages": page_number - 1 if page_number > 1 else 0,
+                    "total_count": len(all_items),
+                    "total_saved": total_saved,
+                    "items": all_items,
+                }
 
             current_items = result.get("items", [])
             if not current_items:

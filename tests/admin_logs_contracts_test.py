@@ -111,6 +111,32 @@ class AdminLogsContractsTest(unittest.TestCase):
         self.assertEqual(filtered_logs[0]["level"], "ERROR")
         self.assertEqual(filtered_logs[0]["message"], "error-line")
 
+    def test_file_log_collector_resets_offset_when_log_file_is_truncated(self):
+        log_path = Path(self.temp_dir.name) / "realtime.log"
+        log_path.write_text("first\nsecond\n", encoding="utf-8")
+
+        collector = file_log_collector.FileLogCollector.__new__(file_log_collector.FileLogCollector)
+        collector.max_logs = 10
+        collector.logs = deque(maxlen=10)
+        collector.lock = threading.Lock()
+        collector.log_file = str(log_path)
+        collector.last_position = len("first\nsecond\n")
+
+        # 模拟日志文件被清空后重新写入，监控器应该把偏移回退到 0。
+        log_path.write_text("third\n", encoding="utf-8")
+        file_size = os.path.getsize(log_path)
+        if file_size < collector.last_position:
+            collector.last_position = 0
+        with open(log_path, "r", encoding="utf-8") as handle:
+            handle.seek(collector.last_position)
+            new_lines = handle.readlines()
+            collector.last_position = handle.tell()
+        for line in new_lines:
+            collector.parse_log_line(line.strip())
+
+        logs = collector.get_logs(lines=10)
+        self.assertEqual([entry["message"] for entry in logs], ["third"])
+
     def test_log_file_list_includes_compressed_archives_and_sorts_by_modified_time(self):
         self._create_log_file(
             "xianyu_2026-05-24.log",
@@ -158,6 +184,24 @@ class AdminLogsContractsTest(unittest.TestCase):
             f'attachment; filename="{archive.name}"',
         )
         self.assertEqual(streamed_body, archive_payload)
+
+    def test_log_file_list_surfaces_internal_failures_with_safe_message(self):
+        with mock.patch.object(reply_server.os.path, "isdir", side_effect=RuntimeError("log dir exploded")):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                reply_server.list_log_files(admin_user=self.admin_user)
+
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertEqual(raised.exception.detail, "获取日志文件列表失败，请稍后重试")
+
+    def test_log_export_surfaces_internal_failures_with_safe_message(self):
+        self._create_log_file("xianyu_2026-05-25.log", "demo-log\n", 100.0)
+
+        with mock.patch.object(reply_server.os.path, "basename", side_effect=RuntimeError("basename exploded")):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                reply_server.export_log_file("xianyu_2026-05-25.log", admin_user=self.admin_user)
+
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertEqual(raised.exception.detail, "导出日志文件失败，请稍后重试")
 
 
 if __name__ == "__main__":

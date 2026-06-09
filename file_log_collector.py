@@ -68,10 +68,9 @@ class FileLogCollector:
                 self.log_file,
                 format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {name}:{function}:{line} - {message}",
                 level="INFO",
-                rotation="10 MB",
-                retention="3 days",
                 enqueue=False,
-                buffering=1
+                buffering=1,
+                encoding="utf-8",
             )
             
             # 添加按日期轮转的日志文件输出到logs目录
@@ -99,6 +98,9 @@ class FileLogCollector:
                 if os.path.exists(self.log_file):
                     # 获取文件大小
                     file_size = os.path.getsize(self.log_file)
+
+                    if file_size < self.last_position:
+                        self.last_position = 0
                     
                     if file_size > self.last_position:
                         # 读取新增内容
@@ -147,6 +149,18 @@ class FileLogCollector:
                     "message": message
                 }
                 
+                with self.lock:
+                    self.logs.append(log_entry)
+            else:
+                log_entry = {
+                    "timestamp": datetime.now().isoformat(),
+                    "level": "INFO",
+                    "source": "system",
+                    "function": "unknown",
+                    "line": 0,
+                    "message": line
+                }
+
                 with self.lock:
                     self.logs.append(log_entry)
             

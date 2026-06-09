@@ -182,7 +182,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         )
         self.assertLess(
             load_body.index("if (!response.ok) {"),
-            load_body.index("const data = await response.json();"),
+            load_body.index("const data = await response.json().catch(() => ({}));"),
             "系统日志应先检查 HTTP 状态，再解析响应体",
         )
 
@@ -226,7 +226,11 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", load_body)
         self.assertIn("throw new Error(errorMessage);", load_body)
         self.assertIn("showToast(`加载日志失败: ${error.message || '请稍后重试'}`, 'danger');", load_body)
-        self.assertIn("if (!data || typeof data !== 'object' || (data.logs != null && !Array.isArray(data.logs))) {", load_body)
+        self.assertIn("if (!data || typeof data !== 'object' || Array.isArray(data) || (data.logs != null && !Array.isArray(data.logs))) {", load_body)
+        self.assertIn("(data.success != null && typeof data.success !== 'boolean')", load_body)
+        self.assertIn("(data.log_file != null && typeof data.log_file !== 'string')", load_body)
+        self.assertIn("(data.total_lines != null && (!Number.isInteger(data.total_lines) || data.total_lines < 0))", load_body)
+        self.assertIn("(Array.isArray(data.logs) && data.logs.some(log => typeof log !== 'string'))", load_body)
         self.assertIn("throw new Error('日志数据返回格式异常');", load_body)
 
         error_index = load_body.index("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);")
@@ -348,8 +352,8 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             (slider_body, "if (requestId !== currentRiskSliderStatsRequestId) {", "滑块统计 401 时应直接跳登录，别继续走旧请求状态分支"),
             (page_body, "if (!response.ok) {", "风控日志分页 401 时应直接跳登录，别继续伪造错误结果"),
             (filter_body, "if (response.ok) {", "风控日志账号筛选器 401 时应直接跳登录，别继续装成普通加载失败"),
-            (delete_body, "const data = await response.json();", "删除风控日志 401 时应直接跳登录，别继续把未授权响应当业务 JSON 解析"),
-            (clear_body, "const data = await response.json();", "清空风控日志 401 时应直接跳登录，别继续把未授权响应当业务 JSON 解析"),
+            (delete_body, "const data = await response.json().catch(() => ({}));", "删除风控日志 401 时应直接跳登录，别继续把未授权响应当业务 JSON 解析"),
+            (clear_body, "const data = await response.json().catch(() => ({}));", "清空风控日志 401 时应直接跳登录，别继续把未授权响应当业务 JSON 解析"),
         ):
             with self.subTest(anchor_fragment=anchor_fragment):
                 self.assertIn("if (handleUnauthorizedApiResponse(response)) {", body)
@@ -400,7 +404,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         )
 
         render_index = body.index("list.appendChild(item);")
-        response_json_index = body.index("const data = await response.json();")
+        response_json_index = body.index("const data = await response.json().catch(() => ({}));")
         self.assertGreater(
             body.rfind("modalRequestSequence !== logFileModalRequestSequence", 0, render_index),
             response_json_index,
@@ -430,12 +434,19 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
 
         self.assertIn("if (!data || typeof data !== 'object' || Array.isArray(data)) {", body)
         self.assertIn("throw new Error('日志文件列表返回格式异常');", body)
-        self.assertIn("if (data.success === true && data.files != null && !Array.isArray(data.files)) {", body)
-        self.assertIn("const files = Array.isArray(data.files) ? data.files : [];", body)
+        self.assertIn("typeof data.success !== 'boolean'", body)
+        self.assertIn("(data.message != null && typeof data.message !== 'string')", body)
+        self.assertIn("(data.success === true && !Array.isArray(data.files))", body)
+        self.assertIn("const files = data.files;", body)
+        self.assertIn("if (files.some(file =>", body)
+        self.assertIn("typeof file.name !== 'string'", body)
+        self.assertIn("const normalizedFileName = file.name.trim();", body)
+        self.assertIn("downloadBtn.onclick = () => downloadLogFile(normalizedFileName, downloadBtn);", body)
         self.assertIn("error.textContent = `加载日志文件失败: ${err.message || '请稍后重试'}`;", body)
 
         format_guard_index = body.index("if (!data || typeof data !== 'object' || Array.isArray(data)) {")
-        files_guard_index = body.index("if (data.success === true && data.files != null && !Array.isArray(data.files)) {")
+        files_guard_index = body.index("(data.success === true && !Array.isArray(data.files))")
+        file_entry_guard_index = body.index("if (files.some(file =>")
         render_index = body.index("files.forEach(file => {")
         catch_error_index = body.index("error.textContent = `加载日志文件失败: ${err.message || '请稍后重试'}`;")
 
@@ -445,9 +456,19 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "日志文件列表接口成功态如果回了歪 payload，先拦住再说，别一头扎进渲染逻辑里自爆",
         )
         self.assertLess(
+            body.index("typeof data.success !== 'boolean'"),
+            render_index,
+            "日志文件列表 success 标记都歪了就得先判格式异常，别继续拿 truthy/falsy 硬分成功失败",
+        )
+        self.assertLess(
             files_guard_index,
             render_index,
             "日志文件列表的 files 不是数组时得直接判格式异常，别等 forEach 当场翻车",
+        )
+        self.assertLess(
+            file_entry_guard_index,
+            render_index,
+            "日志文件列表里每个文件对象的关键字段也得先验，再渲染下载按钮和元信息，别拿脏数据直接上 DOM",
         )
         self.assertLess(
             body.index("throw new Error('日志文件列表返回格式异常');"),
@@ -470,7 +491,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("requestSequence !== systemLogRequestSequence", body)
         self.assertIn("return;", body)
         self.assertLess(
-            body.index("const data = await response.json();"),
+            body.index("const data = await response.json().catch(() => ({}));"),
             body.index("loadingDiv.style.display = 'none';"),
             "系统日志必须先拿到响应体，再判断这次请求是不是已经过期",
         )
@@ -549,15 +570,15 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("setRiskControlSliderStatsError(scopeLabel, message || '滑块验证统计加载失败，请稍后重试');", load_body)
         self.assertIn("if (!data.success) {", load_body)
         self.assertIn("setRiskControlSliderStatsError(scopeLabel, data.message || data.detail || '滑块验证统计加载失败，请稍后重试');", load_body)
-        self.assertIn("renderRiskControlSliderStats(data.data || {});", load_body)
+        self.assertIn("renderRiskControlSliderStats(data.data);", load_body)
         self.assertLess(
             load_body.index("if (!response.ok) {"),
-            load_body.index("renderRiskControlSliderStats(data.data || {});"),
+            load_body.index("renderRiskControlSliderStats(data.data);"),
             "风控滑块统计应先把失败分支踢出去，别把接口异常伪装成空数据",
         )
         self.assertLess(
             load_body.index("if (!data.success) {"),
-            load_body.index("renderRiskControlSliderStats(data.data || {});"),
+            load_body.index("renderRiskControlSliderStats(data.data);"),
             "风控滑块统计业务失败也得先踢出去，别拿异常响应当空数据刷 UI",
         )
 
@@ -665,21 +686,46 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
 
     def test_risk_control_slider_stats_rejects_malformed_success_payload_before_rendering(self):
         body = _extract_function_body(self.app_js, "loadRiskControlSliderStats")
+        helper_body = _extract_function_body(self.app_js, "hasMalformedRiskControlSliderStatsData")
+
+        self.assertIn("function hasMalformedRiskControlSliderStatsData(stats) {", self.app_js)
+        self.assertIn("'total_sessions'", helper_body)
+        self.assertIn("'total_attempts'", helper_body)
+        self.assertIn("'success_count'", helper_body)
+        self.assertIn("'failure_count'", helper_body)
+        self.assertIn("'processing_count'", helper_body)
+        self.assertIn("'completed_sessions'", helper_body)
+        self.assertIn("'accounts_with_sessions'", helper_body)
+        self.assertIn("'accounts_with_failures'", helper_body)
+        self.assertIn("!Number.isFinite(Number(stats.success_rate))", helper_body)
+        self.assertIn("Number(stats.success_rate) > 100", helper_body)
+        self.assertIn("stats.recent_success != null && typeof stats.recent_success !== 'string'", helper_body)
+        self.assertIn("stats.recent_failure != null && typeof stats.recent_failure !== 'string'", helper_body)
+        self.assertIn("stats.summary_text != null && typeof stats.summary_text !== 'string'", helper_body)
+        self.assertIn("stats.scope_label != null && typeof stats.scope_label !== 'string'", helper_body)
 
         self.assertIn("if (!data || typeof data !== 'object' || Array.isArray(data)) {", body)
         self.assertIn("throw new Error('滑块验证统计返回格式异常');", body)
-        self.assertIn("if (data.success === true && (!data.data || typeof data.data !== 'object' || Array.isArray(data.data))) {", body)
+        self.assertIn("typeof data.success !== 'boolean'", body)
+        self.assertIn("(data.message != null && typeof data.message !== 'string')", body)
+        self.assertIn("(data.detail != null && typeof data.detail !== 'string')", body)
+        self.assertIn("if (data.success === true && hasMalformedRiskControlSliderStatsData(data.data)) {", body)
         self.assertIn("setRiskControlSliderStatsError(scopeLabel, error.message || '滑块验证统计加载失败，请稍后重试');", body)
 
         object_guard_index = body.index("if (!data || typeof data !== 'object' || Array.isArray(data)) {")
-        payload_guard_index = body.index("if (data.success === true && (!data.data || typeof data.data !== 'object' || Array.isArray(data.data))) {")
-        render_index = body.index("renderRiskControlSliderStats(data.data || {});")
+        payload_guard_index = body.index("if (data.success === true && hasMalformedRiskControlSliderStatsData(data.data)) {")
+        render_index = body.index("renderRiskControlSliderStats(data.data);")
         catch_error_state_index = body.index("setRiskControlSliderStatsError(scopeLabel, error.message || '滑块验证统计加载失败，请稍后重试');")
 
         self.assertLess(
             object_guard_index,
             render_index,
             "风控滑块统计如果连最外层 JSON 都歪了，得先拦住，别还把垃圾 payload 当空数据往卡片里灌",
+        )
+        self.assertLess(
+            body.index("typeof data.success !== 'boolean'"),
+            render_index,
+            "风控滑块统计 success 标记都歪了就该先判格式异常，别继续拿 truthy/falsy 冒充正常业务返回",
         )
         self.assertLess(
             payload_guard_index,
@@ -721,6 +767,40 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("showToast(`加载风控日志失败: ${error.message || '请稍后重试'}`, 'danger');", load_body)
         self.assertNotIn("noLogsDiv.style.display = 'block';", load_body)
 
+    def test_risk_control_logs_reject_malformed_success_payloads_before_rendering(self):
+        load_body = _extract_function_body(self.app_js, "loadRiskControlLogs")
+        display_body = _extract_function_body(self.app_js, "displayRiskControlLogs")
+
+        self.assertIn("function hasMalformedRiskControlLogEntries(logs) {", self.app_js)
+        self.assertIn("if (!log || typeof log !== 'object' || Array.isArray(log)) {", self.app_js)
+        self.assertIn("if (log.account_id != null && typeof log.account_id !== 'string') {", self.app_js)
+        self.assertIn("if (log.processing_status != null && typeof log.processing_status !== 'string') {", self.app_js)
+        self.assertIn("if (log.result_code != null && typeof log.result_code !== 'string') {", self.app_js)
+        self.assertIn("if (log.duration_ms != null && (typeof log.duration_ms !== 'number' || !Number.isFinite(log.duration_ms) || log.duration_ms < 0)) {", self.app_js)
+
+        self.assertIn("throw new Error('风控日志返回格式异常');", load_body)
+        self.assertIn("Array.isArray(data)", load_body)
+        self.assertIn("(data.success === true && !Array.isArray(data.data))", load_body)
+        self.assertIn("(data.success === true && !Number.isInteger(data.total))", load_body)
+        self.assertIn("(data.limit != null && !Number.isInteger(data.limit))", load_body)
+        self.assertIn("(data.offset != null && !Number.isInteger(data.offset))", load_body)
+        self.assertIn("if (data.success === true && hasMalformedRiskControlLogEntries(data.data)) {", load_body)
+        self.assertIn("if (!Array.isArray(logs) || hasMalformedRiskControlLogEntries(logs)) {", display_body)
+
+        payload_guard_index = load_body.index("!data")
+        malformed_entry_guard_index = load_body.index("if (data.success === true && hasMalformedRiskControlLogEntries(data.data)) {")
+        render_index = load_body.index("displayRiskControlLogs(data.data);")
+        self.assertLess(
+            payload_guard_index,
+            render_index,
+            "风控日志成功态最外层 payload 都没验明白，就别继续往表格渲染里灌了",
+        )
+        self.assertLess(
+            malformed_entry_guard_index,
+            render_index,
+            "风控日志数组里混进坏 log 时得先拦住，别让脏字段一路流到 summary/outcome/session 渲染里",
+        )
+
     def test_risk_control_logs_catch_toast_surfaces_runtime_errors(self):
         body = _extract_function_body(self.app_js, "loadRiskControlLogs")
 
@@ -748,10 +828,17 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
 
         self.assertIn("const message = await readResponseErrorMessage(response, `HTTP ${response.status}`);", page_body)
         self.assertIn("message: message || `HTTP ${response.status}`,", page_body)
+        self.assertIn("const data = await response.json().catch(() => ({}));", page_body)
+        self.assertIn("throw new Error('风控日志返回格式异常');", page_body)
         self.assertLess(
             page_body.index("const message = await readResponseErrorMessage(response, `HTTP ${response.status}`);"),
-            page_body.index("return response.json();"),
+            page_body.index("const data = await response.json().catch(() => ({}));"),
             "风控日志分页 HTTP 失败时得先把 detail/message 解出来，别糊个通用错误完事",
+        )
+        self.assertLess(
+            page_body.index("const data = await response.json().catch(() => ({}));"),
+            page_body.index("return data;"),
+            "风控日志分页成功态也得先把 JSON 兜底成对象再返回，别半截响应直接炸到调用方脸上",
         )
 
         for body, toast_fragment, message in (
@@ -877,10 +964,17 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
 
         self.assertIn("if (!data || typeof data !== 'object' || Array.isArray(data)) {", body)
         self.assertIn("throw new Error('账号选项返回格式异常');", body)
+        self.assertIn("typeof data.success !== 'boolean'", body)
+        self.assertIn("(data.message != null && typeof data.message !== 'string')", body)
+        self.assertIn("(data.detail != null && typeof data.detail !== 'string')", body)
         self.assertIn("if (data.success === true && !Array.isArray(data.accounts)) {", body)
+        self.assertIn("if (data.success === true && data.accounts.some(account =>", body)
+        self.assertIn("typeof account.account_id !== 'string'", body)
+        self.assertIn("const normalizedAccountId = account.account_id.trim();", body)
 
         object_guard_index = body.index("if (!data || typeof data !== 'object' || Array.isArray(data)) {")
         accounts_guard_index = body.index("if (data.success === true && !Array.isArray(data.accounts)) {")
+        account_entry_guard_index = body.index("if (data.success === true && data.accounts.some(account =>")
         render_index = body.index("data.accounts.forEach(account => {")
 
         self.assertLess(
@@ -892,6 +986,11 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             accounts_guard_index,
             render_index,
             "风控日志账号筛选器的 accounts 不是数组时别硬上 forEach，不然这玩意儿当场就炸",
+        )
+        self.assertLess(
+            account_entry_guard_index,
+            render_index,
+            "风控日志账号筛选器数组里如果混进坏账号对象，也得先拦住，别拿空 account_id 或脏字段继续渲染选项",
         )
 
     def test_risk_control_logs_account_filter_sets_explicit_failure_option_when_reload_fails_without_selection(self):
@@ -927,8 +1026,11 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
 
         self.assertIn("return true;", load_body)
         self.assertIn("return false;", load_body)
+        self.assertIn("function hasMalformedRiskControlLogMutationResult(result) {", self.app_js)
 
         self.assertIn("const loaded = await loadRiskControlLogs(currentRiskLogOffset);", delete_body)
+        self.assertIn("if (hasMalformedRiskControlLogMutationResult(data)) {", delete_body)
+        self.assertIn("throw new Error('风控日志删除结果返回格式异常');", delete_body)
         self.assertIn("if (loaded) {", delete_body)
         self.assertIn("showToast('删除成功', 'success');", delete_body)
         self.assertIn("showToast('删除成功，但风控日志列表刷新失败，请稍后手动刷新', 'warning');", delete_body)
@@ -937,8 +1039,15 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             delete_body.index("showToast('删除成功', 'success');"),
             "删除风控日志应先确认列表刷新成功，再提示 success",
         )
+        self.assertLess(
+            delete_body.index("if (hasMalformedRiskControlLogMutationResult(data)) {"),
+            delete_body.index("const loaded = await loadRiskControlLogs(currentRiskLogOffset);"),
+            "风控日志删除结果 payload 歪了得先拦住，别继续刷新列表制造假成功",
+        )
 
         self.assertIn("const loaded = await loadRiskControlLogs(0);", clear_body)
+        self.assertIn("if (hasMalformedDataManagementMutationResult(data)) {", clear_body)
+        self.assertIn("throw new Error('风控日志清空结果返回格式异常');", clear_body)
         self.assertIn("if (loaded) {", clear_body)
         self.assertIn("showToast('风控日志已清空', 'success');", clear_body)
         self.assertIn("showToast('风控日志已清空，但风控日志列表刷新失败，请稍后手动刷新', 'warning');", clear_body)
@@ -947,6 +1056,13 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             clear_body.index("showToast('风控日志已清空', 'success');"),
             "清空风控日志应先确认列表刷新成功，再提示 success",
         )
+        self.assertLess(
+            clear_body.index("if (hasMalformedDataManagementMutationResult(data)) {"),
+            clear_body.index("const loaded = await loadRiskControlLogs(0);"),
+            "风控日志清空结果 payload 歪了得先拦住，别继续刷新列表制造假成功",
+        )
+        self.assertIn("if (data && typeof data === 'object' && data.success === true) {", clear_body)
+        self.assertNotIn("if (data.success !== false) {", clear_body)
 
     def test_risk_control_log_mutations_do_not_emit_cross_page_toasts_after_leaving_section(self):
         delete_body = _extract_function_body(self.app_js, "deleteRiskControlLog")
@@ -1208,7 +1324,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
     def test_online_im_account_list_preserves_current_selection_when_still_available(self):
         body = _extract_function_body(self.app_js, "loadImAccountList")
         self.assertIn("const previousValue = select ? select.value : '';", body)
-        self.assertIn("imAccountsData = (data || [])", body)
+        self.assertIn("imAccountsData = data", body)
         self.assertIn("account_id: String(accountId || '').trim(),", body)
         self.assertIn("if (!accountId) {", body)
         self.assertIn("return;", body)
@@ -1963,7 +2079,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("return null;", body)
         self.assertLess(
             body.index("requestSequence !== itemSearchRequestSequence"),
-            body.index("searchResultsData = data.data || [];"),
+            body.index("searchResultsData = data.data;"),
             "旧的商品搜索响应不该晚回来后把当前搜索结果覆盖掉",
         )
         self.assertLess(
@@ -1983,6 +2099,60 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             body.rfind("!document.getElementById('item-search-section')?.classList.contains('active')", session_checker_index, body.index("showToast('🎨 检测到滑块验证，请完成验证', 'warning');")),
             body.index("showToast('🎨 检测到滑块验证，请完成验证', 'warning');"),
             "都切出商品搜索页了，旧会话检查器就别再跨页弹滑块提示了",
+        )
+
+    def test_item_search_aborts_inflight_browser_runtime_requests_when_leaving_page(self):
+        self.assertIn("let itemSearchAbortController = null;", self.app_js)
+        self.assertIn("function stopItemSearchRequests() {", self.app_js)
+        self.assertIn("function resetItemSearchAbortController() {", self.app_js)
+        self.assertIn(
+            "window.addEventListener('pagehide', stopItemSearchRequests);",
+            self.app_js,
+        )
+
+        show_section_body = _extract_function_body(self.app_js, "showSection")
+        stop_body = _extract_function_body(self.app_js, "stopItemSearchRequests")
+        handle_body = _extract_function_body(self.app_js, "handleItemSearch")
+
+        self.assertIn("stopItemSearchRequests();", show_section_body)
+        self.assertLess(
+            show_section_body.index("stopItemSearchRequests();"),
+            show_section_body.index("stopCaptchaSessionMonitor();"),
+            "切出商品搜索页时先 abort 主搜索请求，再收验证码监控；别让后端浏览器任务继续后台烤地瓜",
+        )
+        self.assertIn("itemSearchAbortController.abort();", stop_body)
+        self.assertIn("itemSearchAbortController = null;", stop_body)
+        self.assertIn("const controller = resetItemSearchAbortController();", handle_body)
+        self.assertIn("signal: controller.signal", handle_body)
+        self.assertIn("if (controller.signal.aborted || error?.name === 'AbortError') {", handle_body)
+        self.assertIn("if (itemSearchAbortController === controller) {", handle_body)
+        self.assertIn("itemSearchAbortController = null;", handle_body)
+        self.assertIn("fetchPromise.finally(() => {", handle_body)
+        self.assertIn("}).catch(() => {});", handle_body)
+
+        first_search_index = handle_body.index("const fetchPromise = fetch('/items/search_multiple', {")
+        first_signal_index = handle_body.index("signal: controller.signal", first_search_index)
+        first_body_index = handle_body.index("body: JSON.stringify({", first_search_index)
+        retry_search_index = handle_body.index("const retryResponse = await fetch('/items/search_multiple', {")
+        retry_signal_index = handle_body.index("signal: controller.signal", retry_search_index)
+        retry_body_index = handle_body.index("body: JSON.stringify({", retry_search_index)
+        abort_guard_index = handle_body.index("if (controller.signal.aborted || error?.name === 'AbortError') {")
+        error_toast_index = handle_body.index("showToast(`搜索商品失败: ${error.message || '请稍后重试'}`, 'danger');")
+
+        self.assertLess(
+            first_signal_index,
+            first_body_index,
+            "商品搜索主请求必须挂 AbortController.signal，切页/关 tab 后别让 /items/search_multiple 继续拉浏览器 runtime",
+        )
+        self.assertLess(
+            retry_signal_index,
+            retry_body_index,
+            "验证码后的重试搜索也必须挂同一个 AbortController.signal，不然第一锅关了第二锅还在后台炖",
+        )
+        self.assertLess(
+            abort_guard_index,
+            error_toast_index,
+            "商品搜索被主动 abort 时应该静默退出，别用户切页了还甩一个失败 toast 回来吓人",
         )
 
     def test_item_search_session_checker_ignores_sessions_that_already_existed_before_current_search(self):
@@ -2026,8 +2196,32 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         session_checker_index = body.index("sessionChecker = setInterval(async () => {")
         self.assertLess(
             body.index("if (handleUnauthorizedApiResponse(checkResponse)) {", session_checker_index),
-            body.index("const checkData = await checkResponse.json();", session_checker_index),
+            body.index("const checkData = await checkResponse.json().catch(() => ({}));", session_checker_index),
             "轮询验证码会话时也得先处理 401，别上来就 json() 把后端真实响应吞了",
+        )
+
+    def test_item_search_captcha_session_fetches_reject_malformed_payloads_before_using_session_lists(self):
+        body = _extract_function_body(self.app_js, "handleItemSearch")
+
+        self.assertIn("function hasMalformedCaptchaSessionListEntries(sessions) {", self.app_js)
+        self.assertIn("function hasMalformedCaptchaSessionListResult(result) {", self.app_js)
+        self.assertIn("const initialCaptchaSessionsData = await initialCaptchaSessionsResponse.json().catch(() => ({}));", body)
+        self.assertIn("if (hasMalformedCaptchaSessionListResult(initialCaptchaSessionsData)) {", body)
+        self.assertIn("throw new Error('验证码会话列表返回格式异常');", body)
+        self.assertLess(
+            body.index("if (hasMalformedCaptchaSessionListResult(initialCaptchaSessionsData)) {"),
+            body.index("const initialCaptchaSessions = initialCaptchaSessionsData.sessions;"),
+            "验证码会话预取接口如果回了歪 payload，得先拦住，别拿坏 sessions 去污染本轮搜索的会话基线",
+        )
+
+        session_checker_index = body.index("sessionChecker = setInterval(async () => {")
+        check_data_index = body.index("const checkData = await checkResponse.json().catch(() => ({}));", session_checker_index)
+        check_guard_index = body.index("if (hasMalformedCaptchaSessionListResult(checkData)) {", check_data_index)
+        check_loop_index = body.index("if (checkData.sessions.length > 0) {", check_guard_index)
+        self.assertLess(
+            check_guard_index,
+            check_loop_index,
+            "验证码会话轮询如果回了歪 payload，也得先挡住，别让坏 sessions 继续驱动滑块弹窗逻辑",
         )
 
     def test_switching_away_from_item_search_stops_captcha_monitor_and_closes_modal(self):
@@ -2063,6 +2257,43 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             show_modal_body.index("modal.show();"),
             "轮到当前滑块会话真正展示前，得先把它从排队队列里摘掉，别后面又被自己重复弹一次",
         )
+        self.assertIn("const data = await response.json().catch(() => ({}));", monitor_body)
+        self.assertIn("if (hasMalformedCaptchaSessionListResult(data)) {", monitor_body)
+        self.assertIn("throw new Error('验证码会话列表返回格式异常');", monitor_body)
+        self.assertLess(
+            monitor_body.index("if (hasMalformedCaptchaSessionListResult(data)) {"),
+            monitor_body.index("if (data.sessions && data.sessions.length > 0) {"),
+            "全局滑块会话监控收到歪 payload 时得先挡住，别拿坏 sessions 继续驱动弹窗逻辑",
+        )
+
+    def test_captcha_monitor_only_runs_while_item_search_section_is_active(self):
+        monitor_body = _extract_function_body(self.app_js, "startCaptchaSessionMonitor")
+        dom_ready_body = _extract_brace_block_after(
+            self.app_js,
+            "document.addEventListener('DOMContentLoaded', async () =>",
+        )
+
+        self.assertIn("function isItemSearchSectionActive() {", self.app_js)
+        self.assertNotIn("startCaptchaSessionMonitor();", dom_ready_body)
+        self.assertIn("if (!isItemSearchSectionActive()) {", monitor_body)
+        self.assertIn("return null;", monitor_body)
+        self.assertIn("stopCaptchaSessionMonitor();", monitor_body)
+        self.assertLess(
+            monitor_body.index("if (!isItemSearchSectionActive()) {"),
+            monitor_body.index("captchaSessionMonitor = setInterval(async () => {"),
+            "商品搜索滑块监控别在后台页启动，登录后就全局轮询弹窗，这不纯纯吓人么",
+        )
+        interval_index = monitor_body.index("captchaSessionMonitor = setInterval(async () => {")
+        self.assertLess(
+            monitor_body.index("if (!isItemSearchSectionActive()) {", interval_index),
+            monitor_body.index("const response = await fetch('/api/captcha/sessions');", interval_index),
+            "监控 interval 每轮先确认还在商品搜索页，再请求会话；都切页了还轮询个锤子",
+        )
+        self.assertLess(
+            monitor_body.rfind("isItemSearchSectionActive()", interval_index, monitor_body.index("showCaptchaVerificationModal(session.session_id);")),
+            monitor_body.index("showCaptchaVerificationModal(session.session_id);"),
+            "弹滑块窗口前必须再次确认商品搜索页仍 active，别跨页跳脸",
+        )
 
     def test_check_captcha_completion_distinguishes_completed_timeout_and_user_cancel_hides(self):
         check_body = _extract_function_body(self.app_js, "checkCaptchaCompletion")
@@ -2080,6 +2311,23 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("reject(new Error('验证已取消'));", check_body)
         self.assertIn("modalElement.removeEventListener('hidden.bs.modal', handleHidden);", check_body)
         self.assertIn("if (data.completed || (data.session_exists === false && data.success)) {", check_body)
+        self.assertIn("function hasMalformedCaptchaCompletionStatusResult(result) {", self.app_js)
+        self.assertIn("const data = await response.json().catch(() => ({}));", check_body)
+        self.assertIn("if (hasMalformedCaptchaCompletionStatusResult(data)) {", check_body)
+        self.assertIn("throw new Error('验证码状态返回格式异常');", check_body)
+        self.assertIn("const data = await response.json().catch(() => ({}));", auto_monitor_body)
+        self.assertIn("if (hasMalformedCaptchaCompletionStatusResult(data)) {", auto_monitor_body)
+        self.assertIn("throw new Error('验证码状态返回格式异常');", auto_monitor_body)
+        self.assertLess(
+            check_body.index("if (hasMalformedCaptchaCompletionStatusResult(data)) {"),
+            check_body.index("if (data.completed || (data.session_exists === false && data.success)) {"),
+            "Promise 模式滑块轮询如果回了歪状态，先按契约错误拦住，别继续拿脏字段判完成",
+        )
+        self.assertLess(
+            auto_monitor_body.index("if (hasMalformedCaptchaCompletionStatusResult(data)) {"),
+            auto_monitor_body.index("if (data.completed || (data.session_exists === false && data.success)) {"),
+            "自动滑块轮询如果回了歪状态，先拦住再说，别把坏 payload 当完成信号",
+        )
         self.assertLess(
             check_body.index("if (modalElement?.dataset.captchaSessionId !== sessionId || settled) {"),
             check_body.index("reject(new Error('验证已取消'));"),
@@ -2114,6 +2362,68 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "自动监控确认验证成功时，得先标记 completed 再关弹窗，不然 Promise 收到的只有一嘴取消",
         )
 
+    def test_auto_captcha_completion_monitor_does_not_emit_cross_page_toasts(self):
+        auto_monitor_body = _extract_function_body(self.app_js, "startCheckCaptchaCompletion")
+
+        self.assertIn("if (!isItemSearchSectionActive()) {", auto_monitor_body)
+        self.assertIn("return null;", auto_monitor_body)
+        interval_index = auto_monitor_body.index("checkInterval = setInterval(async () => {")
+        self.assertLess(
+            auto_monitor_body.index("if (!isItemSearchSectionActive()) {", interval_index),
+            auto_monitor_body.index("const response = await fetch(`/api/captcha/status/${sessionId}`);", interval_index),
+            "自动滑块完成轮询每轮先确认还在商品搜索页，别切页了还继续查状态",
+        )
+
+        success_toast = "showToast('✅ 滑块验证成功！', 'success');"
+        timeout_toast = "showToast('❌ 验证超时，请重试', 'danger');"
+        self.assertLess(
+            auto_monitor_body.rfind("if (!isItemSearchSectionActive()) {", 0, auto_monitor_body.index(success_toast)),
+            auto_monitor_body.index(success_toast),
+            "验证成功 toast 前必须确认还在商品搜索页，别切到别的页面了还弹喜报",
+        )
+        self.assertLess(
+            auto_monitor_body.rfind("if (!isItemSearchSectionActive()) {", 0, auto_monitor_body.index(timeout_toast)),
+            auto_monitor_body.index(timeout_toast),
+            "验证超时 toast 前必须确认还在商品搜索页，别跨页报丧",
+        )
+
+    def test_captcha_modal_close_and_pagehide_release_remote_session_and_iframe(self):
+        self.assertIn("function closeRemoteCaptchaSession(sessionId, options = {}) {", self.app_js)
+        self.assertIn("function clearCaptchaVerificationIframe() {", self.app_js)
+        self.assertIn("function stopActiveCaptchaVerificationSessionOnPageHide() {", self.app_js)
+        self.assertIn(
+            "window.addEventListener('pagehide', stopActiveCaptchaVerificationSessionOnPageHide);",
+            self.app_js,
+        )
+
+        close_body = _extract_function_body(self.app_js, "closeRemoteCaptchaSession")
+        clear_iframe_body = _extract_function_body(self.app_js, "clearCaptchaVerificationIframe")
+        pagehide_body = _extract_function_body(self.app_js, "stopActiveCaptchaVerificationSessionOnPageHide")
+        show_modal_body = _extract_function_body(self.app_js, "showCaptchaVerificationModal")
+
+        self.assertIn("fetch(`/api/captcha/session/${encodeURIComponent(normalizedSessionId)}`", close_body)
+        self.assertIn("method: 'DELETE'", close_body)
+        self.assertIn("keepalive: Boolean(options.keepalive)", close_body)
+        self.assertIn("iframe.src = 'about:blank';", clear_iframe_body)
+        self.assertIn("const closeReason = modalElement.dataset.captchaCloseReason || '';", show_modal_body)
+        self.assertIn("if (closeReason !== 'completed') {", show_modal_body)
+        self.assertIn("closeRemoteCaptchaSession(sessionId);", show_modal_body)
+        self.assertIn("clearCaptchaVerificationIframe();", show_modal_body)
+        self.assertIn("closeReason !== 'completed'", pagehide_body)
+        self.assertIn("closeRemoteCaptchaSession(sessionId, { keepalive: true });", pagehide_body)
+        self.assertIn("stopCaptchaSessionMonitor();", pagehide_body)
+        self.assertIn("clearCaptchaVerificationIframe();", pagehide_body)
+        self.assertLess(
+            show_modal_body.index("if (closeReason !== 'completed') {"),
+            show_modal_body.index("closeRemoteCaptchaSession(sessionId);"),
+            "滑块验证已完成时不能前端抢先 DELETE 后端会话，不然后台等待循环可能把成功态看成取消，属于修锅又造锅",
+        )
+        self.assertLess(
+            show_modal_body.index("closeRemoteCaptchaSession(sessionId);"),
+            show_modal_body.index("showNextQueuedCaptchaSession();"),
+            "滑块弹窗取消关闭时得先通知后端释放远控会话，再考虑排队弹下一个；不然后端 page 引用继续挂着，纯纯后台炖锅",
+        )
+
     def test_item_search_treats_account_precheck_http_failures_as_real_failures(self):
         body = _extract_function_body(self.app_js, "handleItemSearch")
 
@@ -2140,6 +2450,27 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             body.index("if (!accountsCheckResponse.ok) {"),
             body.index("const token = localStorage.getItem('auth_token');"),
             "账号预检查接口都 HTTP 挂了，就别继续往下发商品搜索请求装正常",
+        )
+
+    def test_item_search_precheck_rejects_malformed_success_payload_before_branching_on_account_availability(self):
+        body = _extract_function_body(self.app_js, "handleItemSearch")
+
+        self.assertIn("function hasMalformedItemSearchAccountPrecheckResult(result) {", self.app_js)
+        self.assertIn("const accountsData = await accountsCheckResponse.json().catch(() => ({}));", body)
+        self.assertIn("if (hasMalformedItemSearchAccountPrecheckResult(accountsData)) {", body)
+        self.assertIn("throw new Error('商品搜索账号预检返回格式异常');", body)
+        self.assertIn("if (accountsData.success === false) {", body)
+        self.assertIn("const precheckBusinessErrorMessage = String(accountsData.message || accountsData.detail || '检查账号状态失败，请稍后重试').trim() || '检查账号状态失败，请稍后重试';", body)
+        self.assertIn("showToast(`搜索前检查账号状态失败: ${precheckBusinessErrorMessage}`, 'danger');", body)
+        self.assertLess(
+            body.index("if (hasMalformedItemSearchAccountPrecheckResult(accountsData)) {"),
+            body.index("if (accountsData.success === false) {"),
+            "账号预检查 200 成功态如果连最基本结构都歪了，前端得先按格式异常拦下，别急着往业务分支里钻",
+        )
+        self.assertLess(
+            body.index("if (accountsData.success === false) {"),
+            body.index("if (!accountsData.hasValidAccounts) {"),
+            "账号预检查如果后端已经明确 success=false，就别继续拿 hasValidAccounts 去装没事分流",
         )
 
     def test_item_search_http_failures_parse_backend_error_before_stale_guard(self):
@@ -2184,9 +2515,87 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "验证后重试的错误体读完后也得先验请求是不是旧的，别新搜索都开了旧失败还回来吓人",
         )
 
+    def test_item_search_business_failures_and_invalid_payloads_surface_explicit_errors(self):
+        body = _extract_function_body(self.app_js, "handleItemSearch")
+
+        self.assertIn("if (!data || typeof data !== 'object' || (data.data != null && !Array.isArray(data.data))) {", body)
+        self.assertIn("if (Array.isArray(data.data) && hasMalformedItemSearchResultItems(data.data)) {", body)
+        self.assertIn("throw new Error('商品搜索结果返回格式异常');", body)
+        self.assertIn("if (data.success === false) {", body)
+        self.assertIn("const businessErrorMessage = String(data.message || data.detail || '商品搜索失败，请稍后重试').trim() || '商品搜索失败，请稍后重试';", body)
+        self.assertIn("showToast(`搜索失败: ${businessErrorMessage}`, 'danger');", body)
+        self.assertIn("if (!Array.isArray(data.data)) {", body)
+        self.assertIn("function hasMalformedItemSearchResultItems(items) {", self.app_js)
+        self.assertIn("if (!item || typeof item !== 'object' || Array.isArray(item)) {", self.app_js)
+        self.assertIn("if (item.title != null && typeof item.title !== 'string') {", self.app_js)
+        self.assertIn("if (item.seller_name != null && typeof item.seller_name !== 'string') {", self.app_js)
+        self.assertIn("if (item.item_url != null && typeof item.item_url !== 'string') {", self.app_js)
+        self.assertIn("if (item.main_image != null && typeof item.main_image !== 'string') {", self.app_js)
+
+        data_json_index = body.index("const data = await response.json().catch(() => ({}));")
+        invalid_payload_index = body.index("if (!data || typeof data !== 'object' || (data.data != null && !Array.isArray(data.data))) {", data_json_index)
+        malformed_items_index = body.index("if (Array.isArray(data.data) && hasMalformedItemSearchResultItems(data.data)) {", invalid_payload_index)
+        business_failure_index = body.index("if (data.success === false) {", malformed_items_index)
+        business_toast_index = body.index("showToast(`搜索失败: ${businessErrorMessage}`, 'danger');", business_failure_index)
+        normal_results_index = body.index("searchResultsData = data.data;")
+        self.assertLess(
+            invalid_payload_index,
+            malformed_items_index,
+            "商品搜索主请求先拦最外层异常返回体，再验结果数组元素结构，别脏 item 先溜进渲染链路",
+        )
+        self.assertLess(
+            malformed_items_index,
+            business_failure_index,
+            "商品搜索主请求先把结果数组里的脏元素拦住，再处理 success=false，别垃圾 item 混进后面的分支",
+        )
+        self.assertLess(
+            business_failure_index,
+            normal_results_index,
+            "后端都明确 success=false 了，就别继续往正常结果分支里硬冲",
+        )
+        self.assertLess(
+            body.rfind("requestSequence !== itemSearchRequestSequence", business_failure_index, business_toast_index),
+            business_toast_index,
+            "商品搜索业务失败分支在弹红字前也得再验一遍请求活性，别旧失败回魂",
+        )
+
+        self.assertIn("if (!retryData || typeof retryData !== 'object' || (retryData.data != null && !Array.isArray(retryData.data))) {", body)
+        self.assertIn("if (Array.isArray(retryData.data) && hasMalformedItemSearchResultItems(retryData.data)) {", body)
+        self.assertIn("if (retryData.success === false) {", body)
+        self.assertIn("const retryBusinessErrorMessage = String(retryData.message || retryData.detail || '商品搜索失败，请稍后重试').trim() || '商品搜索失败，请稍后重试';", body)
+        self.assertIn("showToast(`验证后搜索失败: ${retryBusinessErrorMessage}`, 'danger');", body)
+        self.assertIn("if (!Array.isArray(retryData.data)) {", body)
+
+        retry_json_index = body.index("const retryData = await retryResponse.json().catch(() => ({}));")
+        retry_invalid_payload_index = body.index("if (!retryData || typeof retryData !== 'object' || (retryData.data != null && !Array.isArray(retryData.data))) {", retry_json_index)
+        retry_malformed_items_index = body.index("if (Array.isArray(retryData.data) && hasMalformedItemSearchResultItems(retryData.data)) {", retry_invalid_payload_index)
+        retry_business_failure_index = body.index("if (retryData.success === false) {", retry_malformed_items_index)
+        retry_business_toast_index = body.index("showToast(`验证后搜索失败: ${retryBusinessErrorMessage}`, 'danger');", retry_business_failure_index)
+        retry_second_captcha_index = body.index("if (retryData.need_captcha || retryData.status === 'need_verification') {", retry_business_failure_index)
+        self.assertLess(
+            retry_invalid_payload_index,
+            retry_malformed_items_index,
+            "验证码后重试也先把最外层异常返回体拦住，再验结果数组元素，别脏 item 混进结果链路",
+        )
+        self.assertLess(
+            retry_malformed_items_index,
+            retry_business_failure_index,
+            "验证码后重试先把结果数组里的脏元素挡住，再看 success=false，别垃圾数据混进后面的验证码/结果分支",
+        )
+        self.assertLess(
+            retry_business_failure_index,
+            retry_second_captcha_index,
+            "验证码后重试如果后端已经明确失败，就别再继续走后面的二次滑块或结果分支",
+        )
+        self.assertLess(
+            body.rfind("requestSequence !== itemSearchRequestSequence", retry_business_failure_index, retry_business_toast_index),
+            retry_business_toast_index,
+            "验证码后重试业务失败在弹红字前也得先验请求活性，别旧失败跨页乱叫",
+        )
+
     def test_item_search_captcha_retry_zero_results_follow_normal_empty_state_contract(self):
         body = _extract_function_body(self.app_js, "handleItemSearch")
-        retry_data_index = body.index("const retryData = await retryResponse.json();")
+        retry_data_index = body.index("const retryData = await retryResponse.json().catch(() => ({}));")
         retry_branch_end = body.index("} catch (error) {", retry_data_index)
         retry_branch = body[retry_data_index:retry_branch_end]
 
@@ -2340,6 +2749,8 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         save_editor_body = _extract_function_body(self.app_js, "saveAccountEdit")
 
         self.assertIn("if (!accounts) {", diagnostics_body)
+        self.assertIn("if (!Array.isArray(accounts)) {", diagnostics_body)
+        self.assertIn("if (hasMalformedCookieDetailsAccounts(accounts)) {", diagnostics_body)
         self.assertLess(
             diagnostics_body.index("if (!accounts) {"),
             diagnostics_body.index("aboutDiagnosticsAccounts = Array.isArray(accounts) ? accounts : [];"),
@@ -2398,6 +2809,71 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "账号代理保存在 helper 因 401 跳转返回空结果后，应直接中止，别继续关弹窗刷成功提示装没事",
         )
 
+    def test_account_diagnostics_fetchjson_callers_abort_when_unauthorized_redirect_returns_no_payload(self):
+        runtime_body = _extract_function_body(self.app_js, "loadAboutRuntimeStatus")
+        keepalive_body = _extract_function_body(self.app_js, "triggerAboutSessionKeepalive")
+        history_body = _extract_function_body(self.app_js, "loadAboutConversationHistory")
+
+        self.assertIn("if (!result) {", runtime_body)
+        self.assertLess(
+            runtime_body.index("if (!result) {"),
+            runtime_body.index("const runtimeStatus = result.runtime_status || null;"),
+            "账号诊断运行态请求在 helper 因 401 跳转返回空结果后，应直接中止，别再拿空结果刷新状态卡片",
+        )
+
+        self.assertIn("if (!result) {", keepalive_body)
+        self.assertLess(
+            keepalive_body.index("if (!result) {"),
+            keepalive_body.index("renderAboutRuntimeStatus(result.runtime_status || null);"),
+            "轻保活请求在 helper 因 401 跳转返回空结果后，应直接中止，别继续刷新运行态再假装执行成功",
+        )
+
+        self.assertIn("if (!result) {", history_body)
+        self.assertLess(
+            history_body.index("if (!result) {"),
+            history_body.index("renderAboutConversationHistory(result.messages, {"),
+            "历史消息查询在 helper 因 401 跳转返回空结果后，应直接中止，别把空结果当成功查询继续渲染",
+        )
+
+    def test_account_management_secret_detail_callers_reject_malformed_payloads_before_using_cookie_or_opening_editor(self):
+        refresh_cookie_body = _extract_function_body(self.app_js, "refreshRealCookie")
+        copy_body = _extract_function_body(self.app_js, "copyCookie")
+        open_editor_body = _extract_function_body(self.app_js, "openAccountEditor")
+        open_modal_body = _extract_function_body(self.app_js, "openAccountEditModal")
+
+        self.assertIn("function hasMalformedAccountSecretDetails(details, expectedAccountId = '') {", self.app_js)
+
+        self.assertIn("if (hasMalformedAccountSecretDetails(details, id)) {", copy_body)
+        self.assertIn("throw new Error('账号详情返回格式异常');", copy_body)
+        self.assertLess(
+            copy_body.index("if (hasMalformedAccountSecretDetails(details, id)) {"),
+            copy_body.index("const value = details?.value || '';"),
+            "复制 Cookie 的账号详情如果结构歪了，得先报格式异常，别继续把脏对象当 value 来源",
+        )
+
+        self.assertIn("if (hasMalformedAccountSecretDetails(currentCookie, accountId)) {", refresh_cookie_body)
+        self.assertIn("throw new Error('账号详情返回格式异常');", refresh_cookie_body)
+        self.assertLess(
+            refresh_cookie_body.index("if (hasMalformedAccountSecretDetails(currentCookie, accountId)) {"),
+            refresh_cookie_body.index("if (!currentCookie.value) {"),
+            "真实 Cookie 刷新前的账号详情如果结构歪了，得先报格式异常，别混成“未找到有效 Cookie”",
+        )
+
+        self.assertIn("if (hasMalformedAccountSecretDetails(details, id)) {", open_editor_body)
+        self.assertIn("throw new Error('账号详情返回格式异常');", open_editor_body)
+        self.assertLess(
+            open_editor_body.index("if (hasMalformedAccountSecretDetails(details, id)) {"),
+            open_editor_body.index("return await openAccountEditModal(details, requestSequence);"),
+            "账号编辑详情如果结构歪了，别继续开编辑弹窗往表单里灌垃圾",
+        )
+
+        self.assertIn("if (hasMalformedAccountSecretDetails(accountData)) {", open_modal_body)
+        self.assertLess(
+            open_modal_body.index("if (hasMalformedAccountSecretDetails(accountData)) {"),
+            open_modal_body.index("const accountId = getCookieDetailsAccountId(accountData);"),
+            "编辑弹窗入口收到歪账号详情时，先拦住，别再继续解 account_id 预填表单",
+        )
+
     def test_account_inline_edit_flows_escape_account_ids_for_selectors_and_path_segments(self):
         self.assertIn("function escapeCssAttributeSelectorValue(value) {", self.app_js)
         edit_remark_body = _extract_function_body(self.app_js, "editRemark")
@@ -2441,13 +2917,13 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             (
                 edit_remark_body,
                 "showToast('备注更新成功', 'success');",
-                "showToast('备注更新失败', 'danger');",
+                "showToast(`备注更新失败: ${errorMessage}`, 'danger');",
                 "remarkCell.innerHTML = originalContent;",
             ),
             (
                 edit_pause_body,
                 "showToast('暂停时间更新成功', 'success');",
-                "showToast('暂停时间更新失败', 'danger');",
+                "showToast(`暂停时间更新失败: ${errorMessage}`, 'danger');",
                 "pauseCell.innerHTML = originalContent;",
             ),
         ):
@@ -2467,6 +2943,77 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                     body.rfind("!document.getElementById('accounts-section')?.classList.contains('active')", 0, body.index(restore_fragment)),
                     body.index(restore_fragment),
                     "都切出账号页了，旧的内联编辑失败回调也别再去回写隐藏页 DOM",
+                )
+
+    def test_account_inline_edit_rejects_malformed_success_payloads_before_dom_updates_or_success_toasts(self):
+        edit_remark_body = _extract_function_body(self.app_js, "editRemark")
+        edit_pause_body = _extract_function_body(self.app_js, "editPauseDuration")
+
+        self.assertIn(
+            "function hasMalformedAccountInlineEditResult(result, stringFieldName = '', numericFieldName = '', minNumericValue = null, maxNumericValue = null) {",
+            self.app_js,
+        )
+
+        for body, guard_fragment, update_fragment, success_fragment, label in (
+            (
+                edit_remark_body,
+                "if (hasMalformedAccountInlineEditResult(result, 'remark')) {",
+                "remarkCell.innerHTML = renderAccountRemarkDisplay(accountId, result.remark);",
+                "showToast('备注更新成功', 'success');",
+                "账号备注",
+            ),
+            (
+                edit_pause_body,
+                "if (hasMalformedAccountInlineEditResult(result, '', 'pause_duration', 0, 60)) {",
+                "pauseCell.innerHTML = renderAccountPauseDurationDisplay(accountId, result.pause_duration);",
+                "showToast('暂停时间更新成功', 'success');",
+                "暂停时间",
+            ),
+        ):
+            with self.subTest(label=label):
+                self.assertIn("const result = await response.json().catch(() => ({}));", body)
+                self.assertLess(
+                    body.index(guard_fragment),
+                    body.index(update_fragment),
+                    f"{label}成功态 payload 歪了得先拦住，别先把旧页 DOM 改了再说",
+                )
+                self.assertLess(
+                    body.index(guard_fragment),
+                    body.index(success_fragment),
+                    f"{label}返回结构都不对了，就别继续弹 success toast 糊人",
+                )
+
+        self.assertIn("throw new Error('备注更新结果返回格式异常');", edit_remark_body)
+        self.assertIn("throw new Error('暂停时间更新结果返回格式异常');", edit_pause_body)
+
+    def test_account_inline_edit_catch_toasts_surface_runtime_error_messages(self):
+        edit_remark_body = _extract_function_body(self.app_js, "editRemark")
+        edit_pause_body = _extract_function_body(self.app_js, "editPauseDuration")
+
+        for body, fallback_fragment, toast_fragment, legacy_fragment, label in (
+            (
+                edit_remark_body,
+                "const errorMessage = error?.message || '请稍后重试';",
+                "showToast(`备注更新失败: ${errorMessage}`, 'danger');",
+                "showToast('备注更新失败', 'danger');",
+                "账号备注",
+            ),
+            (
+                edit_pause_body,
+                "const errorMessage = error?.message || '请稍后重试';",
+                "showToast(`暂停时间更新失败: ${errorMessage}`, 'danger');",
+                "showToast('暂停时间更新失败', 'danger');",
+                "暂停时间",
+            ),
+        ):
+            with self.subTest(label=label):
+                self.assertIn(fallback_fragment, body)
+                self.assertIn(toast_fragment, body)
+                self.assertNotIn(legacy_fragment, body)
+                self.assertLess(
+                    body.index(fallback_fragment),
+                    body.rfind(toast_fragment),
+                    f"{label}catch 到运行时错误后得把真实错误带进 toast，别又退回固定红字装糊涂",
                 )
 
     def test_account_status_and_cooldown_flows_encode_account_ids_for_paths_and_selectors(self):
@@ -2606,17 +3153,29 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
     def test_account_management_child_fetch_failures_do_not_masquerade_as_disabled_defaults(self):
         body = _extract_function_body(self.app_js, "loadAccounts")
 
+        self.assertIn("function hasMalformedKeywordCountMap(result) {", self.app_js)
         self.assertIn("let keywordCountLoadFailed = keywordsResponseResult.status !== 'fulfilled';", body)
         self.assertIn("if (!keywordsResponse || !keywordsResponse.ok) {", body)
         self.assertIn("keywordCountLoadFailed = true;", body)
+        self.assertIn("keywordCounts = await keywordsResponse.json().catch(() => null);", body)
+        self.assertIn("if (hasMalformedKeywordCountMap(keywordCounts)) {", body)
+        self.assertIn("keywordCounts = {};", body)
 
+        self.assertIn("function hasMalformedDefaultReplySettingsMap(result) {", self.app_js)
         self.assertIn("let defaultReplyLoadFailed = defaultReplyResponseResult.status !== 'fulfilled';", body)
         self.assertIn("if (!defaultReplyResponse || !defaultReplyResponse.ok) {", body)
         self.assertIn("defaultReplyLoadFailed = true;", body)
+        self.assertIn("defaultReplies = await defaultReplyResponse.json().catch(() => null);", body)
+        self.assertIn("if (hasMalformedDefaultReplySettingsMap(defaultReplies)) {", body)
+        self.assertIn("defaultReplies = {};", body)
 
+        self.assertIn("function hasMalformedAiReplySettingsMap(result) {", self.app_js)
         self.assertIn("let aiReplyLoadFailed = aiReplyResponseResult.status !== 'fulfilled';", body)
         self.assertIn("if (!aiReplyResponse || !aiReplyResponse.ok) {", body)
         self.assertIn("aiReplyLoadFailed = true;", body)
+        self.assertIn("aiReplySettings = await aiReplyResponse.json().catch(() => null);", body)
+        self.assertIn("if (hasMalformedAiReplySettingsMap(aiReplySettings)) {", body)
+        self.assertIn("aiReplySettings = {};", body)
 
         self.assertIn("keywordCountLoadFailed: keywordCountLoadFailed || loadError,", body)
         self.assertIn("defaultReplyLoadFailed: defaultReplyLoadFailed || loadError,", body)
@@ -2872,6 +3431,37 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "代理配置加载失败时应先拦住保存，别继续把默认 none 发给后端洗掉原配置",
         )
 
+    def test_account_edit_modal_rejects_malformed_proxy_payloads_before_prefilling_proxy_fields(self):
+        open_modal_body = _extract_function_body(self.app_js, "openAccountEditModal")
+
+        self.assertIn("if (!proxyData || typeof proxyData !== 'object' || Array.isArray(proxyData)) {", open_modal_body)
+        self.assertIn("if (proxyData.success != null && typeof proxyData.success !== 'boolean') {", open_modal_body)
+        self.assertIn("if (proxyData.message != null && typeof proxyData.message !== 'string') {", open_modal_body)
+        self.assertIn("if (proxyData.success !== true) {", open_modal_body)
+        self.assertIn("if (!proxyData.data || typeof proxyData.data !== 'object' || Array.isArray(proxyData.data)) {", open_modal_body)
+        self.assertIn("throw new Error('代理配置返回格式异常');", open_modal_body)
+
+        malformed_proxy_guard_index = open_modal_body.index("if (!proxyData || typeof proxyData !== 'object' || Array.isArray(proxyData)) {")
+        success_guard_index = open_modal_body.index("if (proxyData.success !== true) {")
+        prefill_index = open_modal_body.index("document.getElementById('editProxyType').value = proxyData.data.proxy_type || 'none';")
+        default_reset_index = open_modal_body.index("document.getElementById('editProxyType').value = 'none';")
+
+        self.assertLess(
+            malformed_proxy_guard_index,
+            prefill_index,
+            "代理配置 payload 不是对象时就该直接判格式异常，别继续拿 data 子字段往表单里灌",
+        )
+        self.assertLess(
+            success_guard_index,
+            prefill_index,
+            "代理配置业务失败时得先进 catch 标 failed，别假装成“无代理配置”继续预填默认值",
+        )
+        self.assertLess(
+            success_guard_index,
+            default_reset_index,
+            "代理配置业务失败应该走异常分支统一处理，别提前落到默认 none 分支把旧配置洗没了",
+        )
+
     def test_account_edit_save_mutation_respects_modal_request_sequence_and_hidden_section_before_hiding_or_toasting(self):
         open_modal_body = _extract_function_body(self.app_js, "openAccountEditModal")
         save_body = _extract_function_body(self.app_js, "saveAccountEdit")
@@ -2919,6 +3509,58 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                     body.index("actionRequestSequence !== accountMutationActionRequestSequence"),
                     body.index(anchor_fragment),
                     "旧的账号操作响应不该在新一轮操作开始后还回来触发账号列表刷新",
+                )
+
+    def test_account_runtime_browser_actions_abort_when_leaving_accounts_or_unloading(self):
+        self.assertIn("let accountRuntimeActionAbortController = null;", self.app_js)
+        self.assertIn("function stopAccountRuntimeActionRequests() {", self.app_js)
+        self.assertIn("function resetAccountRuntimeActionAbortController() {", self.app_js)
+        self.assertIn(
+            "window.addEventListener('pagehide', stopAccountRuntimeActionRequests);",
+            self.app_js,
+        )
+
+        show_section_body = _extract_function_body(self.app_js, "showSection")
+        stop_body = _extract_function_body(self.app_js, "stopAccountRuntimeActionRequests")
+        reset_body = _extract_function_body(self.app_js, "resetAccountRuntimeActionAbortController")
+
+        self.assertLess(
+            show_section_body.index("stopAccountRuntimeActionRequests();"),
+            show_section_body.index("accountMutationActionRequestSequence += 1;"),
+            "切出账号页时先 abort 后失效化序号，别让一键擦亮/真实 Cookie 刷新继续在后端浏览器里烤地瓜",
+        )
+        self.assertIn("accountRuntimeActionAbortController.abort();", stop_body)
+        self.assertIn("accountRuntimeActionAbortController = null;", stop_body)
+        self.assertIn("stopAccountRuntimeActionRequests();", reset_body)
+        self.assertIn("accountRuntimeActionAbortController = new AbortController();", reset_body)
+        self.assertIn("return accountRuntimeActionAbortController;", reset_body)
+
+        for function_name, fetch_fragment in (
+            ("polishAccountItems", "const response = await fetch(`${apiBase}/accounts/${encodeURIComponent(accountId)}/polish-items`, {"),
+            ("refreshRealCookie", "const response = await fetch(`${apiBase}/qr-login/refresh-cookies`, {"),
+        ):
+            body = _extract_function_body(self.app_js, function_name)
+            with self.subTest(function_name=function_name):
+                self.assertIn("let controller = null;", body)
+                self.assertIn("controller = resetAccountRuntimeActionAbortController();", body)
+                self.assertIn("signal: controller.signal", body)
+                self.assertIn("if (controller?.signal.aborted || error?.name === 'AbortError') {", body)
+                self.assertIn("if (accountRuntimeActionAbortController === controller) {", body)
+                self.assertIn("accountRuntimeActionAbortController = null;", body)
+                self.assertLess(
+                    body.index("controller = resetAccountRuntimeActionAbortController();"),
+                    body.index(fetch_fragment),
+                    f"{function_name} 得在发起后端浏览器请求前建好 AbortController，别 signal 挂了个寂寞",
+                )
+                self.assertLess(
+                    body.index("signal: controller.signal"),
+                    body.index("body: JSON.stringify({") if "body: JSON.stringify({" in body else body.index("});", body.index(fetch_fragment)),
+                    f"{function_name} 的 fetch options 必须带 signal，切页/关 tab 后端 runtime 才能及时收手",
+                )
+                self.assertLess(
+                    body.index("if (controller?.signal.aborted || error?.name === 'AbortError') {"),
+                    body.index("showToast", body.index("} catch (error) {")),
+                    f"{function_name} 主动 abort 时应该静默退出，别用户切页了还弹失败 toast 刷存在感",
                 )
 
     def test_account_delete_and_refresh_mutations_do_not_emit_cross_page_toasts_after_leaving_accounts(self):
@@ -3189,6 +3831,52 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertNotIn("(前端模拟)", body)
         self.assertNotIn("(本地模拟)", body)
 
+    def test_account_toggle_mutations_reject_malformed_success_payloads_before_toasts_and_ui_updates(self):
+        toggle_status_body = _extract_function_body(self.app_js, "toggleAccountStatus")
+        toggle_confirm_body = _extract_function_body(self.app_js, "toggleAutoConfirm")
+        toggle_comment_body = _extract_function_body(self.app_js, "toggleAutoComment")
+
+        self.assertIn("function hasMalformedAccountToggleMutationResult(result, booleanFieldName = '') {", self.app_js)
+
+        self.assertIn("if (hasMalformedAccountToggleMutationResult(result, 'enabled')) {", toggle_status_body)
+        self.assertIn("throw new Error('账号状态更新结果返回格式异常');", toggle_status_body)
+        self.assertLess(
+            toggle_status_body.index("if (hasMalformedAccountToggleMutationResult(result, 'enabled')) {"),
+            toggle_status_body.index("showToast(result.message || `账号 \"${accountId}\" 已${enabled ? '启用' : '禁用'}`, 'success');"),
+            "账号状态更新成功态 payload 歪了得先判格式异常，别继续弹 success 装更新成功",
+        )
+        self.assertLess(
+            toggle_status_body.index("if (hasMalformedAccountToggleMutationResult(result, 'enabled')) {"),
+            toggle_status_body.index("updateAccountRowStatus(accountId, enabled);"),
+            "账号状态更新结果 payload 歪了得先拦住，别继续回写行状态污染 UI",
+        )
+
+        self.assertIn("if (hasMalformedAccountToggleMutationResult(result, 'auto_confirm')) {", toggle_confirm_body)
+        self.assertIn("throw new Error('自动确认发货更新结果返回格式异常');", toggle_confirm_body)
+        self.assertLess(
+            toggle_confirm_body.index("if (hasMalformedAccountToggleMutationResult(result, 'auto_confirm')) {"),
+            toggle_confirm_body.index("showToast(result.message, 'success');"),
+            "自动确认发货成功态 payload 歪了得先判格式异常，别继续弹 success 装保存成功",
+        )
+        self.assertLess(
+            toggle_confirm_body.index("if (hasMalformedAccountToggleMutationResult(result, 'auto_confirm')) {"),
+            toggle_confirm_body.index("updateAutoConfirmRowStatus(accountId, enabled);"),
+            "自动确认发货结果 payload 歪了得先拦住，别继续回写开关 UI",
+        )
+
+        self.assertIn("if (hasMalformedAccountToggleMutationResult(result, 'auto_comment')) {", toggle_comment_body)
+        self.assertIn("throw new Error('自动好评更新结果返回格式异常');", toggle_comment_body)
+        self.assertLess(
+            toggle_comment_body.index("if (hasMalformedAccountToggleMutationResult(result, 'auto_comment')) {"),
+            toggle_comment_body.index("showToast(result.message, 'success');"),
+            "自动好评成功态 payload 歪了得先判格式异常，别继续弹 success 装保存成功",
+        )
+        self.assertLess(
+            toggle_comment_body.index("if (hasMalformedAccountToggleMutationResult(result, 'auto_comment')) {"),
+            toggle_comment_body.index("updateAutoCommentRowStatus(accountId, enabled);"),
+            "自动好评结果 payload 歪了得先拦住，别继续回写开关 UI",
+        )
+
     def test_account_toggle_status_failures_recheck_state_after_error_body_read(self):
         body = _extract_function_body(self.app_js, "toggleAccountStatus")
         error_index = body.index("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);")
@@ -3321,6 +4009,72 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "缺少账号ID时连 loading 都不该亮，别一上来就装忙",
         )
 
+    def test_account_action_result_loaders_reject_malformed_payloads_before_branching_on_success(self):
+        polish_body = _extract_function_body(self.app_js, "polishAccountItems")
+        refresh_body = _extract_function_body(self.app_js, "refreshRealCookie")
+        show_cooldown_body = _extract_function_body(self.app_js, "showCooldownStatus")
+        reset_cooldown_body = _extract_function_body(self.app_js, "resetCooldownTime")
+
+        self.assertIn("function hasMalformedPolishItemsResult(result) {", self.app_js)
+        self.assertIn("function hasMalformedQrRefreshResult(result) {", self.app_js)
+        self.assertIn("function hasMalformedQrCooldownStatusResult(result) {", self.app_js)
+
+        self.assertIn("const data = await response.json().catch(() => ({}));", polish_body)
+        self.assertIn("if (hasMalformedPolishItemsResult(data)) {", polish_body)
+        self.assertIn("throw new Error('擦亮结果返回格式异常');", polish_body)
+        self.assertLess(
+            polish_body.index("const data = await response.json().catch(() => ({}));"),
+            polish_body.index("if (hasMalformedPolishItemsResult(data)) {"),
+            "一键擦亮得先把 JSON 读出来并兜底，别后端回个空壳就把前端成功链炸成随机异常",
+        )
+        self.assertLess(
+            polish_body.index("if (hasMalformedPolishItemsResult(data)) {"),
+            polish_body.index("if (data.success) {"),
+            "一键擦亮结果 payload 歪了得先判格式异常，别继续拿 success/message 假装业务分支正常",
+        )
+
+        self.assertIn("if (hasMalformedQrRefreshResult(result)) {", refresh_body)
+        self.assertIn("throw new Error('真实Cookie刷新结果返回格式异常');", refresh_body)
+        self.assertIn("const result = await response.json().catch(() => ({}));", refresh_body)
+        self.assertLess(
+            refresh_body.index("const result = await response.json().catch(() => ({}));"),
+            refresh_body.index("if (hasMalformedQrRefreshResult(result)) {"),
+            "真实 Cookie 刷新得先把 JSON 读出来并兜底成空对象，再交给 helper 判格式，别让脏响应直接炸成随机异常",
+        )
+        self.assertLess(
+            refresh_body.index("if (hasMalformedQrRefreshResult(result)) {"),
+            refresh_body.index("if (result.success) {"),
+            "真实 Cookie 刷新结果 payload 歪了得先判格式异常，别继续拿 success/message 演假成功",
+        )
+
+        self.assertIn("if (hasMalformedQrCooldownStatusResult(result)) {", show_cooldown_body)
+        self.assertIn("throw new Error('冷却状态返回格式异常');", show_cooldown_body)
+        self.assertIn("const result = await response.json().catch(() => ({}));", show_cooldown_body)
+        self.assertLess(
+            show_cooldown_body.index("const result = await response.json().catch(() => ({}));"),
+            show_cooldown_body.index("if (hasMalformedQrCooldownStatusResult(result)) {"),
+            "冷却状态得先把 JSON 读出来并兜底，别后端回半截内容时直接把前端炸成莫名其妙的 JS 错",
+        )
+        self.assertLess(
+            show_cooldown_body.index("if (hasMalformedQrCooldownStatusResult(result)) {"),
+            show_cooldown_body.index("if (result.success) {"),
+            "冷却状态 payload 歪了得先判格式异常，别继续拼 confirm/alert 文案糊弄人",
+        )
+
+        self.assertIn("if (hasMalformedQrCooldownStatusResult(result)) {", reset_cooldown_body)
+        self.assertIn("throw new Error('重置冷却时间结果返回格式异常');", reset_cooldown_body)
+        self.assertIn("const result = await response.json().catch(() => ({}));", reset_cooldown_body)
+        self.assertLess(
+            reset_cooldown_body.index("const result = await response.json().catch(() => ({}));"),
+            reset_cooldown_body.index("if (hasMalformedQrCooldownStatusResult(result)) {"),
+            "重置冷却时间也得先把 JSON 读出来并兜底，别空体成功响应把整条成功链炸飞",
+        )
+        self.assertLess(
+            reset_cooldown_body.index("if (hasMalformedQrCooldownStatusResult(result)) {"),
+            reset_cooldown_body.index("if (result.success) {"),
+            "重置冷却时间结果 payload 歪了得先判格式异常，别继续拿 previous_remaining_time 拼成功提示",
+        )
+
     def test_refresh_real_cookie_action_sequence_starts_only_after_preflight_checks(self):
         body = _extract_function_body(self.app_js, "refreshRealCookie")
         action_index = body.index("actionRequestSequence = ++accountMutationActionRequestSequence;")
@@ -3353,7 +4107,8 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
 
     def test_manual_cookie_import_modal_close_cancels_backend_session_instead_of_only_resetting_frontend_state(self):
         self.assertIn("async function cancelManualCookieImportSession(sessionId) {", self.app_js)
-        self.assertIn("fetch(`${apiBase}/manual-cookie-import/cancel/${encodeURIComponent(sessionId)}`", self.app_js)
+        self.assertIn("fetch(`${apiBase}/manual-cookie-import/cancel/${encodeURIComponent(normalizedSessionId)}`", self.app_js)
+        self.assertNotIn("fetch(`${apiBase}/manual-cookie-import/cancel/${encodeURIComponent(sessionId)}`", self.app_js)
 
         modal_events_body = _extract_function_body(self.app_js, "bindPasswordLoginQRModalEvents")
         self.assertIn("mode: 'session'", self.app_js)
@@ -3557,12 +4312,80 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "刷新Cookie表单都切走了，旧失败响应也别再对当前页甩 danger toast",
         )
 
+    def test_account_login_submit_success_responses_cancel_backend_session_when_frontend_already_left(self):
+        manual_body = _extract_function_body(self.app_js, "handleManualCookieImport")
+        password_body = _extract_function_body(self.app_js, "handlePasswordLogin")
+        refresh_body = _extract_function_body(self.app_js, "handleRefreshCookie")
+
+        for body, sequence_guard, hidden_guard, cancel_fragment, start_fragment, label in (
+            (
+                manual_body,
+                "submitRequestSequence !== manualCookieImportSubmitRequestSequence",
+                "document.getElementById('manualInputForm')?.style.display === 'none'",
+                "void cancelManualCookieImportSession(responseSessionId || clientSessionId);",
+                "manualCookieImportSessionId = data.session_id;",
+                "手动导入 Cookie",
+            ),
+            (
+                password_body,
+                "submitRequestSequence !== passwordLoginSubmitRequestSequence",
+                "document.getElementById('passwordLoginForm')?.style.display === 'none'",
+                "void cancelPasswordLoginSession(responseSessionId || clientSessionId, '登录');",
+                "passwordLoginSessionId = data.session_id;",
+                "账号密码登录",
+            ),
+            (
+                refresh_body,
+                "submitRequestSequence !== refreshCookieSubmitRequestSequence",
+                "document.getElementById('refreshCookieForm')?.style.display === 'none'",
+                "void cancelPasswordLoginSession(responseSessionId || clientSessionId, '刷新Cookie');",
+                "startRefreshCookiePolling(data.session_id, accountId);",
+                "刷新 Cookie",
+            ),
+        ):
+            with self.subTest(label=label):
+                data_index = body.index("const data = await response.json().catch(() => ({}));")
+                response_session_index = body.index(
+                    "const responseSessionId = typeof data.session_id === 'string' && data.session_id.trim() ? data.session_id : null;",
+                    data_index,
+                )
+                stale_index = body.index(sequence_guard, response_session_index)
+                stale_cancel_index = body.index(cancel_fragment, stale_index)
+                stale_return_index = body.index("return null;", stale_cancel_index)
+                hidden_index = body.index(hidden_guard, stale_return_index)
+                hidden_cancel_index = body.index(cancel_fragment, hidden_index)
+                hidden_return_index = body.index("return null;", hidden_cancel_index)
+                start_index = body.index(start_fragment)
+
+                self.assertLess(
+                    response_session_index,
+                    stale_index,
+                    f"{label} 启动响应成功时，先把后端 session_id 抠出来，后面发现 stale 才能取消",
+                )
+                self.assertLess(
+                    stale_cancel_index,
+                    stale_return_index,
+                    f"{label} 启动响应已经 stale 时不能只 return，得取消刚创建的后端会话",
+                )
+                self.assertLess(
+                    hidden_cancel_index,
+                    hidden_return_index,
+                    f"{label} 启动响应回来时表单已隐藏，也得取消刚创建的后端会话",
+                )
+                self.assertLess(
+                    hidden_return_index,
+                    start_index,
+                    f"{label} 启动响应被丢弃后不能再偷偷启动轮询",
+                )
+
     def test_account_verification_cancel_callbacks_do_not_emit_cross_page_toasts_after_leaving_accounts(self):
         manual_cancel_body = _extract_function_body(self.app_js, "cancelManualCookieImportSession")
         password_cancel_body = _extract_function_body(self.app_js, "cancelPasswordLoginSession")
 
-        self.assertIn("fetch(`${apiBase}/manual-cookie-import/cancel/${encodeURIComponent(sessionId)}`", manual_cancel_body)
-        self.assertIn("fetch(`${apiBase}/password-login/cancel/${encodeURIComponent(sessionId)}`", password_cancel_body)
+        self.assertIn("fetch(`${apiBase}/manual-cookie-import/cancel/${encodeURIComponent(normalizedSessionId)}`", manual_cancel_body)
+        self.assertIn("fetch(`${apiBase}/password-login/cancel/${encodeURIComponent(normalizedSessionId)}`", password_cancel_body)
+        self.assertNotIn("fetch(`${apiBase}/manual-cookie-import/cancel/${encodeURIComponent(sessionId)}`", manual_cancel_body)
+        self.assertNotIn("fetch(`${apiBase}/password-login/cancel/${encodeURIComponent(sessionId)}`", password_cancel_body)
         self.assertNotIn("fetch(`${apiBase}/password-login/cancel/${sessionId}`", password_cancel_body)
 
         for body, toast_fragment in (
@@ -3584,6 +4407,44 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                     "都切出账号页了，旧的取消会话结果就别再跨页弹 toast 了",
                 )
 
+    def test_account_verification_cancel_helpers_dedupe_per_session_instead_of_globally(self):
+        manual_cancel_body = _extract_function_body(self.app_js, "cancelManualCookieImportSession")
+        password_cancel_body = _extract_function_body(self.app_js, "cancelPasswordLoginSession")
+
+        self.assertIn("let manualCookieImportCancelInFlightSessionIds = new Set();", self.app_js)
+        self.assertNotIn("let manualCookieImportCancelInFlight = false;", self.app_js)
+        self.assertIn("cancelInFlightSessionIds: new Set(),", self.app_js)
+        self.assertNotIn("cancelInFlight: false,", self.app_js)
+
+        for body, set_name, label in (
+            (
+                manual_cancel_body,
+                "manualCookieImportCancelInFlightSessionIds",
+                "手动导入 Cookie",
+            ),
+            (
+                password_cancel_body,
+                "passwordLoginQRModalState.cancelInFlightSessionIds",
+                "账号登录/刷新 Cookie",
+            ),
+        ):
+            with self.subTest(label=label):
+                self.assertIn("const normalizedSessionId = String(sessionId || '').trim();", body)
+                self.assertIn(f"if (!normalizedSessionId || {set_name}.has(normalizedSessionId)) {{", body)
+                self.assertIn(f"{set_name}.add(normalizedSessionId);", body)
+                self.assertIn(f"{set_name}.delete(normalizedSessionId);", body)
+                self.assertIn("encodeURIComponent(normalizedSessionId)", body)
+                self.assertLess(
+                    body.index(f"{set_name}.add(normalizedSessionId);"),
+                    body.index("fetch("),
+                    f"{label} 取消请求要按 session_id 去重，别用全局锁把另一个会话的取消请求吞了",
+                )
+                self.assertLess(
+                    body.index("} finally {"),
+                    body.index(f"{set_name}.delete(normalizedSessionId);"),
+                    f"{label} 取消结束后只释放当前 session_id 的 in-flight 标记",
+                )
+
     def test_account_raw_fetch_flows_handle_unauthorized_before_followup_work(self):
         manual_body = _extract_function_body(self.app_js, "handleManualCookieImport")
         manual_poll_body = _extract_function_body(self.app_js, "checkManualCookieImportStatus")
@@ -3600,7 +4461,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             (manual_poll_body, "if (handleUnauthorizedApiResponse(response)) {", "if (response.ok) {"),
             (load_refresh_body, "if (handleUnauthorizedApiResponse(response)) {", "if (!response.ok) {"),
             (refresh_body, "if (handleUnauthorizedApiResponse(response)) {", "if (!response.ok) {"),
-            (refresh_poll_body, "if (handleUnauthorizedApiResponse(response)) {", "const data = await response.json();"),
+            (refresh_poll_body, "if (handleUnauthorizedApiResponse(response)) {", "const data = await response.json().catch(() => ({}));"),
             (password_body, "if (handleUnauthorizedApiResponse(response)) {", "if (!response.ok) {"),
             (password_poll_body, "if (handleUnauthorizedApiResponse(response)) {", "if (response.ok) {"),
             (manual_cancel_body, "if (handleUnauthorizedApiResponse(response)) {", "if (!response.ok) {"),
@@ -3814,6 +4675,38 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                     f"{label}读完错误体后还得再验一次页面状态，别都切页了还拿旧失败响应乱弹 toast",
                 )
 
+    def test_account_face_verification_rejects_malformed_success_payloads_before_opening_modal(self):
+        face_body = _extract_function_body(self.app_js, "showFaceVerification")
+
+        self.assertIn("function hasMalformedFaceVerificationScreenshot(screenshot) {", self.app_js)
+        self.assertIn("const data = await response.json().catch(() => ({}));", face_body)
+        self.assertIn("if (!data || typeof data !== 'object' || Array.isArray(data)) {", face_body)
+        self.assertIn("if (data.success != null && typeof data.success !== 'boolean') {", face_body)
+        self.assertIn("if (data.message != null && typeof data.message !== 'string') {", face_body)
+        self.assertIn("if (data.success === true && hasMalformedFaceVerificationScreenshot(data.screenshot)) {", face_body)
+        self.assertIn("throw new Error('验证截图返回格式异常');", face_body)
+
+        malformed_guard_index = face_body.index("if (data.success === true && hasMalformedFaceVerificationScreenshot(data.screenshot)) {")
+        toggle_loading_index = face_body.find("toggleLoading(false);", malformed_guard_index)
+        warning_toast_index = face_body.index("showToast(data.message || '未找到验证截图', 'warning');")
+        modal_index = face_body.index("showAccountFaceVerificationModal(accountId, data.screenshot);")
+
+        self.assertLess(
+            malformed_guard_index,
+            toggle_loading_index,
+            "验证截图成功态 payload 歪了得先报格式异常，别先关 loading 再假装是正常业务分支",
+        )
+        self.assertLess(
+            malformed_guard_index,
+            warning_toast_index,
+            "验证截图 payload 歪了属于契约错误，别混进“未找到截图”的业务 warning 里糊弄过去",
+        )
+        self.assertLess(
+            malformed_guard_index,
+            modal_index,
+            "验证截图 screenshot 结构不对时，别往弹窗里塞半截脏对象",
+        )
+
     def test_refresh_cookie_account_selector_loader_ignores_stale_async_responses_and_hidden_form_state(self):
         self.assertIn("let refreshCookieAccountListRequestSequence = 0;", self.app_js)
 
@@ -3900,6 +4793,198 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "切出账号页时应先废掉旧登录/导入/刷新会话，再把验证弹窗收口，别留着半截状态诈尸",
         )
 
+    def test_pagehide_cancels_active_account_verification_browser_sessions_silently(self):
+        self.assertIn("function stopAccountVerificationSessionsOnPageHide() {", self.app_js)
+        self.assertIn("function cancelAccountVerificationSessionOnPageHide(endpointPath) {", self.app_js)
+        self.assertIn(
+            "window.addEventListener('pagehide', stopAccountVerificationSessionsOnPageHide);",
+            self.app_js,
+        )
+
+        pagehide_body = _extract_function_body(self.app_js, "stopAccountVerificationSessionsOnPageHide")
+        keepalive_cancel_body = _extract_function_body(self.app_js, "cancelAccountVerificationSessionOnPageHide")
+
+        for fragment in (
+            "const manualActiveSessionId = manualCookieImportPollingState.sessionId || manualCookieImportStartupSessionId;",
+            "const passwordActiveSessionId = passwordLoginPollingState.sessionId || passwordLoginStartupSessionId;",
+            "const refreshActiveSessionId = refreshCookiePollingState.sessionId || refreshCookieStartupSessionId;",
+            "const qrActiveSessionId = qrCodeSessionId || qrCodeVerificationState.activeSessionId || qrCodeStartupSessionId;",
+            "clearManualCookieImportCheck();",
+            "clearPasswordLoginCheck();",
+            "stopRefreshCookiePolling(refreshActiveSessionId);",
+            "clearQRCodeCheck();",
+            "manual-cookie-import/cancel",
+            "password-login/cancel",
+            "qr-login/cancel",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, pagehide_body)
+
+        self.assertIn("keepalive: true", keepalive_cancel_body)
+        self.assertIn("'Authorization': `Bearer ${token}`", keepalive_cancel_body)
+        self.assertNotIn("showToast(", pagehide_body)
+        self.assertNotIn("showToast(", keepalive_cancel_body)
+
+    def test_account_verification_polling_fetches_abort_inflight_checks_when_stopped(self):
+        for fragment in (
+            "let manualCookieImportCheckAbortController = null;",
+            "let passwordLoginCheckAbortController = null;",
+            "let refreshCookieCheckAbortController = null;",
+            "let qrCodeCheckAbortController = null;",
+            "function stopManualCookieImportCheckRequest() {",
+            "function resetManualCookieImportCheckAbortController() {",
+            "function stopPasswordLoginCheckRequest() {",
+            "function resetPasswordLoginCheckAbortController() {",
+            "function stopRefreshCookieCheckRequest() {",
+            "function resetRefreshCookieCheckAbortController() {",
+            "function stopQRCodeCheckRequest() {",
+            "function resetQRCodeCheckAbortController() {",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, self.app_js)
+
+        for function_name, controller_name in (
+            ("stopManualCookieImportCheckRequest", "manualCookieImportCheckAbortController"),
+            ("stopPasswordLoginCheckRequest", "passwordLoginCheckAbortController"),
+            ("stopRefreshCookieCheckRequest", "refreshCookieCheckAbortController"),
+            ("stopQRCodeCheckRequest", "qrCodeCheckAbortController"),
+        ):
+            body = _extract_function_body(self.app_js, function_name)
+            with self.subTest(function_name=function_name):
+                self.assertIn(f"{controller_name}.abort();", body)
+                self.assertIn(f"{controller_name} = null;", body)
+
+        for function_name, stop_call in (
+            ("clearManualCookieImportCheck", "stopManualCookieImportCheckRequest();"),
+            ("clearPasswordLoginCheck", "stopPasswordLoginCheckRequest();"),
+            ("stopRefreshCookiePolling", "stopRefreshCookieCheckRequest();"),
+            ("clearQRCodeCheck", "stopQRCodeCheckRequest();"),
+        ):
+            body = _extract_function_body(self.app_js, function_name)
+            with self.subTest(function_name=function_name):
+                self.assertIn(stop_call, body)
+
+        for function_name, reset_call, controller_name, fetch_fragment, stale_guard in (
+            (
+                "checkManualCookieImportStatus",
+                "const controller = resetManualCookieImportCheckAbortController();",
+                "manualCookieImportCheckAbortController",
+                "fetch(`${apiBase}/manual-cookie-import/check/${sessionId}`, {",
+                "manualCookieImportPollingState.sessionId !== sessionId || manualCookieImportPollingState.completed",
+            ),
+            (
+                "checkPasswordLoginStatus",
+                "const controller = resetPasswordLoginCheckAbortController();",
+                "passwordLoginCheckAbortController",
+                "fetch(`${apiBase}/password-login/check/${sessionId}`, {",
+                "passwordLoginPollingState.sessionId !== sessionId || passwordLoginPollingState.completed",
+            ),
+            (
+                "startRefreshCookiePolling",
+                "const controller = resetRefreshCookieCheckAbortController();",
+                "refreshCookieCheckAbortController",
+                "fetch(`${apiBase}/password-login/check/${sessionId}`, {",
+                "refreshCookiePollingState.sessionId !== sessionId || refreshCookiePollingState.completed",
+            ),
+            (
+                "checkQRCodeStatus",
+                "const controller = resetQRCodeCheckAbortController();",
+                "qrCodeCheckAbortController",
+                "fetch(`${apiBase}/qr-login/check/${requestSessionId}`, {",
+                "requestSequence !== qrCodeLoginRequestSequence",
+            ),
+        ):
+            body = _extract_function_body(self.app_js, function_name)
+            with self.subTest(function_name=function_name):
+                self.assertIn(reset_call, body)
+                self.assertIn("signal: controller.signal", body)
+                self.assertIn("if (error?.name === 'AbortError') {", body)
+                self.assertIn(stale_guard, body)
+                self.assertIn(f"if ({controller_name} === controller) {{", body)
+                self.assertIn(f"{controller_name} = null;", body)
+                fetch_index = body.index(fetch_fragment)
+                signal_index = body.index("signal: controller.signal", fetch_index)
+                closing_index = body.index("});", fetch_index)
+                self.assertLess(
+                    signal_index,
+                    closing_index,
+                    f"{function_name} 的轮询 fetch 必须挂 AbortController.signal，切页/关弹窗后别让旧轮询还在后台喘气",
+                )
+
+    def test_account_verification_startup_requests_preallocate_session_ids_for_pagehide_cancel(self):
+        self.assertIn("function createAccountVerificationSessionId(prefix = 'acct') {", self.app_js)
+        self.assertIn("let manualCookieImportStartupSessionId = null;", self.app_js)
+        self.assertIn("let passwordLoginStartupSessionId = null;", self.app_js)
+        self.assertIn("let refreshCookieStartupSessionId = null;", self.app_js)
+
+        manual_body = _extract_function_body(self.app_js, "handleManualCookieImport")
+        password_body = _extract_function_body(self.app_js, "handlePasswordLogin")
+        refresh_body = _extract_function_body(self.app_js, "handleRefreshCookie")
+        pagehide_body = _extract_function_body(self.app_js, "stopAccountVerificationSessionsOnPageHide")
+
+        for body, prefix, startup_var, session_field, cancel_fragment in (
+            (
+                manual_body,
+                "const clientSessionId = createAccountVerificationSessionId('manual');",
+                "manualCookieImportStartupSessionId = clientSessionId;",
+                "session_id: clientSessionId",
+                "manualCookieImportStartupSessionId = null;",
+            ),
+            (
+                password_body,
+                "const clientSessionId = createAccountVerificationSessionId('password');",
+                "passwordLoginStartupSessionId = clientSessionId;",
+                "session_id: clientSessionId",
+                "passwordLoginStartupSessionId = null;",
+            ),
+            (
+                refresh_body,
+                "const clientSessionId = createAccountVerificationSessionId('refresh');",
+                "refreshCookieStartupSessionId = clientSessionId;",
+                "session_id: clientSessionId",
+                "refreshCookieStartupSessionId = null;",
+            ),
+        ):
+            with self.subTest(prefix=prefix):
+                self.assertIn(prefix, body)
+                self.assertIn(startup_var, body)
+                self.assertIn(session_field, body)
+                self.assertIn(cancel_fragment, body)
+                self.assertLess(body.index(prefix), body.index("fetch("))
+                self.assertLess(body.index(session_field), body.index("});", body.index("body: JSON.stringify({")))
+
+        for fragment in (
+            "const manualActiveSessionId = manualCookieImportPollingState.sessionId || manualCookieImportStartupSessionId;",
+            "const passwordActiveSessionId = passwordLoginPollingState.sessionId || passwordLoginStartupSessionId;",
+            "const refreshActiveSessionId = refreshCookiePollingState.sessionId || refreshCookieStartupSessionId;",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, pagehide_body)
+
+    def test_refresh_cookie_submit_cancels_previous_active_refresh_session_before_starting_new_one(self):
+        body = _extract_function_body(self.app_js, "handleRefreshCookie")
+
+        for fragment in (
+            "const existingRefreshSessionId = refreshCookiePollingState.sessionId || refreshCookieStartupSessionId;",
+            "if (existingRefreshSessionId && !refreshCookiePollingState.completed) {",
+            "refreshCookieSubmitRequestSequence += 1;",
+            "stopRefreshCookiePolling(existingRefreshSessionId);",
+            "refreshCookieStartupSessionId = null;",
+            "void cancelPasswordLoginSession(existingRefreshSessionId, '刷新Cookie');",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, body)
+
+        previous_session_index = body.index("const existingRefreshSessionId = refreshCookiePollingState.sessionId || refreshCookieStartupSessionId;")
+        new_sequence_index = body.index("const submitRequestSequence = ++refreshCookieSubmitRequestSequence;")
+        fetch_index = body.index("const response = await fetch(`${apiBase}/password-login`, {")
+        self.assertLess(
+            previous_session_index,
+            new_sequence_index,
+            "重复提交刷新 Cookie 前，得先取消旧的后台账密刷新；不然旧浏览器 worker 在后面阴魂不散",
+        )
+        self.assertLess(new_sequence_index, fetch_index)
+
     def test_switching_away_from_accounts_closes_account_management_modals(self):
         body = _extract_function_body(self.app_js, "showSection")
 
@@ -3968,6 +5053,36 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "卡券列表既然已经拿到了后端汇总的数据量，就别还强依赖整包 data_content 才能显示数量，白白把大 payload 往前端拖",
         )
 
+    def test_card_list_loader_rejects_malformed_entries_before_rendering(self):
+        load_body = _extract_function_body(self.app_js, "loadCards")
+        render_body = _extract_function_body(self.app_js, "renderCardsList")
+
+        self.assertIn("function hasMalformedCardListEntries(cards) {", self.app_js)
+        self.assertIn("const cards = await response.json().catch(() => null);", load_body)
+        self.assertIn("if (!Number.isFinite(Number(card.id))) {", self.app_js)
+        self.assertIn("if (typeof card.name !== 'string' || !card.name.trim()) {", self.app_js)
+        self.assertIn("if (typeof card.type !== 'string' || !card.type.trim()) {", self.app_js)
+        self.assertIn("if (typeof card.enabled !== 'boolean') {", self.app_js)
+        self.assertIn("if (typeof card.is_multi_spec !== 'boolean') {", self.app_js)
+        self.assertIn("if (card.data_count != null && (!Number.isFinite(Number(card.data_count)) || Number(card.data_count) < 0)) {", self.app_js)
+
+        self.assertIn("if (hasMalformedCardListEntries(cards)) {", load_body)
+        self.assertIn("if (!Array.isArray(cards) || hasMalformedCardListEntries(cards)) {", render_body)
+        self.assertIn("throw new Error('卡券列表返回格式异常');", load_body)
+
+        entry_guard_index = load_body.index("if (hasMalformedCardListEntries(cards)) {")
+        render_index = load_body.index("renderCardsList(cards);")
+        self.assertLess(
+            load_body.index("const cards = await response.json().catch(() => null);"),
+            entry_guard_index,
+            "卡券列表成功态也得先把坏 JSON 兜住，再做数组元素校验，别空响应一来就把前端自己整崩",
+        )
+        self.assertLess(
+            entry_guard_index,
+            render_index,
+            "卡券列表数组里混进坏元素时得先拦住，别让脏数据继续流进列表渲染和统计逻辑",
+        )
+
     def test_delivery_rules_table_escapes_keyword_description_card_name_and_spec_fields(self):
         body = _extract_function_body(self.app_js, "renderDeliveryRulesList")
         self.assertIn("const safeKeyword = escapeHtml(rule.keyword || '');", body)
@@ -4014,6 +5129,36 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertNotIn("const activeRules = rules.filter(rule => Boolean(rule.enabled) && rule.card_enabled !== false).length;", body)
         self.assertNotIn("const activeRules = rules.filter(rule => rule.enabled).length;", body)
 
+    def test_delivery_rule_list_loader_rejects_malformed_entries_before_rendering(self):
+        load_body = _extract_function_body(self.app_js, "loadDeliveryRules")
+        render_body = _extract_function_body(self.app_js, "renderDeliveryRulesList")
+
+        self.assertIn("function hasMalformedDeliveryRuleListEntries(rules) {", self.app_js)
+        self.assertIn("const rules = await response.json().catch(() => null);", load_body)
+        self.assertIn("if (!Number.isFinite(Number(rule.id))) {", self.app_js)
+        self.assertIn("if (typeof rule.keyword !== 'string' || !rule.keyword.trim()) {", self.app_js)
+        self.assertIn("if (typeof rule.enabled !== 'boolean') {", self.app_js)
+        self.assertIn("if (!Number.isFinite(Number(rule.delivery_times))) {", self.app_js)
+        self.assertIn("if (rule.card_enabled != null && typeof rule.card_enabled !== 'boolean') {", self.app_js)
+        self.assertIn("if (rule.is_multi_spec != null && typeof rule.is_multi_spec !== 'boolean') {", self.app_js)
+
+        self.assertIn("if (hasMalformedDeliveryRuleListEntries(rules)) {", load_body)
+        self.assertIn("if (!Array.isArray(rules) || hasMalformedDeliveryRuleListEntries(rules)) {", render_body)
+        self.assertIn("throw new Error('发货规则列表返回格式异常');", load_body)
+
+        entry_guard_index = load_body.index("if (hasMalformedDeliveryRuleListEntries(rules)) {")
+        render_index = load_body.index("renderDeliveryRulesList(rules);")
+        self.assertLess(
+            load_body.index("const rules = await response.json().catch(() => null);"),
+            entry_guard_index,
+            "发货规则列表成功态也得先把坏 JSON 兜住，再验数组元素，别空响应或烂 payload 直接把规则页炸成未知错误",
+        )
+        self.assertLess(
+            entry_guard_index,
+            render_index,
+            "发货规则列表数组里混进坏元素时得先拦住，别让脏数据继续流进规则列表和统计逻辑",
+        )
+
     def test_edit_delivery_rule_keeps_current_disabled_card_available_in_edit_selector(self):
         edit_rule_body = _extract_function_body(self.app_js, "editDeliveryRule")
         self.assertIn("const cardOptionsLoaded = await loadCardsForEditSelect(rule, requestSequence);", edit_rule_body)
@@ -4056,8 +5201,8 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         edit_select_body = _extract_function_body(self.app_js, "loadCardsForEditSelect")
 
         for body, json_fragment in (
-            (add_select_body, "const cards = await response.json();"),
-            (edit_select_body, "const cards = await response.json();"),
+            (add_select_body, "const cards = await response.json().catch(() => null);"),
+            (edit_select_body, "const cards = await response.json().catch(() => null);"),
         ):
             with self.subTest(function_body="loadCardsForSelect" if body is add_select_body else "loadCardsForEditSelect"):
                 self.assertIn("if (!response.ok) {", body)
@@ -4080,6 +5225,22 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                 )
 
         self.assertNotIn("return false;\n    }\n    return true;", edit_select_body)
+
+    def test_delivery_rule_card_select_loaders_reject_malformed_card_entries_before_rendering_options(self):
+        add_select_body = _extract_function_body(self.app_js, "loadCardsForSelect")
+        edit_select_body = _extract_function_body(self.app_js, "loadCardsForEditSelect")
+
+        self.assertIn("function hasMalformedCardListEntries(cards) {", self.app_js)
+
+        for body in (add_select_body, edit_select_body):
+            with self.subTest(function_body="loadCardsForSelect" if body is add_select_body else "loadCardsForEditSelect"):
+                self.assertIn("if (!Array.isArray(cards) || hasMalformedCardListEntries(cards)) {", body)
+                self.assertIn("throw new Error('卡券列表返回格式异常');", body)
+                self.assertLess(
+                    body.index("if (!Array.isArray(cards) || hasMalformedCardListEntries(cards)) {"),
+                    body.index("cards.forEach(card => {"),
+                    "卡券下拉列表接口里混进歪元素时，得先当格式异常拦住，别让坏卡券继续渲染进选项里",
+                )
 
     def test_delivery_rule_card_select_loaders_set_explicit_failure_option_when_reload_fails(self):
         add_select_body = _extract_function_body(self.app_js, "loadCardsForSelect")
@@ -4232,13 +5393,13 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
     def test_card_save_surfaces_auto_delivery_rule_partial_failures_instead_of_false_success(self):
         body = _extract_function_body(self.app_js, "saveCard")
 
-        self.assertIn("const result = await response.json();", body)
+        self.assertIn("const result = await response.json().catch(() => ({}));", body)
         self.assertIn("const deliveryRuleGenerationFailed = result?.delivery_rule_generated === false;", body)
         self.assertIn("const deliveryRuleErrorMessage = result?.delivery_rule_error || '对应发货规则生成失败，请稍后在自动发货中手动创建';", body)
         self.assertIn("showToast(`卡券保存成功，但对应发货规则生成失败: ${deliveryRuleErrorMessage}`, 'warning');", body)
         self.assertIn("showToast(`卡券保存成功，但对应发货规则生成失败: ${deliveryRuleErrorMessage}，且列表刷新失败，请稍后手动刷新`, 'warning');", body)
         self.assertLess(
-            body.index("const result = await response.json();"),
+            body.index("const result = await response.json().catch(() => ({}));"),
             body.index("const modalElement = document.getElementById('addCardModal');"),
             "卡券创建成功后得先把后端返回的自动发货规则结果读出来，别模态框都关完了还不知道其实只是半成功",
         )
@@ -4473,6 +5634,19 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "卡券编辑弹窗都切会话或切页了，延迟多规格字段初始化就别再回来补刀摸当前弹窗了",
         )
 
+    def test_card_edit_modal_rejects_malformed_detail_payload_before_prefilling_form(self):
+        body = _extract_function_body(self.app_js, "editCard")
+
+        self.assertIn("function hasMalformedCardDetails(card) {", self.app_js)
+        self.assertIn("const card = await response.json().catch(() => ({}));", body)
+        self.assertIn("if (hasMalformedCardDetails(card)) {", body)
+        self.assertIn("throw new Error('卡券详情返回格式异常');", body)
+        self.assertLess(
+            body.index("if (hasMalformedCardDetails(card)) {"),
+            body.index("document.getElementById('editCardName').value = card.name;"),
+            "卡券详情接口如果回了歪 payload，得先拦住，别拿 undefined 往编辑表单里硬灌",
+        )
+
     def test_card_and_delivery_edit_helpers_parse_http_failure_details_before_toasting(self):
         card_body = _extract_function_body(self.app_js, "editCard")
         delivery_body = _extract_function_body(self.app_js, "editDeliveryRule")
@@ -4513,6 +5687,19 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                     toast_index,
                     f"{label} HTTP 失败应把真实后端错误带进 toast，别统一红字糊弄人",
                 )
+
+    def test_delivery_rule_edit_modal_rejects_malformed_detail_payload_before_prefilling_form(self):
+        body = _extract_function_body(self.app_js, "editDeliveryRule")
+
+        self.assertIn("function hasMalformedDeliveryRuleDetails(rule) {", self.app_js)
+        self.assertIn("const rule = await response.json().catch(() => ({}));", body)
+        self.assertIn("if (hasMalformedDeliveryRuleDetails(rule)) {", body)
+        self.assertIn("throw new Error('发货规则详情返回格式异常');", body)
+        self.assertLess(
+            body.index("if (hasMalformedDeliveryRuleDetails(rule)) {"),
+            body.index("document.getElementById('editRuleId').value = rule.id;"),
+            "发货规则详情接口如果回了歪 payload，前端得先挡住，别把坏数据直接塞进编辑表单",
+        )
 
     def test_delivery_rules_loader_resets_stale_table_and_stats_before_fetch_and_on_failure(self):
         reset_body = _extract_function_body(self.app_js, "resetDeliveryRulesView")
@@ -4575,13 +5762,24 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         )
 
         self.assertIn("async function refreshTodayDeliveryCount(requestSequence = 0) {", self.app_js)
+        self.assertIn("function hasMalformedDeliveryStatsResult(result) {", self.app_js)
         self.assertIn("requestSequence !== 0", refresh_today_body)
         self.assertIn("requestSequence !== deliveryRulesRequestSequence", refresh_today_body)
         self.assertIn("!document.getElementById('auto-delivery-section')?.classList.contains('active')", refresh_today_body)
+        self.assertIn("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", refresh_today_body)
+        self.assertIn("throw new Error(errorMessage);", refresh_today_body)
+        self.assertIn("const stats = await response.json().catch(() => ({}));", refresh_today_body)
+        self.assertIn("if (hasMalformedDeliveryStatsResult(stats)) {", refresh_today_body)
+        self.assertIn("throw new Error('发货统计返回格式异常');", refresh_today_body)
         self.assertLess(
             refresh_today_body.index("requestSequence !== deliveryRulesRequestSequence"),
-            refresh_today_body.index("todayEl.textContent = stats.today_delivery_count || 0;"),
+            refresh_today_body.index("const todayEl = document.getElementById('todayDeliveries');"),
             "旧的今日发货统计请求不该晚回来后把隐藏页数字偷偷改掉",
+        )
+        self.assertLess(
+            refresh_today_body.index("if (hasMalformedDeliveryStatsResult(stats)) {"),
+            refresh_today_body.index("const todayEl = document.getElementById('todayDeliveries');"),
+            "今日发货统计 payload 都歪了，就该先判格式异常，别继续把脏数据往 DOM 里塞",
         )
         self.assertLess(
             load_body.index("if (statsLoaded === false || cardOptionsLoaded === false) {"),
@@ -4605,6 +5803,88 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                 self.assertIn("} else if (rulesLoaded === false) {", body)
                 self.assertIn(f"showToast('{success_message}', 'success');", body)
                 self.assertIn(f"showToast('{warning_message}', 'warning');", body)
+
+    def test_card_and_delivery_mutations_reject_malformed_success_payloads_before_ui_followups(self):
+        save_card_body = _extract_function_body(self.app_js, "saveCard")
+        update_card_body = _extract_function_body(self.app_js, "updateCard")
+        update_card_image_body = _extract_function_body(self.app_js, "updateCardWithImage")
+        delete_card_body = _extract_function_body(self.app_js, "deleteCard")
+        save_delivery_body = _extract_function_body(self.app_js, "saveDeliveryRule")
+        update_delivery_body = _extract_function_body(self.app_js, "updateDeliveryRule")
+        delete_delivery_body = _extract_function_body(self.app_js, "deleteDeliveryRule")
+
+        self.assertIn("function hasMalformedCardMutationResult(result, requireId = false) {", self.app_js)
+        self.assertIn("function hasMalformedDeliveryRuleMutationResult(result, requireId = false) {", self.app_js)
+
+        for body, helper_call, error_text, followup_fragment, label in (
+            (
+                save_card_body,
+                "if (hasMalformedCardMutationResult(result, true)) {",
+                "throw new Error('卡券保存结果返回格式异常');",
+                "modal.hide();",
+                "卡券新增",
+            ),
+            (
+                update_card_body,
+                "if (hasMalformedCardMutationResult(result)) {",
+                "throw new Error('卡券更新结果返回格式异常');",
+                "modal.hide();",
+                "卡券更新",
+            ),
+            (
+                update_card_image_body,
+                "if (hasMalformedCardMutationResult(result)) {",
+                "throw new Error('卡券更新结果返回格式异常');",
+                "modal.hide();",
+                "带图卡券更新",
+            ),
+            (
+                delete_card_body,
+                "if (hasMalformedCardMutationResult(result)) {",
+                "throw new Error('卡券删除结果返回格式异常');",
+                "const cardsLoaded = await loadCards();",
+                "卡券删除",
+            ),
+            (
+                save_delivery_body,
+                "if (hasMalformedDeliveryRuleMutationResult(result, true)) {",
+                "throw new Error('发货规则保存结果返回格式异常');",
+                "modal.hide();",
+                "发货规则新增",
+            ),
+            (
+                update_delivery_body,
+                "if (hasMalformedDeliveryRuleMutationResult(result)) {",
+                "throw new Error('发货规则更新结果返回格式异常');",
+                "modal.hide();",
+                "发货规则更新",
+            ),
+            (
+                delete_delivery_body,
+                "if (hasMalformedDeliveryRuleMutationResult(result)) {",
+                "throw new Error('发货规则删除结果返回格式异常');",
+                "const rulesLoaded = await loadDeliveryRules();",
+                "发货规则删除",
+            ),
+        ):
+            with self.subTest(label=label):
+                self.assertIn("const result = await response.json().catch(() => ({}));", body)
+                self.assertIn(helper_call, body)
+                self.assertIn(error_text, body)
+                self.assertLess(
+                    body.index("const result = await response.json().catch(() => ({}));"),
+                    body.index(helper_call),
+                    f"{label}成功态 payload 得先读出来再验结构，别连回了啥都没看就往下闷头跑",
+                )
+                self.assertLess(
+                    body.index(helper_call),
+                    body.index(followup_fragment),
+                    f"{label}成功态 payload 歪了得先判格式异常，别继续关弹窗/刷新列表/弹成功把人整迷糊了",
+                )
+
+        self.assertIn("if (result.delivery_rule_generated != null && typeof result.delivery_rule_generated !== 'boolean') {", self.app_js)
+        self.assertIn("if (result.delivery_rule_id != null && !Number.isFinite(Number(result.delivery_rule_id))) {", self.app_js)
+        self.assertIn("if (result.delivery_rule_error != null && typeof result.delivery_rule_error !== 'string') {", self.app_js)
 
     def test_delivery_rule_mutations_do_not_emit_cross_page_toasts_after_leaving_section(self):
         save_body = _extract_function_body(self.app_js, "saveDeliveryRule")
@@ -5296,6 +6576,20 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "订单实时流这条 raw fetch 遇到 401 得先去登录，别后面还继续装成普通连流失败然后死命重连",
         )
 
+    def test_orders_stream_unauthorized_response_stops_reconnect_lifecycle(self):
+        body = _extract_function_body(self.app_js, "startOrdersStream")
+        unauthorized_block = _extract_brace_block_after(
+            body,
+            "if (handleUnauthorizedApiResponse(response))",
+        )
+
+        self.assertIn("ordersStreamShouldRun = false;", unauthorized_block)
+        self.assertLess(
+            unauthorized_block.index("ordersStreamShouldRun = false;"),
+            unauthorized_block.index("return null;"),
+            "订单实时流 401 之后得先停掉 shouldRun，否则 finally 又会安排重连，搁这儿无限敲登录失效的门呢",
+        )
+
     def test_orders_stream_event_handlers_ignore_stale_or_hidden_stream_sessions(self):
         handle_body = _extract_function_body(self.app_js, "handleOrdersStreamEvent")
         update_body = _extract_function_body(self.app_js, "applyRealtimeOrderUpdate")
@@ -5463,6 +6757,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
     def test_orders_list_loader_ignores_stale_async_responses_and_hidden_section(self):
         body = _extract_function_body(self.app_js, "loadAllOrders")
 
+        self.assertIn("function hasMalformedOrderListEntries(orders) {", self.app_js)
         self.assertIn("const requestSequence = ++ordersListRequestSequence;", body)
         self.assertIn("if (handleUnauthorizedApiResponse(response)) {", body)
         self.assertIn("if (!response.ok) {", body)
@@ -5471,10 +6766,20 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("requestSequence !== ordersListRequestSequence", body)
         self.assertIn("!document.getElementById('orders-section')?.classList.contains('active')", body)
         self.assertIn("return false;", body)
+        self.assertIn("typeof data.success !== 'boolean'", body)
+        self.assertIn("(data.message != null && typeof data.message !== 'string')", body)
+        self.assertIn("if (data.success === true && !Array.isArray(data.data)) {", body)
+        self.assertIn("if (data.success === true && hasMalformedOrderListEntries(data.data)) {", body)
+        self.assertIn("throw new Error('订单列表返回格式异常');", body)
         self.assertLess(
             body.index("requestSequence !== ordersListRequestSequence"),
-            body.index("allOrdersData = data.data || [];"),
+            body.index("allOrdersData = data.data;"),
             "过期的订单列表请求不该晚回来后把当前订单表又糊成旧数据",
+        )
+        self.assertLess(
+            body.index("if (data.success === true && hasMalformedOrderListEntries(data.data)) {"),
+            body.index("allOrdersData = data.data;"),
+            "订单列表成功态就算顶层 success=true，里面混进烂 order 条目也得先拦住，别继续排序筛选渲染整页抽风",
         )
 
     def test_orders_list_loader_handles_unauthorized_before_followup_work(self):
@@ -5586,6 +6891,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         modal_body = _extract_function_body(self.app_js, "openOrderHistorySyncModal")
         failure_helper_body = _extract_function_body(self.app_js, "restoreOrderAccountFilterFailureOption")
 
+        self.assertIn("const accounts = await response.json().catch(() => ({}));", helper_body)
         self.assertIn("if (!Array.isArray(accounts)) {", helper_body)
         self.assertIn("accounts.some(account => !account || typeof account !== 'object' || Array.isArray(account) || !getCookieDetailsAccountId(account))", helper_body)
         self.assertIn("throw new Error('订单账号列表返回格式异常');", helper_body)
@@ -6006,6 +7312,39 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("orderHistorySyncModal.addEventListener('hidden.bs.modal', () => {", self.app_js)
         self.assertIn("orderHistorySyncModalRequestSequence += 1;", self.app_js)
 
+    def test_order_history_sync_closing_or_leaving_orders_cancels_active_backend_job(self):
+        show_section_body = _extract_function_body(self.app_js, "showSection")
+        silent_cancel_body = _extract_function_body(self.app_js, "cancelActiveOrderHistorySyncJobSilently")
+        hidden_modal_body = _extract_brace_block_after(
+            self.app_js,
+            "orderHistorySyncModal.addEventListener('hidden.bs.modal', () =>",
+        )
+        pagehide_body = _extract_function_body(self.app_js, "cancelActiveOrderHistorySyncJobOnPageHide")
+
+        self.assertIn("let activeOrderHistorySyncJobStatus = '';", self.app_js)
+        self.assertIn("function isOrderHistorySyncJobActiveStatus(status) {", self.app_js)
+        self.assertIn("cancelActiveOrderHistorySyncJobSilently();", show_section_body)
+        self.assertIn("cancelActiveOrderHistorySyncJobSilently();", hidden_modal_body)
+        self.assertIn("cancelActiveOrderHistorySyncJobSilently({ keepalive: true });", pagehide_body)
+        self.assertIn("window.addEventListener('pagehide', cancelActiveOrderHistorySyncJobOnPageHide);", self.app_js)
+
+        self.assertIn("if (!activeOrderHistorySyncJobId || !isOrderHistorySyncJobActiveStatus(activeOrderHistorySyncJobStatus)) {", silent_cancel_body)
+        self.assertIn("method: 'POST'", silent_cancel_body)
+        self.assertIn("keepalive: Boolean(options.keepalive)", silent_cancel_body)
+        self.assertIn("'Authorization': `Bearer ${token}`", silent_cancel_body)
+        self.assertIn("activeOrderHistorySyncJobStatus = 'cancelled';", silent_cancel_body)
+        self.assertNotIn("showToast(", silent_cancel_body)
+        self.assertLess(
+            show_section_body.index("cancelActiveOrderHistorySyncJobSilently();"),
+            show_section_body.index("stopOrderHistorySyncPolling();"),
+            "切出订单页时不能只停前端轮询，后台历史同步浏览器任务也得先取消，别搁后台偷偷跑，跟锅包肉回锅似的没完没了",
+        )
+        self.assertLess(
+            hidden_modal_body.index("cancelActiveOrderHistorySyncJobSilently();"),
+            hidden_modal_body.index("stopOrderHistorySyncPolling();"),
+            "关历史同步弹窗时必须先通知后端取消 active job，再停轮询；只关前端这叫掩耳盗铃",
+        )
+
     def test_orders_section_switch_closes_order_detail_modal_and_invalidates_item_detail_requests(self):
         show_section_body = _extract_function_body(self.app_js, "showSection")
         self.assertIn("orderDetailItemRequestSequence += 1;", show_section_body)
@@ -6233,12 +7572,27 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
     def test_account_diagnostics_runtime_refresh_ignores_stale_async_responses(self):
         self.assertIn("let aboutRuntimeRequestSequence = 0;", self.app_js)
         body = _extract_function_body(self.app_js, "loadAboutRuntimeStatus")
+        self.assertIn("function hasMalformedAboutRuntimeStatusResult(result, expectedAccountId = '') {", self.app_js)
         self.assertIn("suppressErrorToast: true", body)
         self.assertIn("const result = await fetchJSONWithoutGlobalLoading(`${apiBase}/accounts/${encodeURIComponent(normalizedAccountId)}/runtime-status`, {", body)
         self.assertNotIn("const result = await fetchJSON(`${apiBase}/accounts/${encodeURIComponent(normalizedAccountId)}/runtime-status`, {", body)
         self.assertIn("const requestSequence = ++aboutRuntimeRequestSequence;", body)
         self.assertIn("if (requestSequence !== aboutRuntimeRequestSequence || getAboutSelectedAccountId() !== normalizedAccountId) {", body)
+        self.assertIn("if (!result) {", body)
+        self.assertIn("if (hasMalformedAboutRuntimeStatusResult(result, normalizedAccountId)) {", body)
+        self.assertIn("throw new Error('账号运行态返回格式异常');", body)
+        self.assertIn("const runtimeStatus = result.runtime_status || null;", body)
         self.assertIn("return false;", body)
+        self.assertLess(
+            body.index("if (!result) {"),
+            body.index("const runtimeStatus = result.runtime_status || null;"),
+            "账号诊断运行态在 fetchJSON helper 因 401 跳转返回空结果后，应直接收手，别把空结果伪装成空运行态继续刷新展示",
+        )
+        self.assertLess(
+            body.index("if (hasMalformedAboutRuntimeStatusResult(result, normalizedAccountId)) {"),
+            body.index("const runtimeStatus = result.runtime_status || null;"),
+            "账号诊断运行态在消费 runtime_status 前也得先拦住歪 payload，别拿半截结果继续刷新诊断卡片装正常",
+        )
 
     def test_account_diagnostics_root_loader_ignores_stale_async_responses_and_hidden_accounts_section(self):
         self.assertIn("let aboutDiagnosticsLoadRequestSequence = 0;", self.app_js)
@@ -6249,6 +7603,9 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("const accounts = await fetchJSON(`${apiBase}/accounts/details?summary_only=true`, {", body)
         self.assertIn("aboutDiagnosticsLoadRequestSequence += 1;", show_section_body)
         self.assertIn("const requestSequence = ++aboutDiagnosticsLoadRequestSequence;", body)
+        self.assertIn("if (!Array.isArray(accounts)) {", body)
+        self.assertIn("if (hasMalformedCookieDetailsAccounts(accounts)) {", body)
+        self.assertIn("throw new Error('账号列表返回格式异常');", body)
         self.assertIn("requestSequence !== aboutDiagnosticsLoadRequestSequence", body)
         self.assertIn("!document.getElementById('accounts-section')?.classList.contains('active')", body)
         self.assertIn("return null;", body)
@@ -6256,6 +7613,11 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             body.index("requestSequence !== aboutDiagnosticsLoadRequestSequence"),
             body.index("aboutDiagnosticsAccounts = Array.isArray(accounts) ? accounts : [];"),
             "旧的账号诊断列表请求不该晚回来后把当前隐藏页的诊断账号选项重新糊回去",
+        )
+        self.assertLess(
+            body.index("if (hasMalformedCookieDetailsAccounts(accounts)) {"),
+            body.index("populateAboutAccountOptions(aboutDiagnosticsAccounts);"),
+            "账号诊断页在渲染账号选项前也得先拦住坏账号对象，别把脏 payload 混进诊断面板",
         )
         self.assertLess(
             body.rfind("!document.getElementById('accounts-section')?.classList.contains('active')", 0, body.index("await loadAboutRuntimeStatus(nextAccountId);")),
@@ -6279,11 +7641,40 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("let aboutRuntimeRequestSequence = 0;", self.app_js)
         self.assertIn("let aboutKeepaliveActionRequestSequence = 0;", self.app_js)
         self.assertIn("let aboutConversationHistoryRequestSequence = 0;", self.app_js)
+        self.assertIn("let aboutDiagnosticsAbortController = null;", self.app_js)
         show_section_body = _extract_function_body(self.app_js, "showSection")
 
+        self.assertIn("stopAboutDiagnosticsRequests();", show_section_body)
         self.assertIn("aboutRuntimeRequestSequence += 1;", show_section_body)
         self.assertIn("aboutKeepaliveActionRequestSequence += 1;", show_section_body)
         self.assertIn("aboutConversationHistoryRequestSequence += 1;", show_section_body)
+
+    def test_account_diagnostics_abort_inflight_browser_runtime_requests(self):
+        self.assertIn("function stopAboutDiagnosticsRequests() {", self.app_js)
+        self.assertIn(
+            "window.addEventListener('pagehide', stopAboutDiagnosticsRequests);",
+            self.app_js,
+        )
+        stop_body = _extract_function_body(self.app_js, "stopAboutDiagnosticsRequests")
+        diagnostics_body = _extract_function_body(self.app_js, "loadAboutDiagnostics")
+        runtime_body = _extract_function_body(self.app_js, "loadAboutRuntimeStatus")
+        keepalive_body = _extract_function_body(self.app_js, "triggerAboutSessionKeepalive")
+        history_body = _extract_function_body(self.app_js, "loadAboutConversationHistory")
+
+        self.assertIn("aboutDiagnosticsAbortController.abort();", stop_body)
+        self.assertIn("aboutDiagnosticsAbortController = null;", stop_body)
+        self.assertIn("const controller = resetAboutDiagnosticsAbortController();", diagnostics_body)
+        self.assertIn("signal: controller.signal", diagnostics_body)
+        self.assertIn("if (controller.signal.aborted || error?.name === 'AbortError') {", diagnostics_body)
+        self.assertIn("const controller = resetAboutDiagnosticsAbortController();", runtime_body)
+        self.assertIn("signal: controller.signal", runtime_body)
+        self.assertIn("if (controller.signal.aborted || error?.name === 'AbortError') {", runtime_body)
+        self.assertIn("const controller = resetAboutDiagnosticsAbortController();", keepalive_body)
+        self.assertIn("signal: controller.signal", keepalive_body)
+        self.assertIn("if (controller.signal.aborted || error?.name === 'AbortError') {", keepalive_body)
+        self.assertIn("const controller = resetAboutDiagnosticsAbortController();", history_body)
+        self.assertIn("signal: controller.signal", history_body)
+        self.assertIn("if (controller.signal.aborted || error?.name === 'AbortError') {", history_body)
 
     def test_account_diagnostics_refresh_only_reports_success_when_runtime_reload_succeeds(self):
         load_body = _extract_function_body(self.app_js, "loadAboutRuntimeStatus")
@@ -6324,6 +7715,8 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         keepalive_body = _extract_function_body(self.app_js, "triggerAboutSessionKeepalive")
         history_body = _extract_function_body(self.app_js, "loadAboutConversationHistory")
 
+        self.assertIn("function hasMalformedAboutSessionKeepaliveResult(result, expectedAccountId = '') {", self.app_js)
+        self.assertIn("function hasMalformedAboutConversationHistoryResult(result, expectedAccountId = '', expectedConversationId = '') {", self.app_js)
         self.assertIn("const result = await fetchJSONWithoutGlobalLoading(`${apiBase}/accounts/${encodeURIComponent(accountId)}/session-keepalive`, {", keepalive_body)
         self.assertNotIn("const result = await fetchJSON(`${apiBase}/accounts/${encodeURIComponent(accountId)}/session-keepalive`, {", keepalive_body)
         self.assertIn("const requestedAccountId = accountId;", keepalive_body)
@@ -6332,14 +7725,27 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("getAboutSelectedAccountId() !== requestedAccountId", keepalive_body)
         self.assertIn("!document.getElementById('accounts-section')?.classList.contains('active')", keepalive_body)
         self.assertIn("return null;", keepalive_body)
+        self.assertIn("if (!result) {", keepalive_body)
+        self.assertIn("if (hasMalformedAboutSessionKeepaliveResult(result, requestedAccountId)) {", keepalive_body)
+        self.assertIn("throw new Error('轻保活结果返回格式异常');", keepalive_body)
         self.assertLess(
             keepalive_body.index("actionRequestSequence !== aboutKeepaliveActionRequestSequence"),
             keepalive_body.index("renderAboutAccountMeta(targetAccount);"),
             "旧的轻保活响应不该晚回来后把当前诊断账号的运行态又改回去",
         )
         self.assertLess(
-            keepalive_body.rfind("!document.getElementById('accounts-section')?.classList.contains('active')", 0, keepalive_body.index("showToast(result?.message || '轻保活已执行', result?.success ? 'success' : 'warning');")),
-            keepalive_body.index("showToast(result?.message || '轻保活已执行', result?.success ? 'success' : 'warning');"),
+            keepalive_body.index("if (!result) {"),
+            keepalive_body.index("renderAboutAccountMeta(targetAccount);"),
+            "轻保活请求在 fetchJSON helper 因 401 跳转返回空结果后，应直接收手，别把空结果伪装成轻保活成功继续刷新诊断状态",
+        )
+        self.assertLess(
+            keepalive_body.index("if (hasMalformedAboutSessionKeepaliveResult(result, requestedAccountId)) {"),
+            keepalive_body.index("renderAboutAccountMeta(targetAccount);"),
+            "轻保活结果在更新诊断运行态前也得先拦住歪 payload，别拿半截结果继续刷新状态和弹 toast",
+        )
+        self.assertLess(
+            keepalive_body.rfind("!document.getElementById('accounts-section')?.classList.contains('active')", 0, keepalive_body.index("showToast(result.message || '轻保活已执行', result.success ? 'success' : 'warning');")),
+            keepalive_body.index("showToast(result.message || '轻保活已执行', result.success ? 'success' : 'warning');"),
             "都切出账号页了，旧的轻保活结果不该再跨页弹 toast",
         )
         self.assertIn("suppressErrorToast: true", keepalive_body)
@@ -6361,6 +7767,11 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
 
         self.assertIn("const result = await fetchJSONWithoutGlobalLoading(", history_body)
         self.assertNotIn("const result = await fetchJSON(", history_body)
+        self.assertIn("if (!result) {", history_body)
+        self.assertIn("if (hasMalformedAboutConversationHistoryResult(result, requestedAccountId, requestedConversationId)) {", history_body)
+        self.assertIn("throw new Error('历史消息返回格式异常');", history_body)
+        self.assertIn("renderAboutConversationHistory(result.messages, {", history_body)
+        self.assertIn("conversationId: result.conversation_id || conversationId,", history_body)
         self.assertIn("const requestedAccountId = accountId;", history_body)
         self.assertIn("const requestedConversationId = conversationId;", history_body)
         self.assertIn("const requestSequence = ++aboutConversationHistoryRequestSequence;", history_body)
@@ -6371,8 +7782,18 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("return null;", history_body)
         self.assertIn("suppressErrorToast: true", history_body)
         self.assertLess(
+            history_body.index("if (!result) {"),
+            history_body.index("renderAboutConversationHistory(result.messages, {"),
+            "历史消息查询在 fetchJSON helper 因 401 跳转返回空结果后，应直接收手，别把空结果伪装成历史消息查询成功",
+        )
+        self.assertLess(
+            history_body.index("if (hasMalformedAboutConversationHistoryResult(result, requestedAccountId, requestedConversationId)) {"),
+            history_body.index("renderAboutConversationHistory(result.messages, {"),
+            "历史消息查询在渲染消息前也得先拦住歪 payload，别拿半截结果继续覆盖当前会话面板",
+        )
+        self.assertLess(
             history_body.index("requestSequence !== aboutConversationHistoryRequestSequence"),
-            history_body.index("renderAboutConversationHistory(result?.messages || [], {"),
+            history_body.index("renderAboutConversationHistory(result.messages, {"),
             "旧的历史消息查询结果不该晚回来后把当前会话记录糊回去",
         )
         self.assertLess(
@@ -6425,6 +7846,13 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
 
         self.assertIn("if (handleUnauthorizedApiResponse(response)) {", body)
         self.assertIn("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", body)
+        self.assertIn("const result = await response.json().catch(() => ({}));", body)
+        self.assertIn("if (hasMalformedVerifyResult(result)) {", body)
+        self.assertIn("throw new Error('权限验证结果返回格式异常');", body)
+        self.assertIn("if (!result.authenticated) {", body)
+        self.assertIn("localStorage.removeItem('auth_token');", body)
+        self.assertIn("localStorage.removeItem('user_info');", body)
+        self.assertIn("window.location.href = '/';", body)
         self.assertIn("throw new Error(errorMessage);", body)
         self.assertIn("showToast(`权限验证失败: ${error.message || '请稍后重试'}`, 'danger');", body)
 
@@ -6432,6 +7860,9 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         response_ok_index = body.index("if (!response.ok) {")
         error_index = body.index("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);")
         throw_index = body.index("throw new Error(errorMessage);", error_index)
+        parse_index = body.index("const result = await response.json().catch(() => ({}));")
+        malformed_index = body.index("if (hasMalformedVerifyResult(result)) {")
+        unauthenticated_index = body.index("if (!result.authenticated) {")
         toast_index = body.index("showToast(`权限验证失败: ${error.message || '请稍后重试'}`, 'danger');")
 
         self.assertLess(
@@ -6443,6 +7874,16 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             error_index,
             throw_index,
             "系统设置权限校验 HTTP 失败时得先把 detail/message 解出来，别继续闷头吞后端错误",
+        )
+        self.assertLess(
+            parse_index,
+            malformed_index,
+            "系统设置权限校验成功态也得先把 JSON 兜底读出来，再验结构，别空响应还拿来当管理员信息用",
+        )
+        self.assertLess(
+            malformed_index,
+            unauthenticated_index,
+            "系统设置权限校验成功体结构都歪了，先按格式异常拦住，别继续拿脏 payload 判登录态",
         )
         self.assertLess(
             throw_index,
@@ -6464,6 +7905,24 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             body.find("!isSystemSettingsSectionActive()", error_index),
             throw_index,
             "系统设置权限校验读完错误体后得先看页面还在不在，别切页了还回来甩 danger toast",
+        )
+
+    def test_load_system_settings_verify_false_clears_session_instead_of_falling_back_to_permission_denied(self):
+        body = _extract_function_body(self.app_js, "loadSystemSettings")
+
+        self.assertIn("function hasMalformedVerifyResult(result) {", self.app_js)
+        self.assertIn("if (typeof result.authenticated !== 'boolean') {", self.app_js)
+        self.assertIn("if (result.authenticated !== true) {", self.app_js)
+        self.assertIn("if (!result.authenticated) {", body)
+        self.assertIn("localStorage.removeItem('auth_token');", body)
+        self.assertIn("localStorage.removeItem('user_info');", body)
+        self.assertIn("window.location.href = '/';", body)
+        unauthenticated_index = body.index("if (!result.authenticated) {")
+        admin_visibility_index = body.index("setSystemSettingsAdminVisibility(isAdmin);")
+        self.assertLess(
+            unauthenticated_index,
+            admin_visibility_index,
+            "系统设置 verify 返回 authenticated:false 时应先清登录态跳回去，别继续把它当普通非管理员隐藏面板糊弄人",
         )
 
     def test_load_system_settings_does_not_leave_debug_console_logs(self):
@@ -6518,6 +7977,65 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                 self.assertIn("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", body)
                 self.assertIn("throw new Error(errorMessage);", body)
                 self.assertIn(toast_fragment, body)
+
+    def test_system_settings_child_loaders_reject_malformed_success_payloads_before_writing_ui(self):
+        self.assertIn("function hasMalformedSystemSettingsLoadResult(result) {", self.app_js)
+        self.assertIn("function hasMalformedRegistrationStatusResult(result) {", self.app_js)
+
+        cases = (
+            (
+                "loadAPISecuritySettings",
+                "const settings = await response.json().catch(() => ({}));",
+                "if (hasMalformedSystemSettingsLoadResult(settings)) {",
+                "throw new Error('API安全设置返回格式异常');",
+                "qqReplySecretKeyInput.value = qqReplySecretKey;",
+            ),
+            (
+                "loadDebounceDelay",
+                "const settings = await response.json().catch(() => ({}));",
+                "if (hasMalformedSystemSettingsLoadResult(settings)) {",
+                "throw new Error('防抖延迟设置返回格式异常');",
+                "const val = settings.message_debounce_delay;",
+            ),
+            (
+                "loadOutgoingConfigs",
+                "const settings = await response.json().catch(() => ({}));",
+                "if (hasMalformedSystemSettingsLoadResult(settings)) {",
+                "throw new Error('外发配置返回格式异常');",
+                "renderOutgoingConfigs(settings);",
+            ),
+            (
+                "loadRegistrationSettings",
+                "const data = await response.json().catch(() => ({}));",
+                "if (hasMalformedRegistrationStatusResult(data)) {",
+                "throw new Error('注册设置返回格式异常');",
+                "checkbox.checked = data.enabled;",
+            ),
+            (
+                "loadLoginInfoSettings",
+                "const settings = await response.json().catch(() => ({}));",
+                "if (hasMalformedSystemSettingsLoadResult(settings)) {",
+                "throw new Error('登录信息设置返回格式异常');",
+                "checkbox.checked = settings.show_default_login_info === 'true';",
+            ),
+        )
+
+        for function_name, parse_fragment, guard_fragment, throw_fragment, ui_fragment in cases:
+            with self.subTest(function_name=function_name):
+                body = _extract_function_body(self.app_js, function_name)
+                self.assertIn(parse_fragment, body)
+                self.assertIn(guard_fragment, body)
+                self.assertIn(throw_fragment, body)
+                self.assertLess(
+                    body.index(parse_fragment),
+                    body.index(guard_fragment),
+                    f"{function_name} 成功态也得先把 JSON 兜底读出来，再验结构，别空 body 直接把当前页炸飞",
+                )
+                self.assertLess(
+                    body.index(guard_fragment),
+                    body.index(ui_fragment),
+                    f"{function_name} payload 都歪了得先判格式异常，别继续往系统设置 DOM 里灌脏数据",
+                )
 
     def test_debounce_delay_loader_does_not_fail_silently_on_http_errors(self):
         body = _extract_function_body(self.app_js, "loadDebounceDelay")
@@ -6865,6 +8383,47 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertNotIn("const errorData = await captchaResponse.json();", body)
         self.assertNotIn("showToast('更新登录信息设置失败', 'danger');", body)
 
+    def test_update_login_info_settings_does_not_treat_business_failure_payloads_as_success(self):
+        body = _extract_function_body(self.app_js, "updateLoginInfoSettings")
+
+        for json_fragment, failure_guard, failure_toast, success_fragment, label in (
+            (
+                "const regResult = await regResponse.json().catch(() => ({}));",
+                "if (regResult && typeof regResult === 'object' && regResult.success === false) {",
+                "showToast(`更新注册设置失败: ${regResult.message || '请稍后重试'}`, 'danger');",
+                "messages.push(regEnabled ? '用户注册已开启' : '用户注册已关闭');",
+                "注册设置",
+            ),
+            (
+                "const result = await response.json().catch(() => ({}));",
+                "if (result && typeof result === 'object' && result.success === false) {",
+                "showToast(`更新默认登录信息设置失败: ${result.message || '请稍后重试'}`, 'danger');",
+                "messages.push(enabled ? '默认登录信息显示已开启' : '默认登录信息显示已关闭');",
+                "默认登录信息设置",
+            ),
+            (
+                "const captchaResult = await captchaResponse.json().catch(() => ({}));",
+                "if (captchaResult && typeof captchaResult === 'object' && captchaResult.success === false) {",
+                "showToast(`更新登录验证码设置失败: ${captchaResult.message || '请稍后重试'}`, 'danger');",
+                "messages.push(captchaEnabled ? '登录验证码已开启' : '登录验证码已关闭');",
+                "登录验证码设置",
+            ),
+        ):
+            with self.subTest(label=label):
+                self.assertIn(json_fragment, body)
+                self.assertIn(failure_guard, body)
+                self.assertIn(failure_toast, body)
+                self.assertLess(
+                    body.index(json_fragment),
+                    body.index(failure_guard),
+                    f"{label}先把响应 JSON 读出来，再判断 success:false，别啥都没看就往成功分支冲",
+                )
+                self.assertLess(
+                    body.index(failure_guard),
+                    body.index(success_fragment),
+                    f"{label}如果后端 200 里已经明确业务失败，就别继续追加成功消息骗自己了",
+                )
+
     def test_system_settings_mutations_do_not_emit_cross_page_toasts_or_reopen_hidden_status_after_leaving_section(self):
         theme_body = _extract_function_body(self.app_js, "saveThemeSettings")
         debounce_body = _extract_function_body(self.app_js, "saveDebounceDelay")
@@ -7064,6 +8623,44 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertNotIn("/user-settings/menu_order", reset_body)
         self.assertIn("showToast(`重置菜单设置失败: ${error.message || '请稍后重试'}`, 'danger');", reset_body)
 
+    def test_menu_settings_mutations_reject_malformed_success_payloads_before_state_updates_or_success_toasts(self):
+        save_body = _extract_function_body(self.app_js, "saveMenuSettings")
+        reset_body = _extract_function_body(self.app_js, "resetMenuSettings")
+
+        self.assertIn("function hasMalformedMenuSettingsMutationResult(result) {", self.app_js)
+
+        for body, guard_fragment, state_fragment, success_fragment, label in (
+            (
+                save_body,
+                "if (hasMalformedMenuSettingsMutationResult(result)) {",
+                "menuSettings = visibility;",
+                "showToast('菜单设置保存成功', 'success');",
+                "保存菜单设置",
+            ),
+            (
+                reset_body,
+                "if (hasMalformedMenuSettingsMutationResult(result)) {",
+                "menuSettings = {};",
+                "showToast('菜单设置已恢复默认', 'success');",
+                "重置菜单设置",
+            ),
+        ):
+            with self.subTest(label=label):
+                self.assertIn("const result = await response.json().catch(() => ({}));", body)
+                self.assertLess(
+                    body.index(guard_fragment),
+                    body.index(state_fragment),
+                    f"{label}成功态 payload 歪了得先拦住，别还没验结构就先把 sidebar 状态改了",
+                )
+                self.assertLess(
+                    body.index(guard_fragment),
+                    body.index(success_fragment),
+                    f"{label}结果结构都不对了，就别继续弹 success toast 糊人",
+                )
+
+        self.assertIn("throw new Error('菜单设置保存结果返回格式异常');", save_body)
+        self.assertIn("throw new Error('菜单设置重置结果返回格式异常');", reset_body)
+
     def test_menu_settings_mutations_read_structured_error_messages_before_throwing_and_toasting(self):
         save_body = _extract_function_body(self.app_js, "saveMenuSettings")
         reset_body = _extract_function_body(self.app_js, "resetMenuSettings")
@@ -7259,6 +8856,24 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "菜单设置加载失败应把真实后端错误带进 catch toast，别又给吞成一坨固定红字",
         )
 
+    def test_load_menu_settings_rejects_malformed_success_payload_before_menu_application(self):
+        body = _extract_function_body(self.app_js, "loadMenuSettings")
+
+        self.assertIn("function hasMalformedUserSettingsLoadResult(result) {", self.app_js)
+        self.assertIn("const settings = await response.json().catch(() => ({}));", body)
+        self.assertIn("if (hasMalformedUserSettingsLoadResult(settings)) {", body)
+        self.assertIn("throw new Error('菜单设置返回格式异常');", body)
+        self.assertLess(
+            body.index("const settings = await response.json().catch(() => ({}));"),
+            body.index("if (hasMalformedUserSettingsLoadResult(settings)) {"),
+            "菜单设置成功态也得先把 JSON 兜底读出来，再验结构，别空 body 一来就把 sidebar 配置流程搞成玄学",
+        )
+        self.assertLess(
+            body.index("if (hasMalformedUserSettingsLoadResult(settings)) {"),
+            body.index("if (settings.menu_visibility && settings.menu_visibility.value) {"),
+            "菜单设置 payload 歪了得先判格式异常，别继续解析显隐配置把 sidebar 搞乱套",
+        )
+
     def test_menu_settings_save_waits_for_latest_menu_config_load_before_collecting_dom_state(self):
         load_body = _extract_function_body(self.app_js, "loadMenuSettings")
         save_body = _extract_function_body(self.app_js, "saveMenuSettings")
@@ -7367,6 +8982,26 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             throw_index,
             toast_index,
             "主题设置失败应把真实后端错误带进 catch toast，别又给吞成一句空泛红字",
+        )
+
+    def test_theme_settings_save_rejects_malformed_success_payload_before_applying_theme_or_success_toast(self):
+        body = _extract_function_body(self.app_js, "saveThemeSettings")
+
+        self.assertIn("function hasMalformedUserSettingMutationResult(result, requireKey = false, requireValue = false) {", self.app_js)
+        self.assertIn("const result = await response.json().catch(() => ({}));", body)
+        self.assertIn("hasMalformedUserSettingMutationResult(result, true, true)", body)
+        self.assertIn("result.key !== 'theme_color'", body)
+        self.assertIn("result.value !== normalizedThemeColor", body)
+        self.assertIn("throw new Error('主题设置保存结果返回格式异常');", body)
+        self.assertLess(
+            body.index("hasMalformedUserSettingMutationResult(result, true, true)"),
+            body.index("applyThemeColor(normalizedThemeColor);"),
+            "主题设置成功态 payload 歪了得先拦住，别后端没存明白前端先把全站主题色改了",
+        )
+        self.assertLess(
+            body.index("hasMalformedUserSettingMutationResult(result, true, true)"),
+            body.index("showToast('主题设置保存成功', 'success');"),
+            "主题设置返回结构都不对了，就别继续弹 success toast 糊人",
         )
 
     def test_theme_settings_save_validates_hex_color_before_submitting_or_applying(self):
@@ -7489,6 +9124,26 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "都切出系统设置页了，旧的改密码失败响应别再跨页回来甩 danger toast",
         )
 
+    def test_password_update_submit_rejects_malformed_success_payload_before_success_or_business_failure_branch(self):
+        body = _extract_brace_block_after(
+            self.app_js,
+            "passwordForm.addEventListener('submit', async function(e)",
+        )
+
+        self.assertIn("const result = await response.json().catch(() => ({}));", body)
+        self.assertIn("if (hasMalformedSystemSettingsMutationResult(result, '', true)) {", body)
+        self.assertIn("throw new Error('密码更新结果返回格式异常');", body)
+        self.assertLess(
+            body.index("if (hasMalformedSystemSettingsMutationResult(result, '', true)) {"),
+            body.index("if (result.success) {"),
+            "改密码成功态 payload 歪了得先判格式异常，别继续拿 result.success 往成功/失败分支硬跑",
+        )
+        self.assertLess(
+            body.index("if (hasMalformedSystemSettingsMutationResult(result, '', true)) {"),
+            body.index("showToast('密码更新成功，请重新登录', 'success');"),
+            "改密码结果结构都不对了，就别继续弹 success toast 糊人",
+        )
+
     def test_backend_rejects_invalid_theme_color_user_settings_values(self):
         self.assertIn("if key == 'theme_color':", self.reply_server)
         self.assertIn("normalized_value = str(value or '').strip()", self.reply_server)
@@ -7556,6 +9211,24 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             body.rfind("if (isSystemSettingsSectionActive()) {", 0, toast_index),
             toast_index,
             "不在系统设置页时，用户设置加载失败就别跨页甩 danger toast 了",
+        )
+
+    def test_load_user_settings_rejects_malformed_success_payload_before_theme_update(self):
+        body = _extract_function_body(self.app_js, "loadUserSettings")
+
+        self.assertIn("function hasMalformedUserSettingsLoadResult(result) {", self.app_js)
+        self.assertIn("const settings = await response.json().catch(() => ({}));", body)
+        self.assertIn("if (hasMalformedUserSettingsLoadResult(settings)) {", body)
+        self.assertIn("throw new Error('用户设置返回格式异常');", body)
+        self.assertLess(
+            body.index("const settings = await response.json().catch(() => ({}));"),
+            body.index("if (hasMalformedUserSettingsLoadResult(settings)) {"),
+            "用户设置成功态也得先把 JSON 兜底读出来，再验结构，别空响应一来就把主题设置流程炸掉",
+        )
+        self.assertLess(
+            body.index("if (hasMalformedUserSettingsLoadResult(settings)) {"),
+            body.index("if (settings.theme_color && settings.theme_color.value) {"),
+            "用户设置 payload 歪了得先判格式异常，别继续把 undefined 往主题控件和 CSS 变量里灌",
         )
 
     def test_reset_theme_settings_fields_rehydrates_picker_hex_preset_and_css_defaults(self):
@@ -7766,6 +9439,24 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                     "备份操作失败别再拿裸文本瞎糊，先统一走错误体解析再弹 toast",
                 )
 
+    def test_backup_export_rejects_malformed_success_payload_before_download(self):
+        export_body = _extract_function_body(self.app_js, "exportBackup")
+
+        self.assertIn("function hasMalformedBackupExportData(result) {", self.app_js)
+        self.assertIn("const backupData = await response.json().catch(() => ({}));", export_body)
+        self.assertIn("if (hasMalformedBackupExportData(backupData)) {", export_body)
+        self.assertIn("throw new Error('备份导出数据返回格式异常');", export_body)
+        self.assertLess(
+            export_body.index("const backupData = await response.json().catch(() => ({}));"),
+            export_body.index("if (hasMalformedBackupExportData(backupData)) {"),
+            "备份导出成功态也得先把 JSON 兜底读出来，再验结构，别空 body 一来就开始拼下载文件",
+        )
+        self.assertLess(
+            export_body.index("if (hasMalformedBackupExportData(backupData)) {"),
+            export_body.index("const blob = new Blob([JSON.stringify(backupData, null, 2)], { type: 'application/json' });"),
+            "备份导出 payload 都歪了，就别继续生成 JSON 文件糊用户了",
+        )
+
     def test_backup_upload_and_import_failures_recheck_stale_state_after_error_body_read(self):
         upload_body = _extract_function_body(self.app_js, "uploadDatabaseBackup")
         import_body = _extract_function_body(self.app_js, "importBackup")
@@ -7786,6 +9477,46 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                     body.index(error_fragment),
                     "都切出系统设置页了，旧失败响应读完错误体后也别再跨页弹 danger toast",
                 )
+
+    def test_backup_upload_and_import_reject_malformed_success_payloads_before_success_toast_or_followups(self):
+        upload_body = _extract_function_body(self.app_js, "uploadDatabaseBackup")
+        import_body = _extract_function_body(self.app_js, "importBackup")
+
+        self.assertIn("function hasMalformedBackupMutationResult(result, requireUserCount = false) {", self.app_js)
+
+        for body, helper_call, error_text, followup_fragment, label in (
+            (
+                upload_body,
+                "if (hasMalformedBackupMutationResult(result, true)) {",
+                "throw new Error('数据库恢复结果返回格式异常');",
+                "if (result.warning) {",
+                "数据库恢复",
+            ),
+            (
+                import_body,
+                "if (hasMalformedBackupMutationResult(result)) {",
+                "throw new Error('备份导入结果返回格式异常');",
+                "if (!isSystemSettingsSectionActive()) {",
+                "备份导入",
+            ),
+        ):
+            with self.subTest(label=label):
+                self.assertIn("const result = await response.json().catch(() => ({}));", body)
+                self.assertIn(helper_call, body)
+                self.assertIn(error_text, body)
+                self.assertLess(
+                    body.index("const result = await response.json().catch(() => ({}));"),
+                    body.index(helper_call),
+                    f"{label}成功态 payload 得先读出来并兜底，再交给 helper 验格式，别回个空体就把后续链路撞翻",
+                )
+                self.assertLess(
+                    body.index(helper_call),
+                    body.index(followup_fragment),
+                    f"{label}成功态 payload 歪了得先判格式异常，别继续清文件、弹成功或跑后续回刷",
+                )
+
+        self.assertIn("if (result.warning != null && typeof result.warning !== 'string') {", self.app_js)
+        self.assertIn("if (requireUserCount && (!Number.isFinite(Number(result.user_count)) || Number(result.user_count) < 0)) {", self.app_js)
 
     def test_backup_upload_and_import_followup_callbacks_stop_after_newer_backup_actions(self):
         upload_body = _extract_function_body(self.app_js, "uploadDatabaseBackup")
@@ -7833,6 +9564,79 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             body.index("showToast('系统缓存刷新成功！关键字等数据已更新', 'success');"),
             "缓存刷新不该后端刚回 200 就先报喜，当前页面数据没刷新完之前先别装成功",
         )
+
+    def test_system_settings_mutations_reject_malformed_success_payloads_before_success_ui(self):
+        debounce_body = _extract_function_body(self.app_js, "saveDebounceDelay")
+        secret_body = _extract_function_body(self.app_js, "updateQQReplySecretKey")
+        login_info_body = _extract_function_body(self.app_js, "updateLoginInfoSettings")
+        reload_body = _extract_function_body(self.app_js, "reloadSystemCache")
+
+        self.assertIn("function hasMalformedSystemSettingsMutationResult(result, booleanFieldName = '', requireSuccessFlag = false) {", self.app_js)
+
+        for body, helper_call, error_text, followup_fragment, label in (
+            (
+                debounce_body,
+                "if (hasMalformedSystemSettingsMutationResult(result)) {",
+                "throw new Error('防抖延迟保存结果返回格式异常');",
+                "showToast('防抖延迟已保存', 'success');",
+                "防抖延迟保存",
+            ),
+            (
+                secret_body,
+                "if (hasMalformedSystemSettingsMutationResult(result)) {",
+                "throw new Error('更新QQ回复消息API秘钥结果返回格式异常');",
+                "showToast('QQ回复消息API秘钥更新成功', 'success');",
+                "QQ秘钥保存",
+            ),
+            (
+                reload_body,
+                "if (hasMalformedSystemSettingsMutationResult(result, '', true)) {",
+                "throw new Error('刷新系统缓存结果返回格式异常');",
+                "clearKeywordCache();",
+                "系统缓存刷新",
+            ),
+        ):
+            with self.subTest(label=label):
+                self.assertIn("const result = await response.json().catch(() =>", body)
+                self.assertIn(helper_call, body)
+                self.assertIn(error_text, body)
+                self.assertLess(
+                    body.index(helper_call),
+                    body.index(followup_fragment),
+                    f"{label}成功态 payload 歪了得先判格式异常，别继续报成功或往后刷新页面状态",
+                )
+
+        for helper_call, error_text, next_branch, label in (
+            (
+                "if (hasMalformedSystemSettingsMutationResult(regResult, 'enabled', true)) {",
+                "throw new Error('更新注册设置结果返回格式异常');",
+                "if (regResult && typeof regResult === 'object' && regResult.success === false) {",
+                "注册设置",
+            ),
+            (
+                "if (hasMalformedSystemSettingsMutationResult(result, 'enabled', true)) {",
+                "throw new Error('更新默认登录信息设置结果返回格式异常');",
+                "if (result && typeof result === 'object' && result.success === false) {",
+                "默认登录信息设置",
+            ),
+            (
+                "if (hasMalformedSystemSettingsMutationResult(captchaResult, 'enabled', true)) {",
+                "throw new Error('更新登录验证码设置结果返回格式异常');",
+                "if (captchaResult && typeof captchaResult === 'object' && captchaResult.success === false) {",
+                "登录验证码设置",
+            ),
+        ):
+            with self.subTest(label=label):
+                self.assertIn(helper_call, login_info_body)
+                self.assertIn(error_text, login_info_body)
+                self.assertLess(
+                    login_info_body.index(helper_call),
+                    login_info_body.index(next_branch),
+                    f"{label}成功态 payload 歪了得先判格式异常，别继续拿 success:false 或成功分支硬往下跑",
+                )
+
+        self.assertIn("if (requireSuccessFlag && typeof result.success !== 'boolean') {", self.app_js)
+        self.assertIn("if (booleanFieldName && result[booleanFieldName] != null && typeof result[booleanFieldName] !== 'boolean') {", self.app_js)
 
     def test_reload_system_cache_only_refreshes_auto_reply_keywords_when_auto_reply_section_is_active(self):
         body = _extract_function_body(self.app_js, "reloadSystemCache")
@@ -7935,7 +9739,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         restart_route_start = self.reply_server.index("@app.post('/api/update/restart')")
         restart_route_end = self.reply_server.index("# ==================== 一键擦亮API ====================")
         restart_route_block = self.reply_server[restart_route_start:restart_route_end]
-        self.assertIn('raise HTTPException(status_code=500, detail=f"重启应用失败: {str(e)}")', restart_route_block)
+        self.assertIn('raise HTTPException(status_code=500, detail=safe_client_error("重启应用失败，请稍后重试"))', restart_route_block)
         self.assertNotIn('"success": False', restart_route_block)
 
     def test_system_restart_ignores_older_same_page_responses_and_suppresses_hidden_section_toasts(self):
@@ -8007,6 +9811,23 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("showToast('外发配置保存成功', 'success');", save_body)
         self.assertIn("showToast('外发配置保存成功，但配置界面刷新失败，请稍后手动刷新', 'warning');", save_body)
 
+    def test_outgoing_config_save_rejects_malformed_success_payloads_before_reload_or_success_toast(self):
+        body = _extract_function_body(self.app_js, "saveOutgoingConfigs")
+
+        self.assertIn("const result = await response.json().catch(() => ({}));", body)
+        self.assertIn("if (hasMalformedSystemSettingsMutationResult(result)) {", body)
+        self.assertIn("throw new Error('外发配置保存结果返回格式异常');", body)
+        self.assertLess(
+            body.index("if (hasMalformedSystemSettingsMutationResult(result)) {"),
+            body.index("const loaded = await loadOutgoingConfigs(requestSequence, actionRequestSequence);"),
+            "外发配置保存成功态 payload 歪了得先拦住，别还没验结构就继续刷新表单装成功",
+        )
+        self.assertLess(
+            body.index("if (hasMalformedSystemSettingsMutationResult(result)) {"),
+            body.index("showToast('外发配置保存成功', 'success');"),
+            "外发配置保存结果结构都不对了，就别继续弹 success toast 糊人",
+        )
+
     def test_dashboard_resets_stale_cards_when_account_summary_load_fails(self):
         reset_body = _extract_function_body(self.app_js, "resetDashboardOverviewState")
         load_dashboard_body = _extract_function_body(self.app_js, "loadDashboard")
@@ -8056,10 +9877,17 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
 
         self.assertIn("if (handleUnauthorizedApiResponse(response)) {", body)
         self.assertIn("return fallbackValue;", body)
+        self.assertIn("const data = await response.json().catch(() => fallbackValue);", body)
+        self.assertIn("if (!data || typeof data !== 'object' || Array.isArray(data)) {", body)
         self.assertLess(
             body.index("if (handleUnauthorizedApiResponse(response)) {"),
             body.index("if (!response.ok) {"),
             "仪表盘子资源遇到 401 得先统一跳登录，别装成普通 fallback 把未授权静默吞了",
+        )
+        self.assertLess(
+            body.index("const data = await response.json().catch(() => fallbackValue);"),
+            body.index("return data;"),
+            "仪表盘子资源成功态也得先兜底坏 JSON，再决定是不是交给汇总逻辑继续吃",
         )
 
     def test_dashboard_account_enrichment_uses_batch_summary_endpoints(self):
@@ -8071,6 +9899,17 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertNotIn("fetchDashboardResource(`/keywords/${encodeURIComponent(accountId)}`", body)
         self.assertNotIn("fetchDashboardResource(`/default-replies/${encodeURIComponent(accountId)}`", body)
         self.assertNotIn("fetchDashboardResource(`/ai-reply-settings/${encodeURIComponent(accountId)}`", body)
+        self.assertIn("function hasMalformedScheduledTaskEntries(tasks) {", self.app_js)
+        self.assertIn("const scheduledTasks = scheduledTaskData", body)
+        self.assertIn("&& scheduledTaskData.success", body)
+        self.assertIn("&& Array.isArray(scheduledTaskData.tasks)", body)
+        self.assertIn("&& !hasMalformedScheduledTaskEntries(scheduledTaskData.tasks)", body)
+        self.assertIn("function hasMalformedKeywordCountMap(result) {", self.app_js)
+        self.assertIn("function hasMalformedDefaultReplySettingsMap(result) {", self.app_js)
+        self.assertIn("function hasMalformedAiReplySettingsMap(result) {", self.app_js)
+        self.assertIn("const keywordCounts = hasMalformedKeywordCountMap(keywordCountData)", body)
+        self.assertIn("const defaultReplies = hasMalformedDefaultReplySettingsMap(defaultReplyData)", body)
+        self.assertIn("const aiReplySettings = hasMalformedAiReplySettingsMap(aiReplyData)", body)
         self.assertIn("keywordCount: Number(keywordCounts[accountId] || 0),", body)
         self.assertIn("defaultReply: defaultReplies[accountId] || { enabled: false, reply_content: '' },", body)
         self.assertIn("aiReply: aiReplySettings[accountId] || { ai_enabled: false, model_name: 'qwen-plus' },", body)
@@ -8119,7 +9958,14 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("if (handleUnauthorizedApiResponse(response)) {", body)
         self.assertIn("if (!response.ok) {", body)
         self.assertIn("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", body)
+        self.assertIn("const data = await response.json().catch(() => ({}));", body)
         self.assertIn("throw new Error(errorMessage);", body)
+        self.assertIn("if (!data || typeof data !== 'object' || Array.isArray(data)) {", body)
+        self.assertIn("throw new Error('销售额摘要返回格式异常');", body)
+        self.assertIn("typeof data.success !== 'boolean'", body)
+        self.assertIn("(data.message != null && typeof data.message !== 'string')", body)
+        self.assertIn("if (data.success === true) {", body)
+        self.assertIn("if (hasMalformedSalesSummaryMetrics(data.data)) {", body)
         self.assertLess(
             body.index("if (handleUnauthorizedApiResponse(response)) {"),
             body.index("if (!response.ok) {"),
@@ -8138,6 +9984,34 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             stale_index,
             throw_index,
             "销售额摘要错误体读完后得先验请求序号，别旧错误晚回来把当前摘要状态又糊一遍",
+        )
+
+    def test_dashboard_sales_summary_rejects_malformed_metrics_before_rendering(self):
+        load_body = _extract_function_body(self.app_js, "loadSalesSummary")
+        timer_body = _extract_function_body(self.app_js, "startSalesSummaryRefreshTimer")
+        helper_body = _extract_function_body(self.app_js, "hasMalformedSalesSummaryMetrics")
+
+        self.assertIn("function hasMalformedSalesSummaryMetrics(metrics) {", self.app_js)
+        self.assertIn("typeof metrics.today_sales !== 'number'", helper_body)
+        self.assertIn("!Number.isFinite(metrics.today_sales)", helper_body)
+        self.assertIn("typeof metrics.week_sales !== 'number'", helper_body)
+        self.assertIn("!Number.isFinite(metrics.week_sales)", helper_body)
+        self.assertIn("typeof metrics.month_sales !== 'number'", helper_body)
+        self.assertIn("!Number.isFinite(metrics.month_sales)", helper_body)
+        self.assertIn("typeof metrics.update_time !== 'string'", helper_body)
+        self.assertIn("!metrics.update_time.trim()", helper_body)
+
+        self.assertIn("if (hasMalformedSalesSummaryMetrics(data.data)) {", load_body)
+        self.assertIn("if (hasMalformedSalesSummaryMetrics(data.data)) {", timer_body)
+        self.assertLess(
+            load_body.index("if (hasMalformedSalesSummaryMetrics(data.data)) {"),
+            load_body.index("updateDashboardSalesMetrics(data.data);"),
+            "销售额摘要 metrics 结构都没验明白，就别往仪表盘里灌 NaN/undefined 了",
+        )
+        self.assertLess(
+            timer_body.index("if (hasMalformedSalesSummaryMetrics(data.data)) {"),
+            timer_body.index("updateDashboardSalesMetrics(data.data);"),
+            "销售额摘要定时刷新收到歪 metrics 时也得先拦住，别后台偷偷把仪表盘数字写烂",
         )
 
     def test_dashboard_sales_summary_ignores_stale_async_responses(self):
@@ -8159,6 +10033,10 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("${escapeHtml(message)}", helper_body)
         self.assertIn("if (handleUnauthorizedApiResponse(response)) {", load_body)
         self.assertIn("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", load_body)
+        self.assertIn("const data = await response.json().catch(() => ({}));", load_body)
+        self.assertIn("if (!data || typeof data !== 'object' || Array.isArray(data) || !Array.isArray(data.logs)) {", load_body)
+        self.assertIn("throw new Error('发货日志返回格式异常');", load_body)
+        self.assertIn("if (data.logs.some(log =>", load_body)
         self.assertIn("renderDashboardDeliveryLogsEmptyState(`发货日志加载失败: ${error.message || '请稍后重试'}`);", load_body)
         self.assertIn("renderDashboardDeliveryLogs(logs);", load_body)
         self.assertNotIn("tbody.innerHTML = `", load_body)
@@ -8175,6 +10053,32 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             stale_index,
             failure_index,
             "发货日志错误体读完后得先复验请求活性，再决定要不要把失败态灌回表格",
+        )
+
+    def test_dashboard_delivery_logs_reject_malformed_log_entries_before_rendering(self):
+        body = _extract_function_body(self.app_js, "loadDashboardDeliveryLogs")
+
+        self.assertIn("if (!data || typeof data !== 'object' || Array.isArray(data) || !Array.isArray(data.logs)) {", body)
+        self.assertIn("throw new Error('发货日志返回格式异常');", body)
+        self.assertIn("if (data.logs.some(log =>", body)
+        self.assertIn("(log.created_at != null && typeof log.created_at !== 'string')", body)
+        self.assertIn("(log.order_id != null && typeof log.order_id !== 'string')", body)
+        self.assertIn("(log.status != null && typeof log.status !== 'string')", body)
+        self.assertIn("const logs = data.logs;", body)
+
+        object_guard_index = body.index("if (!data || typeof data !== 'object' || Array.isArray(data) || !Array.isArray(data.logs)) {")
+        entry_guard_index = body.index("if (data.logs.some(log =>")
+        render_index = body.index("renderDashboardDeliveryLogs(logs);")
+
+        self.assertLess(
+            object_guard_index,
+            render_index,
+            "发货日志接口最外层结构不对时得先拦住，别把坏 payload 当空列表或者真日志继续渲染",
+        )
+        self.assertLess(
+            entry_guard_index,
+            render_index,
+            "发货日志数组里混进坏日志对象时也得先拦住，别后面 render 再拿字段硬怼 DOM",
         )
 
     def test_dashboard_delivery_logs_ignore_stale_async_responses(self):
@@ -8238,6 +10142,12 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("if (!response.ok) {", body)
         self.assertIn("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", body)
         self.assertIn("throw new Error(errorMessage);", body)
+        self.assertIn("throw new Error('销售额摘要返回格式异常');", body)
+        self.assertIn("if (!data || typeof data !== 'object' || Array.isArray(data)) {", body)
+        self.assertIn("typeof data.success !== 'boolean'", body)
+        self.assertIn("(data.message != null && typeof data.message !== 'string')", body)
+        self.assertIn("if (data.success === true) {", body)
+        self.assertIn("if (hasMalformedSalesSummaryMetrics(data.data)) {", body)
         self.assertGreater(
             body.find("stopSalesSummaryRefreshTimer();", body.index("if (handleUnauthorizedApiResponse(response)) {")),
             body.index("if (handleUnauthorizedApiResponse(response)) {"),
@@ -8323,7 +10233,15 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                 self.assertIn("if (handleUnauthorizedApiResponse(response)) {", body)
                 self.assertIn("if (!response.ok) {", body)
                 self.assertIn("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", body)
+                self.assertIn("const data = await response.json().catch(() => ({}));", body)
                 self.assertIn("throw new Error(errorMessage);", body)
+                self.assertIn("throw new Error('销售额图表返回格式异常');", body)
+                self.assertIn("typeof data.success !== 'boolean'", body)
+                self.assertIn("(data.message != null && typeof data.message !== 'string')", body)
+                self.assertIn("!Array.isArray(data.data.sales)", body)
+                self.assertIn("if (data.data.sales.some(item =>", body)
+                self.assertIn("typeof item.date !== 'string'", body)
+                self.assertIn("typeof item.amount !== 'number'", body)
                 self.assertIn("throw new Error(data.message || '加载销售额数据失败');", body)
                 self.assertIn("showToast(`加载销售额数据失败: ${error.message || '请稍后重试'}`, 'danger');", body)
                 self.assertLess(
@@ -8361,6 +10279,22 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("const requestSequence = ++dashboardRuntimeSnapshotRequestSequence;", body)
         self.assertIn("if (requestSequence !== dashboardRuntimeSnapshotRequestSequence) {", body)
         self.assertIn("return;", body)
+        self.assertIn("if (!cookieDetails) {", body)
+        self.assertIn("if (!Array.isArray(cookieDetails)) {", body)
+        self.assertIn("if (hasMalformedCookieDetailsAccounts(cookieDetails)) {", body)
+        self.assertIn("throw new Error('账号列表返回格式异常');", body)
+        self.assertNotIn("(Array.isArray(cookieDetails) ? cookieDetails : []).map(", body)
+        self.assertIn("cookieDetails.map(cookie => [String(cookie.account_id), cookie.runtime_status || null])", body)
+        self.assertLess(
+            body.index("if (!cookieDetails) {"),
+            body.index("const runtimeStatusMap = new Map("),
+            "仪表盘运行态刷新在 fetchJSON helper 因 401 跳转返回空结果后，应直接收手，别把空结果伪装成空账号列表继续刷新状态",
+        )
+        self.assertLess(
+            body.index("if (hasMalformedCookieDetailsAccounts(cookieDetails)) {"),
+            body.index("const runtimeStatusMap = new Map("),
+            "仪表盘运行态刷新在构造状态映射前也得先拦住坏账号对象，别把歪 payload 吞成空映射继续把旧状态挂在页面上装正常",
+        )
 
     def test_dashboard_runtime_snapshot_refresh_is_invalidated_when_dashboard_context_changes(self):
         show_section_body = _extract_function_body(self.app_js, "showSection")
@@ -8374,6 +10308,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
     def test_dashboard_order_metrics_clear_stale_values_and_distinguish_failures_from_zero_state(self):
         self.assertIn("function showDashboardOrderMetricsLoadingState() {", self.app_js)
         self.assertIn("function showDashboardOrderMetricsErrorState(message = '加载失败') {", self.app_js)
+        self.assertIn("function hasMalformedOrderListEntries(orders) {", self.app_js)
 
         loading_body = _extract_function_body(self.app_js, "showDashboardOrderMetricsLoadingState")
         error_body = _extract_function_body(self.app_js, "showDashboardOrderMetricsErrorState")
@@ -8399,6 +10334,13 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("if (!response.ok) {", load_body)
         self.assertIn("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", load_body)
         self.assertIn("throw new Error(errorMessage);", load_body)
+        self.assertIn("if (!data || typeof data !== 'object' || Array.isArray(data)) {", load_body)
+        self.assertIn("throw new Error('订单看板返回格式异常');", load_body)
+        self.assertIn("typeof data.success !== 'boolean'", load_body)
+        self.assertIn("(data.message != null && typeof data.message !== 'string')", load_body)
+        self.assertIn("if (!Array.isArray(data.data)) {", load_body)
+        self.assertIn("if (hasMalformedOrderListEntries(data.data)) {", load_body)
+        self.assertIn("const orders = data.data;", load_body)
         self.assertIn("showDashboardOrderMetricsErrorState(error.message || '加载失败');", load_body)
         self.assertNotIn("updateDashboardOrderMetrics(defaultMetrics);", load_body)
 
@@ -8414,6 +10356,29 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             stale_index,
             error_state_index,
             "订单看板错误体读完后也得先验请求序号，别旧错误晚回来把当前指标卡重新糊成失败态",
+        )
+
+    def test_orders_list_and_dashboard_metrics_reject_malformed_order_entries_before_using_them(self):
+        load_orders_body = _extract_function_body(self.app_js, "loadAllOrders")
+        dashboard_body = _extract_function_body(self.app_js, "loadOrderDashboardMetrics")
+
+        self.assertIn("function hasMalformedOrderListEntries(orders) {", self.app_js)
+        self.assertIn("if (typeof order.order_id !== 'string' || !order.order_id.trim()) {", self.app_js)
+        self.assertIn("if (optionalStringFields.some(field => order[field] != null && typeof order[field] !== 'string')) {", self.app_js)
+        self.assertIn("order.quantity != null", self.app_js)
+        self.assertIn("order.amount != null", self.app_js)
+        self.assertIn("order.bargain_flow_detected != null", self.app_js)
+        self.assertIn("order.bargain_success_detected != null", self.app_js)
+
+        self.assertLess(
+            load_orders_body.index("if (data.success === true && hasMalformedOrderListEntries(data.data)) {"),
+            load_orders_body.index("allOrdersData = data.data;"),
+            "订单列表入口得先拦住坏 order 条目，别让脏数据继续流进排序、筛选和表格渲染",
+        )
+        self.assertLess(
+            dashboard_body.index("if (hasMalformedOrderListEntries(data.data)) {"),
+            dashboard_body.index("const orders = data.data;"),
+            "订单看板算指标前也得先把坏 order 条目拦住，别拿残缺对象硬算销量和完成率",
         )
 
     def test_dashboard_order_metrics_ignore_stale_async_responses(self):
@@ -8436,6 +10401,10 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
 
         self.assertIn("const cookiesResponse = await fetch(`${apiBase}/accounts/details?summary_only=true&include_behavior_settings=true`, {", body)
         self.assertIn("const requestSequence = ++dashboardLoadRequestSequence;", body)
+        self.assertIn("const cookiesData = await cookiesResponse.json().catch(() => ({}));", body)
+        self.assertIn("if (!Array.isArray(cookiesData)) {", body)
+        self.assertIn("if (hasMalformedCookieDetailsAccounts(cookiesData)) {", body)
+        self.assertIn("throw new Error('账号列表返回格式异常');", body)
         self.assertIn("if (requestSequence !== dashboardLoadRequestSequence) {", body)
         self.assertIn("dashboardData.accounts = accountsWithKeywords;", body)
         self.assertLess(
@@ -8541,12 +10510,15 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("if (!accountsResponse.ok) {", load_body)
         self.assertIn("const accountsErrorMessage = await readResponseErrorMessage(accountsResponse, `HTTP ${accountsResponse.status}`);", load_body)
         self.assertIn("throw new Error(accountsErrorMessage);", load_body)
+        self.assertIn("const accounts = await accountsResponse.json().catch(() => ({}));", load_body)
         self.assertIn("if (!Array.isArray(accounts)) {", load_body)
         self.assertIn("accounts.some(accountId => typeof accountId !== 'string' || !accountId.trim())", load_body)
+        self.assertIn("accounts.some(accountId => accountId.trim() !== accountId)", load_body)
         self.assertIn("throw new Error('账号列表返回格式异常');", load_body)
         self.assertIn("if (!notificationsResponse.ok) {", load_body)
         self.assertIn("const notificationsErrorMessage = await readResponseErrorMessage(notificationsResponse, `HTTP ${notificationsResponse.status}`);", load_body)
         self.assertIn("throw new Error(notificationsErrorMessage);", load_body)
+        self.assertIn("const notifications = await notificationsResponse.json().catch(() => ({}));", load_body)
         self.assertIn("if (!notifications || typeof notifications !== 'object' || Array.isArray(notifications)) {", load_body)
         self.assertIn("Object.values(notifications).some(group => !Array.isArray(group) || group.some(notification =>", load_body)
         self.assertIn("!Number.isFinite(Number(notification.channel_id))", load_body)
@@ -8582,7 +10554,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         load_body = _extract_function_body(self.app_js, "loadMessageNotifications")
         config_body = _extract_function_body(self.app_js, "configAccountNotification")
 
-        accounts_json_index = load_body.index("const accounts = await accountsResponse.json();")
+        accounts_json_index = load_body.index("const accounts = await accountsResponse.json().catch(() => ({}));")
         notifications_fetch_index = load_body.index("fetch(`${apiBase}/message-notifications`, {")
         stale_guard_after_accounts = load_body.find("requestSequence !== messageNotificationsRequestSequence", accounts_json_index)
         self.assertLess(
@@ -8729,12 +10701,16 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("if (!accountsResponse.ok) {", body)
         self.assertIn("const accountsErrorMessage = await readResponseErrorMessage(accountsResponse, `HTTP ${accountsResponse.status}`);", body)
         self.assertIn("throw new Error(accountsErrorMessage);", body)
+        self.assertIn("const accounts = await accountsResponse.json().catch(() => ({}));", body)
         self.assertIn("if (!Array.isArray(accounts)) {", body)
+        self.assertIn("accounts.some(accountId => typeof accountId !== 'string' || !accountId.trim() || accountId.trim() !== accountId)", body)
         self.assertIn("throw new Error('账号列表返回格式异常');", body)
         self.assertIn("if (!repliesResponse.ok) {", body)
         self.assertIn("const repliesErrorMessage = await readResponseErrorMessage(repliesResponse, `HTTP ${repliesResponse.status}`);", body)
         self.assertIn("throw new Error(repliesErrorMessage);", body)
+        self.assertIn("const defaultReplies = await repliesResponse.json().catch(() => ({}));", body)
         self.assertIn("if (!defaultReplies || typeof defaultReplies !== 'object' || Array.isArray(defaultReplies)) {", body)
+        self.assertIn("Object.values(defaultReplies).some(replySettings => hasMalformedDefaultReplySettings(replySettings))", body)
         self.assertIn("throw new Error('默认回复配置返回格式异常');", body)
         self.assertNotIn("let defaultReplies = {};", body)
         self.assertNotIn("if (repliesResponse.ok) {", body)
@@ -8804,6 +10780,31 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("fetch(`${apiBase}/default-replies/${encodedAccountId}/clear-records`", clear_body)
         self.assertNotIn("fetch(`${apiBase}/default-replies/${accountId}/clear-records`", clear_body)
 
+    def test_default_reply_editor_rejects_malformed_settings_payload_before_populating_form(self):
+        body = _extract_function_body(self.app_js, "editDefaultReply")
+
+        self.assertIn("function hasMalformedDefaultReplySettings(result) {", self.app_js)
+        self.assertIn("if (typeof result.enabled !== 'boolean') {", self.app_js)
+        self.assertIn("if (typeof result.reply_content !== 'string') {", self.app_js)
+        self.assertIn("if (typeof result.reply_once !== 'boolean') {", self.app_js)
+        self.assertIn("const settings = await response.json().catch(() => ({}));", body)
+        self.assertIn("if (hasMalformedDefaultReplySettings(settings)) {", body)
+        self.assertIn("throw new Error('默认回复设置返回格式异常');", body)
+
+        parse_index = body.index("const settings = await response.json().catch(() => ({}));")
+        malformed_index = body.index("if (hasMalformedDefaultReplySettings(settings)) {")
+        fill_index = body.index("document.getElementById('editDefaultReplyAccountId').value = accountId;")
+        self.assertLess(
+            parse_index,
+            malformed_index,
+            "默认回复详情成功态也得先把 JSON 兜底读出来，再验结构，别空响应还继续回写表单",
+        )
+        self.assertLess(
+            malformed_index,
+            fill_index,
+            "默认回复详情 payload 歪了得先判格式异常，别继续把 undefined 往编辑弹窗里灌",
+        )
+
     def test_default_reply_mutations_only_report_success_when_followup_reload_succeeds(self):
         save_body = _extract_function_body(self.app_js, "saveDefaultReply")
         clear_body = _extract_function_body(self.app_js, "clearDefaultReplyRecords")
@@ -8819,6 +10820,74 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("if (repliesLoaded) {", clear_body)
         self.assertIn("showToast(`账号 \"${accountId}\" 的默认回复记录已清空`, 'success');", clear_body)
         self.assertIn("showToast(`账号 \"${accountId}\" 的默认回复记录已清空，但列表刷新失败，请稍后手动刷新`, 'warning');", clear_body)
+
+    def test_default_reply_and_ai_reply_save_mutations_reject_malformed_success_payloads_before_hiding_modal(self):
+        save_default_body = _extract_function_body(self.app_js, "saveDefaultReply")
+        clear_default_body = _extract_function_body(self.app_js, "clearDefaultReplyRecords")
+        save_ai_body = _extract_function_body(self.app_js, "saveAIReplyConfig")
+        test_ai_body = _extract_function_body(self.app_js, "testAIReply")
+
+        self.assertIn("function hasMalformedDefaultReplyMutationResult(result) {", self.app_js)
+        self.assertIn("function hasMalformedAiReplyMutationResult(result) {", self.app_js)
+        self.assertIn("function hasMalformedAiReplyTestResult(result) {", self.app_js)
+        self.assertIn("if (typeof result.msg !== 'string' || !result.msg.trim()) {", self.app_js)
+        self.assertIn("if (typeof result.message !== 'string' || !result.message.trim()) {", self.app_js)
+
+        self.assertIn("const result = await response.json().catch(() => ({}));", save_default_body)
+        self.assertIn("if (hasMalformedDefaultReplyMutationResult(result)) {", save_default_body)
+        self.assertIn("throw new Error('默认回复保存结果返回格式异常');", save_default_body)
+        self.assertLess(
+            save_default_body.index("if (hasMalformedDefaultReplyMutationResult(result)) {"),
+            save_default_body.index("modal.hide();"),
+            "默认回复保存成功态 payload 歪了得先判格式异常，别继续关弹窗装保存成功",
+        )
+        self.assertLess(
+            save_default_body.index("if (hasMalformedDefaultReplyMutationResult(result)) {"),
+            save_default_body.index("const repliesLoaded = await loadDefaultReplies();"),
+            "默认回复保存结果 payload 歪了得先拦住，别继续刷新列表制造假成功",
+        )
+
+        self.assertIn("const result = await response.json().catch(() => ({}));", save_ai_body)
+        self.assertIn("if (hasMalformedAiReplyMutationResult(result)) {", save_ai_body)
+        self.assertIn("throw new Error('AI回复配置保存结果返回格式异常');", save_ai_body)
+        self.assertLess(
+            save_ai_body.index("if (hasMalformedAiReplyMutationResult(result)) {"),
+            save_ai_body.index("modal.hide();"),
+            "AI 回复保存成功态 payload 歪了得先判格式异常，别继续关弹窗装保存成功",
+        )
+        self.assertLess(
+            save_ai_body.index("if (hasMalformedAiReplyMutationResult(result)) {"),
+            save_ai_body.index("const accountsLoaded = await loadAccounts();"),
+            "AI 回复保存结果 payload 歪了得先拦住，别继续刷新账号列表制造假成功",
+        )
+
+        self.assertIn("const result = await response.json().catch(() => ({}));", clear_default_body)
+        self.assertIn("if (hasMalformedDefaultReplyMutationResult(result)) {", clear_default_body)
+        self.assertIn("throw new Error('默认回复记录清空结果返回格式异常');", clear_default_body)
+        self.assertLess(
+            clear_default_body.index("const result = await response.json().catch(() => ({}));"),
+            clear_default_body.index("if (hasMalformedDefaultReplyMutationResult(result)) {"),
+            "默认回复记录清空也得先把 JSON 读出来兜底，再交给 helper 验格式，别空响应还往下装成功",
+        )
+        self.assertLess(
+            clear_default_body.index("if (hasMalformedDefaultReplyMutationResult(result)) {"),
+            clear_default_body.index("const repliesLoaded = await loadDefaultReplies();"),
+            "默认回复记录清空成功态 payload 歪了得先判格式异常，别继续刷新列表制造假成功",
+        )
+
+        self.assertIn("const result = await response.json().catch(() => ({}));", test_ai_body)
+        self.assertIn("if (hasMalformedAiReplyTestResult(result)) {", test_ai_body)
+        self.assertIn("throw new Error('AI回复测试结果返回格式异常');", test_ai_body)
+        self.assertLess(
+            test_ai_body.index("const result = await response.json().catch(() => ({}));"),
+            test_ai_body.index("if (hasMalformedAiReplyTestResult(result)) {"),
+            "AI 回复测试成功态也得先把 JSON 读出来兜底，再验结构，别后端回半截内容时直接装成功",
+        )
+        self.assertLess(
+            test_ai_body.index("if (hasMalformedAiReplyTestResult(result)) {"),
+            test_ai_body.index("const safeReply = escapeHtml(result.reply || '').replace(/\\n/g, '<br>');"),
+            "AI 回复测试结果 payload 歪了得先当格式异常拦住，别继续把 undefined 塞进结果面板",
+        )
 
     def test_clear_default_reply_records_ignore_older_same_page_responses(self):
         show_section_body = _extract_function_body(self.app_js, "showSection")
@@ -8877,7 +10946,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "旧的默认回复列表请求不该晚回来后把隐藏页表格再糊回去",
         )
         replies_fetch_index = load_body.index("fetch(`${apiBase}/default-replies`, {")
-        accounts_json_index = load_body.index("const accounts = await accountsResponse.json();")
+        accounts_json_index = load_body.index("const accounts = await accountsResponse.json().catch(() => ({}));")
         self.assertLess(
             replies_fetch_index,
             accounts_json_index,
@@ -9178,11 +11247,18 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             config_body.index("document.getElementById('aiConfigAccountId').value = accountId;"),
             "AI 配置详情在 fetchJSON 因 401 跳转返回空结果后，应直接收手，别继续拿 undefined 往表单里怼",
         )
+        self.assertIn("if (hasMalformedAiReplySettings(settings)) {", config_body)
+        self.assertIn("throw new Error('AI回复设置返回格式异常');", config_body)
+        self.assertLess(
+            config_body.index("if (hasMalformedAiReplySettings(settings)) {"),
+            config_body.index("document.getElementById('aiConfigAccountId').value = accountId;"),
+            "AI 回复配置详情成功态 payload 歪了得先判格式异常，别继续往表单里灌坏字段把弹窗自己整崩",
+        )
 
         self.assertIn("if (presets == null) {", load_presets_body)
         self.assertLess(
             load_presets_body.index("if (presets == null) {"),
-            load_presets_body.index("_aiPresets = presets || [];"),
+            load_presets_body.index("if (!Array.isArray(presets)) {"),
             "AI 预设列表在 401 跳转返回空结果后应直接收手，别继续把空结果当成功列表处理",
         )
 
@@ -9240,6 +11316,38 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("if (presetsLoaded) {", delete_preset_body)
         self.assertIn("showToast('预设已删除', 'success');", delete_preset_body)
         self.assertIn("showToast('预设已删除，但预设列表刷新失败，请稍后手动刷新', 'warning');", delete_preset_body)
+
+    def test_ai_preset_mutations_reject_malformed_success_payloads_before_refreshing_preset_list(self):
+        save_preset_body = _extract_function_body(self.app_js, "saveCurrentAsPreset")
+        delete_preset_body = _extract_function_body(self.app_js, "deleteSelectedPreset")
+
+        self.assertIn("function hasMalformedAiPresetMutationResult(result, requirePresetId = false) {", self.app_js)
+
+        self.assertIn("if (hasMalformedAiPresetMutationResult(saveResult, true)) {", save_preset_body)
+        self.assertIn("throw new Error('AI预设保存结果返回格式异常');", save_preset_body)
+        self.assertLess(
+            save_preset_body.index("if (hasMalformedAiPresetMutationResult(saveResult, true)) {"),
+            save_preset_body.index("const presetsLoaded = await loadAIPresets(requestSequence);"),
+            "AI 预设保存成功态 payload 歪了得先判格式异常，别继续刷新预设列表制造假成功",
+        )
+        self.assertLess(
+            save_preset_body.index("if (hasMalformedAiPresetMutationResult(saveResult, true)) {"),
+            save_preset_body.index("showToast('预设保存成功', 'success');"),
+            "AI 预设保存结果 payload 歪了得先拦住，别继续弹 success 装保存成功",
+        )
+
+        self.assertIn("if (hasMalformedAiPresetMutationResult(deleteResult)) {", delete_preset_body)
+        self.assertIn("throw new Error('AI预设删除结果返回格式异常');", delete_preset_body)
+        self.assertLess(
+            delete_preset_body.index("if (hasMalformedAiPresetMutationResult(deleteResult)) {"),
+            delete_preset_body.index("const presetsLoaded = await loadAIPresets(requestSequence);"),
+            "AI 预设删除成功态 payload 歪了得先判格式异常，别继续刷新预设列表制造假成功",
+        )
+        self.assertLess(
+            delete_preset_body.index("if (hasMalformedAiPresetMutationResult(deleteResult)) {"),
+            delete_preset_body.index("showToast('预设已删除', 'success');"),
+            "AI 预设删除结果 payload 歪了得先拦住，别继续弹 success 装删除成功",
+        )
 
     def test_ai_reply_config_modal_and_preset_actions_ignore_stale_async_responses_and_hidden_state(self):
         self.assertIn("let aiReplyConfigRequestSequence = 0;", self.app_js)
@@ -9321,6 +11429,21 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("if (presetsLoaded === false) {", body)
         self.assertIn("showToast('AI预设加载失败，请稍后重试', 'warning');", body)
 
+    def test_ai_reply_config_modal_rejects_malformed_settings_payload_before_prefilling_form(self):
+        body = _extract_function_body(self.app_js, "configAIReply")
+
+        self.assertIn("function hasMalformedAiReplySettings(result) {", self.app_js)
+        self.assertIn("typeof result.ai_enabled !== 'boolean'", self.app_js)
+        self.assertIn("typeof result.model_name !== 'string' || !result.model_name.trim()", self.app_js)
+        self.assertIn("typeof result.custom_prompts !== 'string'", self.app_js)
+        self.assertIn("if (hasMalformedAiReplySettings(settings)) {", body)
+        self.assertIn("throw new Error('AI回复设置返回格式异常');", body)
+        self.assertLess(
+            body.index("if (hasMalformedAiReplySettings(settings)) {"),
+            body.index("document.getElementById('aiConfigAccountId').value = accountId;"),
+            "AI 回复配置详情接口就算回了 200，也得先验设置结构，别拿坏 payload 继续填表单和解析提示词",
+        )
+
     def test_ai_preset_loader_resets_stale_select_and_cached_presets_before_fetch(self):
         body = _extract_function_body(self.app_js, "loadAIPresets")
         self.assertIn("_aiPresets = [];", body)
@@ -9339,6 +11462,9 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             body.index("const presets = await fetchJSON(`${apiBase}/ai-config-presets`, {"),
             "AI 预设重新加载前应先把下拉框重置成默认空态，别失败后继续挂陈年 option 误导用户",
         )
+        self.assertIn("if (!Array.isArray(presets)) {", body)
+        self.assertIn("throw new Error('AI预设列表返回格式异常');", body)
+        self.assertIn("_aiPresets = presets;", body)
 
     def test_ai_reply_test_action_ignores_stale_modal_session_and_hidden_accounts_state(self):
         body = _extract_function_body(self.app_js, "testAIReply")
@@ -9534,6 +11660,40 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "用户都取消删除通知配置了，就别先把消息通知 mutation action sequence 顶掉别的正常动作",
         )
 
+    def test_message_notification_mutations_reject_malformed_success_payloads_before_refresh_or_modal_hide(self):
+        save_body = _extract_function_body(self.app_js, "saveAccountNotification")
+        delete_body = _extract_function_body(self.app_js, "deleteAccountNotification")
+
+        self.assertIn("function hasMalformedMessageNotificationMutationResult(result) {", self.app_js)
+
+        self.assertIn("const result = await response.json().catch(() => ({}));", save_body)
+        self.assertIn("if (hasMalformedMessageNotificationMutationResult(result)) {", save_body)
+        self.assertIn("throw new Error('通知配置保存结果返回格式异常');", save_body)
+        self.assertLess(
+            save_body.index("if (hasMalformedMessageNotificationMutationResult(result)) {"),
+            save_body.index("modal.hide();"),
+            "通知配置保存成功态 payload 歪了得先判格式异常，别继续关弹窗装保存成功",
+        )
+        self.assertLess(
+            save_body.index("if (hasMalformedMessageNotificationMutationResult(result)) {"),
+            save_body.index("const notificationsLoaded = await loadMessageNotifications();"),
+            "通知配置保存结果 payload 歪了得先拦住，别继续刷新列表制造假成功",
+        )
+
+        self.assertIn("const result = await response.json().catch(() => ({}));", delete_body)
+        self.assertIn("if (hasMalformedMessageNotificationMutationResult(result)) {", delete_body)
+        self.assertIn("throw new Error('通知配置删除结果返回格式异常');", delete_body)
+        self.assertLess(
+            delete_body.index("if (hasMalformedMessageNotificationMutationResult(result)) {"),
+            delete_body.index("const notificationsLoaded = await loadMessageNotifications();"),
+            "通知配置删除成功态 payload 歪了得先判格式异常，别继续刷新列表制造假成功",
+        )
+        self.assertLess(
+            delete_body.index("if (hasMalformedMessageNotificationMutationResult(result)) {"),
+            delete_body.index("showToast('通知配置删除成功', 'success');"),
+            "通知配置删除结果 payload 歪了得先拦住，别继续弹 success 装删除成功",
+        )
+
     def test_message_notification_config_uses_native_multi_select_validity_before_submit(self):
         body = _extract_function_body(self.app_js, "saveAccountNotification")
 
@@ -9627,7 +11787,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
 
     def test_notification_template_loader_waits_for_latest_response_before_clearing_editors(self):
         body = _extract_function_body(self.app_js, "loadNotificationTemplates")
-        response_json_index = body.index("const data = await response.json();")
+        response_json_index = body.index("const data = await response.json().catch(() => ({}));")
         templates_index = body.index("const templates = data.templates || [];")
         reset_index = body.index("resetNotificationTemplateEditors(supportedTemplateTypes);")
         refill_index = body.index("templates.forEach(template => {")
@@ -9869,15 +12029,17 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
     def test_notification_template_reset_rejects_malformed_success_payload_before_overwriting_editor(self):
         body = _extract_function_body(self.app_js, "resetNotificationTemplate")
 
-        self.assertIn("typeof data !== 'object'", body)
-        self.assertIn("Array.isArray(data)", body)
-        self.assertIn("typeof data.template !== 'object'", body)
-        self.assertIn("Array.isArray(data.template)", body)
-        self.assertIn("Object.prototype.hasOwnProperty.call(data.template, 'type')", body)
-        self.assertIn("typeof data.template.template !== 'string'", body)
+        self.assertIn("function hasMalformedNotificationTemplateResetResult(result, templateType) {", self.app_js)
+        self.assertIn("const data = await response.json().catch(() => ({}));", body)
+        self.assertIn("if (hasMalformedNotificationTemplateResetResult(data, templateType)) {", body)
         self.assertIn("throw new Error('通知模板重置结果返回格式异常');", body)
         self.assertLess(
-            body.index("throw new Error('通知模板重置结果返回格式异常');"),
+            body.index("const data = await response.json().catch(() => ({}));"),
+            body.index("if (hasMalformedNotificationTemplateResetResult(data, templateType)) {"),
+            "通知模板重置成功态也得先把 JSON 读出来兜底，再交给 helper 验格式，别空响应把整条成功链带沟里",
+        )
+        self.assertLess(
+            body.index("if (hasMalformedNotificationTemplateResetResult(data, templateType)) {"),
             body.index("editor.value = data.template.template;"),
             "通知模板重置接口如果回了歪 payload，前端得先当格式异常拦住，别把 undefined 或脏对象直接塞进编辑器还弹成功 toast",
         )
@@ -9924,6 +12086,19 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "通知模板保存既然在 catch 里还要验 requestSequence，就别把它声明在 try 里面给自己埋作用域雷",
         )
 
+    def test_notification_template_save_rejects_malformed_success_payload_before_success_toast(self):
+        body = _extract_function_body(self.app_js, "saveNotificationTemplate")
+
+        self.assertIn("function hasMalformedNotificationTemplateSaveResult(result) {", self.app_js)
+        self.assertIn("const result = await response.json().catch(() => ({}));", body)
+        self.assertIn("if (hasMalformedNotificationTemplateSaveResult(result)) {", body)
+        self.assertIn("throw new Error('保存通知模板结果返回格式异常');", body)
+        self.assertLess(
+            body.index("if (hasMalformedNotificationTemplateSaveResult(result)) {"),
+            body.index("showToast('模板保存成功', 'success');"),
+            "通知模板保存成功态 payload 歪了得先当格式异常拦住，别还没验结构就先弹 success toast",
+        )
+
     def test_notification_template_test_action_surfaces_partial_channel_failures_as_warning(self):
         body = _extract_function_body(self.app_js, "testNotificationTemplate")
         self.assertIn("if (data.failed_channels && data.failed_channels.length > 0) {", body)
@@ -9934,11 +12109,17 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
     def test_notification_template_test_action_rejects_malformed_success_payload_before_branching_on_failed_channels(self):
         body = _extract_function_body(self.app_js, "testNotificationTemplate")
 
-        self.assertIn("if (!data || typeof data !== 'object' || Array.isArray(data)) {", body)
-        self.assertIn("if (data.failed_channels != null && !Array.isArray(data.failed_channels)) {", body)
+        self.assertIn("function hasMalformedNotificationTemplateTestResult(result) {", self.app_js)
+        self.assertIn("const data = await response.json().catch(() => ({}));", body)
+        self.assertIn("if (hasMalformedNotificationTemplateTestResult(data)) {", body)
         self.assertIn("throw new Error('通知模板测试结果返回格式异常');", body)
         self.assertLess(
-            body.index("if (data.failed_channels != null && !Array.isArray(data.failed_channels)) {"),
+            body.index("const data = await response.json().catch(() => ({}));"),
+            body.index("if (hasMalformedNotificationTemplateTestResult(data)) {"),
+            "通知模板测试成功态也得先把 JSON 读出来兜底，再交给 helper 验格式，别空响应还继续往下走",
+        )
+        self.assertLess(
+            body.index("if (hasMalformedNotificationTemplateTestResult(data)) {"),
             body.index("if (data.failed_channels && data.failed_channels.length > 0) {"),
             "通知模板测试接口如果把 failed_channels 回歪了，前端得先当格式异常拦住，别拿对象/字符串去硬走部分失败 warning 分支自爆",
         )
@@ -10058,7 +12239,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", test_template_body)
         self.assertLess(
             test_template_body.index("if (!response.ok) {"),
-            test_template_body.index("const data = await response.json();"),
+            test_template_body.index("const data = await response.json().catch(() => ({}));"),
             "测试通知失败时得先处理非成功响应，别上来就硬读 JSON 把自己炸了",
         )
         self.assertLess(
@@ -10259,6 +12440,10 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("const encodedAccountId = encodeURIComponent(accountId);", body)
         self.assertIn("const safeAccountIdForJs = escapeInlineJsSingleQuotedString(accountId);", body)
         self.assertIn("fetch(`${apiBase}/accounts/${encodedAccountId}/comment-templates`", body)
+        self.assertIn("if (!data || typeof data !== 'object' || Array.isArray(data)) {", body)
+        self.assertIn("throw new Error('好评模板列表返回格式异常');", body)
+        self.assertIn("if (!Object.prototype.hasOwnProperty.call(data, 'templates') || !Array.isArray(data.templates)) {", body)
+        self.assertIn("const templates = data.templates;", body)
         self.assertIn("const safeTemplateNameForJs = escapeInlineJsSingleQuotedString(template.name);", body)
         self.assertIn("const safeTemplateContentForJs = escapeInlineJsSingleQuotedString(template.content);", body)
         self.assertIn("const safeTemplateNameDisplay = escapeHtml(template.name);", body)
@@ -10596,6 +12781,75 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                     "模板内容为空时只是前端校验，别先把好评模板 action sequence 顶掉别的正常动作",
                 )
 
+    def test_comment_template_mutations_reject_malformed_success_payloads_before_refresh_or_success_toast(self):
+        add_body = _extract_function_body(self.app_js, "addCommentTemplate")
+        edit_body = _extract_function_body(self.app_js, "saveEditCommentTemplate")
+        delete_body = _extract_function_body(self.app_js, "deleteCommentTemplate")
+        activate_body = _extract_function_body(self.app_js, "activateCommentTemplate")
+
+        self.assertIn("function hasMalformedCommentTemplateMutationResult(result, requireTemplateId = false) {", self.app_js)
+
+        for body, helper_call, error_text, followup_fragment, label in (
+            (
+                add_body,
+                "if (hasMalformedCommentTemplateMutationResult(result, true)) {",
+                "throw new Error('添加好评模板结果返回格式异常');",
+                "const templatesLoaded = await showCommentTemplates(currentCommentTemplateAccountId);",
+                "新增好评模板",
+            ),
+            (
+                edit_body,
+                "if (hasMalformedCommentTemplateMutationResult(result)) {",
+                "throw new Error('更新好评模板结果返回格式异常');",
+                "const templatesLoaded = await showCommentTemplates(currentCommentTemplateAccountId);",
+                "编辑好评模板",
+            ),
+            (
+                delete_body,
+                "if (hasMalformedCommentTemplateMutationResult(result)) {",
+                "throw new Error('删除好评模板结果返回格式异常');",
+                "const templatesLoaded = await showCommentTemplates(accountId);",
+                "删除好评模板",
+            ),
+            (
+                activate_body,
+                "if (hasMalformedCommentTemplateMutationResult(result)) {",
+                "throw new Error('切换好评模板结果返回格式异常');",
+                "const templatesLoaded = await showCommentTemplates(accountId);",
+                "切换好评模板",
+            ),
+        ):
+            with self.subTest(label=label):
+                self.assertIn("const result = await response.json().catch(() => ({}));", body)
+                self.assertIn(helper_call, body)
+                self.assertIn(error_text, body)
+                self.assertLess(
+                    body.index(helper_call),
+                    body.index(followup_fragment),
+                    f"{label}成功态 payload 歪了得先拦住，别继续刷新模板列表假装保存成功",
+                )
+
+        self.assertLess(
+            add_body.index("if (hasMalformedCommentTemplateMutationResult(result, true)) {"),
+            add_body.index("showToast('添加好评模板成功', 'success');"),
+            "新增好评模板结果结构都不对了，就别继续弹 success toast 糊人",
+        )
+        self.assertLess(
+            edit_body.index("if (hasMalformedCommentTemplateMutationResult(result)) {"),
+            edit_body.index("showToast('更新好评模板成功', 'success');"),
+            "编辑好评模板结果结构都不对了，就别继续弹 success toast 糊人",
+        )
+        self.assertLess(
+            delete_body.index("if (hasMalformedCommentTemplateMutationResult(result)) {"),
+            delete_body.index("showToast('删除好评模板成功', 'success');"),
+            "删除好评模板结果结构都不对了，就别继续弹 success toast 糊人",
+        )
+        self.assertLess(
+            activate_body.index("if (hasMalformedCommentTemplateMutationResult(result)) {"),
+            activate_body.index("showToast('已切换使用此模板', 'success');"),
+            "切换好评模板结果结构都不对了，就别继续弹 success toast 糊人",
+        )
+
     def test_comment_template_mutations_release_loading_state_in_finally(self):
         for function_name in (
             "addCommentTemplate",
@@ -10661,7 +12915,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         close_body = _extract_function_body(self.app_js, "closeQRCodeLoginModal")
 
         for body, toast_fragment in (
-            (status_body, "showToast(data.message || '扫码登录失败', 'danger');"),
+            (status_body, "showToast(data.message || data.error || '扫码登录失败', 'danger');"),
             (success_body, "showToast(successMessage, 'warning');"),
             (success_body, "showToast(successMessage, 'success');"),
             (success_body, "showToast(data.message || '扫码登录已完成，账号信息已同步', 'success');"),
@@ -10695,6 +12949,84 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("linkButton.removeAttribute('href');", password_body)
         self.assertNotIn("linkButton.href = '#';", password_body)
 
+    def test_qr_login_modal_close_cancels_backend_session_instead_of_only_clearing_frontend_state(self):
+        self.assertIn("async function cancelQRCodeLoginSession(sessionId) {", self.app_js)
+
+        cancel_body = _extract_function_body(self.app_js, "cancelQRCodeLoginSession")
+        self.assertIn("fetch(`${apiBase}/qr-login/cancel/${encodeURIComponent(sessionId)}`", cancel_body)
+        self.assertIn("method: 'POST'", cancel_body)
+        self.assertIn("'Authorization': `Bearer ${authToken}`", cancel_body)
+        self.assertIn("if (handleUnauthorizedApiResponse(response)) {", cancel_body)
+        self.assertNotIn("showToast(", cancel_body)
+
+        modal_body = _extract_function_body(self.app_js, "initializeQRCodeLoginModal")
+        hidden_body = _extract_brace_block_after(
+            modal_body,
+            "modalElement.addEventListener('hidden.bs.modal', function ()",
+        )
+        self.assertIn("const activeSessionId = qrCodeSessionId || qrCodeVerificationState.activeSessionId || qrCodeStartupSessionId;", hidden_body)
+        self.assertIn("const shouldCancel = Boolean(activeSessionId) && !qrCodeVerificationState.completed;", hidden_body)
+        self.assertIn("clearQRCodeCheck();", hidden_body)
+        self.assertIn("void cancelQRCodeLoginSession(activeSessionId);", hidden_body)
+        self.assertLess(
+            hidden_body.index("const activeSessionId = qrCodeSessionId || qrCodeVerificationState.activeSessionId || qrCodeStartupSessionId;"),
+            hidden_body.index("clearQRCodeCheck();"),
+            "关闭扫码弹窗时得先把后端 session_id 留住，再清前端状态；反过来就真成掩耳盗铃了",
+        )
+        self.assertLess(
+            hidden_body.index("const shouldCancel = Boolean(activeSessionId) && !qrCodeVerificationState.completed;"),
+            hidden_body.index("clearQRCodeCheck();"),
+            "是否需要取消后端会话必须在 clearQRCodeCheck 重置 completed 前判断",
+        )
+        self.assertLess(
+            hidden_body.index("clearQRCodeCheck();"),
+            hidden_body.index("void cancelQRCodeLoginSession(activeSessionId);"),
+            "先停前端轮询，再通知后端取消，避免旧轮询和取消请求互相顶牛",
+        )
+
+    def test_qr_login_startup_request_preallocates_session_id_for_pagehide_cancel(self):
+        self.assertIn("let qrCodeStartupSessionId = null;", self.app_js)
+
+        generate_body = _extract_function_body(self.app_js, "generateQRCode")
+        pagehide_body = _extract_function_body(self.app_js, "stopAccountVerificationSessionsOnPageHide")
+        modal_body = _extract_function_body(self.app_js, "initializeQRCodeLoginModal")
+        hidden_body = _extract_brace_block_after(
+            modal_body,
+            "modalElement.addEventListener('hidden.bs.modal', function ()",
+        )
+        clear_body = _extract_function_body(self.app_js, "clearQRCodeCheck")
+
+        for fragment in (
+            "let clientSessionId = null;",
+            "clientSessionId = createAccountVerificationSessionId('qr');",
+            "qrCodeStartupSessionId = clientSessionId;",
+            "session_id: clientSessionId",
+            "qrCodeStartupSessionId = null;",
+            "void cancelQRCodeLoginSession(responseSessionId || clientSessionId);",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, generate_body)
+
+        self.assertLess(
+            generate_body.index("clientSessionId = createAccountVerificationSessionId('qr');"),
+            generate_body.index("fetch("),
+            "扫码二维码请求发出去前就得有客户端 session_id；响应都没回来时关页才取消得着",
+        )
+        self.assertLess(
+            generate_body.index("session_id: clientSessionId"),
+            generate_body.index("});", generate_body.index("body: JSON.stringify({")),
+            "扫码二维码生成请求体必须带客户端 session_id，别让 pagehide 取消接口取消空气",
+        )
+        self.assertIn(
+            "const qrActiveSessionId = qrCodeSessionId || qrCodeVerificationState.activeSessionId || qrCodeStartupSessionId;",
+            pagehide_body,
+        )
+        self.assertIn(
+            "const activeSessionId = qrCodeSessionId || qrCodeVerificationState.activeSessionId || qrCodeStartupSessionId;",
+            hidden_body,
+        )
+        self.assertIn("qrCodeStartupSessionId = null;", clear_body)
+
     def test_qr_login_raw_fetch_flows_handle_unauthorized_before_followup_work(self):
         generate_body = _extract_function_body(self.app_js, "generateQRCode")
         status_body = _extract_function_body(self.app_js, "checkQRCodeStatus")
@@ -10715,6 +13047,9 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         generate_body = _extract_function_body(self.app_js, "generateQRCode")
         status_body = _extract_function_body(self.app_js, "checkQRCodeStatus")
 
+        self.assertIn("const data = await response.json().catch(() => ({}));", generate_body)
+        self.assertIn("const data = await response.json().catch(() => ({}));", status_body)
+
         for body, error_fragment, toast_fragment, label in (
             (generate_body, "const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", "showQRCodeError(errorMessage || '生成二维码失败');", "扫码登录二维码生成"),
             (status_body, "const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", "showToast(errorMessage || '扫码登录失败', 'danger');", "扫码登录状态轮询"),
@@ -10726,6 +13061,64 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                     body.index(toast_fragment),
                     f"{label}失败时先统一解析错误体，别再拿裸 HTTP 状态把人糊弄过去",
                 )
+
+    def test_qr_login_failed_status_is_treated_as_terminal_error_state(self):
+        status_body = _extract_function_body(self.app_js, "checkQRCodeStatus")
+
+        self.assertIn("case 'failed':", status_body)
+        self.assertIn("case 'error':", status_body)
+        self.assertIn("showToast(data.message || data.error || '扫码登录失败', 'danger');", status_body)
+
+        failed_case_index = status_body.index("case 'failed':")
+        error_case_index = status_body.index("case 'error':")
+        completed_index = status_body.index("qrCodeVerificationState.completed = true;", error_case_index)
+        clear_index = status_body.index("clearQRCodeCheck();", completed_index)
+        toast_index = status_body.index("showToast(data.message || data.error || '扫码登录失败', 'danger');", clear_index)
+
+        self.assertLess(
+            failed_case_index,
+            error_case_index,
+            "扫码登录状态机得显式接住 failed 终态，别让后端都宣判失败了前端还装没看见继续轮询",
+        )
+        self.assertLess(
+            error_case_index,
+            completed_index,
+            "failed/error 终态得先把扫码流程标记完成，别继续留着轮询状态在那抽风",
+        )
+        self.assertLess(
+            completed_index,
+            clear_index,
+            "failed/error 终态先标记完成再清理轮询，别让旧回调还有机会回魂继续改当前弹窗状态",
+        )
+        self.assertLess(
+            clear_index,
+            toast_index,
+            "failed/error 终态得先停掉轮询再弹失败提示，不然前端状态和提示顺序都乱套",
+        )
+
+    def test_qr_login_success_payloads_reject_malformed_results_before_updating_ui(self):
+        generate_body = _extract_function_body(self.app_js, "generateQRCode")
+        status_body = _extract_function_body(self.app_js, "checkQRCodeStatus")
+
+        self.assertIn("function hasMalformedQrLoginGenerateResult(result) {", self.app_js)
+        self.assertIn("function hasMalformedQrLoginStatusResult(result) {", self.app_js)
+        self.assertIn("const data = await response.json().catch(() => ({}));", generate_body)
+        self.assertIn("const data = await response.json().catch(() => ({}));", status_body)
+        self.assertIn("if (hasMalformedQrLoginGenerateResult(data)) {", generate_body)
+        self.assertIn("throw new Error('二维码生成返回格式异常');", generate_body)
+        self.assertIn("if (hasMalformedQrLoginStatusResult(data)) {", status_body)
+        self.assertIn("throw new Error('扫码登录状态返回格式异常');", status_body)
+
+        self.assertLess(
+            generate_body.index("if (hasMalformedQrLoginGenerateResult(data)) {"),
+            generate_body.index("if (data.success) {"),
+            "扫码二维码成功态 payload 先验结构，别拿歪 session_id 或 qr_code_url 直接开后续流程",
+        )
+        self.assertLess(
+            status_body.index("if (hasMalformedQrLoginStatusResult(data)) {"),
+            status_body.index("switch (data.status) {"),
+            "扫码状态成功态 payload 先卡契约，别让脏 status 继续驱动 UI 和后续持久化",
+        )
 
     def test_qr_login_async_flows_ignore_stale_or_hidden_modal_responses(self):
         generate_body = _extract_function_body(self.app_js, "generateQRCode")
@@ -10748,12 +13141,47 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             generate_body.index("showQRCodeError(errorMessage || '生成二维码失败');"),
             "扫码二维码生成失败读完错误体后也得先确认当前还是同一轮请求，别旧错误回来把新弹窗糊一脸",
         )
+        data_index = generate_body.index("const data = await response.json().catch(() => ({}));")
+        malformed_index = generate_body.index("if (hasMalformedQrLoginGenerateResult(data)) {", data_index)
+        response_session_index = generate_body.index(
+            "const responseSessionId = data.success === true ? data.session_id : null;",
+            malformed_index,
+        )
+        stale_after_data_index = generate_body.index(
+            "requestSequence !== qrCodeLoginRequestSequence",
+            response_session_index,
+        )
+        cancel_late_session_index = generate_body.index(
+            "void cancelQRCodeLoginSession(responseSessionId || clientSessionId);",
+            stale_after_data_index,
+        )
+        return_after_cancel_index = generate_body.index("return null;", cancel_late_session_index)
+        self.assertLess(
+            malformed_index,
+            response_session_index,
+            "先验扫码二维码生成 payload，再拿 session_id 去取消；别让脏响应把取消接口也带沟里",
+        )
+        self.assertLess(
+            response_session_index,
+            stale_after_data_index,
+            "成功生成但响应晚到时，前端检查 stale 前得先记住后端刚创建的 session_id",
+        )
+        self.assertLess(
+            cancel_late_session_index,
+            return_after_cancel_index,
+            "成功生成但弹窗已关闭/切页后，不能只 return；必须顺手取消后端扫码 session，不然浏览器资源继续挂着",
+        )
+        self.assertLess(
+            return_after_cancel_index,
+            generate_body.index("startQRCodeCheck();"),
+            "旧的二维码生成响应被丢弃后更不能再启动轮询",
+        )
 
         self.assertIn("const requestSequence = qrCodeLoginRequestSequence;", status_body)
         self.assertIn("requestSequence !== qrCodeLoginRequestSequence", status_body)
         self.assertLess(
             status_body.index("requestSequence !== qrCodeLoginRequestSequence"),
-            status_body.index("const data = await response.json();"),
+            status_body.index("const data = await response.json().catch(() => ({}));"),
             "扫码状态轮询旧响应不该晚回来后还继续消费当前会话的状态正文",
         )
         self.assertLess(
@@ -10869,6 +13297,55 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                 self.assertIn("} else if (channelsLoaded === false) {", body)
                 self.assertIn(f"showToast('{success_message}', 'success');", body)
                 self.assertIn(f"showToast('{warning_message}', 'warning');", body)
+
+    def test_notification_channel_mutations_reject_malformed_success_payloads_before_refreshing_list_or_hiding_modal(self):
+        save_body = _extract_function_body(self.app_js, "saveNotificationChannel")
+        update_body = _extract_function_body(self.app_js, "updateNotificationChannel")
+        delete_body = _extract_function_body(self.app_js, "deleteNotificationChannel")
+
+        self.assertIn("function hasMalformedNotificationChannelMutationResult(result, requireId = false) {", self.app_js)
+
+        self.assertIn("const result = await response.json().catch(() => ({}));", save_body)
+        self.assertIn("if (hasMalformedNotificationChannelMutationResult(result, true)) {", save_body)
+        self.assertIn("throw new Error('通知渠道添加结果返回格式异常');", save_body)
+        self.assertLess(
+            save_body.index("if (hasMalformedNotificationChannelMutationResult(result, true)) {"),
+            save_body.index("modal.hide();"),
+            "通知渠道新增成功态 payload 歪了得先判格式异常，别继续关弹窗装添加成功",
+        )
+        self.assertLess(
+            save_body.index("if (hasMalformedNotificationChannelMutationResult(result, true)) {"),
+            save_body.index("const channelsLoaded = await loadNotificationChannels();"),
+            "通知渠道新增结果 payload 歪了得先拦住，别继续刷新列表制造假成功",
+        )
+
+        self.assertIn("const result = await response.json().catch(() => ({}));", update_body)
+        self.assertIn("if (hasMalformedNotificationChannelMutationResult(result)) {", update_body)
+        self.assertIn("throw new Error('通知渠道更新结果返回格式异常');", update_body)
+        self.assertLess(
+            update_body.index("if (hasMalformedNotificationChannelMutationResult(result)) {"),
+            update_body.index("modal.hide();"),
+            "通知渠道更新成功态 payload 歪了得先判格式异常，别继续关弹窗装更新成功",
+        )
+        self.assertLess(
+            update_body.index("if (hasMalformedNotificationChannelMutationResult(result)) {"),
+            update_body.index("const channelsLoaded = await loadNotificationChannels();"),
+            "通知渠道更新结果 payload 歪了得先拦住，别继续刷新列表制造假成功",
+        )
+
+        self.assertIn("const result = await response.json().catch(() => ({}));", delete_body)
+        self.assertIn("if (hasMalformedNotificationChannelMutationResult(result)) {", delete_body)
+        self.assertIn("throw new Error('通知渠道删除结果返回格式异常');", delete_body)
+        self.assertLess(
+            delete_body.index("if (hasMalformedNotificationChannelMutationResult(result)) {"),
+            delete_body.index("const channelsLoaded = await loadNotificationChannels();"),
+            "通知渠道删除成功态 payload 歪了得先判格式异常，别继续刷新列表制造假成功",
+        )
+        self.assertLess(
+            delete_body.index("if (hasMalformedNotificationChannelMutationResult(result)) {"),
+            delete_body.index("showToast('通知渠道删除成功', 'success');"),
+            "通知渠道删除结果 payload 歪了得先拦住，别继续弹 success 装删除成功",
+        )
 
     def test_notification_channel_mutations_do_not_emit_cross_page_toasts_after_leaving_section(self):
         save_body = _extract_function_body(self.app_js, "saveNotificationChannel")
@@ -11099,7 +13576,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         body = _extract_function_body(self.app_js, "editNotificationChannel")
 
         self.assertIn("const response = await fetch(`${apiBase}/notification-channels/${channelId}`, {", body)
-        self.assertIn("const channel = await response.json();", body)
+        self.assertIn("const channel = await response.json().catch(() => ({}));", body)
         self.assertNotIn("const response = await fetch(`${apiBase}/notification-channels`, {", body)
         self.assertNotIn("const channels = await response.json();", body)
         self.assertNotIn("channels.find(c => c.id === channelId)", body)
@@ -11107,16 +13584,11 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
     def test_notification_channel_edit_modal_rejects_malformed_detail_payload_before_prefilling_form(self):
         body = _extract_function_body(self.app_js, "editNotificationChannel")
 
-        self.assertIn("if (", body)
-        self.assertIn("Array.isArray(channel)", body)
-        self.assertIn("!Number.isFinite(Number(channel.id))", body)
-        self.assertIn("typeof channel.name !== 'string'", body)
-        self.assertIn("!String(channel.type || '').trim()", body)
-        self.assertIn("typeof channel.enabled !== 'boolean'", body)
-        self.assertIn("typeof channel.config !== 'string'", body)
+        self.assertIn("function hasMalformedNotificationChannelDetails(channel) {", self.app_js)
+        self.assertIn("if (hasMalformedNotificationChannelDetails(channel)) {", body)
         self.assertIn("throw new Error('通知渠道详情返回格式异常');", body)
         self.assertLess(
-            body.index("throw new Error('通知渠道详情返回格式异常');"),
+            body.index("if (hasMalformedNotificationChannelDetails(channel)) {"),
             body.index("let channelType = normalizeNotificationChannelType(channel.type);"),
             "通知渠道详情接口如果回了歪 payload，前端得先当格式异常拦住，别把 undefined 类型误提示成“不支持的渠道类型”继续糊弄人",
         )
@@ -11329,7 +13801,10 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
 
         self.assertIn("const ordersLoaded = await refreshOrdersData();", deliver_body)
         self.assertIn("if (ordersLoaded) {", deliver_body)
-        self.assertIn("showToast(`发货成功！\\n${result.message}`, 'success');", deliver_body)
+        self.assertIn("const deliveryResultState = String(result.result_state || '').toLowerCase();", deliver_body)
+        self.assertIn("const deliveryToastType = deliveryResultState === 'warning' ? 'warning' : 'success';", deliver_body)
+        self.assertIn("const deliverySuccessPrefix = deliveryToastType === 'warning' ? '发货已执行，但仍有后续处理需要关注！' : '发货成功！';", deliver_body)
+        self.assertIn("showToast(`${deliverySuccessPrefix}\\n${result.message}`, deliveryToastType);", deliver_body)
         self.assertIn("showToast('发货成功，但订单列表刷新失败，请稍后手动刷新', 'warning');", deliver_body)
 
         self.assertIn("const ordersLoaded = await refreshOrdersData();", refresh_body)
@@ -11363,6 +13838,14 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             refresh_body.index("showToast(`${result.message || '订单状态无变化'}，但订单列表刷新失败，请稍后手动刷新`, 'warning');"),
             "订单状态没变化时跟进刷新如果也翻车，前端得把这事说明白，别装作列表还是新的",
         )
+        self.assertIn("if (result && typeof result === 'object' && result.success === false) {", refresh_body)
+        self.assertIn("showToast(`刷新失败: ${result.message || '请稍后重试'}，但订单列表刷新失败，请稍后手动刷新`, 'warning');", refresh_body)
+        self.assertIn("showToast(`刷新失败: ${result.message || '请稍后重试'}`, 'warning');", refresh_body)
+        self.assertLess(
+            refresh_body.index("if (result && typeof result === 'object' && result.success === false) {"),
+            refresh_body.index("} else if (result.updated) {"),
+            "单条刷新订单状态如果后端已经明确 success=false，先按失败处理，别混进“状态无变化”分支糊弄人",
+        )
 
     def test_order_single_mutation_actions_do_not_emit_cross_page_toasts_after_leaving_orders(self):
         delete_body = _extract_function_body(self.app_js, "deleteOrder")
@@ -11371,7 +13854,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
 
         for body, success_fragment in (
             (delete_body, "showToast('订单删除成功', 'success');"),
-            (deliver_body, "showToast(`发货成功！\\n${result.message}`, 'success');"),
+            (deliver_body, "showToast(`${deliverySuccessPrefix}\\n${result.message}`, deliveryToastType);"),
             (refresh_body, "showToast(`订单状态已更新: ${getOrderStatusText(result.new_status)}`, 'success');"),
         ):
             with self.subTest(success_fragment=success_fragment):
@@ -11381,6 +13864,52 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                     body.index("!isOrdersSectionActive()"),
                     body.index(success_fragment),
                     "订单单项操作在离开 orders 页面后不该再跨页弹 success toast",
+                )
+
+    def test_order_runtime_actions_abort_inflight_browser_runtime_requests_when_leaving_orders(self):
+        self.assertIn("let orderRuntimeActionAbortController = null;", self.app_js)
+        self.assertIn("function stopOrderRuntimeActionRequests() {", self.app_js)
+        self.assertIn("function resetOrderRuntimeActionAbortController() {", self.app_js)
+        self.assertIn(
+            "window.addEventListener('pagehide', stopOrderRuntimeActionRequests);",
+            self.app_js,
+        )
+
+        show_section_body = _extract_function_body(self.app_js, "showSection")
+        stop_body = _extract_function_body(self.app_js, "stopOrderRuntimeActionRequests")
+        deliver_body = _extract_function_body(self.app_js, "manualDeliverOrder")
+        refresh_body = _extract_function_body(self.app_js, "refreshOrderStatus")
+        batch_refresh_body = _extract_function_body(self.app_js, "batchRefreshOrders")
+
+        self.assertIn("stopOrderRuntimeActionRequests();", show_section_body)
+        self.assertLess(
+            show_section_body.index("stopOrderRuntimeActionRequests();"),
+            show_section_body.index("orderMutationActionRequestSequence += 1;"),
+            "切出订单页时得先 abort 正在摸浏览器 runtime 的订单操作请求，再失效序号；别让后台继续占浏览器烤冷面",
+        )
+        self.assertIn("orderRuntimeActionAbortController.abort();", stop_body)
+        self.assertIn("orderRuntimeActionAbortController = null;", stop_body)
+
+        for body, fetch_fragment, label in (
+            (deliver_body, "const response = await fetch(scopedUrl, {", "手动发货"),
+            (refresh_body, "const response = await fetch(scopedUrl, {", "刷新订单状态"),
+            (batch_refresh_body, "const response = await fetch(scopedUrl, {", "批量刷新订单状态"),
+        ):
+            with self.subTest(label=label):
+                self.assertIn("let controller = null;", body)
+                self.assertIn("controller = resetOrderRuntimeActionAbortController();", body)
+                self.assertIn("signal: controller.signal", body)
+                self.assertIn("if (controller?.signal.aborted || error?.name === 'AbortError') {", body)
+                self.assertIn("if (orderRuntimeActionAbortController === controller) {", body)
+                self.assertIn("orderRuntimeActionAbortController = null;", body)
+                fetch_index = body.index(fetch_fragment)
+                signal_index = body.index("signal: controller.signal", fetch_index)
+                body_index = body.find("body:", fetch_index)
+                closing_index = body.index("});", fetch_index)
+                self.assertLess(
+                    signal_index,
+                    body_index if body_index != -1 and body_index < closing_index else closing_index,
+                    f"{label}请求必须挂 AbortController.signal，切页/关 tab 后别让后端 managed runtime 继续跑",
                 )
 
     def test_order_batch_actions_do_not_emit_cross_page_results_after_leaving_orders(self):
@@ -11434,8 +13963,8 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         for body, anchor_fragment in (
             (delete_body, "if (response.ok) {"),
             (batch_delete_body, "if (response.ok) {"),
-            (deliver_body, "const result = await response.json();"),
-            (refresh_body, "const result = await response.json();"),
+            (deliver_body, "const result = await response.json().catch(() => ({}));"),
+            (refresh_body, "const result = await response.json().catch(() => ({}));"),
             (batch_refresh_body, "if (response.ok) {"),
         ):
             with self.subTest(anchor_fragment=anchor_fragment):
@@ -11464,13 +13993,94 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                     f"{label}失败时得先把 detail/message 解出来，别上来就拿固定红字糊脸",
                 )
 
+    def test_order_mutations_reject_malformed_success_payloads_before_reload_or_business_branching(self):
+        delete_body = _extract_function_body(self.app_js, "deleteOrder")
+        batch_delete_body = _extract_function_body(self.app_js, "batchDeleteOrders")
+        deliver_body = _extract_function_body(self.app_js, "manualDeliverOrder")
+        refresh_body = _extract_function_body(self.app_js, "refreshOrderStatus")
+        batch_refresh_body = _extract_function_body(self.app_js, "batchRefreshOrders")
+
+        self.assertIn("function hasMalformedOrderDeleteMutationResult(result) {", self.app_js)
+        self.assertIn("function hasMalformedOrderDeliveryMutationResult(result) {", self.app_js)
+        self.assertIn("function hasMalformedOrderRefreshMutationResult(result) {", self.app_js)
+
+        for body, helper_call, error_text, followup_fragment, label in (
+            (
+                delete_body,
+                "if (hasMalformedOrderDeleteMutationResult(result)) {",
+                "throw new Error('订单删除结果返回格式异常');",
+                "const ordersLoaded = await refreshOrdersData();",
+                "删除订单",
+            ),
+            (
+                batch_delete_body,
+                "if (hasMalformedOrderDeleteMutationResult(result)) {",
+                "throw new Error('订单删除结果返回格式异常');",
+                "if (result.success === false) {",
+                "批量删除订单",
+            ),
+            (
+                deliver_body,
+                "if (hasMalformedOrderDeliveryMutationResult(result)) {",
+                "throw new Error('手动发货结果返回格式异常');",
+                "if (response.ok) {",
+                "手动发货",
+            ),
+            (
+                refresh_body,
+                "if (hasMalformedOrderRefreshMutationResult(result)) {",
+                "throw new Error('刷新订单状态结果返回格式异常');",
+                "if (response.ok) {",
+                "刷新订单状态",
+            ),
+            (
+                batch_refresh_body,
+                "if (hasMalformedOrderRefreshMutationResult(result)) {",
+                "throw new Error('刷新订单状态结果返回格式异常');",
+                "if (result.success === false) {",
+                "批量刷新订单状态",
+            ),
+        ):
+            with self.subTest(label=label):
+                self.assertIn("const result = await response.json().catch(() => ({}));", body)
+                self.assertIn(helper_call, body)
+                self.assertIn(error_text, body)
+                self.assertLess(
+                    body.index("const result = await response.json().catch(() => ({}));"),
+                    body.index(helper_call),
+                    f"{label}得先把成功态 JSON 读出来再验结构，别还没看 payload 就往后续分支冲",
+                )
+                self.assertLess(
+                    body.index(helper_call),
+                    body.index(followup_fragment),
+                    f"{label}成功态 payload 歪了得先判格式异常，别继续刷新列表或走业务分支装正常",
+                )
+
+        self.assertIn("if (typeof result.delivered !== 'boolean') {", self.app_js)
+        self.assertIn("if (result.result_state != null && typeof result.result_state !== 'string') {", self.app_js)
+        self.assertIn("if (typeof result.updated !== 'boolean') {", self.app_js)
+        self.assertIn("if (result.new_status != null && typeof result.new_status !== 'string') {", self.app_js)
+        self.assertLess(
+            batch_delete_body.index("if (hasMalformedOrderDeleteMutationResult(result)) {"),
+            batch_delete_body.index("successCount++;"),
+            "批量删单成功态 payload 歪了得先判格式异常，别先把成功计数加上去再说",
+        )
+        self.assertLess(
+            batch_delete_body.index("if (result.success === false) {"),
+            batch_delete_body.index("successCount++;"),
+            "批量删单如果后端 200 里已经明确 success=false，先按失败记账，别还往成功计数里硬塞",
+        )
+
     def test_order_batch_delete_all_failures_surface_first_backend_or_runtime_error_message(self):
         body = _extract_function_body(self.app_js, "batchDeleteOrders")
         runtime_toast = "showToast(`批量删除失败: ${firstFailureMessage || '请稍后重试'}`, 'danger');"
 
         self.assertNotIn("showToast('批量删除失败', 'danger');", body)
         self.assertIn("let firstFailureMessage = '';", body)
+        self.assertIn("const result = await response.json().catch(() => ({}));", body)
+        self.assertIn("if (hasMalformedOrderDeleteMutationResult(result)) {", body)
         self.assertIn("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", body)
+        self.assertIn("firstFailureMessage = result.message || '请稍后重试';", body)
         self.assertIn("firstFailureMessage = errorMessage || `HTTP ${response.status}`;", body)
         self.assertIn("firstFailureMessage = error.message || '请稍后重试';", body)
         self.assertIn(runtime_toast, body)
@@ -11547,11 +14157,11 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
     def test_order_batch_refresh_treats_http_200_business_failures_as_failures_instead_of_successes(self):
         body = _extract_function_body(self.app_js, "batchRefreshOrders")
 
-        self.assertIn("const result = await response.json();", body)
+        self.assertIn("const result = await response.json().catch(() => ({}));", body)
         self.assertIn("if (result.success === false) {", body)
         self.assertIn("firstFailureMessage = result.message || '请稍后重试';", body)
 
-        json_index = body.index("const result = await response.json();")
+        json_index = body.index("const result = await response.json().catch(() => ({}));")
         success_false_index = body.index("if (result.success === false) {", json_index)
         fail_count_index = body.index("failCount++;", success_false_index)
         success_count_index = body.index("successCount++;", success_false_index)
@@ -12114,6 +14724,36 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             import_body.index("modalRequestSequence !== importKeywordsModalRequestSequence"),
             import_body.index("modal.hide();"),
             "旧的关键词导入响应不该在弹窗已经关掉或重开后，还回来把当前 modal 会话又关掉并弹成功提示",
+        )
+
+    def test_import_keywords_rejects_malformed_success_payloads_before_followup_ui(self):
+        import_body = _extract_function_body(self.app_js, "importKeywords")
+
+        self.assertIn("function hasMalformedKeywordImportResult(result) {", self.app_js)
+        self.assertIn("if (result.added == null || !Number.isFinite(Number(result.added)) || Number(result.added) < 0) {", self.app_js)
+        self.assertIn("if (result.updated == null || !Number.isFinite(Number(result.updated)) || Number(result.updated) < 0) {", self.app_js)
+        self.assertIn("const result = await response.json().catch(() => ({}));", import_body)
+        self.assertIn("if (hasMalformedKeywordImportResult(result)) {", import_body)
+        self.assertIn("throw new Error('关键词导入结果返回格式异常');", import_body)
+
+        parse_index = import_body.index("const result = await response.json().catch(() => ({}));")
+        malformed_index = import_body.index("if (hasMalformedKeywordImportResult(result)) {")
+        hide_index = import_body.index("modal.hide();")
+        reload_index = import_body.index("const keywordsLoaded = await loadAccountKeywords();")
+        self.assertLess(
+            parse_index,
+            malformed_index,
+            "关键词导入成功态也得先把 JSON 兜底读出来，再验结构，别后端回半截数据还继续装成功",
+        )
+        self.assertLess(
+            malformed_index,
+            hide_index,
+            "关键词导入结果 payload 歪了得先当格式异常拦住，别继续关弹窗制造假成功",
+        )
+        self.assertLess(
+            malformed_index,
+            reload_index,
+            "关键词导入结果 payload 歪了得先拦住，别继续刷新关键词列表把错误流程伪装成成功",
         )
 
     def test_auto_reply_image_keyword_save_respects_modal_session_before_hiding_or_toasting(self):
@@ -12720,6 +15360,16 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
     def test_auto_reply_account_list_keyword_fetches_encode_account_ids_and_surface_load_failures(self):
         body = _extract_function_body(self.app_js, "refreshAccountList")
 
+        self.assertIn("function hasMalformedCookieDetailsAccounts(accounts) {", self.app_js)
+        self.assertIn("function hasMalformedKeywordCountMap(result) {", self.app_js)
+        self.assertIn("!getCookieDetailsAccountId(account)", self.app_js)
+        self.assertIn("(account.enabled != null && typeof account.enabled !== 'boolean')", self.app_js)
+        self.assertIn("(account.remark != null && typeof account.remark !== 'string')", self.app_js)
+        self.assertIn("(account.username != null && typeof account.username !== 'string')", self.app_js)
+        self.assertIn("(account.has_password != null && typeof account.has_password !== 'boolean')", self.app_js)
+        self.assertIn("if (!Array.isArray(accounts)) {", body)
+        self.assertIn("if (hasMalformedCookieDetailsAccounts(accounts)) {", body)
+        self.assertIn("throw new Error('账号列表返回格式异常');", body)
         self.assertIn("const accountId = getCookieDetailsAccountId(account);", body)
         self.assertIn("if (!accountId) {", body)
         self.assertIn("fetch(`${apiBase}/keywords/counts`", body)
@@ -12729,6 +15379,9 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("let keywordCountLoadFailed = false;", body)
         self.assertIn("if (!keywordsResponse.ok) {", body)
         self.assertIn("keywordCountLoadFailed = true;", body)
+        self.assertIn("keywordCounts = await keywordsResponse.json().catch(() => null);", body)
+        self.assertIn("if (hasMalformedKeywordCountMap(keywordCounts)) {", body)
+        self.assertIn("throw new Error('关键词数量返回格式异常');", body)
         self.assertIn("keywordCount: keywordCountLoadFailed ? 0 : Number(keywordCounts[accountId] || 0),", body)
         self.assertIn("keywordCountLoadFailed: keywordCountLoadFailed,", body)
 
@@ -12760,6 +15413,9 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("Object.prototype.hasOwnProperty.call(accountKeywordCache, accountId)", body)
         self.assertIn("fetch(`${apiBase}/keywords/counts`", body)
         self.assertIn("if (handleUnauthorizedApiResponse(response)) {", body)
+        self.assertIn("function hasMalformedKeywordCountMap(result) {", self.app_js)
+        self.assertIn("if (hasMalformedKeywordCountMap(keywordCounts)) {", body)
+        self.assertIn("accountKeywordCache = keywordCounts;", body)
         self.assertNotIn("fetch(`${apiBase}/keywords/${encodedAccountId}`", body)
         self.assertNotIn("fetch(`${apiBase}/keywords/${accountId}`", body)
 
@@ -12848,6 +15504,8 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         load_body = _extract_function_body(self.app_js, "loadScheduledTasks")
         open_body = _extract_function_body(self.app_js, "openPolishScheduleModal")
 
+        self.assertIn("if (!data || typeof data !== 'object' || Array.isArray(data)) {", load_body)
+        self.assertIn("throw new Error('定时任务列表返回格式异常');", load_body)
         self.assertIn("showToast(`加载定时任务失败: ${data.message || '未知错误'}`, 'danger');", load_body)
         self.assertIn("return null;", load_body)
         self.assertNotIn("return [];", load_body)
@@ -12927,6 +15585,14 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("data = await updateScheduledTask(taskId, {", save_body)
         self.assertIn("suppressErrorToast: true", save_body)
         self.assertIn("data = await createScheduledTask(accountId, runHour, enabled, { suppressErrorToast: true });", save_body)
+        self.assertIn("function hasMalformedScheduledTaskMutationResult(result) {", self.app_js)
+        self.assertIn("if (hasMalformedScheduledTaskMutationResult(data)) {", save_body)
+        self.assertIn("throw new Error('定时擦亮保存结果返回格式异常');", save_body)
+        self.assertLess(
+            save_body.index("if (hasMalformedScheduledTaskMutationResult(data)) {"),
+            save_body.index("if (!data.success) {"),
+            "定时擦亮保存结果在判 success 前也得先验结构，别后端回半截 JSON 还被前端当成业务失败或成功继续往下演",
+        )
 
     def test_polish_schedule_fetchjson_callers_abort_when_unauthorized_redirect_returns_no_payload(self):
         load_body = _extract_function_body(self.app_js, "loadScheduledTasks")
@@ -12935,8 +15601,13 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("if (data == null) {", load_body)
         self.assertLess(
             load_body.index("if (data == null) {"),
-            load_body.index("if (data.success) {"),
+            load_body.index("if (!data || typeof data !== 'object' || Array.isArray(data)) {"),
             "定时任务列表 helper 在 401 跳转后返回空值时，调用方得先收手，别上来就解引用 data.success 把自己整崩了",
+        )
+        self.assertLess(
+            load_body.index("if (!data || typeof data !== 'object' || Array.isArray(data)) {"),
+            load_body.index("if (data.success) {"),
+            "定时任务列表不是对象时也得先拦住，别拿歪 payload 当成功列表继续跑",
         )
 
         self.assertIn("if (!data) {", save_body)
@@ -12944,6 +15615,34 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             save_body.index("if (!data) {"),
             save_body.index("if (!data.success) {"),
             "定时擦亮保存 helper 在 401 跳转后返回空值时，调用方得把它当成中止，别再拿空值硬怼 success",
+        )
+
+    def test_polish_schedule_task_loader_rejects_malformed_task_entries_before_modal_defaults(self):
+        load_body = _extract_function_body(self.app_js, "loadScheduledTasks")
+        open_body = _extract_function_body(self.app_js, "openPolishScheduleModal")
+
+        self.assertIn("function hasMalformedScheduledTaskEntries(tasks) {", self.app_js)
+        self.assertIn("if (hasMalformedScheduledTaskEntries(data.tasks)) {", load_body)
+        self.assertIn("throw new Error('定时任务列表返回格式异常');", load_body)
+
+        tasks_array_guard_index = load_body.index("if (!Array.isArray(data.tasks)) {")
+        malformed_entries_guard_index = load_body.index("if (hasMalformedScheduledTaskEntries(data.tasks)) {")
+        return_index = load_body.index("return data.tasks;")
+
+        self.assertLess(
+            tasks_array_guard_index,
+            malformed_entries_guard_index,
+            "定时任务先得确认 tasks 是数组，再校验数组项结构，顺序别整反了",
+        )
+        self.assertLess(
+            malformed_entries_guard_index,
+            return_index,
+            "定时任务列表里混进脏 task 时得先判格式异常，别直接把垃圾数据放行给弹窗默认态逻辑",
+        )
+        self.assertLess(
+            open_body.index("if (tasks === null) {"),
+            open_body.index("const task = getPolishScheduledTask(tasks, accountId);"),
+            "加载 helper 识别到格式异常后会返回 null，弹窗调用方得在取 task 前就收手",
         )
 
     def test_auto_reply_account_list_refresh_ignores_stale_async_responses(self):
@@ -12956,7 +15655,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
     def test_auto_reply_account_list_refresh_stops_before_keyword_count_fanout_when_request_turns_stale(self):
         body = _extract_function_body(self.app_js, "refreshAccountList")
 
-        accounts_json_index = body.index("const accounts = await response.json();")
+        accounts_json_index = body.index("const accounts = await response.json().catch(() => null);")
         keyword_counts_fetch_index = body.index("const keywordsResponse = await fetch(`${apiBase}/keywords/counts`, {")
         stale_guard_after_accounts = body.find("requestSequence !== autoReplyAccountListRequestSequence", accounts_json_index)
 
@@ -13109,6 +15808,29 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "关键词配置区显示前得先判空，不然 DOM 一变就直接 ReferenceError，属实给自己找不痛快",
         )
 
+    def test_auto_reply_item_loaders_require_structured_item_list_payloads(self):
+        keyword_items_body = _extract_function_body(self.app_js, "loadItemsList")
+        image_keyword_items_body = _extract_function_body(self.app_js, "loadItemsListForImageKeyword")
+
+        for body, label in (
+            (keyword_items_body, "自动回复文本关键词商品列表"),
+            (image_keyword_items_body, "自动回复图片关键词商品列表"),
+        ):
+            with self.subTest(label=label):
+                self.assertIn("if (!data || typeof data !== 'object' || !Array.isArray(data.items)) {", body)
+                self.assertIn("throw new Error('商品列表返回格式异常');", body)
+                self.assertIn("const items = data.items;", body)
+                self.assertNotIn("const items = data.items || [];", body)
+
+                response_json_index = body.index("const data = await response.json().catch(() => ({}));")
+                payload_guard_index = body.index("if (!data || typeof data !== 'object' || !Array.isArray(data.items)) {", response_json_index)
+                items_assign_index = body.index("const items = data.items;", payload_guard_index)
+                self.assertLess(
+                    payload_guard_index,
+                    items_assign_index,
+                    f"{label}得先确认后端真返回了 items 数组，再往下拉框里塞数据，别把结构错误悄悄吞成空列表",
+                )
+
     def test_item_reply_account_change_wraps_fetch_in_try_block(self):
         body = _extract_function_body(self.app_js, "onAccountChangeForReply")
         self.assertRegex(
@@ -13135,6 +15857,107 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                 self.assertIn("} else if (itemsLoaded === false) {", body)
                 self.assertIn(f"showToast(`{success_message}`, 'success');", body)
                 self.assertIn(f"showToast('{warning_message}', 'warning');", body)
+
+    def test_item_management_mutations_reject_malformed_success_payloads_before_refresh_or_success_toast(self):
+        toggle_multi_spec_body = _extract_function_body(self.app_js, "toggleItemMultiSpec")
+        toggle_multi_quantity_body = _extract_function_body(self.app_js, "toggleItemMultiQuantityDelivery")
+        sync_page_body = _extract_function_body(self.app_js, "getAllItemsFromAccount")
+        sync_all_pages_body = _extract_function_body(self.app_js, "getAllItemsFromAccountAll")
+
+        self.assertIn("function hasMalformedItemToggleMutationResult(result) {", self.app_js)
+        self.assertIn("function hasMalformedItemSyncMutationResult(result, requireCurrentCount = false, requireTotalCount = false, requireTotalPages = false) {", self.app_js)
+
+        for body, helper_call, error_text, followup_fragment, label in (
+            (
+                toggle_multi_spec_body,
+                "if (hasMalformedItemToggleMutationResult(result)) {",
+                "throw new Error('商品多规格切换结果返回格式异常');",
+                "const itemsLoaded = await refreshItemsData();",
+                "商品多规格切换",
+            ),
+            (
+                toggle_multi_quantity_body,
+                "if (hasMalformedItemToggleMutationResult(result)) {",
+                "throw new Error('商品多数量发货切换结果返回格式异常');",
+                "const itemsLoaded = await refreshItemsData();",
+                "商品多数量发货切换",
+            ),
+            (
+                sync_page_body,
+                "if (hasMalformedItemSyncMutationResult(data, true)) {",
+                "throw new Error('商品同步结果返回格式异常');",
+                "if (data.success) {",
+                "分页商品同步",
+            ),
+            (
+                sync_all_pages_body,
+                "if (hasMalformedItemSyncMutationResult(data, false, true, true)) {",
+                "throw new Error('商品同步结果返回格式异常');",
+                "if (data.success) {",
+                "全量商品同步",
+            ),
+        ):
+            with self.subTest(label=label):
+                json_anchor = (
+                    "const data = await response.json().catch(() => ({}));"
+                    if "商品同步" in label
+                    else "const result = await response.json().catch(() => ({}));"
+                )
+                self.assertIn(json_anchor, body)
+                self.assertIn(helper_call, body)
+                self.assertIn(error_text, body)
+                self.assertLess(
+                    body.index(json_anchor),
+                    body.index(helper_call),
+                    f"{label}成功态 payload 得先读出来再验结构，别连返回体都没兜住就继续往下跑",
+                )
+                self.assertLess(
+                    body.index(helper_call),
+                    body.index(followup_fragment),
+                    f"{label}成功态 payload 歪了得先判格式异常，别继续刷新列表或走成功分支装没事",
+                )
+
+        self.assertIn("if (typeof result.message !== 'string' || !result.message.trim()) {", self.app_js)
+        self.assertIn("if (typeof result.success !== 'boolean') {", self.app_js)
+        self.assertIn("if (requireCurrentCount && (!Number.isFinite(Number(result.current_count)) || Number(result.current_count) < 0)) {", self.app_js)
+        self.assertIn("if (requireTotalCount && (!Number.isFinite(Number(result.total_count)) || Number(result.total_count) < 0)) {", self.app_js)
+        self.assertIn("if (requireTotalPages && (!Number.isFinite(Number(result.total_pages)) || Number(result.total_pages) < 1)) {", self.app_js)
+
+    def test_item_management_toggle_failures_read_structured_error_messages(self):
+        toggle_multi_spec_body = _extract_function_body(self.app_js, "toggleItemMultiSpec")
+        toggle_multi_quantity_body = _extract_function_body(self.app_js, "toggleItemMultiQuantityDelivery")
+
+        for body, label in (
+            (toggle_multi_spec_body, "商品多规格"),
+            (toggle_multi_quantity_body, "商品多数量发货"),
+        ):
+            with self.subTest(label=label):
+                self.assertIn("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", body)
+                self.assertIn("throw new Error(errorMessage || '操作失败');", body)
+                self.assertNotIn("const errorData = await response.json();", body)
+                error_index = body.index("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);")
+                throw_index = body.index("throw new Error(errorMessage || '操作失败');", error_index)
+                self.assertLess(
+                    error_index,
+                    throw_index,
+                    f"{label}切换失败时得先把后端 detail/message 解出来，别只会读一个 error 字段然后装瞎",
+                )
+
+    def test_item_management_toggle_raw_fetches_handle_unauthorized_before_followup_processing(self):
+        toggle_multi_spec_body = _extract_function_body(self.app_js, "toggleItemMultiSpec")
+        toggle_multi_quantity_body = _extract_function_body(self.app_js, "toggleItemMultiQuantityDelivery")
+
+        for body, label in (
+            (toggle_multi_spec_body, "商品多规格"),
+            (toggle_multi_quantity_body, "商品多数量发货"),
+        ):
+            with self.subTest(label=label):
+                self.assertIn("if (handleUnauthorizedApiResponse(response)) {", body)
+                self.assertLess(
+                    body.index("if (handleUnauthorizedApiResponse(response)) {"),
+                    body.index("if (response.ok) {"),
+                    f"{label}切换遇到 401 时得先回登录，别后面还继续刷新商品列表、弹成功 toast 或解析错误体",
+                )
 
     def test_refresh_items_and_item_reply_wrappers_do_not_emit_cross_page_toasts(self):
         refresh_items_body = _extract_function_body(self.app_js, "refreshItems")
@@ -13229,15 +16052,43 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                 )
 
         self.assertLess(
-            sync_page_body.rfind("actionRequestSequence !== itemMutationActionRequestSequence", 0, sync_page_body.index("showToast('同步商品信息失败', 'danger');")),
-            sync_page_body.index("showToast('同步商品信息失败', 'danger');"),
+            sync_page_body.rfind("actionRequestSequence !== itemMutationActionRequestSequence", 0, sync_page_body.index("showToast(error.message || '同步商品信息失败', 'danger');")),
+            sync_page_body.index("showToast(error.message || '同步商品信息失败', 'danger');"),
             "商品同步指定页的旧异常响应不该在新动作发起后继续甩通用失败 toast",
         )
         self.assertLess(
-            sync_all_pages_body.rfind("actionRequestSequence !== itemMutationActionRequestSequence", 0, sync_all_pages_body.index("showToast('同步商品信息失败', 'danger');")),
-            sync_all_pages_body.index("showToast('同步商品信息失败', 'danger');"),
+            sync_all_pages_body.rfind("actionRequestSequence !== itemMutationActionRequestSequence", 0, sync_all_pages_body.index("showToast(error.message || '同步商品信息失败', 'danger');")),
+            sync_all_pages_body.index("showToast(error.message || '同步商品信息失败', 'danger');"),
             "商品同步所有页的旧异常响应不该在新动作发起后继续甩通用失败 toast",
         )
+        for body in (sync_page_body, sync_all_pages_body):
+            with self.subTest(error_body=body[:60]):
+                self.assertIn("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", body)
+                self.assertIn("throw new Error(errorMessage || '同步商品信息失败');", body)
+                self.assertIn("showToast(error.message || '同步商品信息失败', 'danger');", body)
+                error_index = body.index("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);")
+                throw_index = body.index("throw new Error(errorMessage || '同步商品信息失败');", error_index)
+                toast_index = body.index("showToast(error.message || '同步商品信息失败', 'danger');")
+                self.assertLess(
+                    error_index,
+                    throw_index,
+                    "商品同步 HTTP 失败时得先把后端 detail/message 解出来，别直接拿状态码糊弄过去",
+                )
+                self.assertLess(
+                    body.rfind("actionRequestSequence !== itemMutationActionRequestSequence", 0, throw_index),
+                    throw_index,
+                    "商品同步旧失败响应读完错误体后，也得先验 request sequence，别再进 catch 回魂",
+                )
+                self.assertLess(
+                    body.rfind("!document.getElementById('items-section')?.classList.contains('active')", 0, throw_index),
+                    throw_index,
+                    "都切出商品页了，旧失败响应读完错误体也别继续抛异常",
+                )
+                self.assertLess(
+                    body.rfind("!document.getElementById('items-section')?.classList.contains('active')", 0, toast_index),
+                    toast_index,
+                    "都离开商品页了，旧失败请求进了 catch 也别跨页甩 toast",
+                )
         for body in (sync_page_body, sync_all_pages_body):
             with self.subTest(body=body[:60]):
                 finally_block = body.split("} finally {", 1)[1]
@@ -13252,6 +16103,58 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                     finally_block.index("actionRequestSequence !== itemMutationActionRequestSequence"),
                     finally_block.index("button.innerHTML = originalText;"),
                     "商品同步旧请求的 finally 也不该在新动作开始后把当前按钮文案还原成老状态",
+                )
+
+    def test_item_sync_browser_runtime_requests_abort_when_leaving_items_or_unloading(self):
+        self.assertIn("let itemSyncAbortController = null;", self.app_js)
+        self.assertIn("function stopItemSyncRequests() {", self.app_js)
+        self.assertIn("function resetItemSyncAbortController() {", self.app_js)
+        self.assertIn(
+            "window.addEventListener('pagehide', stopItemSyncRequests);",
+            self.app_js,
+        )
+
+        show_section_body = _extract_function_body(self.app_js, "showSection")
+        stop_body = _extract_function_body(self.app_js, "stopItemSyncRequests")
+        reset_body = _extract_function_body(self.app_js, "resetItemSyncAbortController")
+
+        self.assertLess(
+            show_section_body.index("stopItemSyncRequests();"),
+            show_section_body.index("itemMutationActionRequestSequence += 1;"),
+            "切出商品页时先 abort 同步请求，再失效化序号；别页面走了后端浏览器还搁那翻页",
+        )
+        self.assertIn("itemSyncAbortController.abort();", stop_body)
+        self.assertIn("itemSyncAbortController = null;", stop_body)
+        self.assertIn("stopItemSyncRequests();", reset_body)
+        self.assertIn("itemSyncAbortController = new AbortController();", reset_body)
+        self.assertIn("return itemSyncAbortController;", reset_body)
+
+        for function_name, fetch_fragment in (
+            ("getAllItemsFromAccount", "const response = await fetch(`${apiBase}/items/get-by-page`, {"),
+            ("getAllItemsFromAccountAll", "const response = await fetch(`${apiBase}/items/get-all-from-account`, {"),
+        ):
+            body = _extract_function_body(self.app_js, function_name)
+            with self.subTest(function_name=function_name):
+                self.assertIn("let controller = null;", body)
+                self.assertIn("controller = resetItemSyncAbortController();", body)
+                self.assertIn("signal: controller.signal", body)
+                self.assertIn("if (controller?.signal.aborted || error?.name === 'AbortError') {", body)
+                self.assertIn("if (itemSyncAbortController === controller) {", body)
+                self.assertIn("itemSyncAbortController = null;", body)
+                self.assertLess(
+                    body.index("controller = resetItemSyncAbortController();"),
+                    body.index(fetch_fragment),
+                    f"{function_name} 得在商品同步请求发出去前建好 AbortController",
+                )
+                self.assertLess(
+                    body.index("signal: controller.signal"),
+                    body.index("body: JSON.stringify({"),
+                    f"{function_name} 的后端浏览器同步请求必须挂 signal，不然取消就是嘴炮",
+                )
+                self.assertLess(
+                    body.index("if (controller?.signal.aborted || error?.name === 'AbortError') {"),
+                    body.index("showToast(error.message || '同步商品信息失败', 'danger');"),
+                    f"{function_name} 主动 abort 时应该静默退出，别切页后还糊 danger toast",
                 )
 
     def test_item_and_item_reply_raw_fetches_redirect_on_401_before_followup_processing(self):
@@ -13787,6 +16690,92 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                 self.assertIn(f"showToast(`{success_message}`, 'success');" if "${" in success_message else f"showToast('{success_message}', 'success');", body)
                 self.assertIn(f"showToast('{warning_message}', 'warning');", body)
 
+    def test_item_detail_and_item_reply_mutations_reject_malformed_success_payloads_before_followups(self):
+        save_detail_body = _extract_function_body(self.app_js, "saveItemDetail")
+        delete_item_body = _extract_function_body(self.app_js, "deleteItem")
+        batch_delete_items_body = _extract_function_body(self.app_js, "batchDeleteItems")
+        save_reply_body = _extract_function_body(self.app_js, "saveItemReply")
+        delete_reply_body = _extract_function_body(self.app_js, "deleteItemReply")
+        batch_delete_replies_body = _extract_function_body(self.app_js, "batchDeleteItemReplies")
+
+        self.assertIn("function hasMalformedItemMessageMutationResult(result) {", self.app_js)
+        self.assertIn("function hasMalformedItemBatchDeleteResult(result, requireTotalCount = false) {", self.app_js)
+
+        for body, helper_call, error_text, followup_fragment, label in (
+            (
+                save_detail_body,
+                "if (hasMalformedItemMessageMutationResult(result)) {",
+                "throw new Error('商品详情更新结果返回格式异常');",
+                "const modal = modalElement ? bootstrap.Modal.getInstance(modalElement) : null;",
+                "商品详情更新",
+            ),
+            (
+                delete_item_body,
+                "if (hasMalformedItemMessageMutationResult(result)) {",
+                "throw new Error('商品信息删除结果返回格式异常');",
+                "const itemsLoaded = await refreshItemsData();",
+                "商品删除",
+            ),
+            (
+                batch_delete_items_body,
+                "if (hasMalformedItemBatchDeleteResult(result, true)) {",
+                "throw new Error('批量删除商品结果返回格式异常');",
+                "const successCount = Number(result.success_count || 0);",
+                "商品批量删除",
+            ),
+            (
+                save_reply_body,
+                "if (hasMalformedItemMessageMutationResult(result)) {",
+                "throw new Error('商品回复保存结果返回格式异常');",
+                "const modal = modalElement ? bootstrap.Modal.getInstance(modalElement) : null;",
+                "商品回复保存",
+            ),
+            (
+                delete_reply_body,
+                "if (hasMalformedItemMessageMutationResult(result)) {",
+                "throw new Error('商品回复删除结果返回格式异常');",
+                "const itemRepliesLoaded = await refreshItemsReplayData();",
+                "商品回复删除",
+            ),
+            (
+                batch_delete_replies_body,
+                "if (hasMalformedItemBatchDeleteResult(result)) {",
+                "throw new Error('批量删除商品回复结果返回格式异常');",
+                "const successCount = Number(result.success_count || 0);",
+                "商品回复批量删除",
+            ),
+        ):
+            with self.subTest(label=label):
+                self.assertIn("const result = await response.json().catch(() => ({}));", body)
+                self.assertIn(helper_call, body)
+                self.assertIn(error_text, body)
+                self.assertLess(
+                    body.index(helper_call),
+                    body.index(followup_fragment),
+                    f"{label}成功态 payload 歪了得先拦住，别继续关弹窗、算计数、刷新列表装成功",
+                )
+
+        self.assertLess(
+            save_detail_body.index("if (hasMalformedItemMessageMutationResult(result)) {"),
+            save_detail_body.index("showToast('商品详情更新成功', 'success');"),
+            "商品详情更新结果结构都不对了，就别继续弹 success toast 糊人",
+        )
+        self.assertLess(
+            delete_item_body.index("if (hasMalformedItemMessageMutationResult(result)) {"),
+            delete_item_body.index("showToast('商品信息删除成功', 'success');"),
+            "商品删除结果结构都不对了，就别继续弹 success toast 糊人",
+        )
+        self.assertLess(
+            save_reply_body.index("if (hasMalformedItemMessageMutationResult(result)) {"),
+            save_reply_body.index("showToast('商品回复保存成功', 'success');"),
+            "商品回复保存结果结构都不对了，就别继续弹 success toast 糊人",
+        )
+        self.assertLess(
+            delete_reply_body.index("if (hasMalformedItemMessageMutationResult(result)) {"),
+            delete_reply_body.index("showToast('商品回复删除成功', 'success');"),
+            "商品回复删除结果结构都不对了，就别继续弹 success toast 糊人",
+        )
+
     def test_account_filter_loader_resets_stale_options_before_fetch_and_on_failure(self):
         body = _extract_function_body(self.app_js, "loadAccountOptions")
         self.assertIn("const select = document.getElementById(id);", body)
@@ -13808,9 +16797,10 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("if (!response.ok) {", body)
         self.assertIn("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", body)
         self.assertIn("throw new Error(errorMessage);", body)
+        self.assertIn("const accounts = await response.json().catch(() => ({}));", body)
         self.assertLess(
             body.index("if (!response.ok) {"),
-            body.index("const accounts = await response.json();"),
+            body.index("const accounts = await response.json().catch(() => ({}));"),
             "账号下拉接口都 HTTP 挂了，就别再装作没事去读 JSON 了，直接走失败分支",
         )
         self.assertLess(
@@ -13827,6 +16817,42 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             body.index("throw new Error(errorMessage);"),
             body.index("showToast(`加载账号列表失败: ${error.message || '请稍后重试'}`, 'danger');"),
             "账号下拉接口返回非 2xx 时也得把真实错误带进 toast，别静默留个空下拉糊弄人",
+        )
+
+    def test_account_filter_loader_requires_array_payload_before_rendering_options(self):
+        body = _extract_function_body(self.app_js, "loadAccountOptions")
+
+        self.assertIn("if (!Array.isArray(accounts)) {", body)
+        self.assertIn("if (hasMalformedCookieDetailsAccounts(accounts)) {", body)
+        self.assertIn("throw new Error('账号列表返回格式异常');", body)
+        self.assertLess(
+            body.index("if (!Array.isArray(accounts)) {"),
+            body.index("if (accounts.length === 0) {"),
+            "账号下拉拿到的 payload 不是数组时，得先判格式错误，别拿 length 瞎跑把页面搞成半死不活",
+        )
+        self.assertLess(
+            body.index("if (hasMalformedCookieDetailsAccounts(accounts)) {"),
+            body.index("if (accounts.length === 0) {"),
+            "账号下拉数组里混进坏账号对象时也得先拦住，别把空账号或脏状态渲成正常选项糊弄人",
+        )
+
+    def test_account_summary_helper_rejects_malformed_username_password_and_cookie_presence_fields(self):
+        self.assertIn("(account.username != null && typeof account.username !== 'string')", self.app_js)
+        self.assertIn("(account.has_password != null && typeof account.has_password !== 'boolean')", self.app_js)
+        self.assertIn("(account.value != null && typeof account.value !== 'string')", self.app_js)
+        self.assertIn("(account.has_cookie_value != null && typeof account.has_cookie_value !== 'boolean')", self.app_js)
+        self.assertIn("(account.runtime_status_error != null && typeof account.runtime_status_error !== 'string')", self.app_js)
+
+    def test_account_management_loader_rejects_malformed_account_entries_before_rendering_rows(self):
+        body = _extract_function_body(self.app_js, "loadAccounts")
+
+        self.assertIn("if (!Array.isArray(cookieDetails)) {", body)
+        self.assertIn("if (hasMalformedCookieDetailsAccounts(cookieDetails)) {", body)
+        self.assertIn("throw new Error('账号列表返回格式异常');", body)
+        self.assertLess(
+            body.index("if (hasMalformedCookieDetailsAccounts(cookieDetails)) {"),
+            body.index("accountsWithKeywords.forEach(cookie => {"),
+            "账号管理表格在渲染前也得先把坏账号对象拦住，别让假空 account_id 或脏状态一路混进操作列",
         )
 
     def test_account_filter_loader_surfaces_empty_state_when_no_valid_account_ids_exist(self):
@@ -14639,13 +17665,23 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
 
         self.assertIn("if (handleUnauthorizedApiResponse(response)) {", body)
         self.assertIn("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", body)
+        self.assertIn("const result = await response.json().catch(() => ({}));", body)
+        self.assertIn("if (hasMalformedVerifyResult(result)) {", body)
+        self.assertIn("throw new Error('权限验证结果返回格式异常');", body)
+        self.assertIn("if (!result.authenticated) {", body)
+        self.assertIn("localStorage.removeItem('auth_token');", body)
+        self.assertIn("localStorage.removeItem('user_info');", body)
+        self.assertIn("window.location.href = '/';", body)
         self.assertIn("throw new Error(errorMessage);", body)
         self.assertIn("showToast(`权限验证失败: ${error.message || '请稍后重试'}`, 'danger');", body)
 
         unauthorized_index = body.index("if (handleUnauthorizedApiResponse(response)) {")
-        response_ok_index = body.index("if (response.ok) {")
+        response_ok_index = body.index("if (!response.ok) {")
         error_index = body.index("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);")
         throw_index = body.index("throw new Error(errorMessage);", error_index)
+        parse_index = body.index("const result = await response.json().catch(() => ({}));")
+        malformed_index = body.index("if (hasMalformedVerifyResult(result)) {")
+        unauthenticated_index = body.index("if (!result.authenticated) {")
         toast_index = body.index("showToast(`权限验证失败: ${error.message || '请稍后重试'}`, 'danger');")
 
         self.assertLess(
@@ -14659,6 +17695,16 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "数据管理权限校验 HTTP 失败时得先把 detail/message 解出来，别固定甩一句权限验证失败糊弄人",
         )
         self.assertLess(
+            parse_index,
+            malformed_index,
+            "数据管理权限校验成功态也得先把 JSON 兜底读出来，再验结构，别空响应还拿来判管理员权限",
+        )
+        self.assertLess(
+            malformed_index,
+            unauthenticated_index,
+            "数据管理权限校验成功体结构都歪了，先按格式异常拦住，别继续拿脏 payload 判登录态",
+        )
+        self.assertLess(
             body.find("requestSequence !== dataManagementLoadRequestSequence", error_index),
             throw_index,
             "数据管理权限校验旧失败响应读完错误体后，先验 root loader 会话还活着，再决定要不要抛错",
@@ -14667,6 +17713,22 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             throw_index,
             toast_index,
             "数据管理权限校验应把真实后端错误带进 catch toast，别把错误体又吞回固定红字",
+        )
+
+    def test_data_management_verify_false_redirects_instead_of_reporting_permission_denied(self):
+        body = _extract_function_body(self.app_js, "loadDataManagement")
+
+        self.assertIn("if (!result.authenticated) {", body)
+        self.assertIn("localStorage.removeItem('auth_token');", body)
+        self.assertIn("localStorage.removeItem('user_info');", body)
+        self.assertIn("window.location.href = '/';", body)
+
+        unauthenticated_index = body.index("if (!result.authenticated) {")
+        no_permission_index = body.index("showToast('您没有权限访问数据管理功能', 'danger');")
+        self.assertLess(
+            unauthenticated_index,
+            no_permission_index,
+            "数据管理 verify 返回 authenticated:false 时应先清登录态跳回去，别误报成没权限",
         )
 
     def test_data_management_table_loader_ignores_hidden_section_and_http_failures(self):
@@ -14686,13 +17748,25 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
 
     def test_data_management_table_loader_reads_structured_http_errors_before_throwing_and_toasting(self):
         load_body = _extract_function_body(self.app_js, "loadTableData")
+        display_body = _extract_function_body(self.app_js, "displayTableData")
 
         self.assertIn("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", load_body)
         self.assertIn("throw new Error(errorMessage);", load_body)
         self.assertIn("showToast(`加载数据失败: ${error.message || '请稍后重试'}`, 'danger');", load_body)
-        self.assertIn("if (!data || typeof data !== 'object') {", load_body)
+        self.assertIn("if (!data || typeof data !== 'object' || Array.isArray(data)) {", load_body)
+        self.assertIn("typeof data.success !== 'boolean'", load_body)
+        self.assertIn("(data.message != null && typeof data.message !== 'string')", load_body)
         self.assertIn("if (data.success && (!Array.isArray(data.data) || !Array.isArray(data.columns))) {", load_body)
+        self.assertIn("if (data.success && (hasMalformedDataTableColumns(data.columns) || hasMalformedDataTableRows(data.data))) {", load_body)
         self.assertIn("throw new Error('数据表返回格式异常');", load_body)
+        self.assertIn("function hasMalformedDataTableColumns(columns) {", self.app_js)
+        self.assertIn("return columns.some(column => typeof column !== 'string' || !column.trim());", self.app_js)
+        self.assertIn("function hasMalformedDataTableRows(rows) {", self.app_js)
+        self.assertIn("return rows.some(row => !row || typeof row !== 'object' || Array.isArray(row));", self.app_js)
+        self.assertIn("!Array.isArray(data)", display_body)
+        self.assertIn("!Array.isArray(columns)", display_body)
+        self.assertIn("hasMalformedDataTableColumns(columns)", display_body)
+        self.assertIn("hasMalformedDataTableRows(data)", display_body)
 
         error_index = load_body.index("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);")
         throw_index = load_body.index("throw new Error(errorMessage);", error_index)
@@ -14793,7 +17867,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         delete_body = _extract_function_body(self.app_js, "confirmDeleteRecord")
 
         for body, unauthorized_fragment, anchor_fragment in (
-            (load_body, "if (handleUnauthorizedApiResponse(response)) {", "if (response.ok) {"),
+            (load_body, "if (handleUnauthorizedApiResponse(response)) {", "if (!response.ok) {"),
             (export_body, "if (handleUnauthorizedApiResponse(response)) {", "if (!response.ok) {"),
             (clear_body, "if (handleUnauthorizedApiResponse(response)) {", "if (response.ok) {"),
             (delete_body, "if (handleUnauthorizedApiResponse(response)) {", "if (response.ok) {"),
@@ -15124,7 +18198,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             ),
             (
                 export_body,
-                "const backupData = await response.json();",
+                "const backupData = await response.json().catch(() => ({}));",
                 "showToast('备份导出成功', 'success');",
             ),
         ):
@@ -15171,6 +18245,52 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         self.assertIn("if (loaded) {", delete_body)
         self.assertIn("showToast(data.message || '删除成功', 'success');", delete_body)
         self.assertIn("showToast('删除成功，但表格刷新失败，请稍后手动刷新', 'warning');", delete_body)
+
+    def test_data_management_mutations_reject_malformed_success_payloads_before_reload_or_modal_hide(self):
+        clear_body = _extract_function_body(self.app_js, "clearTableData")
+        delete_body = _extract_function_body(self.app_js, "confirmDeleteRecord")
+
+        self.assertIn("function hasMalformedDataManagementMutationResult(result) {", self.app_js)
+        self.assertIn("if (typeof result.success !== 'boolean') {", self.app_js)
+        self.assertIn("if (result.detail != null && typeof result.detail !== 'string') {", self.app_js)
+        self.assertIn("const data = await response.json().catch(() => ({}));", clear_body)
+        self.assertIn("const data = await response.json().catch(() => ({}));", delete_body)
+
+        self.assertIn("if (hasMalformedDataManagementMutationResult(data)) {", clear_body)
+        self.assertIn("throw new Error('数据清空结果返回格式异常');", clear_body)
+        self.assertLess(
+            clear_body.index("const data = await response.json().catch(() => ({}));"),
+            clear_body.index("if (hasMalformedDataManagementMutationResult(data)) {"),
+            "数据清空成功态得先把 JSON 读出来并兜底成空对象，再交给 helper 判格式，别让半截响应直接炸成随机 JS 错",
+        )
+        self.assertLess(
+            clear_body.index("if (hasMalformedDataManagementMutationResult(data)) {"),
+            clear_body.index("const loaded = await loadTableData();"),
+            "数据清空成功态 payload 歪了得先判格式异常，别继续刷新表格制造假成功",
+        )
+        self.assertLess(
+            clear_body.index("if (hasMalformedDataManagementMutationResult(data)) {"),
+            clear_body.index("showToast(data.message || '数据清空成功', 'success');"),
+            "数据清空结果 payload 歪了得先拦住，别继续弹 success 装清空成功",
+        )
+
+        self.assertIn("if (hasMalformedDataManagementMutationResult(data)) {", delete_body)
+        self.assertIn("throw new Error('删除记录结果返回格式异常');", delete_body)
+        self.assertLess(
+            delete_body.index("const data = await response.json().catch(() => ({}));"),
+            delete_body.index("if (hasMalformedDataManagementMutationResult(data)) {"),
+            "删除记录成功态也得先把 JSON 读出来并兜底，别后端回半截内容时直接把删除流程炸成 runtime error",
+        )
+        self.assertLess(
+            delete_body.index("if (hasMalformedDataManagementMutationResult(data)) {"),
+            delete_body.index("deleteRecordModal.hide();"),
+            "删除记录成功态 payload 歪了得先判格式异常，别继续关弹窗装删除成功",
+        )
+        self.assertLess(
+            delete_body.index("if (hasMalformedDataManagementMutationResult(data)) {"),
+            delete_body.index("const loaded = await loadTableData();"),
+            "删除记录结果 payload 歪了得先拦住，别继续刷新表格制造假成功",
+        )
 
     def test_data_management_mutations_do_not_emit_cross_page_toasts_after_leaving_section(self):
         clear_body = _extract_function_body(self.app_js, "clearTableData")
@@ -15443,6 +18563,14 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         toggle_body = _extract_function_body(self.app_js, "toggleUserAdmin")
         delete_body = _extract_function_body(self.app_js, "confirmDeleteUser")
 
+        self.assertIn("if (data && typeof data === 'object' && data.success === false) {", toggle_body)
+        self.assertIn("showToast(`操作失败: ${data.message || '请稍后重试'}`, 'danger');", toggle_body)
+        self.assertLess(
+            toggle_body.index("if (data && typeof data === 'object' && data.success === false) {"),
+            toggle_body.index("const usersLoaded = await loadUsers();"),
+            "切换管理员状态如果后端返回 200 里的业务失败，先认账，别继续刷新列表然后弹 success",
+        )
+
         self.assertIn("const usersLoaded = await loadUsers();", toggle_body)
         self.assertIn("if (usersLoaded === true) {", toggle_body)
         self.assertIn("} else if (usersLoaded === false) {", toggle_body)
@@ -15452,6 +18580,14 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             toggle_body.index("const usersLoaded = await loadUsers();"),
             toggle_body.index("showToast(data.message || `用户已${action}`, 'success');"),
             "切换管理员状态不该先吹成功，再慢吞吞去刷新列表",
+        )
+
+        self.assertIn("if (data && typeof data === 'object' && data.success === false) {", delete_body)
+        self.assertIn("showToast(`删除失败: ${data.message || '请稍后重试'}`, 'danger');", delete_body)
+        self.assertLess(
+            delete_body.index("if (data && typeof data === 'object' && data.success === false) {"),
+            delete_body.index("const deleteUserModalElement = document.getElementById('deleteUserModal');"),
+            "删除用户如果后端返回 200 里的业务失败，别先关模态框、刷统计，再假装删成了",
         )
 
         self.assertIn("const [statsLoaded, usersLoaded] = await Promise.all([", delete_body)
@@ -15465,6 +18601,50 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             delete_body.index("const [statsLoaded, usersLoaded] = await Promise.all(["),
             delete_body.index("showToast(data.message || '用户删除成功', 'success');"),
             "删除用户不该先报喜，再让后续刷新失败把脸打肿",
+        )
+
+    def test_user_management_mutations_reject_malformed_success_payloads_before_reload_or_modal_hide(self):
+        toggle_body = _extract_function_body(self.app_js, "toggleUserAdmin")
+        delete_body = _extract_function_body(self.app_js, "confirmDeleteUser")
+
+        self.assertIn("function hasMalformedUserManagementMutationResult(result, requireSuccessFlag = false) {", self.app_js)
+        self.assertIn("const data = await response.json().catch(() => ({}));", toggle_body)
+        self.assertIn("const data = await response.json().catch(() => ({}));", delete_body)
+
+        self.assertIn("if (hasMalformedUserManagementMutationResult(data, true)) {", toggle_body)
+        self.assertIn("throw new Error('用户权限更新结果返回格式异常');", toggle_body)
+        self.assertLess(
+            toggle_body.index("const data = await response.json().catch(() => ({}));"),
+            toggle_body.index("if (hasMalformedUserManagementMutationResult(data, true)) {"),
+            "切换用户权限成功态也得先把 JSON 读出来并兜底，别后端回空体时直接炸成随机运行时错误",
+        )
+        self.assertLess(
+            toggle_body.index("if (hasMalformedUserManagementMutationResult(data, true)) {"),
+            toggle_body.index("const usersLoaded = await loadUsers();"),
+            "切换用户权限成功态 payload 歪了得先判格式异常，别继续刷新列表制造假成功",
+        )
+        self.assertLess(
+            toggle_body.index("if (hasMalformedUserManagementMutationResult(data, true)) {"),
+            toggle_body.index("showToast(data.message || `用户已${action}`, 'success');"),
+            "切换用户权限结果 payload 歪了得先拦住，别继续弹 success 装更新成功",
+        )
+
+        self.assertIn("if (hasMalformedUserManagementMutationResult(data)) {", delete_body)
+        self.assertIn("throw new Error('删除用户结果返回格式异常');", delete_body)
+        self.assertLess(
+            delete_body.index("const data = await response.json().catch(() => ({}));"),
+            delete_body.index("if (hasMalformedUserManagementMutationResult(data)) {"),
+            "删除用户成功态也得先把 JSON 读出来并兜底，别后端回半截内容时直接把删人流程炸成随机报错",
+        )
+        self.assertLess(
+            delete_body.index("if (hasMalformedUserManagementMutationResult(data)) {"),
+            delete_body.index("deleteUserModal.hide();"),
+            "删除用户成功态 payload 歪了得先判格式异常，别继续关弹窗装删除成功",
+        )
+        self.assertLess(
+            delete_body.index("if (hasMalformedUserManagementMutationResult(data)) {"),
+            delete_body.index("const [statsLoaded, usersLoaded] = await Promise.all(["),
+            "删除用户结果 payload 歪了得先拦住，别继续刷新统计和列表制造假成功",
         )
 
     def test_load_user_management_surfaces_partial_stats_failure_when_user_list_still_loads(self):
@@ -15626,6 +18806,37 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
             "用户管理总加载在拉统计和列表前也得再验一次请求序号，别旧请求回来又开工",
         )
 
+    def test_user_management_root_loader_rejects_malformed_verify_payload_and_redirects_when_not_authenticated(self):
+        body = _extract_function_body(self.app_js, "loadUserManagement")
+
+        self.assertIn("const result = await response.json().catch(() => ({}));", body)
+        self.assertIn("if (hasMalformedVerifyResult(result)) {", body)
+        self.assertIn("throw new Error('权限验证结果返回格式异常');", body)
+        self.assertIn("if (!result.authenticated) {", body)
+        self.assertIn("localStorage.removeItem('auth_token');", body)
+        self.assertIn("localStorage.removeItem('user_info');", body)
+        self.assertIn("window.location.href = '/';", body)
+
+        parse_index = body.index("const result = await response.json().catch(() => ({}));")
+        malformed_index = body.index("if (hasMalformedVerifyResult(result)) {")
+        unauthenticated_index = body.index("if (!result.authenticated) {")
+        no_permission_index = body.index("showToast('您没有权限访问用户管理功能', 'danger');")
+        self.assertLess(
+            parse_index,
+            malformed_index,
+            "用户管理权限校验成功态也得先把 JSON 兜底读出来，再验结构，别空响应还拿来判管理员权限",
+        )
+        self.assertLess(
+            malformed_index,
+            unauthenticated_index,
+            "用户管理权限校验成功体结构都歪了，先按格式异常拦住，别继续拿脏 payload 判登录态",
+        )
+        self.assertLess(
+            unauthenticated_index,
+            no_permission_index,
+            "用户管理 verify 返回 authenticated:false 时应先清登录态跳回去，别误报成没权限",
+        )
+
     def test_user_management_root_loader_does_not_emit_cross_page_permission_failure_toasts(self):
         body = _extract_function_body(self.app_js, "loadUserManagement")
         toast_fragment = "showToast(`权限验证失败: ${error.message || '请稍后重试'}`, 'danger');"
@@ -15648,7 +18859,7 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         delete_body = _extract_function_body(self.app_js, "confirmDeleteUser")
 
         for body, unauthorized_fragment, anchor_fragment in (
-            (load_body, "if (handleUnauthorizedApiResponse(response)) {", "if (response.ok) {"),
+            (load_body, "if (handleUnauthorizedApiResponse(response)) {", "if (!response.ok) {"),
             (stats_body, "if (handleUnauthorizedApiResponse(statsResponse)) {", "if (!statsResponse.ok) {"),
             (users_body, "if (handleUnauthorizedApiResponse(response)) {", "if (!response.ok) {"),
             (toggle_body, "if (handleUnauthorizedApiResponse(response)) {", "if (response.ok) {"),
@@ -15775,9 +18986,42 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         check_auth_body = _extract_function_body(self.app_js, "checkAuth")
         logout_body = _extract_function_body(self.app_js, "logout")
 
+        self.assertIn("if (handleUnauthorizedApiResponse(response)) {", check_auth_body)
+        self.assertIn("const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);", check_auth_body)
+        self.assertIn("const result = await response.json().catch(() => ({}));", check_auth_body)
+        self.assertIn("if (hasMalformedVerifyResult(result)) {", check_auth_body)
+        self.assertIn("throw new Error('认证信息返回格式异常');", check_auth_body)
         self.assertIn("localStorage.setItem('user_info', JSON.stringify({", check_auth_body)
         self.assertIn("localStorage.removeItem('user_info');", check_auth_body)
         self.assertIn("localStorage.removeItem('user_info');", logout_body)
+
+        unauthorized_index = check_auth_body.index("if (handleUnauthorizedApiResponse(response)) {")
+        response_ok_index = check_auth_body.index("if (!response.ok) {")
+        parse_index = check_auth_body.index("const result = await response.json().catch(() => ({}));")
+        malformed_index = check_auth_body.index("if (hasMalformedVerifyResult(result)) {")
+        unauthenticated_index = check_auth_body.index("if (!result.authenticated) {")
+        set_user_info_index = check_auth_body.index("localStorage.setItem('user_info', JSON.stringify({")
+
+        self.assertLess(
+            unauthorized_index,
+            response_ok_index,
+            "checkAuth 遇到 401 得先走统一未授权处理，别后面还继续装成普通校验失败",
+        )
+        self.assertLess(
+            parse_index,
+            malformed_index,
+            "checkAuth 成功态也得先把 JSON 兜底读出来，再验结构，别空响应还继续写本地 user_info",
+        )
+        self.assertLess(
+            malformed_index,
+            unauthenticated_index,
+            "checkAuth 成功体结构都歪了，先按格式异常拦住，别继续拿脏 payload 判登录态",
+        )
+        self.assertLess(
+            unauthenticated_index,
+            set_user_info_index,
+            "checkAuth verify 返回 authenticated:false 时应先清登录态跳回去，别继续把脏信息写进 user_info",
+        )
 
     def test_card_save_and_update_do_not_log_debug_payloads(self):
         save_body = _extract_function_body(self.app_js, "saveCard")
@@ -15802,9 +19046,9 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
         )
 
         for function_name, json_anchor in (
-            ("checkLoginCaptchaEnabled", "const result = await response.json();"),
-            ("checkRegistrationStatus", "const data = await response.json();"),
-            ("checkLoginInfoStatus", "const result = await response.json();"),
+            ("checkLoginCaptchaEnabled", "const result = await response.json().catch(() => ({}));"),
+            ("checkRegistrationStatus", "const data = await response.json().catch(() => ({}));"),
+            ("checkLoginInfoStatus", "const result = await response.json().catch(() => ({}));"),
         ):
             with self.subTest(function_name=function_name):
                 body = _extract_function_body(self.login_html, function_name)
@@ -15819,6 +19063,182 @@ class AdminFrontendStaticContractsTest(unittest.TestCase):
                     body.index(json_anchor),
                     f"{function_name} 先判断 HTTP 状态，再解析 JSON，别把 500 当成功配置吃下去",
                 )
+
+    def test_login_page_error_and_config_helpers_reject_malformed_payloads(self):
+        self.assertIn(
+            "async function readResponseErrorMessage(response, fallbackMessage = '') {",
+            self.login_html,
+        )
+        helper_body = _extract_function_body(self.login_html, "readResponseErrorMessage")
+        self.assertIn("const errorText = await response.text();", helper_body)
+        self.assertIn("const errorJson = JSON.parse(errorText);", helper_body)
+        self.assertIn("return errorJson.detail || errorJson.message || errorText;", helper_body)
+        self.assertIn("return fallbackMessage || `HTTP ${response.status} ${response.statusText}`;", helper_body)
+
+        self.assertIn("function hasMalformedEnabledFlagResult(result) {", self.login_html)
+        self.assertIn("function hasMalformedCaptchaRequiredResult(result) {", self.login_html)
+        self.assertIn("function hasMalformedLoginResult(result) {", self.login_html)
+        self.assertIn("function hasMalformedCaptchaGenerationResult(result) {", self.login_html)
+        self.assertIn("function hasMalformedSuccessMessageResult(result) {", self.login_html)
+        self.assertIn("function hasMalformedVerifyResult(result) {", self.login_html)
+
+        for function_name, guard_fragment, error_fragment in (
+            ("checkLoginCaptchaEnabled", "if (hasMalformedEnabledFlagResult(result)) {", "throw new Error('登录验证码配置返回格式异常');"),
+            ("checkSecurityCaptchaRequired", "if (hasMalformedCaptchaRequiredResult(result)) {", "throw new Error('验证码需求配置返回格式异常');"),
+            ("checkRegistrationStatus", "if (hasMalformedEnabledFlagResult(data)) {", "throw new Error('注册状态返回格式异常');"),
+            ("checkLoginInfoStatus", "if (hasMalformedEnabledFlagResult(result)) {", "throw new Error('登录信息显示配置返回格式异常');"),
+        ):
+            with self.subTest(function_name=function_name):
+                body = _extract_function_body(self.login_html, function_name)
+                self.assertIn(guard_fragment, body)
+                self.assertIn(error_fragment, body)
+                self.assertLess(
+                    body.index(guard_fragment),
+                    body.index(error_fragment),
+                    f"{function_name} 识别到歪 payload 后得立刻抛格式异常，别继续拿脏数据往 UI 链路里灌",
+                )
+
+    def test_login_email_code_flow_invalidates_consumed_captcha_session(self):
+        self.assertIn("function invalidateEmailCodeCaptchaState() {", self.login_html)
+        helper_body = _extract_function_body(self.login_html, "invalidateEmailCodeCaptchaState")
+        self.assertIn("captchaVerified = false;", helper_body)
+        self.assertIn("sessionId = generateSessionId();", helper_body)
+        self.assertIn("updateSendCodeButton();", helper_body)
+
+        refresh_body = _extract_function_body(self.login_html, "refreshCaptcha")
+        self.assertIn("sessionId = generateSessionId();", refresh_body)
+
+        send_code_body = _extract_function_body(self.login_html, "sendVerificationCode")
+        self.assertIn("invalidateEmailCodeCaptchaState();", send_code_body)
+        self.assertIn("refreshCaptcha();", send_code_body)
+        self.assertLess(
+            send_code_body.index("invalidateEmailCodeCaptchaState();"),
+            send_code_body.index("startCountdown();"),
+            "登录页邮箱验证码发送成功后，必须先让一次性图形验证码会话失效，再进入倒计时",
+        )
+
+        submit_body = _extract_brace_block_after(
+            self.login_html,
+            "loginForm.addEventListener('submit', async (e) =>",
+        )
+        email_code_start = submit_body.index("} else if (loginType === 'email-code') {")
+        email_code_end = submit_body.index("loginData = { email, verification_code: verificationCode };")
+        email_code_block = submit_body[email_code_start:email_code_end]
+        self.assertNotIn("if (!captchaVerified) {", email_code_block)
+
+    def test_register_page_public_flows_check_http_status_before_parsing(self):
+        self.assertIn(
+            "async function readResponseErrorMessage(response, fallbackMessage = '') {",
+            self.register_html,
+        )
+
+        for function_name, json_anchor in (
+            ("checkRegistrationStatus", "const data = await response.json().catch(() => ({}));"),
+            ("loadCaptcha", "const result = await response.json().catch(() => ({}));"),
+            ("verifyCaptcha", "const result = await response.json().catch(() => ({}));"),
+            ("sendVerificationCode", "const result = await response.json().catch(() => ({}));"),
+        ):
+            with self.subTest(function_name=function_name):
+                body = _extract_function_body(self.register_html, function_name)
+                self.assertIn("if (!response.ok) {", body)
+                self.assertIn(
+                    "const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);",
+                    body,
+                )
+                self.assertIn("throw new Error(errorMessage);", body)
+                self.assertLess(
+                    body.index("if (!response.ok) {"),
+                    body.index(json_anchor),
+                    f"{function_name} 先判断 HTTP 状态，再解析 JSON，别把 500/空响应直接炸成前端随机错",
+                )
+
+        submit_body = _extract_brace_block_after(
+            self.register_html,
+            "document.getElementById('registerForm').addEventListener('submit', async function(e)",
+        )
+        self.assertIn("if (!response.ok) {", submit_body)
+        self.assertIn(
+            "const errorMessage = await readResponseErrorMessage(response, `HTTP ${response.status}`);",
+            submit_body,
+        )
+        self.assertIn("throw new Error(errorMessage);", submit_body)
+        self.assertLess(
+            submit_body.index("if (!response.ok) {"),
+            submit_body.index("const result = await response.json().catch(() => ({}));"),
+            "注册提交也得先踢掉 HTTP 错误，再解析 JSON，别把后端 4xx/5xx 伪装成业务失败",
+        )
+
+    def test_register_page_helpers_reject_malformed_success_payloads(self):
+        self.assertIn("function escapeHtml(value) {", self.register_html)
+        self.assertIn("function isPlainObjectPayload(value) {", self.register_html)
+        self.assertIn("function hasMalformedEnabledFlagResult(result) {", self.register_html)
+        self.assertIn("function hasMalformedCaptchaGenerationResult(result) {", self.register_html)
+        self.assertIn("function hasMalformedSuccessMessageResult(result) {", self.register_html)
+
+        alert_body = _extract_function_body(self.register_html, "showAlert")
+        self.assertIn("const safeType = ['success', 'warning', 'danger'].includes(type) ? type : 'danger';", alert_body)
+        self.assertIn("const safeMessage = escapeHtml(message || '');", alert_body)
+        self.assertIn("${safeMessage}", alert_body)
+        self.assertNotIn("${message}", alert_body)
+
+        for function_name, guard_fragment, error_fragment in (
+            ("checkRegistrationStatus", "if (hasMalformedEnabledFlagResult(data)) {", "throw new Error('注册状态返回格式异常');"),
+            ("loadCaptcha", "if (hasMalformedCaptchaGenerationResult(result)) {", "throw new Error('图形验证码返回格式异常');"),
+            ("verifyCaptcha", "if (hasMalformedSuccessMessageResult(result)) {", "throw new Error('图形验证码校验结果返回格式异常');"),
+            ("sendVerificationCode", "if (hasMalformedSuccessMessageResult(result)) {", "throw new Error('发送验证码结果返回格式异常');"),
+        ):
+            with self.subTest(function_name=function_name):
+                body = _extract_function_body(self.register_html, function_name)
+                self.assertIn(guard_fragment, body)
+                self.assertIn(error_fragment, body)
+                self.assertLess(
+                    body.index(guard_fragment),
+                    body.index(error_fragment),
+                    f"{function_name} 识别到歪 payload 后得立刻抛格式异常，别继续拿脏数据往页面状态里灌",
+                )
+
+        submit_body = _extract_brace_block_after(
+            self.register_html,
+            "document.getElementById('registerForm').addEventListener('submit', async function(e)",
+        )
+        self.assertIn("if (hasMalformedSuccessMessageResult(result)) {", submit_body)
+        self.assertIn("throw new Error('注册结果返回格式异常');", submit_body)
+        self.assertLess(
+            submit_body.index("if (hasMalformedSuccessMessageResult(result)) {"),
+            submit_body.index("if (result.success) {"),
+            "注册结果 payload 都歪了就别继续按 success/failed 分支演戏了，先按格式异常拦住",
+        )
+
+    def test_register_page_invalidates_consumed_captcha_session_after_send_code(self):
+        self.assertIn("function invalidateRegisterCaptchaState() {", self.register_html)
+        helper_body = _extract_function_body(self.register_html, "invalidateRegisterCaptchaState")
+        self.assertIn("captchaVerified = false;", helper_body)
+        self.assertIn("sessionId = generateSessionId();", helper_body)
+        self.assertIn("updateSendCodeButton();", helper_body)
+
+        send_code_body = _extract_function_body(self.register_html, "sendVerificationCode")
+        self.assertIn("invalidateRegisterCaptchaState();", send_code_body)
+        self.assertIn("refreshCaptcha();", send_code_body)
+        self.assertLess(
+            send_code_body.index("invalidateRegisterCaptchaState();"),
+            send_code_body.index("showAlert(result.message, 'success');"),
+            "注册页验证码发送成功后，必须先废掉已消费的图形验证码会话，再提示发送成功",
+        )
+
+        submit_body = _extract_brace_block_after(
+            self.register_html,
+            "document.getElementById('registerForm').addEventListener('submit', async function(e)",
+        )
+        self.assertNotIn("if (!captchaVerified) {", submit_body)
+
+    def test_public_captcha_status_messages_do_not_render_untrusted_html(self):
+        for page_name, html in (("login", self.login_html), ("register", self.register_html)):
+            with self.subTest(page=page_name):
+                verify_body = _extract_function_body(html, "verifyCaptcha")
+                self.assertNotIn("captchaStatus.innerHTML", verify_body)
+                self.assertIn("errorStatus.textContent = `✗ ${result.message || '图形验证码错误，请重新输入'}`;", verify_body)
+                self.assertIn("errorStatus.textContent = error.message || '验证失败，请检查网络连接';", verify_body)
+                self.assertIn("captchaStatus.replaceChildren(errorStatus);", verify_body)
 
     def test_admin_pages_define_favicon_to_avoid_404_requests(self):
         favicon_fragment = '<link rel="icon" href="data:,">'

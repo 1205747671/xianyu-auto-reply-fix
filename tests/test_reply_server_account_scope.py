@@ -13,6 +13,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import types
 import unittest
@@ -288,6 +289,56 @@ class ReplyServerAccountWorkerFutureWaitTest(_ReplyServerModuleBindingMixin, uni
 
         self.assertEqual("nested-ok", result)
 
+    def test_run_sync_task_on_account_thread_does_not_execute_abandoned_timeout_call_later(self):
+        from utils.account_browser_runtime import AccountBrowserRuntimeManager
+
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(temp_dir, ignore_errors=True))
+        manager = AccountBrowserRuntimeManager(base_dir=temp_dir)
+        state = manager._get_sync_account_worker_state("account-timeout-abandon-1")
+
+        executed = []
+        release_worker = threading.Event()
+
+        def blocking_task():
+            release_worker.wait(timeout=1.0)
+            return "blocking-finished"
+
+        def should_not_run():
+            executed.append("ran")
+            return "unexpected"
+
+        worker_thread = threading.Thread(
+            target=lambda: manager.run_sync_task_on_account_thread(
+                "account-timeout-abandon-1",
+                blocking_task,
+                timeout=1.0,
+            ),
+            daemon=True,
+        )
+        worker_thread.start()
+
+        deadline = time.time() + 1.0
+        thread_id = None
+        while time.time() < deadline:
+            with state.lock:
+                thread_id = state.thread_id
+            if thread_id is not None:
+                break
+            time.sleep(0.01)
+        self.assertIsNotNone(thread_id)
+
+        with self.assertRaises(TimeoutError):
+            manager.run_sync_task_on_account_thread(
+                "account-timeout-abandon-1",
+                should_not_run,
+                timeout=0.05,
+            )
+
+        release_worker.set()
+        worker_thread.join(timeout=1.0)
+        self.assertEqual([], executed)
+
     def test_item_sync_endpoints_accept_account_id_request_field(self):
         source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
 
@@ -344,15 +395,23 @@ class ReplyServerAccountWorkerFutureWaitTest(_ReplyServerModuleBindingMixin, uni
         self.assertNotIn("检查cookie_id是否在cookies表中存在", xianyu_async)
         self.assertNotIn("如果当前实例的cookie_id匹配", xianyu_async)
 
-    def test_qr_cookie_refresh_source_keeps_human_readable_cookie_diff_logs(self):
+    def test_qr_cookie_refresh_source_keeps_human_readable_masked_cookie_diff_logs(self):
         xianyu_async = (REPO_ROOT / "XianyuAutoAsync.py").read_text(encoding="utf-8")
 
-        self.assertIn('logger.info(f"【{target_account_id}】  {i:2d}. {key}: {value}")', xianyu_async)
+        self.assertIn(
+            "display_value = self._mask_secret_value(cookie_value, head=4, tail=2)",
+            xianyu_async,
+        )
+        self.assertIn(
+            'logger.info(f"【{target_account_id}】  {i:2d}. {key}: {display_value} (长度: {len(cookie_value)})")',
+            xianyu_async,
+        )
         self.assertIn(
             'logger.info(f"【{target_account_id}】  值: {self._mask_secret_value(cookie_value, head=8, tail=6)}")',
             xianyu_async,
         )
         self.assertIn('logger.info(f"【{target_account_id}】  ---")', xianyu_async)
+        self.assertNotIn('logger.info(f"【{target_account_id}】  {i:2d}. {key}: {value}")', xianyu_async)
         self.assertNotIn('logger.info(f"【{target_account_id}? {i:2d}. {key}: {value}")', xianyu_async)
         self.assertNotIn(
             'logger.info(f"【{target_account_id}? ? {self._mask_secret_value(cookie_value, head=8, tail=6)}")',
@@ -392,6 +451,7 @@ class ReplyServerAccountWorkerFutureWaitTest(_ReplyServerModuleBindingMixin, uni
             "                    account_id,\n"
             "                    'password_login',\n"
             "                    slider_instance,\n"
+            "                    action_text='执行账号密码登录',\n"
             "                )\n"
             "                cookies_dict = slider_instance.login_with_password_browser(\n"
             "                    account=account,\n"
@@ -407,6 +467,7 @@ class ReplyServerAccountWorkerFutureWaitTest(_ReplyServerModuleBindingMixin, uni
             "                    account_id,\n"
             "                    'manual_cookie_import',\n"
             "                    slider_instance,\n"
+            "                    action_text='执行手动导入 Cookie',\n"
             "                )\n"
             "                success, cookies_dict = slider_instance.run(\n"
             "                    target_url,\n"
@@ -433,6 +494,42 @@ class ReplyServerAccountWorkerFutureWaitTest(_ReplyServerModuleBindingMixin, uni
             "                require_managed_runtime=True,\n"
             "            )",
             xianyu_async,
+        )
+
+    def test_account_persistent_slider_paths_fail_closed_without_managed_runtime(self):
+        slider_source = (REPO_ROOT / "utils" / "xianyu_slider_stealth.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "def _missing_managed_runtime_message(self, scene: str = \"account-scoped browser flow\") -> str:",
+            slider_source,
+        )
+        self.assertIn(
+            "if _is_account_persistent_profile_requested(self):\n"
+            "                raise RuntimeError(self._missing_managed_runtime_message(\"account-scoped verification flow\"))",
+            slider_source,
+        )
+        self.assertIn(
+            "if _is_account_persistent_profile_requested(self) and not using_managed_runtime:\n"
+            "                logger.error(\n"
+            "                    f\"【{self.pure_user_id}】账号级 persistent profile 必须通过 managed runtime/owner 申请，\"\n"
+            "                    \"拒绝直接启动浏览器\"\n"
+            "                )\n"
+            "                return self._fail_login(self._missing_managed_runtime_message(\"account-scoped password login\"))",
+            slider_source,
+        )
+        self.assertIn(
+            "if not using_managed_runtime and not force_clean_context:\n"
+            "                logger.error(\n"
+            "                    f\"【{self.pure_user_id}】账号级密码登录浏览器必须通过 managed runtime/owner 申请，\"\n"
+            "                    \"拒绝直接启动 persistent profile\"\n"
+            "                )\n"
+            "                return self._fail_login(self._missing_managed_runtime_message(\"account-scoped password login\"))",
+            slider_source,
+        )
+        self.assertIn(
+            "if _is_account_persistent_profile_requested(self) and not using_managed_runtime:\n"
+            "                self.last_login_error = self._missing_managed_runtime_message(\"account-scoped verification flow\")",
+            slider_source,
         )
 
     def test_password_login_handoff_releases_sync_runtime_before_persisting_account_task(self):
@@ -634,6 +731,18 @@ class ReplyServerProxyUpdateBehaviorTest(_ReplyServerModuleBindingMixin, unittes
         self.assertNotIn("cid = entry.get('account_id')", start_source)
         self.assertNotIn("manager.add_cookie(cid, val, kw_list)", start_source)
 
+    def test_startup_api_env_host_and_port_override_config(self):
+        start_source = (REPO_ROOT / "Start.py").read_text(encoding="utf-8")
+
+        self.assertIn("env_host = os.getenv('API_HOST')", start_source)
+        self.assertIn("env_port = os.getenv('API_PORT')", start_source)
+        self.assertIn("config_host = api_conf.get('host')", start_source)
+        self.assertIn("config_port = api_conf.get('port')", start_source)
+        self.assertIn("host = env_host or config_host or '0.0.0.0'", start_source)
+        self.assertIn("port = int(env_port or config_port or 8090)", start_source)
+        self.assertNotIn("host = os.getenv('API_HOST', '0.0.0.0')", start_source)
+        self.assertNotIn("port = int(os.getenv('API_PORT', '8090'))", start_source)
+
     def test_runtime_and_cookie_responses_use_account_id_fields(self):
         source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
 
@@ -780,7 +889,7 @@ class ReplyServerProxyUpdateBehaviorTest(_ReplyServerModuleBindingMixin, unittes
             result = asyncio.run(invoke())
 
         self.assertFalse(result["success"])
-        self.assertIn("non-empty, non-default account_id", result["message"])
+        self.assertEqual("账号ID不能为空，且不能使用 default", result["message"])
 
     def test_password_login_rejects_foreign_account_id_before_creating_session(self):
         current_user = {"user_id": 1, "username": "admin"}
@@ -870,6 +979,225 @@ class ReplyServerProxyUpdateBehaviorTest(_ReplyServerModuleBindingMixin, unittes
         self.assertIn("session_id", result)
         create_task.assert_called_once()
 
+    def test_password_login_normalizes_string_boolean_flags_before_creating_session(self):
+        current_user = {"user_id": 7, "username": "demo-user"}
+        original_sessions = dict(reply_server.password_login_sessions)
+        reply_server.password_login_sessions.clear()
+
+        created_tasks = []
+
+        def restore_sessions():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        def fake_create_task(coro):
+            created_tasks.append(coro)
+            coro.close()
+            return mock.Mock()
+
+        async def invoke():
+            return await reply_server.password_login(
+                {
+                    "account_id": "acc-refresh-bool-1",
+                    "show_browser": "false",
+                    "refresh_mode": "false",
+                    "account": "refresh-user",
+                    "password": "refresh-pass",
+                },
+                current_user=current_user,
+            )
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_binding_info",
+            return_value=None,
+        ), mock.patch.object(
+            reply_server,
+            "_ensure_manual_browser_entry_runtime_available",
+            new=mock.AsyncMock(return_value=None),
+        ), mock.patch(
+            "asyncio.create_task",
+            side_effect=fake_create_task,
+        ) as create_task, mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertTrue(result["success"])
+        self.assertEqual("processing", result["status"])
+        self.assertEqual(1, len(created_tasks))
+        session_id = result["session_id"]
+        self.assertIn(session_id, reply_server.password_login_sessions)
+        self.assertFalse(reply_server.password_login_sessions[session_id]["show_browser"])
+        self.assertFalse(reply_server.password_login_sessions[session_id]["refresh_mode"])
+        create_task.assert_called_once()
+
+    def test_password_login_rejects_running_async_browser_runtime_before_creating_session(self):
+        current_user = {"user_id": 1, "username": "admin"}
+        original_sessions = dict(reply_server.password_login_sessions)
+        reply_server.password_login_sessions.clear()
+
+        def restore_sessions():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        async def invoke():
+            return await reply_server.password_login(
+                {
+                    "account_id": "acc-runtime-busy-1",
+                    "account": "unit-user",
+                    "password": "unit-password",
+                    "refresh_mode": False,
+                },
+                current_user=current_user,
+            )
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_binding_info",
+            return_value=None,
+        ), mock.patch.object(
+            reply_server.account_browser_runtime_manager,
+            "get_account_runtime_state_snapshot",
+            return_value={
+                "owner_mode": "async",
+                "owner_mode_active_count": 1,
+                "async_runtime_alive": True,
+                "async_active_leases": 1,
+                "async_pending_closures": 0,
+            },
+        ), mock.patch.object(
+            reply_server,
+            "_run_managed_live_instance_optional_call",
+            new=mock.AsyncMock(return_value={"instance_exists": True, "running": True}),
+        ), mock.patch(
+            "asyncio.create_task",
+            return_value=mock.Mock(),
+        ) as create_task, mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertFalse(result["success"])
+        self.assertIn("运行中的账号浏览器任务", result["message"])
+        self.assertEqual({}, reply_server.password_login_sessions)
+        create_task.assert_not_called()
+
+    def test_password_login_refresh_mode_rejects_running_async_browser_runtime_before_creating_session(self):
+        current_user = {"user_id": 7, "username": "demo-user"}
+        original_sessions = dict(reply_server.password_login_sessions)
+        reply_server.password_login_sessions.clear()
+
+        def restore_sessions():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        async def invoke():
+            return await reply_server.password_login(
+                {
+                    "account_id": "acc-runtime-busy-refresh-1",
+                    "refresh_mode": True,
+                },
+                current_user=current_user,
+            )
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_details",
+            return_value={
+                "user_id": 7,
+                "username": "refresh-user",
+                "password": "refresh-pass",
+                "show_browser": False,
+            },
+        ), mock.patch(
+            "XianyuAutoAsync.XianyuLive.is_manual_refresh_active",
+            return_value=False,
+        ), mock.patch.object(
+            reply_server.account_browser_runtime_manager,
+            "get_account_runtime_state_snapshot",
+            return_value={
+                "owner_mode": "async",
+                "owner_mode_active_count": 1,
+                "async_runtime_alive": True,
+                "async_active_leases": 1,
+                "async_pending_closures": 0,
+            },
+        ), mock.patch.object(
+            reply_server,
+            "_run_managed_live_instance_optional_call",
+            new=mock.AsyncMock(return_value=None),
+        ), mock.patch(
+            "asyncio.create_task",
+            return_value=mock.Mock(),
+        ) as create_task, mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertFalse(result["success"])
+        self.assertIn("运行中的账号浏览器任务", result["message"])
+        self.assertEqual({}, reply_server.password_login_sessions)
+        create_task.assert_not_called()
+
+    def test_password_login_allows_idle_async_runtime_cache_without_active_leases(self):
+        current_user = {"user_id": 1, "username": "admin"}
+        original_sessions = dict(reply_server.password_login_sessions)
+        reply_server.password_login_sessions.clear()
+
+        created_tasks = []
+
+        def restore_sessions():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        def fake_create_task(coro):
+            created_tasks.append(coro)
+            coro.close()
+            return mock.Mock()
+
+        async def invoke():
+            return await reply_server.password_login(
+                {
+                    "account_id": "acc-runtime-idle-1",
+                    "account": "unit-user",
+                    "password": "unit-password",
+                    "refresh_mode": False,
+                },
+                current_user=current_user,
+            )
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_binding_info",
+            return_value=None,
+        ), mock.patch.object(
+            reply_server.account_browser_runtime_manager,
+            "get_account_runtime_state_snapshot",
+            return_value={
+                "owner_mode": None,
+                "owner_mode_active_count": 0,
+                "async_runtime_alive": True,
+                "async_active_leases": 0,
+                "async_pending_closures": 0,
+            },
+        ), mock.patch.object(
+            reply_server,
+            "_run_managed_live_instance_optional_call",
+            new=mock.AsyncMock(return_value=None),
+        ), mock.patch(
+            "asyncio.create_task",
+            side_effect=fake_create_task,
+        ) as create_task, mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertTrue(result["success"])
+        self.assertEqual("processing", result["status"])
+        self.assertEqual(1, len(created_tasks))
+        create_task.assert_called_once()
+
     def test_manual_cookie_import_rejects_default_account_id_before_db_access(self):
         async def invoke():
             return await reply_server.manual_cookie_import(
@@ -888,7 +1216,760 @@ class ReplyServerProxyUpdateBehaviorTest(_ReplyServerModuleBindingMixin, unittes
             result = asyncio.run(invoke())
 
         self.assertFalse(result["success"])
-        self.assertIn("non-empty, non-default account_id", result["message"])
+        self.assertEqual("账号ID不能为空，且不能使用 default", result["message"])
+
+    def test_manual_cookie_import_rejects_invalid_account_id_format_with_user_friendly_message(self):
+        async def invoke():
+            return await reply_server.manual_cookie_import(
+                reply_server.ManualCookieImportRequest(
+                    account_id="acc invalid",
+                    cookie="unb=test_user; cookie2=test_cookie2",
+                ),
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_all_cookies",
+            side_effect=AssertionError("invalid account_id should be rejected before cookie lookup"),
+        ), mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertFalse(result["success"])
+        self.assertEqual("账号ID只能包含英文字母、数字、下划线和短横线", result["message"])
+
+    def test_manual_cookie_import_rejects_running_async_browser_runtime_before_creating_session(self):
+        current_user = {"user_id": 1, "username": "admin"}
+        original_sessions = dict(reply_server.manual_cookie_import_sessions)
+        reply_server.manual_cookie_import_sessions.clear()
+
+        def restore_sessions():
+            reply_server.manual_cookie_import_sessions.clear()
+            reply_server.manual_cookie_import_sessions.update(original_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        async def invoke():
+            return await reply_server.manual_cookie_import(
+                reply_server.ManualCookieImportRequest(
+                    account_id="acc-runtime-busy-import-1",
+                    cookie="unb=test_user; cookie2=test_cookie2",
+                ),
+                current_user=current_user,
+            )
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_binding_info",
+            return_value=None,
+        ), mock.patch.object(
+            reply_server.account_browser_runtime_manager,
+            "get_account_runtime_state_snapshot",
+            return_value={
+                "owner_mode": "async",
+                "owner_mode_active_count": 1,
+                "async_runtime_alive": True,
+                "async_active_leases": 1,
+                "async_pending_closures": 0,
+            },
+        ), mock.patch.object(
+            reply_server,
+            "_run_managed_live_instance_optional_call",
+            new=mock.AsyncMock(return_value={"instance_exists": True, "running": True}),
+        ), mock.patch(
+            "asyncio.create_task",
+            return_value=mock.Mock(),
+        ) as create_task, mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertFalse(result["success"])
+        self.assertIn("运行中的账号浏览器任务", result["message"])
+        self.assertEqual({}, reply_server.manual_cookie_import_sessions)
+        create_task.assert_not_called()
+
+    def test_manual_cookie_import_allows_idle_async_runtime_cache_without_active_leases(self):
+        current_user = {"user_id": 1, "username": "admin"}
+        original_sessions = dict(reply_server.manual_cookie_import_sessions)
+        reply_server.manual_cookie_import_sessions.clear()
+
+        created_tasks = []
+
+        def restore_sessions():
+            reply_server.manual_cookie_import_sessions.clear()
+            reply_server.manual_cookie_import_sessions.update(original_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        def fake_create_task(coro):
+            created_tasks.append(coro)
+            coro.close()
+            return mock.Mock()
+
+        async def invoke():
+            return await reply_server.manual_cookie_import(
+                reply_server.ManualCookieImportRequest(
+                    account_id="acc-runtime-idle-import-1",
+                    cookie="unb=test_user; cookie2=test_cookie2",
+                ),
+                current_user=current_user,
+            )
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_binding_info",
+            return_value=None,
+        ), mock.patch.object(
+            reply_server.account_browser_runtime_manager,
+            "get_account_runtime_state_snapshot",
+            return_value={
+                "owner_mode": None,
+                "owner_mode_active_count": 0,
+                "async_runtime_alive": True,
+                "async_active_leases": 0,
+                "async_pending_closures": 0,
+            },
+        ), mock.patch.object(
+            reply_server,
+            "_run_managed_live_instance_optional_call",
+            new=mock.AsyncMock(return_value=None),
+        ), mock.patch(
+            "asyncio.create_task",
+            side_effect=fake_create_task,
+        ) as create_task, mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertTrue(result["success"])
+        self.assertEqual("processing", result["status"])
+        self.assertEqual(1, len(created_tasks))
+        create_task.assert_called_once()
+
+    def test_password_login_rejects_duplicate_manual_cookie_import_session_for_same_account(self):
+        current_user = {"user_id": 1, "username": "admin"}
+        original_password_sessions = dict(reply_server.password_login_sessions)
+        original_manual_sessions = dict(reply_server.manual_cookie_import_sessions)
+        reply_server.password_login_sessions.clear()
+        reply_server.manual_cookie_import_sessions.clear()
+        reply_server.manual_cookie_import_sessions["manual-import-active-1"] = {
+            "account_id": "acc-dup-manual-1",
+            "status": "processing",
+            "timestamp": time.time(),
+            "completed_at": None,
+            "user_id": 1,
+        }
+
+        def restore_state():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_password_sessions)
+            reply_server.manual_cookie_import_sessions.clear()
+            reply_server.manual_cookie_import_sessions.update(original_manual_sessions)
+
+        self.addCleanup(restore_state)
+
+        async def invoke():
+            return await reply_server.password_login(
+                {
+                    "account_id": "acc-dup-manual-1",
+                    "account": "unit-user",
+                    "password": "unit-password",
+                    "refresh_mode": False,
+                },
+                current_user=current_user,
+            )
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_binding_info",
+            return_value=None,
+        ), mock.patch(
+            "asyncio.create_task",
+            return_value=mock.Mock(),
+        ) as create_task, mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertFalse(result["success"])
+        self.assertIn("手动导入 Cookie 流程", result["message"])
+        self.assertEqual({}, reply_server.password_login_sessions)
+        create_task.assert_not_called()
+
+    def test_manual_cookie_import_rejects_duplicate_password_login_session_for_same_account(self):
+        current_user = {"user_id": 1, "username": "admin"}
+        original_password_sessions = dict(reply_server.password_login_sessions)
+        original_manual_sessions = dict(reply_server.manual_cookie_import_sessions)
+        reply_server.password_login_sessions.clear()
+        reply_server.manual_cookie_import_sessions.clear()
+        reply_server.password_login_sessions["password-login-active-1"] = {
+            "account_id": "acc-dup-password-1",
+            "status": "verification_required",
+            "timestamp": time.time(),
+            "completed_at": None,
+            "user_id": 1,
+        }
+
+        def restore_state():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_password_sessions)
+            reply_server.manual_cookie_import_sessions.clear()
+            reply_server.manual_cookie_import_sessions.update(original_manual_sessions)
+
+        self.addCleanup(restore_state)
+
+        async def invoke():
+            return await reply_server.manual_cookie_import(
+                reply_server.ManualCookieImportRequest(
+                    account_id="acc-dup-password-1",
+                    cookie="unb=test_user; cookie2=test_cookie2",
+                ),
+                current_user=current_user,
+            )
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_binding_info",
+            return_value=None,
+        ), mock.patch(
+            "asyncio.create_task",
+            return_value=mock.Mock(),
+        ) as create_task, mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertFalse(result["success"])
+        self.assertIn("账号密码登录流程", result["message"])
+        self.assertEqual(1, len(reply_server.password_login_sessions))
+        self.assertEqual({}, reply_server.manual_cookie_import_sessions)
+        create_task.assert_not_called()
+
+    def test_manual_cookie_import_ignores_stale_done_password_login_session_for_same_account(self):
+        current_user = {"user_id": 1, "username": "admin"}
+        original_password_sessions = dict(reply_server.password_login_sessions)
+        original_manual_sessions = dict(reply_server.manual_cookie_import_sessions)
+        reply_server.password_login_sessions.clear()
+        reply_server.manual_cookie_import_sessions.clear()
+        reply_server.password_login_sessions["password-login-stale-done-1"] = {
+            "account_id": "acc-stale-done-password-1",
+            "status": "processing",
+            "timestamp": time.time(),
+            "completed_at": None,
+            "user_id": 1,
+            "task": SimpleNamespace(done=lambda: True),
+        }
+
+        def restore_state():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_password_sessions)
+            reply_server.manual_cookie_import_sessions.clear()
+            reply_server.manual_cookie_import_sessions.update(original_manual_sessions)
+
+        self.addCleanup(restore_state)
+
+        async def invoke():
+            return await reply_server.manual_cookie_import(
+                reply_server.ManualCookieImportRequest(
+                    account_id="acc-stale-done-password-1",
+                    cookie="unb=test_user; cookie2=test_cookie2",
+                ),
+                current_user=current_user,
+            )
+
+        def fake_create_task(coro):
+            coro.close()
+            return mock.Mock()
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_binding_info",
+            return_value=None,
+        ), mock.patch.object(
+            reply_server,
+            "_run_managed_live_instance_optional_call",
+            new=mock.AsyncMock(return_value=None),
+        ), mock.patch.object(
+            reply_server.account_browser_runtime_manager,
+            "get_account_runtime_state_snapshot",
+            return_value={
+                "owner_mode": None,
+                "owner_mode_active_count": 0,
+                "async_runtime_alive": False,
+                "async_active_leases": 0,
+                "async_pending_closures": 0,
+            },
+        ), mock.patch(
+            "asyncio.create_task",
+            side_effect=fake_create_task,
+        ) as create_task, mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertTrue(result["success"])
+        stale_session = reply_server.password_login_sessions["password-login-stale-done-1"]
+        self.assertEqual("failed", stale_session["status"])
+        self.assertIn("状态未正常回写", stale_session["error"])
+        create_task.assert_called_once()
+
+    def test_manual_cookie_import_keeps_done_password_login_session_with_live_worker_thread_for_same_account(self):
+        current_user = {"user_id": 1, "username": "admin"}
+        original_password_sessions = dict(reply_server.password_login_sessions)
+        original_manual_sessions = dict(reply_server.manual_cookie_import_sessions)
+        reply_server.password_login_sessions.clear()
+        reply_server.manual_cookie_import_sessions.clear()
+        reply_server.password_login_sessions["password-login-live-worker-1"] = {
+            "account_id": "acc-live-worker-password-1",
+            "status": "processing",
+            "timestamp": time.time(),
+            "completed_at": None,
+            "user_id": 1,
+            "task": SimpleNamespace(done=lambda: True),
+            "worker_thread": SimpleNamespace(is_alive=lambda: True),
+        }
+
+        def restore_state():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_password_sessions)
+            reply_server.manual_cookie_import_sessions.clear()
+            reply_server.manual_cookie_import_sessions.update(original_manual_sessions)
+
+        self.addCleanup(restore_state)
+
+        async def invoke():
+            return await reply_server.manual_cookie_import(
+                reply_server.ManualCookieImportRequest(
+                    account_id="acc-live-worker-password-1",
+                    cookie="unb=test_user; cookie2=test_cookie2",
+                ),
+                current_user=current_user,
+            )
+
+        with mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertFalse(result["success"])
+        self.assertIn("账号密码登录流程", result["message"])
+        self.assertEqual("processing", reply_server.password_login_sessions["password-login-live-worker-1"]["status"])
+
+    def test_password_login_create_task_failure_does_not_leave_processing_session(self):
+        current_user = {"user_id": 1, "username": "admin"}
+        original_sessions = dict(reply_server.password_login_sessions)
+        reply_server.password_login_sessions.clear()
+
+        def restore_sessions():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        async def invoke():
+            return await reply_server.password_login(
+                {
+                    "account_id": "acc-create-task-fail-1",
+                    "account": "unit-user",
+                    "password": "unit-password",
+                    "refresh_mode": False,
+                },
+                current_user=current_user,
+            )
+
+        def fake_create_task(coro):
+            coro.close()
+            raise RuntimeError("event loop is closing")
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_binding_info",
+            return_value=None,
+        ), mock.patch.object(
+            reply_server,
+            "_run_managed_live_instance_optional_call",
+            new=mock.AsyncMock(return_value=None),
+        ), mock.patch.object(
+            reply_server.account_browser_runtime_manager,
+            "get_account_runtime_state_snapshot",
+            return_value={
+                "owner_mode": None,
+                "owner_mode_active_count": 0,
+                "async_runtime_alive": False,
+                "async_active_leases": 0,
+                "async_pending_closures": 0,
+            },
+        ), mock.patch(
+            "asyncio.create_task",
+            side_effect=fake_create_task,
+        ), mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertFalse(result["success"])
+        self.assertIn("event loop is closing", result["message"])
+        self.assertEqual({}, reply_server.password_login_sessions)
+
+    def test_check_password_login_status_marks_stale_done_session_failed(self):
+        original_sessions = dict(reply_server.password_login_sessions)
+        reply_server.password_login_sessions.clear()
+        reply_server.password_login_sessions["stale-password-status-1"] = {
+            "account_id": "acc-stale-status-1",
+            "status": "processing",
+            "timestamp": time.time(),
+            "completed_at": None,
+            "user_id": 1,
+            "task": SimpleNamespace(done=lambda: True),
+        }
+
+        def restore_sessions():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        async def invoke():
+            return await reply_server.check_password_login_status(
+                "stale-password-status-1",
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        with mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertEqual("failed", result["status"])
+        self.assertIn("状态未正常回写", result["message"])
+
+    def test_check_password_login_status_keeps_done_session_while_worker_thread_alive(self):
+        original_sessions = dict(reply_server.password_login_sessions)
+        reply_server.password_login_sessions.clear()
+        reply_server.password_login_sessions["live-worker-password-status-1"] = {
+            "account_id": "acc-live-worker-status-1",
+            "status": "processing",
+            "timestamp": time.time(),
+            "completed_at": None,
+            "user_id": 1,
+            "task": SimpleNamespace(done=lambda: True),
+            "worker_thread": SimpleNamespace(is_alive=lambda: True),
+        }
+
+        def restore_sessions():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        async def invoke():
+            return await reply_server.check_password_login_status(
+                "live-worker-password-status-1",
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        with mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertEqual("processing", result["status"])
+        self.assertIn("live-worker-password-status-1", reply_server.password_login_sessions)
+        self.assertEqual(
+            "processing",
+            reply_server.password_login_sessions["live-worker-password-status-1"]["status"],
+        )
+
+    def test_check_password_login_status_stale_done_session_fills_blank_error_message(self):
+        original_sessions = dict(reply_server.password_login_sessions)
+        reply_server.password_login_sessions.clear()
+        reply_server.password_login_sessions["stale-password-status-blank-error-1"] = {
+            "account_id": "acc-stale-status-blank-1",
+            "status": "processing",
+            "timestamp": time.time(),
+            "completed_at": None,
+            "user_id": 1,
+            "error": "",
+            "task": SimpleNamespace(done=lambda: True),
+        }
+
+        def restore_sessions():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        async def invoke():
+            return await reply_server.check_password_login_status(
+                "stale-password-status-blank-error-1",
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        with mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("登录任务已结束，但会话状态未正常回写", result["message"])
+
+    def test_check_password_login_status_deletes_expired_screenshot_via_shared_cleanup_helper(self):
+        original_sessions = dict(reply_server.password_login_sessions)
+        reply_server.password_login_sessions.clear()
+        reply_server.password_login_sessions["expired-password-login-1"] = {
+            "account_id": "acc-expired-screenshot-1",
+            "status": "verification_required",
+            "timestamp": time.time() - 4000,
+            "completed_at": None,
+            "screenshot_path": "static/uploads/images/face_verify_expired_1.jpg",
+            "user_id": 1,
+        }
+
+        def restore_sessions():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        async def invoke():
+            return await reply_server.check_password_login_status(
+                "expired-password-login-1",
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        fake_image_manager = SimpleNamespace(delete_image=mock.Mock(return_value=True))
+        with mock.patch("utils.image_utils.image_manager", fake_image_manager), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertEqual("not_found", result["status"])
+        fake_image_manager.delete_image.assert_called_once_with(
+            "static/uploads/images/face_verify_expired_1.jpg"
+        )
+        self.assertEqual({}, reply_server.password_login_sessions)
+
+    def test_check_password_login_status_keeps_old_running_session(self):
+        original_sessions = dict(reply_server.password_login_sessions)
+        reply_server.password_login_sessions.clear()
+        reply_server.password_login_sessions["running-password-login-1"] = {
+            "account_id": "acc-running-password-1",
+            "status": "processing",
+            "timestamp": time.time() - 4000,
+            "completed_at": None,
+            "screenshot_path": "static/uploads/images/face_verify_running_1.jpg",
+            "user_id": 1,
+            "task": SimpleNamespace(done=lambda: False),
+        }
+
+        def restore_sessions():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        async def invoke():
+            return await reply_server.check_password_login_status(
+                "running-password-login-1",
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        fake_image_manager = SimpleNamespace(delete_image=mock.Mock(return_value=True))
+        with mock.patch("utils.image_utils.image_manager", fake_image_manager), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertEqual("processing", result["status"])
+        self.assertIn("running-password-login-1", reply_server.password_login_sessions)
+        fake_image_manager.delete_image.assert_not_called()
+
+    def test_prune_expired_manual_browser_entry_sessions_cleans_manual_cookie_import_screenshot(self):
+        original_sessions = dict(reply_server.manual_cookie_import_sessions)
+        reply_server.manual_cookie_import_sessions.clear()
+        reply_server.manual_cookie_import_sessions["expired-manual-import-1"] = {
+            "account_id": "acc-expired-import-1",
+            "status": "verification_required",
+            "timestamp": time.time() - 4000,
+            "completed_at": None,
+            "screenshot_path": "static/uploads/images/face_verify_expired_import_1.jpg",
+            "user_id": 1,
+        }
+
+        def restore_sessions():
+            reply_server.manual_cookie_import_sessions.clear()
+            reply_server.manual_cookie_import_sessions.update(original_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        fake_image_manager = SimpleNamespace(delete_image=mock.Mock(return_value=True))
+        with mock.patch("utils.image_utils.image_manager", fake_image_manager), \
+             mock.patch.object(reply_server, "log_with_user"):
+            reply_server._prune_expired_manual_browser_entry_sessions()
+
+        fake_image_manager.delete_image.assert_called_once_with(
+            "static/uploads/images/face_verify_expired_import_1.jpg"
+        )
+        self.assertEqual({}, reply_server.manual_cookie_import_sessions)
+
+    def test_prune_expired_manual_browser_entry_sessions_keeps_old_running_sessions(self):
+        original_password_sessions = dict(reply_server.password_login_sessions)
+        original_manual_sessions = dict(reply_server.manual_cookie_import_sessions)
+        reply_server.password_login_sessions.clear()
+        reply_server.manual_cookie_import_sessions.clear()
+        reply_server.password_login_sessions["running-password-login-prune-1"] = {
+            "account_id": "acc-running-password-prune-1",
+            "status": "processing",
+            "timestamp": time.time() - 4000,
+            "completed_at": None,
+            "screenshot_path": "static/uploads/images/face_verify_running_prune_password_1.jpg",
+            "user_id": 1,
+            "task": SimpleNamespace(done=lambda: False),
+        }
+        reply_server.manual_cookie_import_sessions["running-manual-import-prune-1"] = {
+            "account_id": "acc-running-import-prune-1",
+            "status": "processing",
+            "timestamp": time.time() - 4000,
+            "completed_at": None,
+            "screenshot_path": "static/uploads/images/face_verify_running_prune_import_1.jpg",
+            "user_id": 1,
+            "task": SimpleNamespace(done=lambda: False),
+        }
+
+        def restore_sessions():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_password_sessions)
+            reply_server.manual_cookie_import_sessions.clear()
+            reply_server.manual_cookie_import_sessions.update(original_manual_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        fake_image_manager = SimpleNamespace(delete_image=mock.Mock(return_value=True))
+        with mock.patch("utils.image_utils.image_manager", fake_image_manager), \
+             mock.patch.object(reply_server, "log_with_user"):
+            reply_server._prune_expired_manual_browser_entry_sessions()
+
+        self.assertIn(
+            "running-password-login-prune-1",
+            reply_server.password_login_sessions,
+        )
+        self.assertIn(
+            "running-manual-import-prune-1",
+            reply_server.manual_cookie_import_sessions,
+        )
+        fake_image_manager.delete_image.assert_not_called()
+
+    def test_prune_expired_manual_browser_entry_sessions_keeps_done_sessions_with_live_worker_threads(self):
+        original_password_sessions = dict(reply_server.password_login_sessions)
+        original_manual_sessions = dict(reply_server.manual_cookie_import_sessions)
+        reply_server.password_login_sessions.clear()
+        reply_server.manual_cookie_import_sessions.clear()
+        reply_server.password_login_sessions["done-password-login-prune-live-worker-1"] = {
+            "account_id": "acc-done-password-prune-live-worker-1",
+            "status": "processing",
+            "timestamp": time.time() - 4000,
+            "completed_at": None,
+            "screenshot_path": "static/uploads/images/face_verify_done_prune_password_1.jpg",
+            "user_id": 1,
+            "task": SimpleNamespace(done=lambda: True),
+            "worker_thread": SimpleNamespace(is_alive=lambda: True),
+        }
+        reply_server.manual_cookie_import_sessions["done-manual-import-prune-live-worker-1"] = {
+            "account_id": "acc-done-import-prune-live-worker-1",
+            "status": "processing",
+            "timestamp": time.time() - 4000,
+            "completed_at": None,
+            "screenshot_path": "static/uploads/images/face_verify_done_prune_import_1.jpg",
+            "user_id": 1,
+            "task": SimpleNamespace(done=lambda: True),
+            "worker_thread": SimpleNamespace(is_alive=lambda: True),
+        }
+
+        def restore_sessions():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_password_sessions)
+            reply_server.manual_cookie_import_sessions.clear()
+            reply_server.manual_cookie_import_sessions.update(original_manual_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        fake_image_manager = SimpleNamespace(delete_image=mock.Mock(return_value=True))
+        with mock.patch("utils.image_utils.image_manager", fake_image_manager), \
+             mock.patch.object(reply_server, "log_with_user"):
+            reply_server._prune_expired_manual_browser_entry_sessions()
+
+        self.assertIn(
+            "done-password-login-prune-live-worker-1",
+            reply_server.password_login_sessions,
+        )
+        self.assertIn(
+            "done-manual-import-prune-live-worker-1",
+            reply_server.manual_cookie_import_sessions,
+        )
+        fake_image_manager.delete_image.assert_not_called()
+
+    def test_prune_expired_manual_browser_entry_sessions_keeps_completed_sessions_with_live_worker_threads(self):
+        original_password_sessions = dict(reply_server.password_login_sessions)
+        original_manual_sessions = dict(reply_server.manual_cookie_import_sessions)
+        reply_server.password_login_sessions.clear()
+        reply_server.manual_cookie_import_sessions.clear()
+        old_completed_at = time.time() - 600
+        reply_server.password_login_sessions["completed-password-login-live-worker-1"] = {
+            "account_id": "acc-completed-password-live-worker-1",
+            "status": "cancelled",
+            "timestamp": time.time() - 4000,
+            "completed_at": old_completed_at,
+            "screenshot_path": "static/uploads/images/face_verify_completed_prune_password_1.jpg",
+            "user_id": 1,
+            "task": SimpleNamespace(done=lambda: True),
+            "worker_thread": SimpleNamespace(is_alive=lambda: True),
+        }
+        reply_server.manual_cookie_import_sessions["completed-manual-import-live-worker-1"] = {
+            "account_id": "acc-completed-import-live-worker-1",
+            "status": "failed",
+            "timestamp": time.time() - 4000,
+            "completed_at": old_completed_at,
+            "screenshot_path": "static/uploads/images/face_verify_completed_prune_import_1.jpg",
+            "user_id": 1,
+            "task": SimpleNamespace(done=lambda: True),
+            "worker_thread": SimpleNamespace(is_alive=lambda: True),
+        }
+
+        def restore_sessions():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_password_sessions)
+            reply_server.manual_cookie_import_sessions.clear()
+            reply_server.manual_cookie_import_sessions.update(original_manual_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        fake_image_manager = SimpleNamespace(delete_image=mock.Mock(return_value=True))
+        with mock.patch("utils.image_utils.image_manager", fake_image_manager), \
+             mock.patch.object(reply_server, "log_with_user"):
+            reply_server._prune_expired_manual_browser_entry_sessions()
+
+        self.assertIn(
+            "completed-password-login-live-worker-1",
+            reply_server.password_login_sessions,
+        )
+        self.assertIn(
+            "completed-manual-import-live-worker-1",
+            reply_server.manual_cookie_import_sessions,
+        )
+        fake_image_manager.delete_image.assert_not_called()
+
+    def test_check_manual_cookie_import_status_keeps_old_running_session(self):
+        original_sessions = dict(reply_server.manual_cookie_import_sessions)
+        reply_server.manual_cookie_import_sessions.clear()
+        reply_server.manual_cookie_import_sessions["running-manual-import-1"] = {
+            "account_id": "acc-running-import-1",
+            "status": "processing",
+            "timestamp": time.time() - 4000,
+            "completed_at": None,
+            "screenshot_path": "static/uploads/images/face_verify_running_import_1.jpg",
+            "user_id": 1,
+            "task": SimpleNamespace(done=lambda: False),
+        }
+
+        def restore_sessions():
+            reply_server.manual_cookie_import_sessions.clear()
+            reply_server.manual_cookie_import_sessions.update(original_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        async def invoke():
+            return await reply_server.check_manual_cookie_import_status(
+                "running-manual-import-1",
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        fake_image_manager = SimpleNamespace(delete_image=mock.Mock(return_value=True))
+        with mock.patch("utils.image_utils.image_manager", fake_image_manager), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(invoke())
+
+        self.assertEqual("processing", result["status"])
+        self.assertIn("running-manual-import-1", reply_server.manual_cookie_import_sessions)
+        fake_image_manager.delete_image.assert_not_called()
 
     def test_password_login_cleans_stale_foreign_pending_placeholder_before_creating_session(self):
         current_user = {"user_id": 1, "username": "admin"}
@@ -1051,7 +2132,7 @@ class ReplyServerProxyUpdateBehaviorTest(_ReplyServerModuleBindingMixin, unittes
             "timestamp": reply_server.time.time(),
             "completed_at": None,
             "user_id": 7,
-            "task": None,
+            "task": mock.Mock(done=mock.Mock(return_value=False), cancel=mock.Mock()),
             "slider_instance": None,
         }
 
@@ -1079,6 +2160,7 @@ class ReplyServerProxyUpdateBehaviorTest(_ReplyServerModuleBindingMixin, unittes
         self.assertEqual("acc-pwd-status-1", status_result["account_id"])
         self.assertTrue(cancel_result["success"])
         self.assertEqual("cancelled", cancel_result["status"])
+        reply_server.password_login_sessions["pwd-cancel-string"]["task"].cancel.assert_called_once_with()
 
     def test_manual_cookie_import_session_status_and_cancel_accept_string_user_id_snapshot(self):
         original_sessions = dict(reply_server.manual_cookie_import_sessions)
@@ -1127,6 +2209,419 @@ class ReplyServerProxyUpdateBehaviorTest(_ReplyServerModuleBindingMixin, unittes
         self.assertEqual("acc-manual-status-1", status_result["account_id"])
         self.assertTrue(cancel_result["success"])
         self.assertEqual("cancelled", cancel_result["status"])
+
+    def test_manual_cookie_import_and_password_cancel_missing_sessions_are_idempotent(self):
+        original_manual_sessions = dict(reply_server.manual_cookie_import_sessions)
+        original_password_sessions = dict(reply_server.password_login_sessions)
+        reply_server.manual_cookie_import_sessions.clear()
+        reply_server.password_login_sessions.clear()
+
+        def restore_sessions():
+            reply_server.manual_cookie_import_sessions.clear()
+            reply_server.manual_cookie_import_sessions.update(original_manual_sessions)
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_password_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        current_user = {"user_id": 7, "username": "tester"}
+        with mock.patch.object(
+            reply_server,
+            "_set_manual_cookie_import_session_status",
+        ) as set_manual_status, mock.patch.object(
+            reply_server,
+            "_set_password_login_session_status",
+        ) as set_password_status, mock.patch.object(
+            reply_server,
+            "_update_session_risk_log",
+        ) as update_risk_log, mock.patch.object(
+            reply_server,
+            "_close_password_login_pending_verification_risk_logs",
+        ) as close_pending_risk_logs:
+            manual_result = asyncio.run(
+                reply_server.cancel_manual_cookie_import(
+                    "missing-manual-cancel",
+                    current_user=current_user,
+                )
+            )
+            password_result = asyncio.run(
+                reply_server.cancel_password_login(
+                    "missing-password-cancel",
+                    current_user=current_user,
+                )
+            )
+
+        self.assertEqual(
+            {
+                "success": True,
+                "status": "not_found",
+                "message": "手动导入 Cookie 会话已结束",
+            },
+            manual_result,
+        )
+        self.assertEqual(
+            {
+                "success": True,
+                "status": "not_found",
+                "message": "登录会话已结束",
+            },
+            password_result,
+        )
+        set_manual_status.assert_not_called()
+        set_password_status.assert_not_called()
+        update_risk_log.assert_not_called()
+        close_pending_risk_logs.assert_not_called()
+
+    def test_manual_cookie_import_and_password_cancel_invalidate_account_managed_runtime(self):
+        original_manual_sessions = dict(reply_server.manual_cookie_import_sessions)
+        original_password_sessions = dict(reply_server.password_login_sessions)
+        reply_server.manual_cookie_import_sessions.clear()
+        reply_server.password_login_sessions.clear()
+
+        def restore_sessions():
+            reply_server.manual_cookie_import_sessions.clear()
+            reply_server.manual_cookie_import_sessions.update(original_manual_sessions)
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_password_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        reply_server.manual_cookie_import_sessions["manual-runtime-cancel"] = {
+            "account_id": "acc-manual-runtime-cancel",
+            "status": "verification_required",
+            "timestamp": reply_server.time.time(),
+            "completed_at": None,
+            "user_id": 7,
+            "task": mock.Mock(done=mock.Mock(return_value=False), cancel=mock.Mock()),
+            "slider_instance": mock.Mock(close_browser=mock.Mock()),
+        }
+        reply_server.password_login_sessions["pwd-runtime-cancel"] = {
+            "account_id": "acc-pwd-runtime-cancel",
+            "status": "verification_required",
+            "timestamp": reply_server.time.time(),
+            "completed_at": None,
+            "user_id": 7,
+            "task": mock.Mock(done=mock.Mock(return_value=False), cancel=mock.Mock()),
+            "slider_instance": mock.Mock(close_browser=mock.Mock()),
+            "risk_control_log_id": None,
+            "risk_session_id": "risk-pwd-runtime-cancel",
+            "refresh_mode": False,
+        }
+
+        with mock.patch.object(reply_server, "log_with_user"), mock.patch.object(
+            reply_server,
+            "_invalidate_slider_managed_runtime_sync",
+            return_value=True,
+        ) as invalidate_runtime, mock.patch.object(
+            reply_server,
+            "_update_session_risk_log",
+        ), mock.patch.object(
+            reply_server,
+            "_close_password_login_pending_verification_risk_logs",
+        ):
+            manual_result = asyncio.run(
+                reply_server.cancel_manual_cookie_import(
+                    "manual-runtime-cancel",
+                    current_user={"user_id": "7", "username": "tester"},
+                )
+            )
+            password_result = asyncio.run(
+                reply_server.cancel_password_login(
+                    "pwd-runtime-cancel",
+                    current_user={"user_id": "7", "username": "tester"},
+                )
+            )
+
+        self.assertTrue(manual_result["success"])
+        self.assertEqual("cancelled", manual_result["status"])
+        self.assertTrue(password_result["success"])
+        self.assertEqual("cancelled", password_result["status"])
+        self.assertEqual(
+            [
+                mock.call(
+                    "acc-manual-runtime-cancel",
+                    reason="manual_cookie_import_cancelled",
+                ),
+                mock.call(
+                    "acc-pwd-runtime-cancel",
+                    reason="password_login_cancelled",
+                ),
+            ],
+            invalidate_runtime.call_args_list,
+        )
+        reply_server.manual_cookie_import_sessions["manual-runtime-cancel"]["task"].cancel.assert_called_once_with()
+        reply_server.password_login_sessions["pwd-runtime-cancel"]["task"].cancel.assert_called_once_with()
+        reply_server.manual_cookie_import_sessions["manual-runtime-cancel"]["slider_instance"].close_browser.assert_called_once_with()
+        reply_server.password_login_sessions["pwd-runtime-cancel"]["slider_instance"].close_browser.assert_called_once_with()
+
+    def test_pre_cancelled_manual_and_password_client_session_ids_do_not_start_browser_tasks(self):
+        original_manual_sessions = dict(reply_server.manual_cookie_import_sessions)
+        original_password_sessions = dict(reply_server.password_login_sessions)
+        original_prestart_cancellations = dict(getattr(reply_server, "account_verification_prestart_cancellations", {}))
+        reply_server.manual_cookie_import_sessions.clear()
+        reply_server.password_login_sessions.clear()
+        if hasattr(reply_server, "account_verification_prestart_cancellations"):
+            reply_server.account_verification_prestart_cancellations.clear()
+
+        def restore_sessions():
+            reply_server.manual_cookie_import_sessions.clear()
+            reply_server.manual_cookie_import_sessions.update(original_manual_sessions)
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_password_sessions)
+            if hasattr(reply_server, "account_verification_prestart_cancellations"):
+                reply_server.account_verification_prestart_cancellations.clear()
+                reply_server.account_verification_prestart_cancellations.update(original_prestart_cancellations)
+
+        self.addCleanup(restore_sessions)
+
+        current_user = {"user_id": 7, "username": "tester"}
+
+        with mock.patch.object(
+            reply_server,
+            "_get_active_manual_browser_entry_conflict",
+            return_value=None,
+        ), mock.patch.object(
+            reply_server,
+            "_cleanup_stale_foreign_pending_placeholder",
+        ), mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_binding_info",
+            return_value=None,
+        ), mock.patch.object(
+            reply_server,
+            "_ensure_manual_browser_entry_runtime_available",
+            new=mock.AsyncMock(return_value=None),
+        ), mock.patch.object(
+            reply_server,
+            "_update_session_risk_log",
+        ), mock.patch.object(
+            reply_server,
+            "_close_password_login_pending_verification_risk_logs",
+        ), mock.patch(
+            "asyncio.create_task",
+        ) as create_task, mock.patch.object(reply_server, "log_with_user"):
+            manual_cancel = asyncio.run(
+                reply_server.cancel_manual_cookie_import(
+                    "manual-client-cancel-1",
+                    current_user=current_user,
+                )
+            )
+            password_cancel = asyncio.run(
+                reply_server.cancel_password_login(
+                    "password-client-cancel-1",
+                    current_user=current_user,
+                )
+            )
+            manual_start = asyncio.run(
+                reply_server.manual_cookie_import(
+                    reply_server.ManualCookieImportRequest(
+                        account_id="acc-manual-client-cancel-1",
+                        cookie="unb=test_user; cookie2=test_cookie2",
+                        session_id="manual-client-cancel-1",
+                    ),
+                    current_user=current_user,
+                )
+            )
+            password_start = asyncio.run(
+                reply_server.password_login(
+                    {
+                        "account_id": "acc-password-client-cancel-1",
+                        "account": "unit-user",
+                        "password": "unit-pass",
+                        "session_id": "password-client-cancel-1",
+                    },
+                    current_user=current_user,
+                )
+            )
+
+        self.assertEqual("not_found", manual_cancel["status"])
+        self.assertEqual("not_found", password_cancel["status"])
+        self.assertEqual(
+            {
+                "success": False,
+                "status": "cancelled",
+                "session_id": "manual-client-cancel-1",
+                "message": "手动导入 Cookie 会话已取消",
+            },
+            manual_start,
+        )
+        self.assertEqual(
+            {
+                "success": False,
+                "status": "cancelled",
+                "session_id": "password-client-cancel-1",
+                "message": "登录会话已取消",
+            },
+            password_start,
+        )
+        self.assertEqual({}, reply_server.manual_cookie_import_sessions)
+        self.assertEqual({}, reply_server.password_login_sessions)
+        create_task.assert_not_called()
+
+    def test_manual_cookie_import_routes_surface_internal_failures_with_safe_messages(self):
+        original_manual_sessions = dict(reply_server.manual_cookie_import_sessions)
+        original_password_sessions = dict(reply_server.password_login_sessions)
+        reply_server.manual_cookie_import_sessions.clear()
+        reply_server.password_login_sessions.clear()
+
+        def restore_sessions():
+            reply_server.manual_cookie_import_sessions.clear()
+            reply_server.manual_cookie_import_sessions.update(original_manual_sessions)
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_password_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        reply_server.manual_cookie_import_sessions["manual-import-status-error"] = {
+            "account_id": "acc-manual-status-error",
+            "status": "processing",
+            "timestamp": reply_server.time.time(),
+            "completed_at": None,
+            "user_id": 7,
+        }
+        reply_server.manual_cookie_import_sessions["manual-import-cancel-error"] = {
+            "account_id": "acc-manual-cancel-error",
+            "status": "processing",
+            "timestamp": reply_server.time.time(),
+            "completed_at": None,
+            "user_id": 7,
+            "task": None,
+            "slider_instance": None,
+        }
+        reply_server.password_login_sessions["pwd-cancel-error"] = {
+            "account_id": "acc-pwd-cancel-error",
+            "status": "processing",
+            "timestamp": reply_server.time.time(),
+            "completed_at": None,
+            "user_id": 7,
+            "task": None,
+            "slider_instance": None,
+        }
+
+        with mock.patch.object(
+            reply_server,
+            "_get_active_manual_browser_entry_conflict",
+            return_value=None,
+        ), mock.patch.object(
+            reply_server,
+            "_cleanup_stale_foreign_pending_placeholder",
+        ), mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_binding_info",
+            return_value=None,
+        ), mock.patch.object(
+            reply_server,
+            "_ensure_manual_browser_entry_runtime_available",
+            side_effect=RuntimeError("manual import runtime exploded"),
+        ), mock.patch.object(
+            reply_server,
+            "_should_prune_manual_browser_entry_session",
+            side_effect=RuntimeError("manual import status exploded"),
+        ), mock.patch.object(
+            reply_server,
+            "_same_user_id",
+            side_effect=RuntimeError("manual import cancel exploded"),
+        ), mock.patch.object(reply_server, "log_with_user"):
+            start_result = asyncio.run(
+                reply_server.manual_cookie_import(
+                    reply_server.ManualCookieImportRequest(
+                        account_id="acc-manual-start-error",
+                        cookie="unb=test_user; cookie2=test_cookie2",
+                    ),
+                    current_user={"user_id": 7, "username": "tester"},
+                )
+            )
+            status_result = asyncio.run(
+                reply_server.check_manual_cookie_import_status(
+                    "manual-import-status-error",
+                    current_user={"user_id": 7, "username": "tester"},
+                )
+            )
+            cancel_result = asyncio.run(
+                reply_server.cancel_manual_cookie_import(
+                    "manual-import-cancel-error",
+                    current_user={"user_id": 7, "username": "tester"},
+                )
+            )
+            password_cancel_result = asyncio.run(
+                reply_server.cancel_password_login(
+                    "pwd-cancel-error",
+                    current_user={"user_id": 7, "username": "tester"},
+                )
+            )
+
+        self.assertEqual(
+            {"success": False, "message": "手动导入 Cookie 失败，请稍后重试"},
+            start_result,
+        )
+        self.assertEqual(
+            {"status": "error", "message": "检查 Cookie 导入状态失败，请稍后重试"},
+            status_result,
+        )
+        self.assertEqual(
+            {
+                "success": False,
+                "status": "error",
+                "message": "取消 Cookie 导入验证失败，请稍后重试",
+            },
+            cancel_result,
+        )
+        self.assertEqual(
+            {
+                "success": False,
+                "status": "error",
+                "message": "取消登录失败，请稍后重试",
+            },
+            password_cancel_result,
+        )
+
+    def test_password_login_cancelled_session_does_not_start_slider_or_worker(self):
+        original_sessions = dict(reply_server.password_login_sessions)
+        reply_server.password_login_sessions.clear()
+
+        def restore_sessions():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        reply_server.password_login_sessions["pwd-cancelled-before-execute"] = {
+            "account_id": "acc-pwd-cancelled-before-execute",
+            "account": "unit-user",
+            "status": "cancelled",
+            "timestamp": reply_server.time.time(),
+            "completed_at": reply_server.time.time(),
+            "user_id": 7,
+            "task": None,
+            "worker_thread": None,
+            "slider_instance": None,
+            "refresh_mode": False,
+            "error": "用户取消登录",
+        }
+
+        async def invoke():
+            await reply_server._execute_password_login(
+                "pwd-cancelled-before-execute",
+                "acc-pwd-cancelled-before-execute",
+                "unit-user",
+                "unit-password",
+                False,
+                7,
+                {"user_id": 7, "username": "tester"},
+            )
+
+        with mock.patch("utils.xianyu_slider_stealth.XianyuSliderStealth") as slider_cls, \
+             mock.patch.object(reply_server, "log_with_user"):
+            asyncio.run(invoke())
+
+        slider_cls.assert_not_called()
+        self.assertEqual(
+            "cancelled",
+            reply_server.password_login_sessions["pwd-cancelled-before-execute"]["status"],
+        )
+        self.assertIsNone(
+            reply_server.password_login_sessions["pwd-cancelled-before-execute"]["worker_thread"]
+        )
 
     def test_account_management_routes_use_account_id_placeholders(self):
         source = (REPO_ROOT / "reply_server.py").read_text(encoding="utf-8")
@@ -1286,10 +2781,11 @@ class ReplyServerProxyUpdateBehaviorTest(_ReplyServerModuleBindingMixin, unittes
             "get_scheduled_tasks",
             side_effect=RuntimeError("scheduled task exploded"),
         ):
-            result = asyncio.run(invoke())
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                asyncio.run(invoke())
 
-        self.assertFalse(result["success"])
-        self.assertIn("scheduled task exploded", result["message"])
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertEqual(raised.exception.detail, "获取定时任务列表失败，请稍后重试")
 
     def test_get_all_message_notifications_fallback_filters_to_owned_accounts(self):
         fake_db = mock.Mock()
@@ -1446,6 +2942,162 @@ class FrontendAccountScopeContractTest(unittest.TestCase):
 
 
 class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_soft_timeout_manager_loop_call_cancels_threadsafe_future_when_request_is_cancelled(self):
+        fake_thread_future = mock.Mock()
+        fake_wrapped_future = mock.Mock()
+        fake_target_loop = SimpleNamespace(
+            is_closed=mock.Mock(return_value=False),
+            is_running=mock.Mock(return_value=True),
+        )
+        fake_manager = SimpleNamespace(loop=fake_target_loop)
+
+        async def never_called_factory():
+            raise AssertionError("coroutine factory should stay inside patched manager-loop future")
+
+        def fake_run_coroutine_threadsafe(coro, loop):
+            coro.close()
+            self.assertIs(loop, fake_target_loop)
+            return fake_thread_future
+
+        with mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(
+                 reply_server.asyncio,
+                 "run_coroutine_threadsafe",
+                 side_effect=fake_run_coroutine_threadsafe,
+             ), \
+             mock.patch.object(
+                 reply_server.asyncio,
+                 "wrap_future",
+                 return_value=fake_wrapped_future,
+             ), \
+             mock.patch.object(
+                 reply_server.asyncio,
+                 "wait",
+                 mock.AsyncMock(side_effect=asyncio.CancelledError()),
+             ):
+            with self.assertRaises(asyncio.CancelledError):
+                await reply_server._run_live_instance_on_manager_loop(
+                    "acc-soft-cancel-1",
+                    never_called_factory,
+                    timeout=25.0,
+                    cancel_on_timeout=False,
+                )
+
+        fake_thread_future.cancel.assert_called_once_with()
+
+    async def test_run_managed_live_instance_call_translates_browser_runtime_conflict_to_http_409(self):
+        async def invoke():
+            return await reply_server._run_managed_live_instance_call(
+                "acc-runtime-conflict-1",
+                lambda _live_instance: None,
+            )
+
+        with mock.patch.object(
+            reply_server,
+            "_run_live_instance_on_manager_loop",
+            mock.AsyncMock(side_effect=RuntimeError("账号 acc-runtime-conflict-1 当前有其他浏览器任务正在执行，请稍后再试")),
+        ), mock.patch.object(
+            reply_server.account_browser_runtime_manager,
+            "get_account_runtime_state_snapshot",
+            return_value={
+                "owner_mode": "async",
+                "owner_mode_active_count": 1,
+                "async_current_purpose": "item_search",
+                "async_active_leases": 1,
+                "sync_current_purpose": None,
+                "sync_active_leases": 0,
+            },
+        ):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                await invoke()
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("其他浏览器任务正在执行", raised.exception.detail)
+        self.assertIn("当前占用任务：商品搜索", raised.exception.detail)
+
+    async def test_run_managed_live_instance_call_redacts_profile_claim_conflict_metadata_from_http_409(self):
+        async def invoke():
+            return await reply_server._run_managed_live_instance_call(
+                "acc-runtime-conflict-2",
+                lambda _live_instance: None,
+            )
+
+        with mock.patch.object(
+            reply_server,
+            "_run_live_instance_on_manager_loop",
+            mock.AsyncMock(
+                side_effect=RuntimeError(
+                    "账号级 browser profile 已被其他 runtime 持有，拒绝并发复用: "
+                    "profile_dir=C:\\\\demo\\\\browser_data\\\\user_account_1, "
+                    "owner=manager=1, requested_owner=manager=2"
+                )
+            ),
+        ), mock.patch.object(
+            reply_server.account_browser_runtime_manager,
+            "get_account_runtime_state_snapshot",
+            return_value={
+                "owner_mode": "sync",
+                "owner_mode_active_count": 1,
+                "async_current_purpose": None,
+                "async_active_leases": 0,
+                "sync_current_purpose": "order_detail_fetch",
+                "sync_active_leases": 1,
+            },
+        ):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                await invoke()
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(
+            raised.exception.detail,
+            "账号级 browser profile 已被其他 runtime 持有，拒绝并发复用 当前占用任务：订单详情抓取",
+        )
+        self.assertNotIn("profile_dir=", raised.exception.detail)
+        self.assertNotIn("requested_owner", raised.exception.detail)
+
+    def test_build_manual_browser_entry_busy_message_includes_safe_runtime_purpose_label(self):
+        with mock.patch.object(
+            reply_server.account_browser_runtime_manager,
+            "get_account_runtime_state_snapshot",
+            return_value={
+                "owner_mode": "async",
+                "owner_mode_active_count": 1,
+                "async_current_purpose": "qr_login_verification",
+                "async_active_leases": 1,
+                "sync_current_purpose": None,
+                "sync_active_leases": 0,
+            },
+        ):
+            message = reply_server._build_manual_browser_entry_busy_message(
+                "acc-manual-busy-1",
+                "打开扫码验证",
+            )
+
+        self.assertIn("运行中的账号浏览器任务", message)
+        self.assertIn("当前占用任务：扫码登录验证", message)
+
+    async def test_run_managed_live_instance_call_translates_runtime_draining_conflict_to_http_409(self):
+        async def invoke():
+            return await reply_server._run_managed_live_instance_call(
+                "acc-runtime-draining-1",
+                lambda _live_instance: None,
+            )
+
+        with mock.patch.object(
+            reply_server,
+            "_run_live_instance_on_manager_loop",
+            mock.AsyncMock(
+                side_effect=RuntimeError(
+                    "账号 acc-runtime-draining-1 的 async runtime 正在失效回收，旧 lease 未释放，拒绝提前重建"
+                )
+            ),
+        ):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                await invoke()
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.detail, "runtime 正在失效回收，旧 lease 未释放，拒绝提前重建")
+
     async def test_get_managed_live_instance_rejects_calls_outside_manager_loop(self):
         fake_manager = SimpleNamespace(
             get_xianyu_instance=mock.Mock(return_value=object()),
@@ -1495,6 +3147,31 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
         self.assertFalse(runtime_status["instance_exists"])
         self.assertFalse(runtime_status["running"])
         fake_manager.get_xianyu_instance.assert_called_once_with("acc-runtime-1")
+
+    async def test_build_live_runtime_status_normalizes_runtime_error_messages(self):
+        snapshot = {
+            "connection_state": "connected",
+            "ws_transport_ready": True,
+            "session_transport_ready": True,
+            "token_cached": False,
+            "token_refresh_status": "token_refresh_failed",
+            "last_token_refresh_error_message": '{"ret":["FAIL_SYS_TOKEN_EXOIRED::令牌过期"],"data":{"detail":"missing canonical account_id for token refresh"}}',
+            "session_keepalive_status": "exception",
+            "last_session_keepalive_error_message": "RuntimeError: websocket exploded",
+            "last_successful_connection": time.time(),
+            "last_heartbeat_response": time.time(),
+            "last_heartbeat_time": time.time(),
+        }
+
+        with mock.patch.object(
+            reply_server,
+            "_get_managed_live_runtime_snapshot",
+            mock.AsyncMock(return_value=snapshot),
+        ), mock.patch("XianyuAutoAsync.XianyuLive.is_manual_refresh_active", return_value=False):
+            runtime_status = await reply_server._build_live_runtime_status("acc-runtime-normalize-1")
+
+        self.assertEqual("Token刷新失败，请稍后重试", runtime_status["token_refresh_error_message"])
+        self.assertEqual("轻量保活失败，请稍后重试", runtime_status["session_keepalive_error_message"])
 
     async def test_send_message_api_uses_managed_account_runtime_without_global_fallback(self):
         from XianyuAutoAsync import ConnectionState
@@ -1613,6 +3290,78 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
             (current_live.ws, "chat-send-1", "buyer-send-1", "第一行\n第二行"),
         )
 
+    async def test_send_message_api_preserves_explicit_runtime_unready_message(self):
+        from XianyuAutoAsync import ConnectionState
+
+        current_live = SimpleNamespace(
+            connection_state=ConnectionState.RECONNECTING,
+            ws=object(),
+            send_msg=mock.AsyncMock(),
+        )
+        manager_loop_state = {"active": False}
+
+        def get_instance_only_on_manager_loop(_account_id):
+            if not manager_loop_state["active"]:
+                raise AssertionError("runtime lookup should stay inside manager loop")
+            return current_live
+
+        fake_manager = SimpleNamespace(
+            get_xianyu_instance=mock.Mock(side_effect=get_instance_only_on_manager_loop),
+            loop=SimpleNamespace(
+                is_closed=mock.Mock(return_value=False),
+                is_running=mock.Mock(return_value=True),
+            ),
+        )
+        request = reply_server.SendMessageRequest(
+            api_key="real-key",
+            account_id="acc-send-reconnecting",
+            chat_id="chat-send-1",
+            to_user_id="buyer-send-1",
+            message="hello",
+        )
+
+        async def execute_on_manager_loop(_account_id, coroutine_factory, timeout=None):
+            manager_loop_state["active"] = True
+            access_token = reply_server._MANAGED_LIVE_INSTANCE_ACCESS.set(True)
+            try:
+                return await coroutine_factory()
+            finally:
+                reply_server._MANAGED_LIVE_INSTANCE_ACCESS.reset(access_token)
+                manager_loop_state["active"] = False
+
+        with mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "verify_api_key", return_value=True), \
+             mock.patch.object(reply_server, "_run_live_instance_on_manager_loop", side_effect=execute_on_manager_loop), \
+             mock.patch("XianyuAutoAsync.XianyuLive.get_instance", side_effect=AssertionError("global fallback should stay unused")):
+            response = await reply_server.send_message_api(request)
+
+        self.assertFalse(response.success)
+        self.assertEqual("账号WebSocket连接状态异常(reconnecting)，请等待重连", response.message)
+
+    async def test_send_message_api_masks_unexpected_runtime_failure_message(self):
+        with mock.patch.object(
+            reply_server,
+            "_run_managed_live_instance_call",
+            mock.AsyncMock(
+                return_value={
+                    "success": False,
+                    "message": "RuntimeError: websocket send exploded with internal stack",
+                }
+            ),
+        ), mock.patch.object(reply_server, "verify_api_key", return_value=True):
+            response = await reply_server.send_message_api(
+                reply_server.SendMessageRequest(
+                    api_key="real-key",
+                    account_id="acc-send-mask",
+                    chat_id="chat-send-1",
+                    to_user_id="buyer-send-1",
+                    message="hello",
+                )
+            )
+
+        self.assertFalse(response.success)
+        self.assertEqual("消息发送失败，请稍后重试", response.message)
+
     async def test_get_conversation_history_uses_managed_account_runtime_without_global_fallback(self):
         current_live = SimpleNamespace(
             list_all_conversations=mock.AsyncMock(return_value=[{"id": "m-1"}]),
@@ -1663,6 +3412,62 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
             page_size=20,
         )
         self.assertEqual(run_mock.await_count, 2)
+
+    async def test_get_conversation_history_clamps_page_size_bounds(self):
+        current_live = SimpleNamespace(
+            list_all_conversations=mock.AsyncMock(return_value=[]),
+        )
+        manager_loop_state = {"active": False}
+
+        def get_instance_only_on_manager_loop(_account_id):
+            if not manager_loop_state["active"]:
+                raise AssertionError("runtime lookup should stay inside manager loop")
+            return current_live
+
+        fake_manager = SimpleNamespace(
+            get_xianyu_instance=mock.Mock(side_effect=get_instance_only_on_manager_loop),
+            loop=SimpleNamespace(
+                is_closed=mock.Mock(return_value=False),
+                is_running=mock.Mock(return_value=True),
+            ),
+        )
+
+        async def execute_on_manager_loop(_account_id, coroutine_factory, timeout=None):
+            manager_loop_state["active"] = True
+            access_token = reply_server._MANAGED_LIVE_INSTANCE_ACCESS.set(True)
+            try:
+                return await coroutine_factory()
+            finally:
+                reply_server._MANAGED_LIVE_INSTANCE_ACCESS.reset(access_token)
+                manager_loop_state["active"] = False
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-history-2"), \
+             mock.patch.object(reply_server, "log_with_user"), \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "_run_live_instance_on_manager_loop", side_effect=execute_on_manager_loop), \
+             mock.patch.object(reply_server, "_build_live_runtime_status_best_effort", mock.AsyncMock(return_value=({"running": True}, None))):
+            small_result = await reply_server.get_conversation_history(
+                "acc-history-2",
+                "conv-history-2@ali",
+                page_size=0,
+                current_user={"user_id": 1},
+            )
+            large_result = await reply_server.get_conversation_history(
+                "acc-history-2",
+                "conv-history-2@ali",
+                page_size=999,
+                current_user={"user_id": 1},
+            )
+
+        self.assertEqual(1, small_result["page_size"])
+        self.assertEqual(100, large_result["page_size"])
+        current_live.list_all_conversations.assert_has_awaits(
+            [
+                mock.call("conv-history-2", page_size=1),
+                mock.call("conv-history-2", page_size=100),
+            ]
+        )
+        self.assertEqual(fake_manager.get_xianyu_instance.call_count, 2)
 
     async def test_trigger_session_keepalive_uses_managed_account_runtime_without_global_fallback(self):
         current_live = SimpleNamespace(
@@ -1806,6 +3611,138 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
                     "手动触发 Token 刷新失败，请稍后重试",
                 )
 
+    async def test_account_runtime_routes_keep_success_payload_when_runtime_status_snapshot_fails_after_success(self):
+        current_user = {"user_id": 1}
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-runtime-soft-fail"), \
+             mock.patch.object(
+                 reply_server,
+                 "_run_managed_live_instance_call",
+                 mock.AsyncMock(side_effect=[
+                     [{"id": "msg-1"}],
+                     True,
+                     {
+                         "success": True,
+                         "path": "refresh_token",
+                         "token_received": True,
+                         "last_token_refresh_status": "success",
+                         "last_token_refresh_error_message": None,
+                     },
+                 ]),
+             ), \
+             mock.patch.object(
+                 reply_server,
+                 "_build_live_runtime_status",
+                 mock.AsyncMock(side_effect=RuntimeError("runtime status exploded after success")),
+             ), \
+             mock.patch.object(reply_server, "log_with_user"):
+            history_result = await reply_server.get_conversation_history(
+                "acc-runtime-soft-fail",
+                "conv-soft-fail@ali",
+                page_size=20,
+                current_user=current_user,
+            )
+            keepalive_result = await reply_server.trigger_session_keepalive(
+                "acc-runtime-soft-fail",
+                current_user=current_user,
+            )
+            refresh_result = await reply_server.trigger_runtime_token_refresh(
+                "acc-runtime-soft-fail",
+                request=reply_server.RuntimeTokenRefreshRequest(),
+                current_user=current_user,
+            )
+
+        self.assertTrue(history_result["success"])
+        self.assertEqual(history_result["messages"], [{"id": "msg-1"}])
+        self.assertIsNone(history_result["runtime_status"])
+        self.assertEqual(history_result["runtime_status_error"], "获取账号运行态失败，请稍后重试")
+
+        self.assertTrue(keepalive_result["success"])
+        self.assertIsNone(keepalive_result["runtime_status"])
+        self.assertEqual(keepalive_result["runtime_status_error"], "获取账号运行态失败，请稍后重试")
+
+        self.assertTrue(refresh_result["success"])
+        self.assertEqual(refresh_result["result"]["path"], "refresh_token")
+        self.assertIsNone(refresh_result["runtime_status"])
+        self.assertEqual(refresh_result["runtime_status_error"], "获取账号运行态失败，请稍后重试")
+
+    async def test_trigger_runtime_token_refresh_normalizes_result_error_message(self):
+        current_user = {"user_id": 1}
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-runtime-soft-fail"), \
+             mock.patch.object(
+                 reply_server,
+                 "_run_managed_live_instance_call",
+                 mock.AsyncMock(
+                     return_value={
+                         "success": False,
+                         "path": "refresh_token",
+                         "token_received": False,
+                         "last_token_refresh_status": "token_refresh_failed",
+                         "last_token_refresh_error_message": "missing canonical account_id for token refresh",
+                     }
+                 ),
+             ), \
+             mock.patch.object(
+                 reply_server,
+                 "_build_live_runtime_status",
+                 mock.AsyncMock(return_value={"running": True}),
+             ), \
+             mock.patch.object(reply_server, "log_with_user"):
+            refresh_result = await reply_server.trigger_runtime_token_refresh(
+                "acc-runtime-soft-fail",
+                request=reply_server.RuntimeTokenRefreshRequest(),
+                current_user=current_user,
+            )
+
+        self.assertFalse(refresh_result["success"])
+        self.assertEqual("Token刷新失败，请稍后重试", refresh_result["result"]["last_token_refresh_error_message"])
+
+    async def test_account_runtime_routes_propagate_managed_runtime_conflicts_as_http_409(self):
+        current_user = {"user_id": 1}
+
+        async def assert_http_409(awaitable_factory, expected_detail):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                await awaitable_factory()
+            self.assertEqual(409, raised.exception.status_code)
+            self.assertEqual(expected_detail, raised.exception.detail)
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-runtime-conflict-route"):
+            with mock.patch.object(
+                reply_server,
+                "_run_managed_live_instance_call",
+                mock.AsyncMock(
+                    side_effect=reply_server.HTTPException(
+                        status_code=409,
+                        detail="当前有其他浏览器任务正在执行，请稍后再试",
+                    )
+                ),
+            ), mock.patch.object(reply_server, "log_with_user"):
+                await assert_http_409(
+                    lambda: reply_server.get_conversation_history(
+                        "acc-runtime-conflict-route",
+                        "conv-runtime-conflict@ali",
+                        page_size=20,
+                        current_user=current_user,
+                    ),
+                    "当前有其他浏览器任务正在执行，请稍后再试",
+                )
+                await assert_http_409(
+                    lambda: reply_server.trigger_session_keepalive(
+                        "acc-runtime-conflict-route",
+                        current_user=current_user,
+                    ),
+                    "当前有其他浏览器任务正在执行，请稍后再试",
+                )
+                await assert_http_409(
+                    lambda: reply_server.trigger_runtime_token_refresh(
+                        "acc-runtime-conflict-route",
+                        request=reply_server.RuntimeTokenRefreshRequest(),
+                        current_user=current_user,
+                    ),
+                    "当前有其他浏览器任务正在执行，请稍后再试",
+                )
+
     async def test_trigger_runtime_token_refresh_simulated_captcha_uses_debug_recovery(self):
         current_live = SimpleNamespace(
             debug_force_captcha_recovery=mock.AsyncMock(
@@ -1931,9 +3868,13 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
         run_mock.assert_awaited_once()
 
     async def test_process_qr_login_cookies_uses_target_cookie_snapshot_instead_of_full_cookie_scan(self):
+        instances = []
+
         class FakeXianyuLive:
             def __init__(self, *args, **kwargs):
                 self.refresh_cookies_from_qr_login = mock.AsyncMock(return_value=False)
+                self.close_session = mock.AsyncMock()
+                instances.append(self)
 
         fake_db = mock.Mock()
         fake_db.get_cookie_binding_info.return_value = {
@@ -1958,10 +3899,141 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
                     current_user={"user_id": 7, "username": "demo-user"},
                 )
 
-        self.assertEqual("扫码登录未完成：获取真实Cookie异常: 扫码登录未完成：真实Cookie获取失败", str(raised.exception))
+        self.assertEqual("扫码登录未完成：真实Cookie获取失败", str(raised.exception))
         fake_db.get_cookie_binding_info.assert_called_once_with("acc-qr-chain-1")
         fake_db.assert_cookie_belongs_to_user.assert_called_once_with("acc-qr-chain-1", 7)
         fake_db.get_cookie.assert_called_once_with("acc-qr-chain-1")
+        self.assertEqual(1, len(instances))
+        instances[0].close_session.assert_awaited_once()
+
+    async def test_process_qr_login_cookies_masks_unexpected_refresh_errors_in_risk_log(self):
+        instances = []
+
+        class FakeXianyuLive:
+            def __init__(self, *args, **kwargs):
+                self.refresh_cookies_from_qr_login = mock.AsyncMock(
+                    side_effect=RuntimeError("refresh chain internal exploded")
+                )
+                self.close_session = mock.AsyncMock()
+                instances.append(self)
+
+        fake_db = mock.Mock()
+        fake_db.get_cookie_binding_info.return_value = {
+            "account_id": "acc-qr-chain-mask-1",
+            "user_id": 7,
+            "bound_unb": "",
+            "bind_status": "active",
+        }
+        fake_db.assert_cookie_belongs_to_user = mock.Mock(return_value=True)
+        fake_db.get_cookie.return_value = ""
+        fake_db.add_risk_control_log.return_value = 321
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch("XianyuAutoAsync.XianyuLive", FakeXianyuLive), \
+             mock.patch.object(reply_server, "log_with_user"):
+            with self.assertRaises(RuntimeError) as raised:
+                await reply_server.process_qr_login_cookies(
+                    "acc-qr-chain-mask-1",
+                    "qr-cookie-value",
+                    "unb-demo",
+                    current_user={"user_id": 7, "username": "demo-user"},
+                )
+
+        self.assertEqual("扫码登录未完成：扫码登录真实Cookie处理失败，请稍后重试", str(raised.exception))
+        fake_db.update_risk_control_log.assert_called_once()
+        self.assertEqual(
+            "扫码登录真实Cookie处理失败，请稍后重试",
+            fake_db.update_risk_control_log.call_args.kwargs["error_message"],
+        )
+        self.assertEqual(1, len(instances))
+        instances[0].close_session.assert_awaited_once()
+
+    async def test_refresh_cookies_from_qr_login_updates_manager_on_manager_loop_and_closes_temp_session(self):
+        instances = []
+
+        class FakeXianyuLive:
+            def __init__(self, *args, **kwargs):
+                self.refresh_cookies_from_qr_login = mock.AsyncMock(return_value=True)
+                self.close_session = mock.AsyncMock()
+                instances.append(self)
+
+        async def execute_on_manager_loop(_account_id, coroutine_factory, timeout=None, cancel_on_timeout=True):
+            return await coroutine_factory()
+
+        fake_manager = SimpleNamespace(
+            update_cookie=mock.Mock(return_value=None),
+        )
+        fake_db = mock.Mock()
+        fake_db.add_risk_control_log.return_value = None
+        fake_db.get_cookie_by_id.return_value = {
+            "cookies_str": "unb=unb-demo; cookie2=c2; sgcookie=sg1; t=t1",
+        }
+        fake_db.bind_cookie_account_unb.return_value = True
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-qr-refresh-1"), \
+             mock.patch.object(reply_server, "_get_user_cookies_map", return_value={}), \
+             mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch("XianyuAutoAsync.XianyuLive", FakeXianyuLive), \
+             mock.patch.object(reply_server, "_run_live_instance_on_manager_loop", side_effect=execute_on_manager_loop) as run_mock, \
+             mock.patch.object(reply_server, "log_with_user"):
+            response = await reply_server.refresh_cookies_from_qr_login(
+                {"qr_cookies": "qr-cookie-value", "account_id": "acc-qr-refresh-1"},
+                current_user={"user_id": 7, "username": "demo-user"},
+            )
+
+        self.assertTrue(response["success"])
+        self.assertEqual("acc-qr-refresh-1", response["account_id"])
+        run_mock.assert_awaited_once()
+        fake_manager.update_cookie.assert_called_once_with(
+            "acc-qr-refresh-1",
+            "unb=unb-demo; cookie2=c2; sgcookie=sg1; t=t1",
+            save_to_db=False,
+        )
+        self.assertEqual(1, len(instances))
+        instances[0].close_session.assert_awaited_once()
+
+    async def test_refresh_cookies_from_qr_login_masks_unexpected_runtime_switch_warning_message(self):
+        instances = []
+
+        class FakeXianyuLive:
+            def __init__(self, *args, **kwargs):
+                self.refresh_cookies_from_qr_login = mock.AsyncMock(return_value=True)
+                self.close_session = mock.AsyncMock()
+                instances.append(self)
+
+        async def fail_on_manager_loop(*_args, **_kwargs):
+            raise RuntimeError("manager loop internal exploded")
+
+        fake_manager = SimpleNamespace(
+            update_cookie=mock.Mock(return_value=None),
+        )
+        fake_db = mock.Mock()
+        fake_db.add_risk_control_log.return_value = None
+        fake_db.get_cookie_by_id.return_value = {
+            "cookies_str": "unb=unb-demo; cookie2=c2; sgcookie=sg1; t=t1",
+        }
+        fake_db.bind_cookie_account_unb.return_value = True
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-qr-refresh-mask-1"), \
+             mock.patch.object(reply_server, "_get_user_cookies_map", return_value={}), \
+             mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch("XianyuAutoAsync.XianyuLive", FakeXianyuLive), \
+             mock.patch.object(reply_server, "_run_live_instance_on_manager_loop", side_effect=fail_on_manager_loop), \
+             mock.patch.object(reply_server, "log_with_user"):
+            response = await reply_server.refresh_cookies_from_qr_login(
+                {"qr_cookies": "qr-cookie-value", "account_id": "acc-qr-refresh-mask-1"},
+                current_user={"user_id": 7, "username": "demo-user"},
+            )
+
+        self.assertTrue(response["success"])
+        self.assertEqual(
+            "真实Cookie已保存，但运行中账号任务尚未切换，请稍后重试或手动启动账号任务",
+            response["warning_message"],
+        )
+        self.assertEqual(1, len(instances))
+        instances[0].close_session.assert_awaited_once()
 
     async def test_check_valid_accounts_scopes_counts_to_current_user(self):
         fake_manager = SimpleNamespace(
@@ -2137,10 +4209,35 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
                 )
 
         self.assertEqual(raised.exception.status_code, 500)
-        self.assertEqual(raised.exception.detail, "检查账号状态失败: cookie preflight exploded")
+        self.assertEqual(raised.exception.detail, "检查账号状态失败，请稍后重试")
         get_account_ids.assert_called_once_with(321)
         get_cookie_status.assert_called_once_with("acc-owned-disabled")
         get_cookie.assert_called_once_with("acc-owned-disabled")
+
+    async def test_check_valid_accounts_stops_masking_list_cookie_lookup_failures_as_empty_preflight(self):
+        with mock.patch.object(reply_server.cookie_manager, "manager", None), mock.patch.object(
+            reply_server.db_manager,
+            "get_account_ids",
+            return_value=["acc-owned-valid", "acc-owned-disabled"],
+        ) as get_account_ids, mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_status",
+            side_effect=lambda account_id: account_id == "acc-owned-valid",
+        ) as get_cookie_status, mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie",
+            side_effect=RuntimeError("cookie list preflight exploded"),
+        ) as get_cookie:
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                await reply_server.check_valid_accounts(
+                    current_user={"user_id": 321, "username": "owner"},
+                )
+
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertEqual(raised.exception.detail, "检查账号状态失败，请稍后重试")
+        get_account_ids.assert_called_once_with(321)
+        get_cookie_status.assert_called_once_with("acc-owned-valid")
+        get_cookie.assert_called_once_with("acc-owned-valid")
 
     async def test_health_check_surfaces_internal_probe_failures_as_503(self):
         with mock.patch.object(reply_server.cookie_manager, "manager", object()), \
@@ -2151,7 +4248,7 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
 
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(raised.exception.detail["status"], "unhealthy")
-        self.assertEqual(raised.exception.detail["error"], "psutil probe exploded")
+        self.assertEqual(raised.exception.detail["error"], "健康检查失败，请稍后重试")
 
     def test_item_search_multiple_request_rejects_total_pages_outside_supported_range(self):
         with self.assertRaises(ValidationError):
@@ -2209,6 +4306,334 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
         self.assertEqual(request.page, 2)
         self.assertEqual(request.page_size, 100)
 
+    async def test_search_items_masks_unknown_internal_failure_message(self):
+        current_user = {"user_id": 7, "username": "owner"}
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-item-search-1"), \
+             mock.patch.object(reply_server, "_get_user_cookies_map", return_value={"acc-item-search-1": "cookie-value"}), \
+             mock.patch.object(
+                 reply_server,
+                 "_run_managed_live_instance_call",
+                 side_effect=reply_server.HTTPException(
+                     status_code=400,
+                     detail="账号 acc-item-search-1 未启动，暂无法复用运行中浏览器搜索",
+                 ),
+             ), \
+             mock.patch(
+                 "utils.item_search.search_xianyu_items",
+                 mock.AsyncMock(return_value={"items": [], "total": 0, "error": "未知错误"}),
+             ):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                await reply_server.search_items(
+                    reply_server.ItemSearchRequest(
+                        account_id="acc-item-search-1",
+                        keyword="switch",
+                        page=1,
+                        page_size=20,
+                    ),
+                    current_user=current_user,
+                )
+
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertEqual(raised.exception.detail, "商品搜索失败，请稍后重试")
+
+    async def test_item_search_routes_cancel_browser_runtime_on_request_disconnect(self):
+        class DisconnectingRequest:
+            def __init__(self, operation_started):
+                self.operation_started = operation_started
+                self.disconnect_checks = 0
+
+            async def is_disconnected(self):
+                self.disconnect_checks += 1
+                await self.operation_started.wait()
+                return True
+
+        class BlockingSearch:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.cancelled = False
+
+            async def __call__(self, *_args, **_kwargs):
+                self.started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled = True
+                    raise
+
+        current_user = {"user_id": 7, "username": "owner"}
+
+        async def assert_disconnect_cancels_search(
+            scenario_name,
+            invoke_factory,
+            *,
+            managed_side_effect,
+            fallback_patch_target=None,
+        ):
+            with self.subTest(scenario=scenario_name):
+                blocking_search = BlockingSearch()
+                fake_request = DisconnectingRequest(blocking_search.started)
+
+                patches = [
+                    mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-item-search-1"),
+                    mock.patch.object(
+                        reply_server,
+                        "_get_user_cookies_map",
+                        return_value={"acc-item-search-1": "cookie-value"},
+                    ),
+                    mock.patch.object(
+                        reply_server,
+                        "_run_managed_live_instance_call",
+                        side_effect=managed_side_effect(blocking_search),
+                    ),
+                    mock.patch.object(reply_server, "logger"),
+                ]
+                if fallback_patch_target:
+                    patches.append(mock.patch(fallback_patch_target, blocking_search))
+
+                with patches[0], patches[1], patches[2], patches[3]:
+                    if fallback_patch_target:
+                        with patches[4]:
+                            with self.assertRaises(asyncio.CancelledError):
+                                await asyncio.wait_for(invoke_factory(fake_request), timeout=1.0)
+                    else:
+                        with self.assertRaises(asyncio.CancelledError):
+                            await asyncio.wait_for(invoke_factory(fake_request), timeout=1.0)
+
+                self.assertGreaterEqual(fake_request.disconnect_checks, 1)
+                self.assertTrue(blocking_search.cancelled)
+
+        def managed_blocks(blocking_search):
+            async def _side_effect(*_args, **_kwargs):
+                return await blocking_search()
+            return _side_effect
+
+        def managed_unavailable(_blocking_search):
+            async def _side_effect(_account_id, _coroutine_factory, **_kwargs):
+                raise reply_server.HTTPException(
+                    status_code=400,
+                    detail="账号 acc-item-search-1 未启动，暂无法复用运行中浏览器搜索",
+                )
+            return _side_effect
+
+        await assert_disconnect_cancels_search(
+            "single-managed",
+            lambda http_request: reply_server.search_items(
+                reply_server.ItemSearchRequest(
+                    account_id="acc-item-search-1",
+                    keyword="switch",
+                    page=1,
+                    page_size=20,
+                ),
+                current_user=current_user,
+                http_request=http_request,
+            ),
+            managed_side_effect=managed_blocks,
+        )
+        await assert_disconnect_cancels_search(
+            "single-fallback",
+            lambda http_request: reply_server.search_items(
+                reply_server.ItemSearchRequest(
+                    account_id="acc-item-search-1",
+                    keyword="switch",
+                    page=1,
+                    page_size=20,
+                ),
+                current_user=current_user,
+                http_request=http_request,
+            ),
+            managed_side_effect=managed_unavailable,
+            fallback_patch_target="utils.item_search.search_xianyu_items",
+        )
+        await assert_disconnect_cancels_search(
+            "multiple-managed",
+            lambda http_request: reply_server.search_multiple_pages(
+                reply_server.ItemSearchMultipleRequest(
+                    account_id="acc-item-search-1",
+                    keyword="switch",
+                    total_pages=2,
+                ),
+                current_user=current_user,
+                http_request=http_request,
+            ),
+            managed_side_effect=managed_blocks,
+        )
+        await assert_disconnect_cancels_search(
+            "multiple-fallback",
+            lambda http_request: reply_server.search_multiple_pages(
+                reply_server.ItemSearchMultipleRequest(
+                    account_id="acc-item-search-1",
+                    keyword="switch",
+                    total_pages=2,
+                ),
+                current_user=current_user,
+                http_request=http_request,
+            ),
+            managed_side_effect=managed_unavailable,
+            fallback_patch_target="utils.item_search.search_multiple_pages_xianyu",
+        )
+
+    async def test_temporary_browser_runtime_operation_ignores_disconnect_probe_errors_without_abandoning_operation(self):
+        operation_started = asyncio.Event()
+        disconnect_probe_failed = asyncio.Event()
+        allow_operation_complete = asyncio.Event()
+        operation_tasks = []
+
+        class BrokenDisconnectRequest:
+            async def is_disconnected(self):
+                await operation_started.wait()
+                disconnect_probe_failed.set()
+                raise RuntimeError("disconnect probe exploded")
+
+        async def operation():
+            operation_tasks.append(asyncio.current_task())
+            operation_started.set()
+            await allow_operation_complete.wait()
+            return {"success": True}
+
+        helper_task = asyncio.create_task(
+            reply_server._await_temporary_browser_runtime_operation(
+                operation(),
+                http_request=BrokenDisconnectRequest(),
+                account_id="acc-helper-probe-1",
+                scene="商品搜索",
+            )
+        )
+        try:
+            await asyncio.wait_for(disconnect_probe_failed.wait(), timeout=1.0)
+            allow_operation_complete.set()
+            result = await asyncio.wait_for(helper_task, timeout=1.0)
+        finally:
+            allow_operation_complete.set()
+            if not helper_task.done():
+                helper_task.cancel()
+                try:
+                    await helper_task
+                except asyncio.CancelledError:
+                    pass
+            for operation_task in operation_tasks:
+                if operation_task is not None and not operation_task.done():
+                    operation_task.cancel()
+                    try:
+                        await operation_task
+                    except asyncio.CancelledError:
+                        pass
+
+        self.assertEqual({"success": True}, result)
+
+    async def test_temporary_browser_runtime_operation_preserves_disconnect_cancellation_when_child_cleanup_fails(self):
+        operation_started = asyncio.Event()
+        operation_cleanup_failed = asyncio.Event()
+
+        class DisconnectingRequest:
+            async def is_disconnected(self):
+                await operation_started.wait()
+                return True
+
+        async def operation():
+            operation_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                operation_cleanup_failed.set()
+                raise RuntimeError("cleanup exploded after cancellation")
+
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(
+                reply_server._await_temporary_browser_runtime_operation(
+                    operation(),
+                    http_request=DisconnectingRequest(),
+                    account_id="acc-helper-disconnect-1",
+                    scene="商品搜索",
+                ),
+                timeout=1.0,
+            )
+
+        self.assertTrue(operation_cleanup_failed.is_set())
+
+    async def test_search_multiple_pages_preserves_runtime_conflict_message(self):
+        current_user = {"user_id": 7, "username": "owner"}
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-item-search-1"), \
+             mock.patch.object(reply_server, "_get_user_cookies_map", return_value={"acc-item-search-1": "cookie-value"}), \
+             mock.patch.object(
+                 reply_server,
+                 "_run_managed_live_instance_call",
+                 side_effect=reply_server.HTTPException(
+                     status_code=409,
+                     detail="账号 acc-item-search-1 当前有其他浏览器任务正在执行，请稍后再试",
+                 ),
+             ):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                await reply_server.search_multiple_pages(
+                    reply_server.ItemSearchMultipleRequest(
+                        account_id="acc-item-search-1",
+                        keyword="switch",
+                        total_pages=2,
+                    ),
+                    current_user=current_user,
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.detail, "账号 acc-item-search-1 当前有其他浏览器任务正在执行，请稍后再试")
+
+    async def test_search_items_masks_internal_warning_in_success_payload_error_field(self):
+        current_user = {"user_id": 7, "username": "owner"}
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-item-search-1"), \
+             mock.patch.object(reply_server, "_get_user_cookies_map", return_value={"acc-item-search-1": "cookie-value"}), \
+             mock.patch.object(
+                 reply_server,
+                 "_run_managed_live_instance_call",
+                 return_value={
+                     "items": [{"id": "item-1"}],
+                     "total": 1,
+                     "error": "Traceback: RuntimeError: browser runtime exploded",
+                     "source": "managed_runtime",
+                 },
+             ):
+            result = await reply_server.search_items(
+                reply_server.ItemSearchRequest(
+                    account_id="acc-item-search-1",
+                    keyword="switch",
+                    page=1,
+                    page_size=20,
+                ),
+                current_user=current_user,
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual("商品搜索失败，请稍后重试", result["error"])
+        self.assertEqual([{"id": "item-1"}], result["data"])
+
+    async def test_search_multiple_pages_masks_internal_warning_in_success_payload_error_field(self):
+        current_user = {"user_id": 7, "username": "owner"}
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-item-search-1"), \
+             mock.patch.object(reply_server, "_get_user_cookies_map", return_value={"acc-item-search-1": "cookie-value"}), \
+             mock.patch.object(
+                 reply_server,
+                 "_run_managed_live_instance_call",
+                 return_value={
+                     "items": [{"id": "item-1"}],
+                     "total": 1,
+                     "error": "Traceback: RuntimeError: browser runtime exploded",
+                     "source": "managed_runtime",
+                 },
+             ):
+            result = await reply_server.search_multiple_pages(
+                reply_server.ItemSearchMultipleRequest(
+                    account_id="acc-item-search-1",
+                    keyword="switch",
+                    total_pages=2,
+                ),
+                current_user=current_user,
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual("商品搜索失败，请稍后重试", result["error"])
+        self.assertEqual([{"id": "item-1"}], result["data"])
+
     async def test_optional_managed_live_instance_call_raises_when_manager_runtime_unavailable(self):
         with mock.patch.object(reply_server, "_get_cookie_manager_runtime_issue", return_value="task_manager_loop_closed"):
             with self.assertRaises(reply_server.HTTPException) as raised:
@@ -2255,11 +4680,11 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
             )
 
         self.assertEqual(
-            {"success": False, "message": "重置冷却时间失败: qr account lookup exploded"},
+            {"success": False, "message": "重置冷却时间失败，请稍后重试"},
             reset_response,
         )
         self.assertEqual(
-            {"success": False, "message": "获取冷却状态失败: qr account lookup exploded"},
+            {"success": False, "message": "获取冷却状态失败，请稍后重试"},
             status_response,
         )
 
@@ -2277,6 +4702,199 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
 
         self.assertEqual(raised.exception.status_code, 403)
         self.assertEqual(raised.exception.detail, "无权限访问该账号")
+
+    async def test_password_login_routes_surface_internal_failures_with_safe_messages(self):
+        current_user = {"user_id": 1, "username": "admin"}
+        original_sessions = dict(reply_server.password_login_sessions)
+        reply_server.password_login_sessions.clear()
+        reply_server.password_login_sessions["password-login-error-1"] = {
+            "account_id": "acc-password-error-1",
+            "status": "processing",
+            "timestamp": time.time(),
+            "completed_at": None,
+            "user_id": 1,
+        }
+
+        def restore_sessions():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        with mock.patch.object(reply_server, "_get_active_manual_browser_entry_conflict", return_value=None), \
+             mock.patch.object(
+                 reply_server,
+                 "_ensure_manual_browser_entry_runtime_available",
+                 side_effect=RuntimeError("runtime snapshot exploded"),
+             ), \
+             mock.patch.object(reply_server, "log_with_user"), \
+             mock.patch.object(
+                 reply_server,
+                 "_should_prune_manual_browser_entry_session",
+                 side_effect=RuntimeError("password status lookup exploded"),
+             ):
+            start_response = await reply_server.password_login(
+                {
+                    "account_id": "acc-password-error-1",
+                    "account": "demo_account",
+                    "password": "demo_password",
+                },
+                current_user=current_user,
+            )
+            status_response = await reply_server.check_password_login_status(
+                "password-login-error-1",
+                current_user=current_user,
+            )
+
+        self.assertEqual(
+            {"success": False, "message": "登录失败，请稍后重试"},
+            start_response,
+        )
+        self.assertEqual(
+            {"status": "error", "message": "检查登录状态失败，请稍后重试"},
+            status_response,
+        )
+
+    def test_normalize_password_login_session_failure_message_masks_internal_errors(self):
+        self.assertEqual(
+            "密码登录后Cookie稳定化失败，任务未切换，请稍后重试",
+            reply_server._normalize_password_login_session_failure_message(
+                RuntimeError("stabilization exploded"),
+                default_message="密码登录后Cookie稳定化失败，任务未切换，请稍后重试",
+            ),
+        )
+        self.assertEqual(
+            "账号级 browser profile 已被其他 runtime 持有",
+            reply_server._normalize_password_login_session_failure_message(
+                "账号级 browser profile 已被其他 runtime 持有",
+                default_message="密码登录后Cookie稳定化失败，任务未切换，请稍后重试",
+            ),
+        )
+        self.assertEqual(
+            "CookieManager 未就绪",
+            reply_server._normalize_password_login_session_failure_message(
+                "CookieManager 未就绪",
+                default_message="登录失败，请稍后重试",
+            ),
+        )
+        self.assertEqual(
+            "登录失败，请稍后重试",
+            reply_server._normalize_password_login_session_failure_message(
+                "Traceback: RuntimeError: login chain exploded",
+                default_message="登录失败，请稍后重试",
+            ),
+        )
+
+    def test_finalize_password_login_session_failure_re_normalizes_internal_errors(self):
+        original_sessions = dict(reply_server.password_login_sessions)
+        reply_server.password_login_sessions.clear()
+        reply_server.password_login_sessions["password-finalize-normalize-1"] = {
+            "account_id": "acc-password-finalize-1",
+            "status": "processing",
+            "timestamp": time.time(),
+            "completed_at": None,
+            "user_id": 1,
+        }
+
+        def restore_sessions():
+            reply_server.password_login_sessions.clear()
+            reply_server.password_login_sessions.update(original_sessions)
+
+        self.addCleanup(restore_sessions)
+
+        with mock.patch.object(reply_server, "_update_session_risk_log"), \
+             mock.patch.object(reply_server, "_close_password_login_pending_verification_risk_logs"):
+            finalized = reply_server._finalize_password_login_session_failure(
+                "password-finalize-normalize-1",
+                "Traceback: RuntimeError: login chain exploded",
+            )
+
+        self.assertTrue(finalized)
+        self.assertEqual(
+            "登录失败，请稍后重试",
+            reply_server.password_login_sessions["password-finalize-normalize-1"]["error"],
+        )
+
+    def test_normalize_manual_cookie_import_failure_message_masks_internal_errors(self):
+        self.assertEqual(
+            "Cookie 导入验证失败，请稍后重试",
+            reply_server._normalize_manual_cookie_import_failure_message(
+                "Traceback: RuntimeError: manual import exploded",
+                default_message="Cookie 导入验证失败，请稍后重试",
+            ),
+        )
+        self.assertEqual(
+            "账号级 browser profile 已被其他 runtime 持有",
+            reply_server._normalize_manual_cookie_import_failure_message(
+                "账号级 browser profile 已被其他 runtime 持有",
+                default_message="Cookie 导入验证失败，请稍后重试",
+            ),
+        )
+        self.assertEqual(
+            reply_server.MANUAL_COOKIE_IMPORT_RUNTIME_CLOSED_ERROR,
+            reply_server._normalize_manual_cookie_import_failure_message(
+                "Target page, context or browser has been closed",
+                default_message="Cookie 导入验证失败，请稍后重试",
+            ),
+        )
+
+    async def test_qr_login_routes_surface_internal_failures_with_safe_messages(self):
+        current_user = {"user_id": 1, "username": "admin"}
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-qr-error-1"), \
+             mock.patch.object(reply_server.qr_login_manager, "cleanup_expired_sessions"), \
+             mock.patch.object(reply_server.qr_login_manager, "invalidate_account_sessions", return_value=[]), \
+             mock.patch.object(reply_server, "_cleanup_stale_foreign_pending_placeholder"), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_binding_info", return_value=None), \
+             mock.patch.object(reply_server.db_manager, "create_cookie_account_placeholder", return_value=True), \
+             mock.patch.object(
+                 reply_server.qr_login_manager,
+                 "generate_qr_code",
+                 side_effect=RuntimeError("qr cdp startup exploded"),
+             ), \
+             mock.patch.object(reply_server, "log_with_user"):
+            generate_response = await reply_server.generate_qr_code(
+                reply_server.QRLoginGenerateRequest(account_id="acc-qr-error-1"),
+                current_user=current_user,
+            )
+
+        self.assertEqual(
+            {"success": False, "message": "生成二维码失败，请稍后重试"},
+            generate_response,
+        )
+
+        with mock.patch.object(reply_server, "cleanup_qr_check_records"), \
+             mock.patch.object(
+                 reply_server.qr_login_manager,
+                 "get_session_status",
+                 side_effect=RuntimeError("qr status exploded"),
+             ), \
+             mock.patch.object(reply_server, "log_with_user"):
+            status_response = await reply_server.check_qr_code_status(
+                "qr-status-error-1",
+                current_user=current_user,
+            )
+
+        self.assertEqual(
+            {"status": "error", "message": "检查扫码登录状态失败，请稍后重试"},
+            status_response,
+        )
+
+    def test_normalize_qr_login_handoff_failure_message_masks_internal_errors(self):
+        self.assertEqual(
+            "扫码登录Cookie处理失败，请稍后重试",
+            reply_server._normalize_qr_login_handoff_failure_message(
+                RuntimeError("handoff exploded"),
+                default_message="扫码登录Cookie处理失败，请稍后重试",
+            ),
+        )
+        self.assertEqual(
+            "当前有其他浏览器任务正在执行",
+            reply_server._normalize_qr_login_handoff_failure_message(
+                "当前有其他浏览器任务正在执行",
+                default_message="扫码登录Cookie处理失败，请稍后重试",
+            ),
+        )
 
     async def test_manual_deliver_order_routes_live_calls_via_managed_helper(self):
         fake_db = mock.Mock()
@@ -2306,6 +4924,7 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
 
         self.assertTrue(result["success"])
         self.assertTrue(result["delivered"])
+        self.assertEqual(result["message"], "ok")
         fake_db.get_item_info.assert_called_once_with("acc-deliver-2", "item-deliver-2")
         managed_call.assert_awaited_once()
         self.assertEqual(managed_call.await_args.args[0], "acc-deliver-2")
@@ -2313,6 +4932,253 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
         self.assertEqual(
             managed_call.await_args.kwargs["missing_detail"],
             "账号 acc-deliver-2 未运行，请先启动账号",
+        )
+
+    async def test_manual_deliver_order_cancels_managed_runtime_call_on_request_disconnect(self):
+        class DisconnectingRequest:
+            def __init__(self, operation_started):
+                self.operation_started = operation_started
+                self.disconnect_checks = 0
+
+            async def is_disconnected(self):
+                self.disconnect_checks += 1
+                await self.operation_started.wait()
+                return True
+
+        operation_started = asyncio.Event()
+        operation_cancelled = False
+        fake_db = mock.Mock()
+        fake_db.get_item_info.return_value = {"item_title": "测试商品"}
+        order = {
+            "order_id": "order-deliver-disconnect",
+            "account_id": "acc-deliver-disconnect",
+            "item_id": "item-deliver-disconnect",
+            "buyer_id": "buyer-deliver-disconnect",
+            "quantity": 1,
+        }
+
+        async def managed_call(*_args, **_kwargs):
+            nonlocal operation_cancelled
+            operation_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                operation_cancelled = True
+                raise
+
+        fake_request = DisconnectingRequest(operation_started)
+
+        with mock.patch.object(reply_server, "_get_scoped_order_for_current_user", return_value=("acc-deliver-disconnect", order)), \
+             mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(reply_server, "_run_managed_live_instance_call", side_effect=managed_call), \
+             mock.patch.object(reply_server, "log_with_user"):
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(
+                    reply_server.manual_deliver_order(
+                        "order-deliver-disconnect",
+                        account_id="acc-deliver-disconnect",
+                        current_user={"user_id": 1, "username": "admin"},
+                        http_request=fake_request,
+                    ),
+                    timeout=1.0,
+                )
+
+        self.assertGreaterEqual(fake_request.disconnect_checks, 1)
+        self.assertTrue(operation_cancelled)
+
+    async def test_manual_deliver_order_masks_internal_finalize_failure_message_in_business_payload(self):
+        fake_db = mock.Mock()
+        fake_db.get_item_info.return_value = {"item_title": "测试商品"}
+        order = {
+            "order_id": "order-deliver-finalize-1",
+            "account_id": "acc-deliver-finalize-1",
+            "item_id": "item-deliver-finalize-1",
+            "buyer_id": "buyer-deliver-finalize-1",
+            "quantity": 1,
+        }
+        fake_live = SimpleNamespace(
+            _summarize_delivery_progress=mock.Mock(return_value={
+                "pending_finalize_unit_indexes": [1],
+            }),
+            _get_pending_delivery_finalization_meta=mock.Mock(return_value={
+                "success": True,
+                "rule_id": 1,
+            }),
+            _finalize_delivery_after_send=mock.AsyncMock(return_value={
+                "success": False,
+                "error": "missing canonical account_id for delivery finalization",
+            }),
+            _persist_delivery_finalization_state=mock.Mock(),
+        )
+
+        async def managed_call(account_id, coroutine_factory, **kwargs):
+            return await coroutine_factory(fake_live)
+
+        with mock.patch.object(reply_server, "_get_scoped_order_for_current_user", return_value=("acc-deliver-finalize-1", order)), \
+             mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(reply_server, "_run_managed_live_instance_call", side_effect=managed_call), \
+             mock.patch.object(reply_server, "log_with_user"), \
+             mock.patch.object(reply_server, "publish_order_update_event"):
+            result = await reply_server.manual_deliver_order(
+                "order-deliver-finalize-1",
+                account_id="acc-deliver-finalize-1",
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        self.assertFalse(result["success"])
+        self.assertFalse(result["delivered"])
+        self.assertEqual(result["message"], "检测到已有发货记录，但补完成收尾失败，请稍后重试")
+        fake_live._persist_delivery_finalization_state.assert_called_once()
+        persisted_error = fake_live._persist_delivery_finalization_state.call_args.kwargs["last_error"]
+        self.assertEqual(persisted_error, "检测到已有发货记录，但补完成收尾失败，请稍后重试")
+
+    async def test_manual_deliver_order_masks_internal_post_send_finalize_failure_message(self):
+        fake_db = mock.Mock()
+        fake_db.get_item_info.return_value = {"item_title": "测试商品"}
+        fake_db.create_delivery_log = mock.Mock()
+        order = {
+            "order_id": "order-deliver-finalize-2",
+            "account_id": "acc-deliver-finalize-2",
+            "item_id": "item-deliver-finalize-2",
+            "buyer_id": "buyer-deliver-finalize-2",
+            "quantity": 1,
+        }
+        fake_live = SimpleNamespace(
+            ws=None,
+            _summarize_delivery_progress=mock.Mock(side_effect=[
+                {"pending_finalize_unit_indexes": [], "remaining_unit_indexes": [1]},
+                {
+                    "remaining_unit_indexes": [],
+                    "aggregate_status": "partial_pending_finalize",
+                    "finalized_count": 0,
+                    "pending_finalize_count": 1,
+                },
+            ]),
+            _get_pending_delivery_finalization_meta=mock.Mock(return_value=None),
+            _auto_delivery=mock.AsyncMock(return_value={
+                "success": True,
+                "content": "demo-content",
+                "delivery_steps": [{"type": "text", "content": "demo-content"}],
+                "rule_id": 1,
+                "rule_keyword": "demo",
+                "card_type": "text",
+                "card_id": 10,
+                "match_mode": "no_spec_match",
+                "order_spec_mode": "no_spec",
+                "rule_spec_mode": "no_spec",
+                "item_config_mode": "no_spec",
+            }),
+            _build_delivery_send_groups=mock.Mock(return_value=[{
+                "mode": "single",
+                "units": [{
+                    "unit_index": 1,
+                    "delivery_steps": [{"type": "text", "content": "demo-content"}],
+                    "card_type": "text",
+                    "rule_meta": {
+                        "success": True,
+                        "rule_id": 1,
+                        "rule_keyword": "demo",
+                        "card_id": 10,
+                        "card_type": "text",
+                        "match_mode": "no_spec_match",
+                        "order_spec_mode": "no_spec",
+                        "rule_spec_mode": "no_spec",
+                        "item_config_mode": "no_spec",
+                        "delivery_unit_index": 1,
+                    },
+                }],
+                "delivery_steps": [{"type": "text", "content": "demo-content"}],
+            }]),
+            send_delivery_steps_once=mock.AsyncMock(return_value=None),
+            _mark_data_reservation_sent_if_needed=mock.Mock(return_value=True),
+            _persist_delivery_finalization_state=mock.Mock(),
+            _finalize_delivery_after_send=mock.AsyncMock(return_value={
+                "success": False,
+                "error": "order order-deliver-finalize-2 is outside current account scope",
+            }),
+            _sync_order_delivery_progress=mock.Mock(return_value={
+                "aggregate_status": "partial_pending_finalize",
+                "finalized_count": 0,
+                "pending_finalize_count": 1,
+                "remaining_count": 0,
+            }),
+        )
+
+        async def managed_call(account_id, coroutine_factory, **kwargs):
+            return await coroutine_factory(fake_live)
+
+        with mock.patch.object(reply_server, "_get_scoped_order_for_current_user", return_value=("acc-deliver-finalize-2", order)), \
+             mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(reply_server, "_run_managed_live_instance_call", side_effect=managed_call), \
+             mock.patch.object(reply_server, "log_with_user"), \
+             mock.patch.object(reply_server, "publish_order_update_event"):
+            result = await reply_server.manual_deliver_order(
+                "order-deliver-finalize-2",
+                account_id="acc-deliver-finalize-2",
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        self.assertTrue(result["success"])
+        self.assertFalse(result["delivered"])
+        self.assertIn("仍有 1 个单元待收尾", result["message"])
+        self.assertEqual(result["result_state"], "warning")
+        persisted_errors = [
+            call.kwargs.get("last_error")
+            for call in fake_live._persist_delivery_finalization_state.call_args_list
+            if "last_error" in call.kwargs
+        ]
+        self.assertIn("发送成功但提交发货后续处理失败，请稍后重试", persisted_errors)
+
+    def test_resolve_manual_delivery_result_state_marks_partial_or_pending_states_as_warning(self):
+        self.assertEqual(
+            "success",
+            reply_server._resolve_manual_delivery_result_state(
+                "shipped",
+                finalized_count=2,
+                pending_finalize_count=0,
+                failed_count=0,
+            ),
+        )
+        self.assertEqual(
+            "warning",
+            reply_server._resolve_manual_delivery_result_state(
+                "partial_pending_finalize",
+                finalized_count=1,
+                pending_finalize_count=1,
+                failed_count=0,
+            ),
+        )
+        self.assertEqual(
+            "warning",
+            reply_server._resolve_manual_delivery_result_state(
+                "shipped",
+                finalized_count=1,
+                pending_finalize_count=0,
+                failed_count=1,
+            ),
+        )
+
+    def test_normalize_manual_delivery_failure_message_preserves_runtime_and_business_errors(self):
+        self.assertEqual(
+            "当前有其他浏览器任务正在执行，请稍后再试",
+            reply_server._normalize_manual_delivery_failure_message(
+                "当前有其他浏览器任务正在执行，请稍后再试",
+                default_message="手动发货失败，请稍后重试",
+            ),
+        )
+        self.assertEqual(
+            "批量数据消费失败，已中止后续确认发货",
+            reply_server._normalize_manual_delivery_failure_message(
+                "批量数据消费失败，已中止后续确认发货",
+                default_message="手动发货失败，请稍后重试",
+            ),
+        )
+        self.assertEqual(
+            "手动发货失败，请稍后重试",
+            reply_server._normalize_manual_delivery_failure_message(
+                "missing order_id for delivery finalization",
+                default_message="手动发货失败，请稍后重试",
+            ),
         )
 
     async def test_refresh_order_status_routes_runtime_call_via_managed_helper(self):
@@ -2359,44 +5225,121 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
             "账号 acc-refresh-2 未运行，请先启动账号",
         )
 
+    async def test_refresh_order_status_cancels_managed_runtime_call_on_request_disconnect(self):
+        class DisconnectingRequest:
+            def __init__(self, operation_started):
+                self.operation_started = operation_started
+                self.disconnect_checks = 0
+
+            async def is_disconnected(self):
+                self.disconnect_checks += 1
+                await self.operation_started.wait()
+                return True
+
+        operation_started = asyncio.Event()
+        operation_cancelled = False
+        order = {
+            "order_id": "order-refresh-disconnect",
+            "account_id": "acc-refresh-disconnect",
+            "order_status": "pending_ship",
+            "item_id": "item-refresh-disconnect",
+            "buyer_id": "buyer-refresh-disconnect",
+            "sid": "sid-refresh-disconnect",
+        }
+
+        async def managed_call(*_args, **_kwargs):
+            nonlocal operation_cancelled
+            operation_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                operation_cancelled = True
+                raise
+
+        fake_request = DisconnectingRequest(operation_started)
+
+        with mock.patch.object(reply_server, "_get_scoped_order_for_current_user", return_value=("acc-refresh-disconnect", order)), \
+             mock.patch.object(reply_server, "_run_managed_live_instance_call", side_effect=managed_call), \
+             mock.patch.object(reply_server, "log_with_user"):
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(
+                    reply_server.refresh_order_status(
+                        "order-refresh-disconnect",
+                        account_id="acc-refresh-disconnect",
+                        current_user={"user_id": 1, "username": "admin"},
+                        http_request=fake_request,
+                    ),
+                    timeout=1.0,
+                )
+
+        self.assertGreaterEqual(fake_request.disconnect_checks, 1)
+        self.assertTrue(operation_cancelled)
+
     async def test_start_order_history_sync_rejects_invalid_request_before_creating_background_job(self):
         invalid_cases = [
             (
-                {
-                    "account_id": "acc-history-start-1",
-                    "start_date": "2026/05/01",
-                    "end_date": "2026-05-02",
-                    "max_orders": 120,
-                    "fetch_details": True,
-                },
+                reply_server.OrderHistorySyncRequest(
+                    account_id="acc-history-start-1",
+                    start_date="2026/05/01",
+                    end_date="2026-05-02",
+                    max_orders=120,
+                    fetch_details=True,
+                ),
                 "日期格式错误，应为 YYYY-MM-DD",
             ),
             (
-                {
-                    "account_id": "acc-history-start-2",
-                    "start_date": "2026-05-03",
-                    "end_date": "2026-05-02",
-                    "max_orders": 120,
-                    "fetch_details": True,
-                },
+                reply_server.OrderHistorySyncRequest(
+                    account_id="acc-history-start-2",
+                    start_date="2026-05-03",
+                    end_date="2026-05-02",
+                    max_orders=120,
+                    fetch_details=True,
+                ),
                 "开始日期必须早于结束日期",
             ),
             (
-                {
-                    "account_id": "acc-history-start-3",
-                    "start_date": "2026-05-01",
-                    "end_date": "2026-05-02",
-                    "max_orders": 501,
-                    "fetch_details": True,
-                },
+                reply_server.OrderHistorySyncRequest(
+                    account_id="acc-history-start-3",
+                    start_date="2026-05-01",
+                    end_date="2026-05-02",
+                    max_orders=501,
+                    fetch_details=True,
+                ),
+                "最多同步单数需在 1 到 500 之间",
+            ),
+            (
+                mock.Mock(
+                    model_dump=mock.Mock(
+                        return_value={
+                            "account_id": "acc-history-start-4",
+                            "start_date": "2026-05-01",
+                            "end_date": "2026-05-02",
+                            "max_orders": "abc",
+                            "fetch_details": True,
+                        }
+                    )
+                ),
+                "最多同步单数需在 1 到 500 之间",
+            ),
+            (
+                mock.Mock(
+                    model_dump=mock.Mock(
+                        return_value={
+                            "account_id": "acc-history-start-5",
+                            "start_date": "2026-05-01",
+                            "end_date": "2026-05-02",
+                            "max_orders": "",
+                            "fetch_details": True,
+                        }
+                    )
+                ),
                 "最多同步单数需在 1 到 500 之间",
             ),
         ]
 
-        for request_kwargs, expected_detail in invalid_cases:
-            with self.subTest(request_kwargs=request_kwargs):
+        for request, expected_detail in invalid_cases:
+            with self.subTest(expected_detail=expected_detail):
                 before_job_ids = set(reply_server.order_history_sync_jobs.keys())
-                request = reply_server.OrderHistorySyncRequest(**request_kwargs)
 
                 with mock.patch.object(reply_server, "_cleanup_order_history_sync_jobs") as cleanup_mock, \
                      mock.patch.object(reply_server.asyncio, "create_task") as create_task_mock, \
@@ -2412,6 +5355,44 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
                 cleanup_mock.assert_not_called()
                 create_task_mock.assert_not_called()
                 self.assertEqual(set(reply_server.order_history_sync_jobs.keys()), before_job_ids)
+
+    async def test_start_order_history_sync_normalizes_string_fetch_details_flag(self):
+        request = mock.Mock(
+            model_dump=mock.Mock(
+                return_value={
+                    "account_id": "acc-history-start-bool-1",
+                    "start_date": "2026-05-01",
+                    "end_date": "2026-05-02",
+                    "max_orders": 120,
+                    "fetch_details": "false",
+                }
+            )
+        )
+        scheduled_coroutines = []
+
+        def fake_create_task(coro):
+            scheduled_coroutines.append(coro)
+            return mock.Mock()
+
+        with mock.patch.object(reply_server.db_manager, "get_account_ids", return_value=["acc-history-start-bool-1"]), \
+             mock.patch.object(reply_server, "_cleanup_order_history_sync_jobs"), \
+             mock.patch.object(reply_server.asyncio, "create_task", side_effect=fake_create_task), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = await reply_server.start_order_history_sync(
+                request,
+                current_user={"user_id": 1, "username": "tester"},
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(1, len(scheduled_coroutines))
+        self.assertEqual("false", request.model_dump.return_value["fetch_details"])
+        self.assertEqual(False, result["data"]["request"]["fetch_details"])
+        job_id = result["data"]["job_id"]
+        self.assertFalse(reply_server.order_history_sync_jobs[job_id]["request"]["fetch_details"])
+        for coro in scheduled_coroutines:
+            coro.close()
+        reply_server.order_history_sync_jobs.pop(job_id, None)
+        reply_server.order_history_sync_tasks.pop(job_id, None)
 
     async def test_start_order_history_sync_rejects_unscoped_or_missing_accounts_before_creating_background_job(self):
         base_request = {
@@ -2505,6 +5486,29 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
         cleanup_mock.assert_called_once_with()
         create_task_mock.assert_not_called()
 
+    async def test_start_order_history_sync_masks_unexpected_internal_failures(self):
+        request = reply_server.OrderHistorySyncRequest(
+            account_id="acc-history-owned",
+            start_date="2026-05-01",
+            end_date="2026-05-02",
+            max_orders=120,
+            fetch_details=True,
+        )
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_account_ids",
+            side_effect=RuntimeError("history sync start internal exploded"),
+        ), mock.patch.object(reply_server, "log_with_user"):
+            with self.assertRaises(reply_server.HTTPException) as ctx:
+                await reply_server.start_order_history_sync(
+                    request,
+                    current_user={"user_id": 1, "username": "tester"},
+                )
+
+        self.assertEqual(500, ctx.exception.status_code)
+        self.assertEqual("创建历史订单同步任务失败，请稍后重试", str(ctx.exception.detail))
+
     async def test_order_history_sync_status_and_cancel_accept_string_user_id_snapshot(self):
         job_id = "history-sync-user-id-string"
         job = {
@@ -2541,6 +5545,67 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
         self.assertTrue(cancel_result["success"])
         self.assertEqual("cancelled", cancel_result["data"]["status"])
         self.assertEqual("历史订单同步已取消", cancel_result["data"]["message"])
+
+    async def test_cancel_order_history_sync_schedules_task_cancel_on_owner_loop(self):
+        class FakeLoop:
+            def __init__(self):
+                self.scheduled = []
+
+            def is_running(self):
+                return True
+
+            def call_soon_threadsafe(self, callback, *args):
+                self.scheduled.append((callback, args))
+
+        class FakeTask:
+            def __init__(self, loop):
+                self._loop = loop
+                self.cancel = mock.Mock()
+
+            def done(self):
+                return False
+
+            def get_loop(self):
+                return self._loop
+
+        job_id = "history-sync-owner-loop-cancel"
+        owner_loop = FakeLoop()
+        fake_task = FakeTask(owner_loop)
+        job = {
+            "job_id": job_id,
+            "status": "running",
+            "message": "正在同步历史订单",
+            "user_id": 7,
+            "created_at": "2026-05-27 12:00:00",
+            "request": {
+                "account_id": "acc-history-owned",
+                "start_date": "2026-05-01",
+                "end_date": "2026-05-02",
+                "max_orders": 120,
+                "fetch_details": True,
+            },
+            "warnings": [],
+        }
+        reply_server.order_history_sync_jobs[job_id] = job
+        reply_server.order_history_sync_tasks[job_id] = fake_task
+        try:
+            result = reply_server.cancel_order_history_sync(
+                job_id,
+                current_user={"user_id": 7, "username": "tester"},
+            )
+
+            self.assertTrue(result["success"])
+            self.assertEqual("cancelled", result["data"]["status"])
+            self.assertEqual(1, len(owner_loop.scheduled))
+            fake_task.cancel.assert_not_called()
+            callback, args = owner_loop.scheduled[0]
+            self.assertIs(callback, fake_task.cancel)
+            self.assertEqual((), args)
+            callback(*args)
+            fake_task.cancel.assert_called_once_with()
+        finally:
+            reply_server.order_history_sync_jobs.pop(job_id, None)
+            reply_server.order_history_sync_tasks.pop(job_id, None)
 
     async def test_order_history_sync_prefers_managed_runtime_helper_for_detail_refresh(self):
         job_id = "history-sync-job-managed"
@@ -2621,6 +5686,68 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
             {"order_id": "order-history-1", "order_status": "shipped"},
         )
         save_candidate_mock.assert_not_called()
+
+    async def test_order_history_sync_does_not_save_detail_when_cancelled_during_detail_refresh(self):
+        job_id = "history-sync-job-cancel-during-detail"
+        managed_list_result = {
+            "orders": [{
+                "order_id": "order-history-cancel-detail-1",
+                "item_id": "item-history-cancel-detail-1",
+                "buyer_id": "buyer-history-cancel-detail-1",
+                "buyer_nick": "buyer-history-cancel-detail-nick-1",
+                "sid": "sid-history-cancel-detail-1",
+            }],
+            "scanned_count": 1,
+            "matched_count": 1,
+            "out_of_range_count": 0,
+        }
+        job = {
+            "request": {
+                "start_date": "2026-05-01",
+                "end_date": "2026-05-02",
+                "account_id": "acc-history-cancel-detail-1",
+                "max_orders": 1,
+                "fetch_details": True,
+            },
+            "user_info": {"user_id": 1},
+            "status": "queued",
+        }
+
+        async def managed_call(_account_id, _factory, **_kwargs):
+            if managed_call.calls == 0:
+                managed_call.calls += 1
+                return managed_list_result
+            job["status"] = "cancelled"
+            job["message"] = "历史订单同步已取消"
+            return {"order_id": "order-history-cancel-detail-1", "order_status": "shipped"}
+
+        managed_call.calls = 0
+        fake_fetcher = SimpleNamespace(
+            fetch_recent_orders=mock.AsyncMock(),
+            fetch_order_detail=mock.AsyncMock(),
+            close=mock.AsyncMock(),
+        )
+        reply_server.order_history_sync_jobs[job_id] = job
+        try:
+            with mock.patch.object(reply_server.db_manager, "get_account_ids", return_value=["acc-history-cancel-detail-1"]), \
+                 mock.patch.object(reply_server.db_manager, "get_cookie", return_value="cookie-value"), \
+                 mock.patch("utils.order_history_sync.OrderHistoryPageFetcher", return_value=fake_fetcher) as fetcher_cls, \
+                 mock.patch.object(reply_server, "_run_managed_live_instance_call", side_effect=managed_call), \
+                 mock.patch.object(reply_server, "_save_history_order_detail_result", return_value=True) as save_detail_mock, \
+                 mock.patch.object(reply_server, "_save_history_order_candidate", return_value=True) as save_candidate_mock, \
+                 mock.patch.object(reply_server, "_cleanup_order_history_sync_jobs"):
+                await reply_server._run_order_history_sync_job(job_id)
+        finally:
+            reply_server.order_history_sync_jobs.pop(job_id, None)
+            reply_server.order_history_sync_tasks.pop(job_id, None)
+
+        self.assertEqual("cancelled", job["status"])
+        self.assertEqual("历史订单同步已取消", job["message"])
+        fetcher_cls.assert_not_called()
+        save_detail_mock.assert_not_called()
+        save_candidate_mock.assert_not_called()
+        self.assertEqual(1, job.get("orders_processed"))
+        self.assertEqual(0, job.get("orders_saved"))
 
     async def test_order_history_sync_prefers_managed_runtime_helper_for_order_list(self):
         job_id = "history-sync-job-managed-list"
@@ -2755,6 +5882,59 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
             },
         )
 
+    async def test_order_history_sync_falls_back_to_fetcher_when_managed_order_list_conflicts(self):
+        job_id = "history-sync-job-list-conflict"
+        fake_fetcher = SimpleNamespace(
+            fetch_recent_orders=mock.AsyncMock(return_value={
+                "orders": [{
+                    "order_id": "order-history-list-3",
+                    "item_id": "item-history-list-3",
+                    "buyer_id": "buyer-history-list-3",
+                    "buyer_nick": "buyer-history-list-nick-3",
+                    "sid": "sid-history-list-3",
+                }],
+                "scanned_count": 1,
+                "matched_count": 1,
+                "out_of_range_count": 0,
+            }),
+            fetch_order_detail=mock.AsyncMock(return_value=None),
+            close=mock.AsyncMock(),
+        )
+        managed_call = mock.AsyncMock(side_effect=[
+            reply_server.HTTPException(status_code=409, detail="账号 acc-history-list-3 当前有其他浏览器任务正在执行，请稍后再试"),
+        ])
+        job = {
+            "request": {
+                "start_date": "2026-05-01",
+                "end_date": "2026-05-02",
+                "account_id": "acc-history-list-3",
+                "max_orders": 1,
+                "fetch_details": False,
+            },
+            "user_info": {"user_id": 1},
+            "status": "queued",
+        }
+        reply_server.order_history_sync_jobs[job_id] = job
+        try:
+            with mock.patch.object(reply_server.db_manager, "get_account_ids", return_value=["acc-history-list-3"]), \
+                 mock.patch.object(reply_server.db_manager, "get_cookie", return_value="cookie-value"), \
+                 mock.patch("utils.order_history_sync.OrderHistoryPageFetcher", return_value=fake_fetcher), \
+                 mock.patch.object(reply_server, "_run_managed_live_instance_call", managed_call), \
+                 mock.patch.object(reply_server, "_save_history_order_candidate", return_value=True) as save_candidate_mock, \
+                 mock.patch.object(reply_server, "_cleanup_order_history_sync_jobs"):
+                await reply_server._run_order_history_sync_job(job_id)
+        finally:
+            reply_server.order_history_sync_jobs.pop(job_id, None)
+            reply_server.order_history_sync_tasks.pop(job_id, None)
+
+        self.assertEqual(job["status"], "completed")
+        managed_call.assert_awaited_once()
+        fake_fetcher.fetch_recent_orders.assert_not_awaited()
+        save_candidate_mock.assert_not_called()
+        self.assertEqual(job["orders_saved"], 0)
+        self.assertEqual(job["accounts_completed"], 1)
+        self.assertTrue(any("历史订单列表抓取遇到账号浏览器占用" in warning for warning in (job.get("warnings") or [])))
+
     async def test_order_history_sync_falls_back_to_fetcher_when_managed_runtime_missing(self):
         job_id = "history-sync-job-fallback"
         fake_fetcher = SimpleNamespace(
@@ -2853,6 +6033,34 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
         save_detail_mock.assert_not_called()
         save_candidate_mock.assert_not_called()
 
+    async def test_order_history_sync_masks_unexpected_internal_job_failure_in_status(self):
+        job_id = "history-sync-job-internal-failure"
+        job = {
+            "request": {
+                "start_date": "2026-05-01",
+                "end_date": "2026-05-02",
+                "account_id": "acc-history-internal-1",
+                "max_orders": 1,
+                "fetch_details": True,
+            },
+            "user_info": {"user_id": 1},
+            "status": "queued",
+        }
+        reply_server.order_history_sync_jobs[job_id] = job
+        try:
+            with mock.patch.object(reply_server.db_manager, "get_account_ids", return_value=["acc-history-internal-1"]), \
+                 mock.patch.object(reply_server.db_manager, "get_cookie", return_value="cookie-value"), \
+                 mock.patch.object(reply_server, "_run_managed_live_instance_call", side_effect=RuntimeError("history sync internal exploded")), \
+                 mock.patch.object(reply_server, "_cleanup_order_history_sync_jobs"):
+                await reply_server._run_order_history_sync_job(job_id)
+        finally:
+            reply_server.order_history_sync_jobs.pop(job_id, None)
+            reply_server.order_history_sync_tasks.pop(job_id, None)
+
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual("历史订单同步失败，请稍后重试", job["error"])
+        self.assertEqual("历史订单同步失败，请稍后重试", job["message"])
+
     async def test_order_history_sync_warns_and_falls_back_to_candidate_when_managed_detail_refresh_errors(self):
         job_id = "history-sync-job-detail-warning"
         candidate = {
@@ -2913,9 +6121,148 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
         save_detail_mock.assert_not_called()
         save_candidate_mock.assert_called_once_with("acc-history-3", candidate)
         self.assertEqual(job["orders_saved"], 1)
+        warnings = job.get("warnings") or []
+        self.assertTrue(any("详情刷新失败，请稍后重试" in warning for warning in warnings))
+        self.assertFalse(any("detail boom" in warning for warning in warnings))
+
+    async def test_order_history_sync_warns_and_falls_back_to_candidate_when_managed_detail_refresh_conflicts(self):
+        job_id = "history-sync-job-detail-conflict"
+        candidate = {
+            "order_id": "order-history-4",
+            "item_id": "item-history-4",
+            "buyer_id": "buyer-history-4",
+            "buyer_nick": "buyer-history-nick-4",
+            "sid": "sid-history-4",
+        }
+        managed_call = mock.AsyncMock(side_effect=[
+            {
+                "orders": [candidate],
+                "scanned_count": 1,
+                "matched_count": 1,
+                "out_of_range_count": 0,
+            },
+            reply_server.HTTPException(
+                status_code=409,
+                detail="同账号已存在不兼容的 async runtime 正在使用中，请稍后重试",
+            ),
+        ])
+        job = {
+            "request": {
+                "start_date": "2026-05-01",
+                "end_date": "2026-05-02",
+                "account_id": "acc-history-4",
+                "max_orders": 1,
+                "fetch_details": True,
+            },
+            "user_info": {"user_id": 1},
+            "status": "queued",
+        }
+        reply_server.order_history_sync_jobs[job_id] = job
+        try:
+            with mock.patch.object(reply_server.db_manager, "get_account_ids", return_value=["acc-history-4"]), \
+                 mock.patch.object(reply_server.db_manager, "get_cookie", return_value="cookie-value"), \
+                 mock.patch("utils.order_history_sync.OrderHistoryPageFetcher") as fetcher_cls, \
+                 mock.patch.object(reply_server, "_run_managed_live_instance_call", managed_call), \
+                 mock.patch.object(reply_server, "_save_history_order_detail_result", return_value=True) as save_detail_mock, \
+                 mock.patch.object(reply_server, "_save_history_order_candidate", return_value=True) as save_candidate_mock, \
+                 mock.patch.object(reply_server, "_cleanup_order_history_sync_jobs"):
+                await reply_server._run_order_history_sync_job(job_id)
+        finally:
+            reply_server.order_history_sync_jobs.pop(job_id, None)
+            reply_server.order_history_sync_tasks.pop(job_id, None)
+
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(managed_call.await_count, 2)
+        fetcher_cls.assert_not_called()
+        save_detail_mock.assert_not_called()
+        save_candidate_mock.assert_called_once_with("acc-history-4", candidate)
+        self.assertEqual(job["orders_saved"], 1)
+        self.assertTrue(any("账号浏览器占用" in warning for warning in (job.get("warnings") or [])))
         self.assertEqual(job["orders_failed"], 0)
-        self.assertTrue(
-            any("订单 order-history-3 详情刷新失败: detail boom" in warning for warning in job["warnings"])
+
+    async def test_order_history_sync_does_not_fail_completed_job_when_fetcher_close_raises(self):
+        job_id = "history-sync-job-close-warning"
+        fake_fetcher = SimpleNamespace(
+            fetch_recent_orders=mock.AsyncMock(return_value={
+                "orders": [{
+                    "order_id": "order-history-close-1",
+                    "item_id": "item-history-close-1",
+                    "buyer_id": "buyer-history-close-1",
+                    "buyer_nick": "buyer-history-close-nick-1",
+                    "sid": "sid-history-close-1",
+                }],
+                "scanned_count": 1,
+                "matched_count": 1,
+                "out_of_range_count": 0,
+            }),
+            fetch_order_detail=mock.AsyncMock(return_value=None),
+            close=mock.AsyncMock(side_effect=RuntimeError("close boom")),
+        )
+        managed_call = mock.AsyncMock(
+            side_effect=reply_server.HTTPException(status_code=400, detail="账号未启动，暂无法执行当前操作")
+        )
+        job = {
+            "request": {
+                "start_date": "2026-05-01",
+                "end_date": "2026-05-02",
+                "account_id": "acc-history-close-1",
+                "max_orders": 1,
+                "fetch_details": False,
+            },
+            "user_info": {"user_id": 1},
+            "status": "queued",
+        }
+        reply_server.order_history_sync_jobs[job_id] = job
+        try:
+            with mock.patch.object(reply_server.db_manager, "get_account_ids", return_value=["acc-history-close-1"]), \
+                 mock.patch.object(reply_server.db_manager, "get_cookie", return_value="cookie-value"), \
+                 mock.patch("utils.order_history_sync.OrderHistoryPageFetcher", return_value=fake_fetcher), \
+                 mock.patch.object(reply_server, "_run_managed_live_instance_call", managed_call), \
+                 mock.patch.object(reply_server, "_save_history_order_candidate", return_value=True) as save_candidate_mock, \
+                 mock.patch.object(reply_server, "_cleanup_order_history_sync_jobs"), \
+                 mock.patch.object(reply_server.logger, "warning") as warning_mock:
+                await reply_server._run_order_history_sync_job(job_id)
+        finally:
+            reply_server.order_history_sync_jobs.pop(job_id, None)
+            reply_server.order_history_sync_tasks.pop(job_id, None)
+
+        self.assertEqual(job["status"], "completed")
+        save_candidate_mock.assert_called_once()
+        fake_fetcher.close.assert_awaited_once()
+        warning_mock.assert_called()
+        warnings = job.get("warnings") or []
+        self.assertTrue(any("抓取器关闭失败，请稍后重试" in warning for warning in warnings))
+        self.assertFalse(any("close boom" in warning for warning in warnings))
+        self.assertIn("伴随 1 条警告", job["message"])
+
+    def test_build_order_history_sync_completed_message_includes_failures_and_warnings(self):
+        message = reply_server._build_order_history_sync_completed_message({
+            "orders_discovered": 12,
+            "matched_orders": 6,
+            "orders_saved": 4,
+            "orders_failed": 2,
+            "orders_skipped": 5,
+            "warnings": ["warn-1", "warn-2"],
+        })
+
+        self.assertEqual(
+            "历史订单同步完成，共扫描 12 单，命中时间范围 6 单，入库/更新 4 单，处理失败 2 单，跳过 5 单，伴随 2 条警告",
+            message,
+        )
+
+    def test_build_order_history_sync_completed_message_omits_zero_failure_noise(self):
+        message = reply_server._build_order_history_sync_completed_message({
+            "orders_discovered": 3,
+            "matched_orders": 2,
+            "orders_saved": 2,
+            "orders_failed": 0,
+            "orders_skipped": 0,
+            "warnings": [],
+        })
+
+        self.assertEqual(
+            "历史订单同步完成，共扫描 3 单，命中时间范围 2 单，入库/更新 2 单",
+            message,
         )
 
     def test_item_and_item_reply_dom_use_account_id_ids_and_datasets(self):
@@ -3135,7 +6482,7 @@ class ReplyServerAccountRuntimeIsolationTest(_ReplyServerModuleBindingMixin, uni
         self.assertIn("@app.get('/admin/stats')", source)
 
 
-class ReplyServerOrderAccountScopeRuntimeTest(_ReplyServerModuleBindingMixin, unittest.TestCase):
+class ReplyServerOrderAccountScopeRuntimeTest(_ReplyServerModuleBindingMixin, unittest.IsolatedAsyncioTestCase):
     def test_save_history_order_candidate_passes_account_id_to_order_upsert(self):
         candidate = {
             "order_id": "order-history-helper-1",
@@ -3283,7 +6630,7 @@ class ReplyServerOrderAccountScopeRuntimeTest(_ReplyServerModuleBindingMixin, un
                 reply_server.get_user_orders(current_user={"user_id": 7, "username": "admin"})
 
         self.assertEqual(raised.exception.status_code, 500)
-        self.assertEqual(raised.exception.detail, "查询订单失败: orders exploded")
+        self.assertEqual(raised.exception.detail, "查询订单失败，请稍后重试")
         fake_db.get_account_ids.assert_called_once_with(7)
         fake_db.get_orders_by_account.assert_called_once_with("acc-order-1", limit=None)
 
@@ -3447,6 +6794,39 @@ class ReplyServerOrderAccountScopeRuntimeTest(_ReplyServerModuleBindingMixin, un
         )
         fake_db.get_item_info.assert_called_once_with("acc-order-1", "item-deliver-1")
 
+    def test_manual_deliver_order_propagates_runtime_conflict_http_409(self):
+        fake_db = mock.Mock()
+        fake_db.get_order_by_id.return_value = {
+            "order_id": "order-deliver-conflict-1",
+            "account_id": "acc-order-conflict-1",
+            "item_id": "item-deliver-conflict-1",
+            "buyer_id": "buyer-deliver-conflict-1",
+        }
+        fake_db.get_item_info.return_value = {"item_title": "demo"}
+        managed_call = mock.AsyncMock(
+            side_effect=reply_server.HTTPException(
+                status_code=409,
+                detail="当前有其他浏览器任务正在执行，请稍后再试",
+            )
+        )
+
+        async def invoke():
+            return await reply_server.manual_deliver_order(
+                "order-deliver-conflict-1",
+                account_id="acc-order-conflict-1",
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        with mock.patch.object(reply_server, "_get_user_cookies_map", return_value={"acc-order-conflict-1": "cookie"}), \
+             mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(reply_server, "_run_managed_live_instance_call", managed_call), \
+             mock.patch.object(reply_server, "log_with_user"):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                asyncio.run(invoke())
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.detail, "当前有其他浏览器任务正在执行，请稍后再试")
+
     def test_refresh_order_status_scopes_lookup_by_account_id(self):
         fake_db = mock.Mock()
         fake_db.get_order_by_id.return_value = {
@@ -3517,6 +6897,238 @@ class ReplyServerOrderAccountScopeRuntimeTest(_ReplyServerModuleBindingMixin, un
             "order-refresh-1",
             account_id="acc-order-1",
             user_id=1,
+        )
+
+    def test_refresh_order_status_propagates_runtime_conflict_http_409(self):
+        fake_db = mock.Mock()
+        fake_db.get_order_by_id.return_value = {
+            "order_id": "order-refresh-conflict-1",
+            "account_id": "acc-order-conflict-1",
+            "order_status": "pending_ship",
+            "item_id": "item-refresh-conflict-1",
+            "buyer_id": "buyer-refresh-conflict-1",
+            "sid": "sid-refresh-conflict-1",
+        }
+        managed_call = mock.AsyncMock(
+            side_effect=reply_server.HTTPException(
+                status_code=409,
+                detail="账号级 browser profile 已被其他 runtime 持有，拒绝并发复用",
+            )
+        )
+
+        async def invoke():
+            return await reply_server.refresh_order_status(
+                "order-refresh-conflict-1",
+                account_id="acc-order-conflict-1",
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        with mock.patch.object(reply_server, "_get_user_cookies_map", return_value={"acc-order-conflict-1": "cookie"}), \
+             mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(reply_server, "_run_managed_live_instance_call", managed_call), \
+             mock.patch.object(reply_server, "log_with_user"):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                asyncio.run(invoke())
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.detail, "账号级 browser profile 已被其他 runtime 持有，拒绝并发复用")
+
+    async def test_get_all_items_from_account_masks_unknown_internal_error_message(self):
+        fake_db = mock.Mock()
+        fake_db.get_cookie_by_id.return_value = {
+            "cookies_str": "demo-cookie",
+        }
+        fake_live = mock.Mock()
+        fake_live.get_all_items = mock.AsyncMock(return_value={
+            "success": False,
+            "error": "missing canonical account_id for item sync",
+        })
+        fake_live.close_session = mock.AsyncMock()
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-item-sync-1"), \
+             mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch("XianyuAutoAsync.XianyuLive", return_value=fake_live), \
+             mock.patch.object(reply_server, "log_with_user"), \
+             mock.patch.object(reply_server, "logger"):
+            result = await reply_server.get_all_items_from_account(
+                {"account_id": "acc-item-sync-1"},
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["message"], "获取商品信息失败，请稍后重试")
+        fake_live.get_all_items.assert_awaited_once_with(sync_item_details=True)
+        fake_live.close_session.assert_awaited_once()
+
+    async def test_get_items_by_page_preserves_runtime_conflict_message(self):
+        fake_db = mock.Mock()
+        fake_db.get_cookie_by_id.return_value = {
+            "cookies_str": "demo-cookie",
+        }
+        fake_live = mock.Mock()
+        fake_live.get_item_list_info = mock.AsyncMock(return_value={
+            "success": False,
+            "error": "当前有其他浏览器任务正在执行，请稍后再试 当前占用任务：商品搜索",
+        })
+        fake_live.close_session = mock.AsyncMock()
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-item-page-1"), \
+             mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch("XianyuAutoAsync.XianyuLive", return_value=fake_live), \
+             mock.patch.object(reply_server, "log_with_user"), \
+             mock.patch.object(reply_server, "logger"):
+            result = await reply_server.get_items_by_page(
+                {"account_id": "acc-item-page-1", "page_number": 1, "page_size": 20},
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["message"], "当前有其他浏览器任务正在执行，请稍后再试 当前占用任务：商品搜索")
+        fake_live.get_item_list_info.assert_awaited_once_with(1, 20, sync_item_details=True)
+        fake_live.close_session.assert_awaited_once()
+
+    async def test_item_sync_routes_treat_blank_account_id_as_missing_input(self):
+        current_user = {"user_id": 1, "username": "admin"}
+
+        all_result = await reply_server.get_all_items_from_account(
+            {"account_id": "   "},
+            current_user=current_user,
+        )
+        page_result = await reply_server.get_items_by_page(
+            {"account_id": None, "page_number": 1, "page_size": 20},
+            current_user=current_user,
+        )
+
+        self.assertEqual({"success": False, "message": "缺少account_id参数"}, all_result)
+        self.assertEqual({"success": False, "message": "缺少account_id参数"}, page_result)
+
+    async def test_temporary_browser_runtime_routes_cancel_on_request_disconnect(self):
+        class DisconnectingRequest:
+            def __init__(self, operation_started):
+                self.operation_started = operation_started
+                self.disconnect_checks = 0
+
+            async def is_disconnected(self):
+                self.disconnect_checks += 1
+                await self.operation_started.wait()
+                return True
+
+        class BlockingLive:
+            def __init__(self):
+                self.operation_started = asyncio.Event()
+                self.operation_cancelled = False
+                self.close_session = mock.AsyncMock()
+
+            async def _block_until_cancelled(self):
+                self.operation_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.operation_cancelled = True
+                    raise
+
+            async def get_all_items(self, **_kwargs):
+                await self._block_until_cancelled()
+
+            async def get_item_list_info(self, *_args, **_kwargs):
+                await self._block_until_cancelled()
+
+            async def polish_all_items(self):
+                await self._block_until_cancelled()
+
+            async def refresh_cookies_from_qr_login(self, **_kwargs):
+                await self._block_until_cancelled()
+
+        async def assert_disconnect_cancels_runtime(scenario_name, invoke_factory, *, patch_user_cookies=False):
+            with self.subTest(scenario=scenario_name):
+                fake_live = BlockingLive()
+                fake_request = DisconnectingRequest(fake_live.operation_started)
+                fake_db = mock.Mock()
+                fake_db.get_cookie_by_id.return_value = {"cookies_str": "demo-cookie"}
+                fake_db.add_risk_control_log.return_value = 123
+
+                patches = [
+                    mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-runtime-cancel-1"),
+                    mock.patch.object(reply_server, "db_manager", fake_db),
+                    mock.patch("XianyuAutoAsync.XianyuLive", return_value=fake_live),
+                    mock.patch.object(reply_server, "log_with_user"),
+                    mock.patch.object(reply_server, "logger"),
+                ]
+                if patch_user_cookies:
+                    patches.append(
+                        mock.patch.object(
+                            reply_server,
+                            "_get_user_cookies_map",
+                            return_value={"acc-runtime-cancel-1": "old-cookie"},
+                        )
+                    )
+
+                with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                    if patch_user_cookies:
+                        with patches[5]:
+                            with self.assertRaises(asyncio.CancelledError):
+                                await asyncio.wait_for(invoke_factory(fake_request), timeout=1.0)
+                    else:
+                        with self.assertRaises(asyncio.CancelledError):
+                            await asyncio.wait_for(invoke_factory(fake_request), timeout=1.0)
+
+                self.assertGreaterEqual(fake_request.disconnect_checks, 1)
+                self.assertTrue(fake_live.operation_cancelled)
+                fake_live.close_session.assert_awaited_once()
+
+        current_user = {"user_id": 1, "username": "admin"}
+
+        await assert_disconnect_cancels_runtime(
+            "all-items",
+            lambda http_request: reply_server.get_all_items_from_account(
+                {"account_id": "acc-runtime-cancel-1"},
+                current_user=current_user,
+                http_request=http_request,
+            ),
+        )
+        await assert_disconnect_cancels_runtime(
+            "page-items",
+            lambda http_request: reply_server.get_items_by_page(
+                {"account_id": "acc-runtime-cancel-1", "page_number": 1, "page_size": 20},
+                current_user=current_user,
+                http_request=http_request,
+            ),
+        )
+        await assert_disconnect_cancels_runtime(
+            "polish-items",
+            lambda http_request: reply_server.polish_account_items(
+                "acc-runtime-cancel-1",
+                current_user=current_user,
+                http_request=http_request,
+            ),
+        )
+        await assert_disconnect_cancels_runtime(
+            "qr-refresh",
+            lambda http_request: reply_server.refresh_cookies_from_qr_login(
+                {
+                    "qr_cookies": "unb=demo-user; cookie2=qr-cookie",
+                    "account_id": "acc-runtime-cancel-1",
+                },
+                current_user=current_user,
+                http_request=http_request,
+            ),
+            patch_user_cookies=True,
+        )
+
+    def test_normalize_item_sync_failure_message_masks_unknown_internal_errors(self):
+        self.assertEqual(
+            "获取商品信息失败，请稍后重试",
+            reply_server._normalize_item_sync_failure_message(
+                "missing canonical account_id for item sync",
+                default_message="获取商品信息失败，请稍后重试",
+            ),
+        )
+        self.assertEqual(
+            "当前有其他浏览器任务正在执行，请稍后再试",
+            reply_server._normalize_item_sync_failure_message(
+                "当前有其他浏览器任务正在执行，请稍后再试",
+                default_message="获取商品信息失败，请稍后重试",
+            ),
         )
 
 
@@ -3608,6 +7220,9 @@ class ReplyServerScheduledTaskLifecycleTest(_ReplyServerModuleBindingMixin, unit
 class ReplyServerRestartApplicationTest(_ReplyServerModuleBindingMixin, unittest.IsolatedAsyncioTestCase):
     async def test_restart_application_uses_hidden_helper_instead_of_spawning_second_start_process_immediately(self):
         scheduled = {}
+        original_task = getattr(reply_server.app.state, "delayed_restart_task", None)
+        reply_server.app.state.delayed_restart_task = None
+        self.addCleanup(setattr, reply_server.app.state, "delayed_restart_task", original_task)
 
         def fake_create_task(coro):
             scheduled["coro"] = coro
@@ -3646,6 +7261,23 @@ class ReplyServerRestartApplicationTest(_ReplyServerModuleBindingMixin, unittest
         self.assertNotIn("CREATE_NEW_CONSOLE", command[-1])
         self.assertEqual(kwargs.get("cwd"), "C:\\repo")
 
+    async def test_restart_application_returns_in_progress_when_delayed_restart_task_already_running(self):
+        existing_task = mock.Mock(spec=asyncio.Task)
+        existing_task.done.return_value = False
+        original_task = getattr(reply_server.app.state, "delayed_restart_task", None)
+        reply_server.app.state.delayed_restart_task = existing_task
+        self.addCleanup(setattr, reply_server.app.state, "delayed_restart_task", original_task)
+
+        with mock.patch.object(reply_server, "log_with_user"), \
+             mock.patch.object(reply_server.asyncio, "create_task") as create_task:
+            result = await reply_server.restart_application(
+                current_user={"user_id": 1, "username": "admin", "is_admin": True}
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual("应用重启已在进行中", result["message"])
+        create_task.assert_not_called()
+
     async def test_restart_application_rejects_admin_username_when_is_admin_snapshot_is_false(self):
         with mock.patch.object(reply_server, "log_with_user"), \
              mock.patch.object(reply_server.asyncio, "create_task") as create_task:
@@ -3657,6 +7289,25 @@ class ReplyServerRestartApplicationTest(_ReplyServerModuleBindingMixin, unittest
         self.assertEqual(403, raised.exception.status_code)
         self.assertEqual("只有管理员可以重启应用", raised.exception.detail)
         create_task.assert_not_called()
+
+    async def test_restart_application_surfaces_internal_failures_with_safe_message(self):
+        created_coroutines = []
+
+        def fail_create_task(coro):
+            created_coroutines.append(coro)
+            raise RuntimeError("restart exploded")
+
+        with mock.patch.object(reply_server, "log_with_user"), \
+             mock.patch.object(reply_server.asyncio, "create_task", side_effect=fail_create_task):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                await reply_server.restart_application(
+                    current_user={"user_id": 1, "username": "admin", "is_admin": True}
+                )
+
+        for coro in created_coroutines:
+            coro.close()
+        self.assertEqual(500, raised.exception.status_code)
+        self.assertEqual("重启应用失败，请稍后重试", raised.exception.detail)
 
 
 class ReplyServerFaceVerificationScreenshotAccessTest(_ReplyServerModuleBindingMixin, unittest.IsolatedAsyncioTestCase):
@@ -3785,6 +7436,54 @@ class ReplyServerFaceVerificationScreenshotAccessTest(_ReplyServerModuleBindingM
         fake_db.get_cookie_details.assert_not_called()
         delete_screenshots.assert_called_once_with("acc-1", current_user=current_user)
 
+    async def test_face_verification_screenshot_routes_surface_internal_failures_with_safe_messages(self):
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+        fake_db = mock.Mock()
+        fake_db.get_cookie_details.return_value = {"user_id": 7}
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(
+                 reply_server,
+                 "_build_face_verification_screenshot_info",
+                 side_effect=RuntimeError("face screenshot path exploded"),
+             ), \
+             mock.patch.object(
+                 reply_server,
+                 "_get_latest_password_login_session_for_account",
+                 return_value={
+                     "status": "verification_required",
+                     "screenshot_path": "C:/tmp/face_verify_acc-1_latest.jpg",
+                 },
+             ), \
+             mock.patch.object(reply_server.os.path, "exists", return_value=True), \
+             mock.patch.object(reply_server, "log_with_user"):
+            get_result = await reply_server.get_account_face_verification_screenshot(
+                "acc-1",
+                current_user=current_user,
+            )
+
+        self.assertEqual(
+            {"success": False, "message": "获取验证截图失败，请稍后重试"},
+            get_result,
+        )
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(
+                 reply_server,
+                 "_delete_account_face_verification_screenshots",
+                 side_effect=RuntimeError("face screenshot delete exploded"),
+             ), \
+             mock.patch.object(reply_server, "log_with_user"):
+            delete_result = await reply_server.delete_account_face_verification_screenshot(
+                "acc-1",
+                current_user=current_user,
+            )
+
+        self.assertEqual(
+            {"success": False, "message": "删除验证截图失败，请稍后重试"},
+            delete_result,
+        )
+
 
 class ReplyServerDashboardSalesScopeRuntimeTest(_ReplyServerModuleBindingMixin, unittest.IsolatedAsyncioTestCase):
     async def test_sales_routes_use_module_bound_database_for_current_user_scope(self):
@@ -3851,6 +7550,34 @@ class ReplyServerDashboardSalesScopeRuntimeTest(_ReplyServerModuleBindingMixin, 
         self.assertEqual(["acc-demo-1", "utc-start:2026-05-01", "utc-end:2026-05-31"], sales_params)
         self.assertIn("FROM orders WHERE", summary_query)
         self.assertEqual(["utc-start:2026-05-01", "acc-demo-1"], summary_params)
+
+    async def test_sales_routes_surface_internal_failures_with_safe_messages(self):
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        with mock.patch.object(reply_server.db_manager, "get_account_ids", side_effect=RuntimeError("sales account lookup exploded")):
+            sales_result = await reply_server.get_sales_data(
+                start_date="2026-05-01",
+                end_date="2026-05-31",
+                user_info=current_user,
+            )
+            summary_result = await reply_server.get_sales_summary(user_info=current_user)
+
+        self.assertEqual(
+            {
+                "success": False,
+                "data": None,
+                "message": "获取销售额数据失败，请稍后重试",
+            },
+            sales_result,
+        )
+        self.assertEqual(
+            {
+                "success": False,
+                "data": None,
+                "message": "获取销售额摘要失败，请稍后重试",
+            },
+            summary_result,
+        )
 
 
 class ReplyServerQrLoginSessionIsolationTest(_ReplyServerModuleBindingMixin, unittest.IsolatedAsyncioTestCase):
@@ -4018,6 +7745,77 @@ class ReplyServerQrLoginSessionIsolationTest(_ReplyServerModuleBindingMixin, uni
         self.assertEqual("cancelled", updated.status)
         delete_placeholder.assert_called_once_with("acc-cancel-1", user_id=7)
 
+    async def test_cancel_qr_login_session_endpoint_releases_assets_placeholder_and_tracking(self):
+        from utils.qr_login import QRLoginSession
+
+        session = QRLoginSession("qr-cancel-endpoint-1", user_id=7, account_id="acc-qr-cancel")
+        session.status = "verification_required"
+        session.verification_url = "https://example.invalid/verify"
+        session.browser_alive = True
+        reply_server.qr_login_manager.sessions[session.session_id] = session
+        reply_server.qr_check_processed[session.session_id] = {
+            "processed": False,
+            "processing": True,
+            "timestamp": 123.0,
+        }
+        reply_server.qr_check_locks[session.session_id] = asyncio.Lock()
+        self.addCleanup(reply_server.qr_check_processed.clear)
+        self.addCleanup(reply_server.qr_check_locks.clear)
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "delete_pending_cookie_placeholder",
+            return_value=True,
+            create=True,
+        ) as delete_placeholder, mock.patch.object(
+            reply_server.qr_login_manager,
+            "release_session_assets",
+        ) as release_assets, mock.patch.object(
+            reply_server,
+            "log_with_user",
+        ):
+            response = await reply_server.cancel_qr_login_session(
+                session.session_id,
+                current_user={"user_id": 7, "username": "owner"},
+            )
+
+        self.assertTrue(response["success"])
+        self.assertEqual("cancelled", response["status"])
+        self.assertNotIn(session.session_id, reply_server.qr_login_manager.sessions)
+        self.assertNotIn(session.session_id, reply_server.qr_check_processed)
+        self.assertNotIn(session.session_id, reply_server.qr_check_locks)
+        delete_placeholder.assert_called_once_with("acc-qr-cancel", user_id=7)
+        release_assets.assert_called_once_with(
+            session.session_id,
+            reason="qr_login_cancelled_by_user",
+        )
+
+    async def test_cancel_qr_login_session_endpoint_rejects_foreign_session(self):
+        from utils.qr_login import QRLoginSession
+
+        session = QRLoginSession("qr-cancel-foreign-1", user_id=8, account_id="acc-qr-foreign")
+        reply_server.qr_login_manager.sessions[session.session_id] = session
+
+        with mock.patch.object(
+            reply_server.qr_login_manager,
+            "release_session_assets",
+        ) as release_assets, mock.patch.object(
+            reply_server.db_manager,
+            "delete_pending_cookie_placeholder",
+            return_value=True,
+            create=True,
+        ) as delete_placeholder:
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                await reply_server.cancel_qr_login_session(
+                    session.session_id,
+                    current_user={"user_id": 7, "username": "other"},
+                )
+
+        self.assertEqual(403, raised.exception.status_code)
+        self.assertIn(session.session_id, reply_server.qr_login_manager.sessions)
+        release_assets.assert_not_called()
+        delete_placeholder.assert_not_called()
+
     async def test_cleanup_expired_sessions_releases_pending_placeholder_before_drop(self):
         from utils.qr_login import QRLoginSession
 
@@ -4063,6 +7861,84 @@ class ReplyServerQrLoginSessionIsolationTest(_ReplyServerModuleBindingMixin, uni
         self.assertEqual(["qr-old-1"], replaced_session_ids)
         self.assertNotIn(session.session_id, reply_server.qr_login_manager.sessions)
         delete_placeholder.assert_called_once_with("acc-replaced-1", user_id=9)
+
+    async def test_invalidate_account_sessions_keeps_success_session_until_handoff_completes(self):
+        from utils.qr_login import QRLoginSession
+
+        session = QRLoginSession("qr-success-pending-handoff-1", user_id=9, account_id="acc-replaced-keep-1")
+        session.status = "success"
+        session.handoff_status = "processing"
+        reply_server.qr_login_manager.sessions[session.session_id] = session
+
+        with mock.patch.object(
+            reply_server.qr_login_manager,
+            "_cleanup_session_assets",
+        ) as cleanup_assets, mock.patch.object(
+            reply_server.db_manager,
+            "delete_pending_cookie_placeholder",
+            return_value=True,
+            create=True,
+        ) as delete_placeholder:
+            replaced_session_ids = reply_server.qr_login_manager.invalidate_account_sessions(
+                account_id="acc-replaced-keep-1",
+                user_id=9,
+                reason="unit-test-keep-success",
+            )
+
+        self.assertEqual([], replaced_session_ids)
+        self.assertIn(session.session_id, reply_server.qr_login_manager.sessions)
+        cleanup_assets.assert_not_called()
+        delete_placeholder.assert_not_called()
+
+    async def test_generate_qr_code_keeps_success_session_pending_handoff_for_same_account(self):
+        from utils.qr_login import QRLoginSession
+
+        current_user = {
+            "user_id": 1,
+            "username": "admin",
+            "is_admin": True,
+        }
+        session = QRLoginSession("qr-success-pending-handoff-generate", user_id=1, account_id="acc-generate-keep-1")
+        session.status = "success"
+        session.handoff_status = "failed"
+        reply_server.qr_login_manager.sessions[session.session_id] = session
+
+        with mock.patch.object(
+            reply_server.qr_login_manager,
+            "cleanup_expired_sessions",
+        ), mock.patch.object(
+            reply_server.db_manager,
+            "get_cookie_binding_info",
+            return_value={"account_id": "acc-generate-keep-1", "user_id": 1, "bind_status": "pending_bind"},
+        ), mock.patch.object(
+            reply_server.db_manager,
+            "assert_cookie_belongs_to_user",
+            return_value=True,
+        ), mock.patch.object(
+            reply_server.qr_login_manager,
+            "generate_qr_code",
+            new=mock.AsyncMock(
+                return_value={
+                    "success": True,
+                    "session_id": "new-qr-session-keep",
+                    "qr_code_url": "data:image/png;base64,ZmFrZQ==",
+                }
+            ),
+        ), mock.patch.object(
+            reply_server,
+            "clear_qr_check_records_for_sessions",
+        ) as clear_qr_records, mock.patch.object(
+            reply_server,
+            "log_with_user",
+        ):
+            response = await reply_server.generate_qr_code(
+                request=reply_server.QRLoginGenerateRequest(account_id="acc-generate-keep-1"),
+                current_user=current_user,
+            )
+
+        self.assertTrue(response["success"])
+        self.assertIn(session.session_id, reply_server.qr_login_manager.sessions)
+        clear_qr_records.assert_not_called()
 
 
 class ReplyServerVerificationMaterialStateTest(_ReplyServerModuleBindingMixin, unittest.TestCase):
@@ -4429,6 +8305,81 @@ class ReplyServerPasswordLoginStabilizationTest(_ReplyServerModuleBindingMixin, 
         slider_instance._stabilize_logged_in_context_cookies.assert_not_called()
         self.assertTrue(meta["token_prewarmed"])
         self.assertFalse(meta["real_cookie_refreshed"])
+
+    def test_password_login_http_prewarm_closes_temp_session_after_preflight(self):
+        import XianyuAutoAsync
+        import utils.xianyu_slider_stealth as slider_stealth
+
+        class FakeLive:
+            def __init__(self, cookies_str, account_id, user_id, register_instance=False):
+                self.cookies_str = cookies_str
+                self.account_id = account_id
+                self.user_id = user_id
+                self.register_instance = register_instance
+                self.current_token = None
+
+            async def preflight_token_after_password_login(self):
+                return "prewarmed-token"
+
+        def fake_run_coroutine_threadsafe(coro, loop):
+            coro.close()
+            return object()
+
+        slider_instance = SimpleNamespace(
+            context=object(),
+            page=object(),
+            _stabilize_logged_in_context_cookies=mock.Mock(),
+        )
+
+        with mock.patch.object(
+            XianyuAutoAsync,
+            "PROTECTED_SESSION_COOKIE_FIELDS",
+            ("unb", "sgcookie", "cookie2", "_m_h5_tk", "_m_h5_tk_enc", "t", "cna"),
+        ), mock.patch.object(
+            XianyuAutoAsync,
+            "XianyuLive",
+            FakeLive,
+        ), mock.patch.object(
+            slider_stealth,
+            "probe_cookie_verification_from_cookie",
+            return_value={
+                "status": "cookie_valid",
+                "session_cookies": {
+                    "unb": "u1",
+                    "sgcookie": "sg1",
+                    "cookie2": "c2",
+                    "_m_h5_tk": "tk_1",
+                    "_m_h5_tk_enc": "enc1",
+                    "t": "t1",
+                    "cna": "cna1",
+                },
+            },
+        ), mock.patch.object(
+            reply_server.asyncio,
+            "run_coroutine_threadsafe",
+            side_effect=fake_run_coroutine_threadsafe,
+        ), mock.patch.object(
+            reply_server,
+            "_wait_threadsafe_future_result",
+            return_value="prewarmed-token",
+        ), mock.patch.object(
+            reply_server,
+            "_close_temporary_xianyu_session_sync",
+        ) as close_mock, mock.patch.object(reply_server, "log_with_user"):
+            _, meta = reply_server._stabilize_password_login_cookies_after_login(
+                cookies_str="unb=u1; sgcookie=sg1; cookie2=c2; _m_h5_tk=tk_1; _m_h5_tk_enc=enc1; t=t1; cna=cna1",
+                account_id="1",
+                user_id=1,
+                current_user={"user_id": 1},
+                slider_instance=slider_instance,
+                proxy_config=None,
+                request_loop=mock.Mock(),
+                preflight_timeout=10.0,
+            )
+
+        self.assertTrue(meta["token_prewarmed"])
+        close_mock.assert_called_once()
+        self.assertEqual("密码登录Token预检", close_mock.call_args.kwargs["scene"])
 
     def test_password_login_http_success_skips_runtime_stabilization_when_only_havana_missing(self):
         import XianyuAutoAsync
@@ -5699,6 +9650,118 @@ class ReplyServerRiskControlAdminScopeRuntimeTest(_ReplyServerModuleBindingMixin
         self.assertEqual("删除风控日志失败，请稍后重试", delete_raised.exception.detail)
         delete_db.delete_risk_control_log.assert_called_once_with(11)
 
+    def test_risk_control_routes_clamp_limit_and_offset_bounds(self):
+        admin_user = {"user_id": 1, "username": "admin", "is_admin": True}
+
+        legacy_logs_db = mock.Mock()
+        legacy_logs_db.get_risk_control_logs.return_value = []
+        legacy_logs_db.get_risk_control_logs_count.return_value = 0
+
+        with mock.patch.object(reply_server, "db_manager", legacy_logs_db), mock.patch.object(
+            reply_server, "log_with_user"
+        ):
+            legacy_result = asyncio.run(
+                reply_server.get_risk_control_logs(
+                    limit=99999,
+                    offset=-25,
+                    admin_user=admin_user,
+                )
+            )
+
+        self.assertTrue(legacy_result["success"])
+        self.assertEqual(500, legacy_result["limit"])
+        self.assertEqual(0, legacy_result["offset"])
+        legacy_logs_db.get_risk_control_logs.assert_called_once_with(
+            account_id=None,
+            processing_status=None,
+            event_type=None,
+            trigger_scene=None,
+            session_id=None,
+            result_code=None,
+            date_from=None,
+            date_to=None,
+            limit=500,
+            offset=0,
+        )
+
+        admin_logs_db = mock.Mock()
+        admin_logs_db.get_risk_control_logs.return_value = []
+        admin_logs_db.get_risk_control_logs_count.return_value = 0
+
+        with mock.patch.object(reply_server, "db_manager", admin_logs_db), mock.patch.object(
+            reply_server, "log_with_user"
+        ):
+            admin_result = asyncio.run(
+                reply_server.get_admin_risk_control_logs(
+                    account_id="acc-demo-1",
+                    limit=0,
+                    offset=-10,
+                    admin_user=admin_user,
+                )
+            )
+
+        self.assertTrue(admin_result["success"])
+        self.assertEqual(1, admin_result["limit"])
+        self.assertEqual(0, admin_result["offset"])
+        admin_logs_db.get_risk_control_logs.assert_called_once_with(
+            account_id="acc-demo-1",
+            processing_status=None,
+            event_type=None,
+            trigger_scene=None,
+            session_id=None,
+            result_code=None,
+            date_from=None,
+            date_to=None,
+            limit=1,
+            offset=0,
+        )
+
+    def test_risk_control_routes_share_query_helper(self):
+        admin_user = {"user_id": 1, "username": "admin", "is_admin": True}
+        helper_calls = []
+
+        def fake_query_helper(**kwargs):
+            helper_calls.append(dict(kwargs))
+            return {
+                "success": True,
+                "data": [],
+                "total": 0,
+                "limit": kwargs["limit"],
+                "offset": kwargs["offset"],
+            }
+
+        with mock.patch.object(
+            reply_server,
+            "_query_risk_control_logs_response",
+            side_effect=fake_query_helper,
+        ):
+            legacy_result = asyncio.run(
+                reply_server.get_risk_control_logs(
+                    account_id="acc-helper-1",
+                    limit=20,
+                    offset=3,
+                    admin_user=admin_user,
+                )
+            )
+            admin_result = asyncio.run(
+                reply_server.get_admin_risk_control_logs(
+                    account_id="acc-helper-2",
+                    limit=40,
+                    offset=7,
+                    admin_user=admin_user,
+                )
+            )
+
+        self.assertTrue(legacy_result["success"])
+        self.assertTrue(admin_result["success"])
+        self.assertEqual(2, len(helper_calls))
+        self.assertEqual("acc-helper-1", helper_calls[0]["account_id"])
+        self.assertEqual(20, helper_calls[0]["limit"])
+        self.assertEqual(3, helper_calls[0]["offset"])
+        self.assertEqual("acc-helper-2", helper_calls[1]["account_id"])
+        self.assertEqual(40, helper_calls[1]["limit"])
+        self.assertEqual(7, helper_calls[1]["offset"])
+
     def test_admin_accounts_fallbacks_to_database_status_when_cookie_manager_unready(self):
         with mock.patch.object(reply_server.cookie_manager, "manager", None), mock.patch.object(
             reply_server.db_manager,
@@ -5802,7 +9865,7 @@ class ReplyServerRiskControlAdminScopeRuntimeTest(_ReplyServerModuleBindingMixin
                 )
 
         self.assertEqual(500, raised.exception.status_code)
-        self.assertEqual("admin accounts exploded", raised.exception.detail)
+        self.assertEqual("获取Cookie信息失败，请稍后重试", raised.exception.detail)
         failing_db.get_all_users.assert_called_once_with()
 
     def test_admin_accounts_route_degrades_single_account_runtime_failures_instead_of_500(self):
@@ -5900,6 +9963,78 @@ class ReplyServerLogManagementRuntimeTest(_ReplyServerModuleBindingMixin, unitte
         fake_collector.get_stats.assert_called_once_with()
         fake_collector.clear_logs.assert_called_once_with()
 
+    def test_log_stats_and_clear_raise_http_500_on_collector_failure(self):
+        admin_user = {"user_id": 1, "username": "admin", "is_admin": True}
+        fake_collector = mock.Mock()
+        fake_collector.get_stats.side_effect = RuntimeError("stats exploded")
+        fake_collector.clear_logs.side_effect = RuntimeError("clear exploded")
+
+        async def invoke_stats():
+            return await reply_server.get_log_stats(admin_user=admin_user)
+
+        async def invoke_clear():
+            return await reply_server.clear_logs(admin_user=admin_user)
+
+        with mock.patch.object(reply_server, "get_file_log_collector", return_value=fake_collector), \
+             mock.patch.object(reply_server, "log_with_user"):
+            with self.assertRaises(reply_server.HTTPException) as stats_raised:
+                asyncio.run(invoke_stats())
+            with self.assertRaises(reply_server.HTTPException) as clear_raised:
+                asyncio.run(invoke_clear())
+
+        self.assertEqual(500, stats_raised.exception.status_code)
+        self.assertEqual("获取日志统计失败，请稍后重试", stats_raised.exception.detail)
+        self.assertEqual(500, clear_raised.exception.status_code)
+        self.assertEqual("清空日志失败，请稍后重试", clear_raised.exception.detail)
+
+    def test_get_logs_raises_http_500_on_collector_failure(self):
+        admin_user = {"user_id": 1, "username": "admin", "is_admin": True}
+        fake_collector = mock.Mock()
+        fake_collector.get_logs.side_effect = RuntimeError("logs exploded")
+
+        async def invoke_logs():
+            return await reply_server.get_logs(
+                lines=5,
+                level="info",
+                source="worker",
+                admin_user=admin_user,
+            )
+
+        with mock.patch.object(reply_server, "get_file_log_collector", return_value=fake_collector), \
+             mock.patch.object(reply_server, "log_with_user"):
+            with self.assertRaises(reply_server.HTTPException) as logs_raised:
+                asyncio.run(invoke_logs())
+
+        self.assertEqual(500, logs_raised.exception.status_code)
+        self.assertEqual("获取日志失败，请稍后重试", logs_raised.exception.detail)
+
+    def test_get_logs_clamps_requested_lines_to_supported_bounds(self):
+        admin_user = {"user_id": 1, "username": "admin", "is_admin": True}
+        fake_collector = mock.Mock()
+        fake_collector.get_logs.return_value = ["line-1"]
+
+        async def invoke_logs(lines):
+            return await reply_server.get_logs(
+                lines=lines,
+                level="info",
+                source="worker",
+                admin_user=admin_user,
+            )
+
+        with mock.patch.object(reply_server, "get_file_log_collector", return_value=fake_collector), \
+             mock.patch.object(reply_server, "log_with_user"):
+            large_result = asyncio.run(invoke_logs(999999))
+            small_result = asyncio.run(invoke_logs(0))
+
+        self.assertEqual({"success": True, "logs": ["line-1"]}, large_result)
+        self.assertEqual({"success": True, "logs": ["line-1"]}, small_result)
+        fake_collector.get_logs.assert_has_calls(
+            [
+                mock.call(lines=5000, level_filter="info", source_filter="worker"),
+                mock.call(lines=1, level_filter="info", source_filter="worker"),
+            ]
+        )
+
     def test_system_logs_returns_empty_success_state_when_no_log_files_exist(self):
         with mock.patch.object(
             reply_server,
@@ -5941,8 +10076,60 @@ class ReplyServerLogManagementRuntimeTest(_ReplyServerModuleBindingMixin, unitte
 
         self.assertFalse(result["success"])
         self.assertEqual([], result["logs"])
-        self.assertIn("读取日志文件失败", result["message"])
-        self.assertIn("boom", result["message"])
+        self.assertEqual("读取日志文件失败，请稍后重试", result["message"])
+
+    def test_system_logs_preserve_failure_payload_shape_when_top_level_collection_fails(self):
+        with mock.patch.object(
+            reply_server,
+            "_collect_admin_log_file_paths",
+            side_effect=RuntimeError("collect exploded"),
+        ), mock.patch.object(reply_server, "log_with_user"):
+            result = reply_server.get_system_logs(
+                admin_user={"user_id": 1, "username": "admin", "is_admin": True}
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "logs": [],
+                "message": "获取系统日志失败，请稍后重试",
+                "success": False,
+            },
+        )
+
+    def test_system_logs_clamps_requested_lines_to_supported_bounds(self):
+        log_path = str(REPO_ROOT / "logs" / "xianyu_demo.log")
+        fake_lines = [f"line-{idx}\n" for idx in range(6000)]
+        fake_file = mock.mock_open(read_data="".join(fake_lines))
+
+        with mock.patch.object(
+            reply_server,
+            "_collect_admin_log_file_paths",
+            return_value=[log_path],
+        ), mock.patch(
+            "os.path.getmtime",
+            return_value=123.0,
+        ), mock.patch(
+            "builtins.open",
+            fake_file,
+        ), mock.patch.object(reply_server, "log_with_user"):
+            capped_result = reply_server.get_system_logs(
+                lines=999999,
+                admin_user={"user_id": 1, "username": "admin", "is_admin": True},
+            )
+            minimum_result = reply_server.get_system_logs(
+                lines=-10,
+                admin_user={"user_id": 1, "username": "admin", "is_admin": True},
+            )
+
+        self.assertTrue(capped_result["success"])
+        self.assertEqual(5000, capped_result["total_lines"])
+        self.assertEqual("line-1000", capped_result["logs"][0])
+        self.assertEqual("line-5999", capped_result["logs"][-1])
+
+        self.assertTrue(minimum_result["success"])
+        self.assertEqual(1, minimum_result["total_lines"])
+        self.assertEqual(["line-5999"], minimum_result["logs"])
 
 
 class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, unittest.TestCase):
@@ -6047,6 +10234,38 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
         fake_db.get_auto_confirm.assert_called_once_with("acc-demo-1")
         fake_db.get_auto_comment.assert_called_once_with("acc-demo-1")
         fake_db.get_cookie_list_metadata.assert_called_once_with("acc-demo-1")
+
+    def test_account_details_list_route_keeps_main_payload_when_runtime_snapshot_fails(self):
+        fake_db = mock.Mock()
+        fake_db.get_account_ids.return_value = ["acc-demo-1"]
+        fake_db.get_all_cookies.return_value = {"acc-demo-1": "cookie-value"}
+        fake_db.get_cookie_status.return_value = True
+        fake_db.get_auto_confirm.return_value = True
+        fake_db.get_auto_comment.return_value = False
+        fake_db.get_cookie_list_metadata.return_value = {
+            "remark": "主账号",
+            "username": "seller-demo",
+            "has_password": True,
+            "pause_duration": 17,
+        }
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        with mock.patch.object(reply_server.cookie_manager, "manager", None), \
+             mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(
+                 reply_server,
+                 "_build_live_runtime_status",
+                 new=mock.AsyncMock(side_effect=RuntimeError("runtime status exploded")),
+             ), \
+             mock.patch.object(reply_server, "log_with_user"):
+            result = asyncio.run(reply_server.get_cookies_details(current_user=current_user))
+
+        self.assertEqual(1, len(result))
+        self.assertEqual("acc-demo-1", result[0]["account_id"])
+        self.assertEqual("seller-demo", result[0]["username"])
+        self.assertEqual(reply_server.mask_cookie_value("cookie-value"), result[0]["value"])
+        self.assertIsNone(result[0]["runtime_status"])
+        self.assertEqual(result[0]["runtime_status_error"], "获取账号运行态失败，请稍后重试")
 
     def test_account_details_list_route_skips_runtime_snapshot_when_disabled_for_account_filters(self):
         fake_db = mock.Mock()
@@ -6236,6 +10455,37 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
         self.assertNotIn("runtime_status", result)
         fake_db.get_cookie_details.assert_called_once_with("acc-demo-1")
 
+    def test_single_account_detail_route_keeps_main_payload_when_runtime_snapshot_fails(self):
+        fake_db = mock.Mock()
+        fake_db.get_cookie_details.return_value = {
+            "account_id": "acc-demo-1",
+            "value": "cookie-value",
+            "username": "seller-demo",
+            "password": "pw-demo",
+        }
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-demo-1"), \
+             mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(
+                 reply_server,
+                 "_build_live_runtime_status",
+                 new=mock.AsyncMock(side_effect=RuntimeError("runtime status exploded")),
+             ):
+            result = asyncio.run(
+                reply_server.get_cookie_account_details(
+                    "acc-demo-1",
+                    include_secrets=True,
+                    current_user=current_user,
+                )
+            )
+
+        self.assertEqual("acc-demo-1", result["account_id"])
+        self.assertEqual("seller-demo", result["username"])
+        self.assertEqual("pw-demo", result["password"])
+        self.assertIsNone(result["runtime_status"])
+        self.assertEqual(result["runtime_status_error"], "获取账号运行态失败，请稍后重试")
+
     def test_account_settings_and_comment_template_routes_surface_database_failures_as_server_errors(self):
         broken_conn = mock.Mock()
         broken_conn.cursor.side_effect = sqlite3.OperationalError("account settings exploded")
@@ -6255,22 +10505,22 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
             assert_http_exception(
                 lambda: reply_server.get_auto_confirm("acc-demo-1", current_user=current_user),
                 500,
-                "account settings exploded",
+                "获取自动确认发货设置失败，请稍后重试",
             )
             assert_http_exception(
                 lambda: reply_server.get_auto_comment("acc-demo-1", current_user=current_user),
                 500,
-                "account settings exploded",
+                "获取自动好评设置失败，请稍后重试",
             )
             assert_http_exception(
                 lambda: reply_server.get_cookie_pause_duration("acc-demo-1", current_user=current_user),
                 500,
-                "account settings exploded",
+                "获取暂停时间失败，请稍后重试",
             )
             assert_http_exception(
                 lambda: reply_server.get_cookie_remark("acc-demo-1", current_user=current_user),
                 500,
-                "account settings exploded",
+                "获取账号备注失败，请稍后重试",
             )
             assert_http_exception(
                 lambda: reply_server.get_cookie_proxy_config(
@@ -6303,7 +10553,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                     current_user=current_user,
                 ),
                 500,
-                "account settings exploded",
+                "更新自动确认发货设置失败，请稍后重试",
             )
             assert_http_exception(
                 lambda: reply_server.update_auto_comment(
@@ -6312,7 +10562,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                     current_user=current_user,
                 ),
                 500,
-                "account settings exploded",
+                "更新自动好评设置失败，请稍后重试",
             )
             assert_http_exception(
                 lambda: reply_server.update_cookie_pause_duration(
@@ -6321,7 +10571,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                     current_user=current_user,
                 ),
                 500,
-                "account settings exploded",
+                "更新暂停时间失败，请稍后重试",
             )
             assert_http_exception(
                 lambda: reply_server.update_cookie_remark(
@@ -6330,12 +10580,12 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                     current_user=current_user,
                 ),
                 500,
-                "account settings exploded",
+                "更新账号备注失败，请稍后重试",
             )
             assert_http_exception(
                 lambda: reply_server.get_comment_templates("acc-demo-1", current_user=current_user),
                 500,
-                "account settings exploded",
+                "获取好评模板列表失败，请稍后重试",
             )
             assert_http_exception(
                 lambda: reply_server.add_comment_template(
@@ -6344,7 +10594,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                     current_user=current_user,
                 ),
                 500,
-                "account settings exploded",
+                "添加好评模板失败，请稍后重试",
             )
             assert_http_exception(
                 lambda: reply_server.update_comment_template(
@@ -6354,17 +10604,17 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                     current_user=current_user,
                 ),
                 500,
-                "account settings exploded",
+                "更新好评模板失败，请稍后重试",
             )
             assert_http_exception(
                 lambda: reply_server.delete_comment_template("acc-demo-1", 1, current_user=current_user),
                 500,
-                "account settings exploded",
+                "删除好评模板失败，请稍后重试",
             )
             assert_http_exception(
                 lambda: reply_server.activate_comment_template("acc-demo-1", 1, current_user=current_user),
                 500,
-                "account settings exploded",
+                "激活好评模板失败，请稍后重试",
             )
 
     def test_account_setting_routes_use_database_when_cookie_manager_unready(self):
@@ -6565,6 +10815,27 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
             result,
             {"msg": "status updated", "enabled": False, "runtime_synced": False},
         )
+        fake_db.save_cookie_status.assert_called_once_with("acc-demo-1", False)
+
+    def test_account_status_route_surfaces_database_failures_with_status_specific_message(self):
+        fake_db = mock.Mock()
+        fake_db.save_cookie_status.side_effect = RuntimeError("cookie status exploded")
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        with mock.patch.object(reply_server.cookie_manager, "manager", None), mock.patch.object(
+            reply_server, "db_manager", fake_db
+        ), mock.patch.object(
+            reply_server, "_ensure_account_access", return_value="acc-demo-1"
+        ):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                reply_server.update_cookie_status(
+                    "acc-demo-1",
+                    reply_server.CookieStatusIn(enabled=False),
+                    current_user=current_user,
+                )
+
+        self.assertEqual(500, raised.exception.status_code)
+        self.assertEqual("更新账号状态失败，请稍后重试", raised.exception.detail)
         fake_db.save_cookie_status.assert_called_once_with("acc-demo-1", False)
 
     def test_add_cookie_route_writes_database_when_cookie_manager_unready(self):
@@ -6862,6 +11133,59 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
         )
         delete_image.assert_called_once_with("/static/uploads/images/demo.png")
 
+    def test_update_keywords_with_item_id_treats_null_fields_as_blank_user_input_error(self):
+        fake_db = mock.Mock()
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), mock.patch.object(
+            reply_server, "_ensure_account_access", return_value="acc-demo-1"
+        ):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                reply_server.update_keywords_with_item_id(
+                    "acc-demo-1",
+                    reply_server.KeywordWithItemIdIn(
+                        keywords=[
+                            {"keyword": None, "reply": None, "item_id": None},
+                        ]
+                    ),
+                    current_user=current_user,
+                )
+
+        self.assertEqual(400, raised.exception.status_code)
+        self.assertEqual("关键词不能为空", raised.exception.detail)
+        fake_db.save_text_keywords_only.assert_not_called()
+
+    def test_image_keyword_batch_route_treats_null_json_fields_as_blank_user_input_error(self):
+        fake_db = mock.Mock()
+        fake_db.get_cookie_details.return_value = {"user_id": 7}
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+        request = SimpleNamespace(
+            json=mock.AsyncMock(
+                return_value={
+                    "image_url": None,
+                    "keywords": [None],
+                    "item_ids": [None],
+                }
+            )
+        )
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), mock.patch.object(
+            reply_server, "_ensure_account_access", return_value="acc-demo-1"
+        ), mock.patch.object(reply_server, "log_with_user"):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                asyncio.run(
+                    reply_server.add_image_keyword_batch(
+                        "acc-demo-1",
+                        request,
+                        current_user=current_user,
+                    )
+                )
+
+        self.assertEqual(400, raised.exception.status_code)
+        self.assertEqual("图片URL不能为空", raised.exception.detail)
+        fake_db.check_keyword_duplicate.assert_not_called()
+        fake_db.save_image_keyword.assert_not_called()
+
     def test_add_image_keyword_duplicate_uses_reference_aware_image_cleanup(self):
         fake_db = mock.Mock()
         fake_db.get_cookie_details.return_value = {"user_id": 7}
@@ -7022,9 +11346,9 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                 )
 
         self.assertEqual(500, list_raised.exception.status_code)
-        self.assertEqual("服务器错误: ai preset list exploded", list_raised.exception.detail)
+        self.assertEqual("获取AI配置预设列表失败，请稍后重试", list_raised.exception.detail)
         self.assertEqual(500, save_raised.exception.status_code)
-        self.assertEqual("服务器错误: ai preset list exploded", save_raised.exception.detail)
+        self.assertEqual("保存AI配置预设失败，请稍后重试", save_raised.exception.detail)
         self.assertEqual([mock.call(7), mock.call(7)], preset_lookup_db.get_ai_config_presets.call_args_list)
         preset_lookup_db.save_ai_config_preset.assert_not_called()
 
@@ -7036,7 +11360,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                 reply_server.delete_ai_config_preset(11, current_user=current_user)
 
         self.assertEqual(500, delete_raised.exception.status_code)
-        self.assertEqual("服务器错误: ai preset delete exploded", delete_raised.exception.detail)
+        self.assertEqual("删除AI配置预设失败，请稍后重试", delete_raised.exception.detail)
         delete_db.delete_ai_config_preset.assert_called_once_with(7, 11)
 
     def test_ai_reply_settings_routes_stop_masking_database_failures_as_default_values_or_bad_request(self):
@@ -7053,7 +11377,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                 reply_server.get_all_ai_reply_settings(current_user=current_user)
 
         self.assertEqual(500, all_raised.exception.status_code)
-        self.assertEqual("服务器错误: ai settings exploded", all_raised.exception.detail)
+        self.assertEqual("获取AI回复设置列表失败，请稍后重试", all_raised.exception.detail)
 
         with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-demo-1"), mock.patch.object(
             reply_server.db_manager,
@@ -7064,7 +11388,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                 reply_server.get_ai_reply_settings("acc-demo-1", current_user=current_user)
 
         self.assertEqual(500, detail_raised.exception.status_code)
-        self.assertEqual("服务器错误: ai settings exploded", detail_raised.exception.detail)
+        self.assertEqual("获取AI回复设置失败，请稍后重试", detail_raised.exception.detail)
 
         with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-demo-1"), mock.patch.object(
             reply_server.cookie_manager,
@@ -7083,7 +11407,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                 )
 
         self.assertEqual(500, save_raised.exception.status_code)
-        self.assertEqual("服务器错误: ai settings exploded", save_raised.exception.detail)
+        self.assertEqual("更新AI回复设置失败，请稍后重试", save_raised.exception.detail)
 
     def test_ai_reply_update_and_test_routes_no_longer_require_runtime_manager(self):
         fake_db = mock.Mock()
@@ -7185,14 +11509,14 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                 reply_server.get_default_reply("acc-demo-1", current_user=current_user)
 
         self.assertEqual(500, detail_raised.exception.status_code)
-        self.assertEqual("default reply exploded", detail_raised.exception.detail)
+        self.assertEqual("获取默认回复失败，请稍后重试", detail_raised.exception.detail)
 
         with mock.patch.object(reply_server.db_manager, "get_all_default_replies", side_effect=sqlite3.OperationalError("default reply exploded")):
             with self.assertRaises(reply_server.HTTPException) as list_raised:
                 reply_server.get_all_default_replies(current_user=current_user)
 
         self.assertEqual(500, list_raised.exception.status_code)
-        self.assertEqual("default reply exploded", list_raised.exception.detail)
+        self.assertEqual("获取默认回复列表失败，请稍后重试", list_raised.exception.detail)
 
         with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-demo-1"), \
              mock.patch.object(reply_server.db_manager, "conn", broken_conn):
@@ -7200,7 +11524,27 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                 reply_server.delete_default_reply("acc-demo-1", current_user=current_user)
 
         self.assertEqual(500, delete_raised.exception.status_code)
-        self.assertEqual("default reply exploded", delete_raised.exception.detail)
+        self.assertEqual("删除默认回复失败，请稍后重试", delete_raised.exception.detail)
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-demo-1"), \
+             mock.patch.object(reply_server.db_manager, "conn", broken_conn):
+            with self.assertRaises(reply_server.HTTPException) as update_raised:
+                reply_server.update_default_reply(
+                    "acc-demo-1",
+                    reply_server.DefaultReplyIn(enabled=True, reply_content="您好", reply_once=False),
+                    current_user=current_user,
+                )
+
+        self.assertEqual(500, update_raised.exception.status_code)
+        self.assertEqual("更新默认回复失败，请稍后重试", update_raised.exception.detail)
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-demo-1"), \
+             mock.patch.object(reply_server.db_manager, "conn", broken_conn):
+            with self.assertRaises(reply_server.HTTPException) as clear_raised:
+                reply_server.clear_default_reply_records("acc-demo-1", current_user=current_user)
+
+        self.assertEqual(500, clear_raised.exception.status_code)
+        self.assertEqual("清空默认回复记录失败，请稍后重试", clear_raised.exception.detail)
 
     def test_card_routes_use_module_bound_database_for_crud_calls(self):
         fake_db = mock.Mock()
@@ -7411,7 +11755,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                 reply_server.get_cards(current_user=current_user)
 
         self.assertEqual(500, list_raised.exception.status_code)
-        self.assertEqual("card list exploded", list_raised.exception.detail)
+        self.assertEqual("获取卡券列表失败，请稍后重试", list_raised.exception.detail)
         list_db.get_all_cards.assert_called_once_with(7, summary_only=True)
 
         detail_db = mock.Mock()
@@ -7424,8 +11768,91 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                 reply_server.get_card(404, current_user=current_user)
 
         self.assertEqual(500, detail_raised.exception.status_code)
-        self.assertEqual("card detail exploded", detail_raised.exception.detail)
+        self.assertEqual("获取卡券详情失败，请稍后重试", detail_raised.exception.detail)
         detail_db.get_card_by_id.assert_called_once_with(404, 7)
+
+    def test_card_write_routes_surface_internal_failures_as_server_errors(self):
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        create_db = mock.Mock()
+        create_db.create_card.side_effect = RuntimeError("card create exploded")
+
+        with mock.patch.object(reply_server, "db_manager", create_db), mock.patch.object(
+            reply_server, "log_with_user"
+        ):
+            with self.assertRaises(reply_server.HTTPException) as create_raised:
+                reply_server.create_card(
+                    {"name": "Demo Card", "type": "text", "enabled": True},
+                    current_user=current_user,
+                )
+
+        self.assertEqual(500, create_raised.exception.status_code)
+        self.assertEqual("创建卡券失败，请稍后重试", create_raised.exception.detail)
+        create_db.create_card.assert_called_once()
+
+        update_db = mock.Mock()
+        update_db.update_card.side_effect = RuntimeError("card update exploded")
+
+        with mock.patch.object(reply_server, "db_manager", update_db):
+            with self.assertRaises(reply_server.HTTPException) as update_raised:
+                reply_server.update_card(
+                    7,
+                    {"name": "Demo Card", "type": "text"},
+                    current_user=current_user,
+                )
+
+        self.assertEqual(500, update_raised.exception.status_code)
+        self.assertEqual("更新卡券失败，请稍后重试", update_raised.exception.detail)
+        update_db.update_card.assert_called_once()
+
+        delete_db = mock.Mock()
+        delete_db.delete_card.side_effect = RuntimeError("card delete exploded")
+
+        with mock.patch.object(reply_server, "db_manager", delete_db):
+            with self.assertRaises(reply_server.HTTPException) as delete_raised:
+                reply_server.delete_card(7, current_user=current_user)
+
+        self.assertEqual(500, delete_raised.exception.status_code)
+        self.assertEqual("删除卡券失败，请稍后重试", delete_raised.exception.detail)
+        delete_db.delete_card.assert_called_once_with(7, 7)
+
+    def test_update_card_with_image_surfaces_internal_failures_as_server_errors(self):
+        fake_db = mock.Mock()
+        fake_db.get_card_by_id.return_value = {"id": 7, "image_url": "/static/uploads/images/old-demo.png"}
+        fake_db.update_card.side_effect = RuntimeError("card image update exploded")
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+        fake_image = SimpleNamespace(
+            content_type="image/png",
+            filename="demo.png",
+            read=mock.AsyncMock(return_value=b"image-bytes"),
+        )
+
+        async def invoke():
+            return await reply_server.update_card_with_image(
+                7,
+                image=fake_image,
+                name="Demo Card",
+                type="image",
+                description="",
+                delay_seconds=0,
+                enabled=True,
+                is_multi_spec=False,
+                spec_name="",
+                spec_value="",
+                spec_name_2="",
+                spec_value_2="",
+                current_user=current_user,
+            )
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(reply_server.image_manager, "save_image", return_value="/static/uploads/images/demo.png"), \
+             mock.patch.object(reply_server.image_manager, "delete_image") as delete_image:
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                asyncio.run(invoke())
+
+        self.assertEqual(500, raised.exception.status_code)
+        self.assertEqual("更新带图片的卡券失败，请稍后重试", raised.exception.detail)
+        delete_image.assert_called_once_with("/static/uploads/images/demo.png")
 
     def test_card_create_and_update_surface_duplicate_conflicts_as_bad_request(self):
         fake_db = mock.Mock()
@@ -7899,17 +12326,64 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                 reply_server.get_delivery_rule(71, current_user=current_user)
 
         self.assertEqual(list_raised.exception.status_code, 500)
-        self.assertEqual(list_raised.exception.detail, "delivery rules exploded")
+        self.assertEqual(list_raised.exception.detail, "获取发货规则列表失败，请稍后重试")
         self.assertEqual(stats_raised.exception.status_code, 500)
-        self.assertEqual(stats_raised.exception.detail, "delivery stats exploded")
+        self.assertEqual(stats_raised.exception.detail, "获取发货统计失败，请稍后重试")
         self.assertEqual(logs_raised.exception.status_code, 500)
-        self.assertEqual(logs_raised.exception.detail, "delivery logs exploded")
+        self.assertEqual(logs_raised.exception.detail, "获取最近发货日志失败，请稍后重试")
         self.assertEqual(detail_raised.exception.status_code, 500)
-        self.assertEqual(detail_raised.exception.detail, "delivery detail exploded")
+        self.assertEqual(detail_raised.exception.detail, "获取发货规则详情失败，请稍后重试")
         fake_db.get_all_delivery_rules.assert_called_once_with(7)
         fake_db.get_today_delivery_count.assert_called_once_with(7)
         fake_db.get_recent_delivery_logs.assert_called_once_with(user_id=7, limit=60)
         fake_db.get_delivery_rule_by_id.assert_called_once_with(71, 7)
+
+    def test_delivery_rule_write_routes_surface_internal_failures_as_server_errors(self):
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        create_db = mock.Mock()
+        create_db.get_card_by_id.return_value = {"id": 9, "name": "Demo Card"}
+        create_db.create_delivery_rule.side_effect = RuntimeError("delivery create exploded")
+
+        with mock.patch.object(reply_server, "db_manager", create_db):
+            with self.assertRaises(reply_server.HTTPException) as create_raised:
+                reply_server.create_delivery_rule(
+                    {"keyword": "demo", "card_id": 9},
+                    current_user=current_user,
+                )
+
+        self.assertEqual(500, create_raised.exception.status_code)
+        self.assertEqual("创建发货规则失败，请稍后重试", create_raised.exception.detail)
+        create_db.get_card_by_id.assert_called_once_with(9, 7)
+        create_db.create_delivery_rule.assert_called_once()
+
+        update_db = mock.Mock()
+        update_db.get_card_by_id.return_value = {"id": 9, "name": "Demo Card"}
+        update_db.update_delivery_rule.side_effect = RuntimeError("delivery update exploded")
+
+        with mock.patch.object(reply_server, "db_manager", update_db):
+            with self.assertRaises(reply_server.HTTPException) as update_raised:
+                reply_server.update_delivery_rule(
+                    71,
+                    {"keyword": "demo", "card_id": 9},
+                    current_user=current_user,
+                )
+
+        self.assertEqual(500, update_raised.exception.status_code)
+        self.assertEqual("更新发货规则失败，请稍后重试", update_raised.exception.detail)
+        update_db.get_card_by_id.assert_called_once_with(9, 7)
+        update_db.update_delivery_rule.assert_called_once()
+
+        delete_db = mock.Mock()
+        delete_db.delete_delivery_rule.side_effect = RuntimeError("delivery delete exploded")
+
+        with mock.patch.object(reply_server, "db_manager", delete_db):
+            with self.assertRaises(reply_server.HTTPException) as delete_raised:
+                reply_server.delete_delivery_rule(71, current_user=current_user)
+
+        self.assertEqual(500, delete_raised.exception.status_code)
+        self.assertEqual("删除发货规则失败，请稍后重试", delete_raised.exception.detail)
+        delete_db.delete_delivery_rule.assert_called_once_with(71, 7)
 
     def test_item_reply_routes_use_module_bound_database_and_surface_save_failures(self):
         fake_db = mock.Mock()
@@ -7969,6 +12443,106 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
             item_id="item-1",
             reply_content="updated reply",
         )
+
+    def test_item_reply_routes_surface_internal_failures_with_safe_messages(self):
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        list_db = mock.Mock()
+        list_db.get_account_ids.return_value = ["acc-demo-1"]
+        list_db.get_item_replays_by_account.side_effect = RuntimeError("item reply list exploded")
+        with mock.patch.object(reply_server, "db_manager", list_db):
+            with self.assertRaises(reply_server.HTTPException) as all_items_raised:
+                reply_server.get_all_items(current_user=current_user)
+
+        self.assertEqual(500, all_items_raised.exception.status_code)
+        self.assertEqual("获取商品回复信息失败，请稍后重试", all_items_raised.exception.detail)
+        list_db.get_account_ids.assert_called_once_with(7)
+        list_db.get_item_replays_by_account.assert_called_once_with("acc-demo-1")
+
+        scoped_list_db = mock.Mock()
+        scoped_list_db.get_item_replays_by_account.side_effect = RuntimeError("scoped item reply list exploded")
+        with mock.patch.object(reply_server, "db_manager", scoped_list_db), mock.patch.object(
+            reply_server,
+            "_ensure_account_access",
+            return_value="acc-demo-1",
+        ):
+            with self.assertRaises(reply_server.HTTPException) as scoped_items_raised:
+                reply_server.get_item_replays_by_account("acc-demo-1", current_user=current_user)
+
+        self.assertEqual(500, scoped_items_raised.exception.status_code)
+        self.assertEqual("获取商品信息失败，请稍后重试", scoped_items_raised.exception.detail)
+        scoped_list_db.get_item_replays_by_account.assert_called_once_with("acc-demo-1")
+
+        update_db = mock.Mock()
+        update_db.update_item_reply.side_effect = RuntimeError("item reply update exploded")
+        with mock.patch.object(reply_server, "db_manager", update_db), mock.patch.object(
+            reply_server,
+            "_ensure_account_access",
+            return_value="acc-demo-1",
+        ):
+            with self.assertRaises(reply_server.HTTPException) as update_raised:
+                reply_server.update_item_reply(
+                    "acc-demo-1",
+                    "item-1",
+                    {"reply_content": " updated reply "},
+                    current_user=current_user,
+                )
+
+        self.assertEqual(500, update_raised.exception.status_code)
+        self.assertEqual("更新商品回复失败，请稍后重试", update_raised.exception.detail)
+        update_db.update_item_reply.assert_called_once_with(
+            account_id="acc-demo-1",
+            item_id="item-1",
+            reply_content="updated reply",
+        )
+
+        delete_db = mock.Mock()
+        delete_db.delete_item_reply.side_effect = RuntimeError("item reply delete exploded")
+        with mock.patch.object(reply_server, "db_manager", delete_db), mock.patch.object(
+            reply_server,
+            "_ensure_account_access",
+            return_value="acc-demo-1",
+        ):
+            with self.assertRaises(reply_server.HTTPException) as delete_raised:
+                reply_server.delete_item_reply("acc-demo-1", "item-1", current_user=current_user)
+
+        self.assertEqual(500, delete_raised.exception.status_code)
+        self.assertEqual("删除商品回复失败，请稍后重试", delete_raised.exception.detail)
+        delete_db.delete_item_reply.assert_called_once_with("acc-demo-1", "item-1")
+
+        detail_db = mock.Mock()
+        detail_db.get_item_replays_by_account.side_effect = RuntimeError("item reply detail exploded")
+        with mock.patch.object(reply_server, "db_manager", detail_db), mock.patch.object(
+            reply_server,
+            "_ensure_account_access",
+            return_value="acc-demo-1",
+        ):
+            with self.assertRaises(reply_server.HTTPException) as detail_raised:
+                reply_server.get_item_reply("acc-demo-1", "item-1", current_user=current_user)
+
+        self.assertEqual(500, detail_raised.exception.status_code)
+        self.assertEqual("获取商品回复失败，请稍后重试", detail_raised.exception.detail)
+        detail_db.get_item_replays_by_account.assert_called_once_with("acc-demo-1")
+
+    def test_update_item_reply_treats_none_reply_content_as_blank_user_input_error(self):
+        fake_db = mock.Mock()
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), mock.patch.object(
+            reply_server,
+            "_ensure_account_access",
+            return_value="acc-demo-1",
+        ):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                reply_server.update_item_reply(
+                    "acc-demo-1",
+                    "item-1",
+                    {"reply_content": None},
+                    current_user={"user_id": 7, "username": "demo-user", "is_admin": False},
+                )
+
+        self.assertEqual(400, raised.exception.status_code)
+        self.assertEqual("回复内容不能为空", raised.exception.detail)
+        fake_db.update_item_reply.assert_not_called()
 
     def test_item_reply_all_accounts_route_sorts_rows_by_latest_update_globally(self):
         fake_db = mock.Mock()
@@ -8127,7 +12701,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                 items_endpoint(current_user=current_user)
 
         self.assertEqual(all_items_raised.exception.status_code, 500)
-        self.assertEqual(all_items_raised.exception.detail, "获取商品信息失败: item list exploded")
+        self.assertEqual(all_items_raised.exception.detail, "获取商品信息失败，请稍后重试")
         list_db.get_all_cookies.assert_called_once_with(7)
         list_db.get_items_by_account.assert_called_once_with("acc-demo-1")
 
@@ -8142,7 +12716,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                 reply_server.get_items_by_account("acc-demo-1", current_user=current_user)
 
         self.assertEqual(scoped_items_raised.exception.status_code, 500)
-        self.assertEqual(scoped_items_raised.exception.detail, "获取商品信息失败: scoped item list exploded")
+        self.assertEqual(scoped_items_raised.exception.detail, "获取商品信息失败，请稍后重试")
         scoped_list_db.get_items_by_account.assert_called_once_with("acc-demo-1")
 
         detail_db = mock.Mock()
@@ -8156,7 +12730,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                 reply_server.get_item_detail("acc-demo-1", "item-1", current_user=current_user)
 
         self.assertEqual(detail_raised.exception.status_code, 500)
-        self.assertEqual(detail_raised.exception.detail, "获取商品详情失败: item detail exploded")
+        self.assertEqual(detail_raised.exception.detail, "获取商品详情失败，请稍后重试")
         detail_db.get_item_info.assert_called_once_with("acc-demo-1", "item-1")
 
     def test_item_mutation_routes_stop_masking_database_failures_as_not_found_or_partial_success(self):
@@ -8187,7 +12761,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                     current_user=current_user,
                 ),
                 500,
-                "更新商品详情失败: item detail update exploded",
+                "更新商品详情失败，请稍后重试",
             )
             assert_http_exception(
                 lambda: reply_server.delete_item_info(
@@ -8196,7 +12770,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                     current_user=current_user,
                 ),
                 500,
-                "服务器错误: item delete exploded",
+                "删除商品信息失败，请稍后重试",
             )
             assert_http_exception(
                 lambda: reply_server.batch_delete_items(
@@ -8206,7 +12780,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                     current_user=current_user,
                 ),
                 500,
-                "服务器错误: item batch delete exploded",
+                "批量删除商品信息失败，请稍后重试",
             )
             assert_http_exception(
                 lambda: reply_server.update_item_multi_spec(
@@ -8216,7 +12790,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                     current_user=current_user,
                 ),
                 500,
-                "item multi spec exploded",
+                "更新商品多规格状态失败，请稍后重试",
             )
             assert_http_exception(
                 lambda: reply_server.update_item_multi_quantity_delivery(
@@ -8226,7 +12800,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                     current_user=current_user,
                 ),
                 500,
-                "item multi quantity exploded",
+                "更新商品多数量发货状态失败，请稍后重试",
             )
 
     def test_item_detail_update_route_preserves_not_found_http_exception(self):
@@ -8280,7 +12854,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                     get_all_items=mock.AsyncMock(side_effect=RuntimeError("sync all items exploded")),
                     close_session=mock.AsyncMock(),
                 ),
-                "获取商品信息失败: sync all items exploded",
+                "获取商品信息失败，请稍后重试",
             ),
             (
                 "page-items",
@@ -8289,7 +12863,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                     get_item_list_info=mock.AsyncMock(side_effect=RuntimeError("sync page items exploded")),
                     close_session=mock.AsyncMock(),
                 ),
-                "获取商品信息失败: sync page items exploded",
+                "获取商品信息失败，请稍后重试",
             ),
             (
                 "polish-items",
@@ -8298,7 +12872,7 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                     polish_all_items=mock.AsyncMock(side_effect=RuntimeError("polish items exploded")),
                     close_session=mock.AsyncMock(),
                 ),
-                "擦亮商品失败: polish items exploded",
+                "擦亮商品失败，请稍后重试",
             ),
         ]
 
@@ -8320,6 +12894,95 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
 
                 self.assertEqual(raised.exception.status_code, 500)
                 self.assertEqual(raised.exception.detail, expected_detail)
+                fake_db.get_cookie_by_id.assert_called_once_with("acc-demo-1")
+                fake_live.close_session.assert_awaited_once_with()
+
+    def test_item_sync_routes_preserve_managed_runtime_conflicts_as_http_409(self):
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        async def invoke_get_all_items():
+            return await reply_server.get_all_items_from_account(
+                {"account_id": "acc-demo-1"},
+                current_user=current_user,
+            )
+
+        async def invoke_get_items_by_page():
+            return await reply_server.get_items_by_page(
+                {"account_id": "acc-demo-1", "page_number": 1, "page_size": 20},
+                current_user=current_user,
+            )
+
+        async def invoke_polish_items():
+            return await reply_server.polish_account_items(
+                "acc-demo-1",
+                current_user=current_user,
+            )
+
+        scenarios = [
+            (
+                "all-items",
+                invoke_get_all_items,
+                SimpleNamespace(
+                    get_all_items=mock.AsyncMock(
+                        side_effect=RuntimeError("账号 acc-demo-1 当前有其他浏览器任务正在执行，请稍后再试")
+                    ),
+                    close_session=mock.AsyncMock(),
+                ),
+            ),
+            (
+                "page-items",
+                invoke_get_items_by_page,
+                SimpleNamespace(
+                    get_item_list_info=mock.AsyncMock(
+                        side_effect=RuntimeError("同账号已存在不兼容的 async runtime 正在使用中，请稍后重试")
+                    ),
+                    close_session=mock.AsyncMock(),
+                ),
+            ),
+            (
+                "polish-items",
+                invoke_polish_items,
+                SimpleNamespace(
+                    polish_all_items=mock.AsyncMock(
+                        side_effect=RuntimeError(
+                            "账号级 browser profile 已被其他 runtime 持有，拒绝并发复用: "
+                            "profile_dir=C:\\\\demo\\\\browser_data\\\\user_account_1, owner=manager=1, requested_owner=manager=2"
+                        )
+                    ),
+                    close_session=mock.AsyncMock(),
+                ),
+            ),
+        ]
+
+        for scenario_name, invoke, fake_live in scenarios:
+            with self.subTest(scenario=scenario_name):
+                fake_db = mock.Mock()
+                fake_db.get_cookie_by_id.return_value = {"cookies_str": "cookie-demo-1"}
+
+                with mock.patch.object(reply_server, "db_manager", fake_db), mock.patch.object(
+                    reply_server,
+                    "_ensure_account_access",
+                    return_value="acc-demo-1",
+                ), mock.patch.object(
+                    reply_server.account_browser_runtime_manager,
+                    "get_account_runtime_state_snapshot",
+                    return_value={
+                        "owner_mode": "async",
+                        "owner_mode_active_count": 1,
+                        "async_current_purpose": "item_search",
+                        "async_active_leases": 1,
+                        "sync_current_purpose": None,
+                        "sync_active_leases": 0,
+                    },
+                ), mock.patch(
+                    "XianyuAutoAsync.XianyuLive",
+                    return_value=fake_live,
+                ):
+                    with self.assertRaises(reply_server.HTTPException) as raised:
+                        asyncio.run(invoke())
+
+                self.assertEqual(raised.exception.status_code, 409)
+                self.assertIn("当前占用任务：商品搜索", raised.exception.detail)
                 fake_db.get_cookie_by_id.assert_called_once_with("acc-demo-1")
                 fake_live.close_session.assert_awaited_once_with()
 
@@ -8406,6 +13069,126 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
                 fake_db.get_cookie_by_id.assert_called_once_with("acc-demo-1")
                 fake_live.close_session.assert_awaited_once_with()
 
+    def test_get_all_items_from_account_does_not_report_success_when_first_page_sync_fails(self):
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        async def invoke():
+            return await reply_server.get_all_items_from_account(
+                {"account_id": "acc-demo-1"},
+                current_user=current_user,
+            )
+
+        fake_db = mock.Mock()
+        fake_db.get_cookie_by_id.return_value = {"cookies_str": "cookie-demo-1"}
+        fake_live = SimpleNamespace(
+            get_all_items=mock.AsyncMock(
+                return_value={
+                    "success": False,
+                    "error": "获取商品信息失败: FAIL_SYS_TOKEN_EXPIRED",
+                    "failed_page": 1,
+                    "total_pages": 0,
+                    "total_count": 0,
+                    "total_saved": 0,
+                    "items": [],
+                }
+            ),
+            close_session=mock.AsyncMock(),
+        )
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-demo-1"), \
+             mock.patch("XianyuAutoAsync.XianyuLive", return_value=fake_live):
+            result = asyncio.run(invoke())
+
+        self.assertEqual(
+            {
+                "success": False,
+                "message": "获取商品信息失败: FAIL_SYS_TOKEN_EXPIRED",
+            },
+            result,
+        )
+        fake_db.get_cookie_by_id.assert_called_once_with("acc-demo-1")
+        fake_live.close_session.assert_awaited_once_with()
+
+    def test_polish_account_items_masks_unknown_internal_failure_message(self):
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        async def invoke():
+            return await reply_server.polish_account_items(
+                "acc-demo-1",
+                current_user=current_user,
+            )
+
+        fake_db = mock.Mock()
+        fake_db.get_cookie_by_id.return_value = {"cookies_str": "cookie-demo-1"}
+        fake_live = SimpleNamespace(
+            polish_all_items=mock.AsyncMock(
+                return_value={
+                    "success": False,
+                    "message": "missing canonical account_id for item polish",
+                    "total": 0,
+                    "polished": 0,
+                    "failed": 0,
+                    "results": [],
+                }
+            ),
+            close_session=mock.AsyncMock(),
+        )
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-demo-1"), \
+             mock.patch("XianyuAutoAsync.XianyuLive", return_value=fake_live):
+            result = asyncio.run(invoke())
+
+        self.assertEqual(
+            {
+                "success": False,
+                "message": "擦亮商品失败，请稍后重试",
+                "total": 0,
+                "polished": 0,
+                "failed": 0,
+                "results": [],
+            },
+            result,
+        )
+        fake_db.get_cookie_by_id.assert_called_once_with("acc-demo-1")
+        fake_live.close_session.assert_awaited_once_with()
+
+    def test_polish_account_items_preserves_explicit_business_failure_message(self):
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        async def invoke():
+            return await reply_server.polish_account_items(
+                "acc-demo-1",
+                current_user=current_user,
+            )
+
+        fake_db = mock.Mock()
+        fake_db.get_cookie_by_id.return_value = {"cookies_str": "cookie-demo-1"}
+        fake_live = SimpleNamespace(
+            polish_all_items=mock.AsyncMock(
+                return_value={
+                    "success": False,
+                    "message": "没有在售商品需要擦亮",
+                    "total": 0,
+                    "polished": 0,
+                    "failed": 0,
+                    "results": [],
+                }
+            ),
+            close_session=mock.AsyncMock(),
+        )
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-demo-1"), \
+             mock.patch("XianyuAutoAsync.XianyuLive", return_value=fake_live):
+            result = asyncio.run(invoke())
+
+        self.assertEqual("没有在售商品需要擦亮", result["message"])
+        self.assertFalse(result["success"])
+        fake_db.get_cookie_by_id.assert_called_once_with("acc-demo-1")
+        fake_live.close_session.assert_awaited_once_with()
+
     def test_item_multi_spec_routes_preserve_not_found_http_exception(self):
         fake_db = mock.Mock()
         fake_db.update_item_multi_spec_status.return_value = False
@@ -8457,6 +13240,32 @@ class ReplyServerAccountListRuntimeFallbackTest(_ReplyServerModuleBindingMixin, 
         self.assertEqual(raised.exception.detail, "删除列表不能为空")
         fake_db.batch_delete_item_replies.assert_not_called()
 
+    def test_batch_delete_item_reply_surfaces_database_failures_with_safe_message(self):
+        fake_db = mock.Mock()
+        fake_db.batch_delete_item_replies.side_effect = RuntimeError("item reply batch delete exploded")
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), mock.patch.object(
+            reply_server,
+            "_ensure_account_access",
+            return_value="acc-demo-1",
+        ):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                asyncio.run(
+                    reply_server.batch_delete_item_reply(
+                        reply_server.ItemReplyBatchDeleteRequest(
+                            items=[reply_server.ItemReplyDeleteItem(account_id="acc-demo-1", item_id="item-1")]
+                        ),
+                        current_user=current_user,
+                    )
+                )
+
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertEqual(raised.exception.detail, "批量删除商品回复失败，请稍后重试")
+        fake_db.batch_delete_item_replies.assert_called_once_with(
+            [{"account_id": "acc-demo-1", "item_id": "item-1"}]
+        )
+
     def test_batch_delete_items_rejects_empty_requests_before_db_call(self):
         fake_db = mock.Mock()
         current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
@@ -8483,10 +13292,79 @@ class ReplyServerScheduledTaskSecurityRuntimeTest(_ReplyServerModuleBindingMixin
             "_ensure_account_access",
             side_effect=reply_server.HTTPException(status_code=403, detail="无权限操作该账号"),
         ), mock.patch.object(reply_server.logger, "warning"):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                asyncio.run(
+                    reply_server.create_scheduled_task(
+                        {
+                            "account_id": "acc-other-user-1",
+                            "run_hour": 8,
+                            "random_delay_max": 10,
+                            "enabled": True,
+                        },
+                        current_user=current_user,
+                    )
+                )
+
+        self.assertEqual(raised.exception.status_code, 403)
+        self.assertEqual(raised.exception.detail, "无权限操作该账号")
+        fake_db.get_scheduled_task_by_account.assert_not_called()
+        fake_db.create_scheduled_task.assert_not_called()
+
+    def test_create_scheduled_task_returns_http_400_for_invalid_run_hour(self):
+        fake_db = mock.Mock()
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        with mock.patch.object(reply_server, "db_manager", fake_db):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                asyncio.run(
+                    reply_server.create_scheduled_task(
+                        {
+                            "account_id": "acc-demo-1",
+                            "run_hour": 24,
+                            "random_delay_max": 10,
+                            "enabled": True,
+                        },
+                        current_user=current_user,
+                    )
+                )
+
+        self.assertEqual(400, raised.exception.status_code)
+        self.assertEqual("运行时间必须在 0-23 之间", raised.exception.detail)
+        fake_db.get_scheduled_task_by_account.assert_not_called()
+        fake_db.create_scheduled_task.assert_not_called()
+
+    def test_create_scheduled_task_returns_http_400_for_non_integer_run_hour(self):
+        fake_db = mock.Mock()
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        with mock.patch.object(reply_server, "db_manager", fake_db):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                asyncio.run(
+                    reply_server.create_scheduled_task(
+                        {
+                            "account_id": "acc-demo-1",
+                            "run_hour": "",
+                            "random_delay_max": 10,
+                            "enabled": True,
+                        },
+                        current_user=current_user,
+                    )
+                )
+
+        self.assertEqual(400, raised.exception.status_code)
+        self.assertEqual("运行时间必须是整数", raised.exception.detail)
+        fake_db.get_scheduled_task_by_account.assert_not_called()
+        fake_db.create_scheduled_task.assert_not_called()
+
+    def test_create_scheduled_task_treats_none_account_id_as_user_input_error(self):
+        fake_db = mock.Mock()
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        with mock.patch.object(reply_server, "db_manager", fake_db):
             result = asyncio.run(
                 reply_server.create_scheduled_task(
                     {
-                        "account_id": "acc-other-user-1",
+                        "account_id": None,
                         "run_hour": 8,
                         "random_delay_max": 10,
                         "enabled": True,
@@ -8495,7 +13373,7 @@ class ReplyServerScheduledTaskSecurityRuntimeTest(_ReplyServerModuleBindingMixin
                 )
             )
 
-        self.assertEqual({"success": False, "message": "无权限操作该账号"}, result)
+        self.assertEqual({"success": False, "message": "账号ID不能为空"}, result)
         fake_db.get_scheduled_task_by_account.assert_not_called()
         fake_db.create_scheduled_task.assert_not_called()
 
@@ -8558,6 +13436,193 @@ class ReplyServerScheduledTaskSecurityRuntimeTest(_ReplyServerModuleBindingMixin
             ]
         )
         fake_db.delete_scheduled_task.assert_called_once_with(61)
+
+    def test_update_scheduled_task_returns_http_400_for_invalid_random_delay(self):
+        task_record = {
+            "id": 61,
+            "user_id": 7,
+            "enabled": True,
+            "task_type": "item_polish",
+            "delay_minutes": 8,
+            "random_delay_max": 10,
+        }
+        fake_db = mock.Mock()
+        fake_db.get_scheduled_task.return_value = task_record
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        with mock.patch.object(reply_server, "db_manager", fake_db):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                asyncio.run(
+                    reply_server.update_scheduled_task(
+                        61,
+                        {"random_delay_max": -1},
+                        current_user=current_user,
+                    )
+                )
+
+        self.assertEqual(400, raised.exception.status_code)
+        self.assertEqual("随机分钟不能小于 0", raised.exception.detail)
+        fake_db.update_scheduled_task.assert_not_called()
+
+    def test_update_scheduled_task_returns_http_400_for_non_integer_random_delay(self):
+        task_record = {
+            "id": 61,
+            "user_id": 7,
+            "enabled": True,
+            "task_type": "item_polish",
+            "delay_minutes": 8,
+            "random_delay_max": 10,
+        }
+        fake_db = mock.Mock()
+        fake_db.get_scheduled_task.return_value = task_record
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        with mock.patch.object(reply_server, "db_manager", fake_db):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                asyncio.run(
+                    reply_server.update_scheduled_task(
+                        61,
+                        {"random_delay_max": ""},
+                        current_user=current_user,
+                    )
+                )
+
+        self.assertEqual(400, raised.exception.status_code)
+        self.assertEqual("随机分钟必须是整数", raised.exception.detail)
+        fake_db.update_scheduled_task.assert_not_called()
+
+    def test_update_scheduled_task_returns_http_400_for_invalid_interval_hours(self):
+        task_record = {
+            "id": 61,
+            "user_id": 7,
+            "enabled": True,
+            "task_type": "item_polish",
+            "delay_minutes": 8,
+            "random_delay_max": 10,
+        }
+        fake_db = mock.Mock()
+        fake_db.get_scheduled_task.return_value = task_record
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        with mock.patch.object(reply_server, "db_manager", fake_db):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                asyncio.run(
+                    reply_server.update_scheduled_task(
+                        61,
+                        {"interval_hours": "abc"},
+                        current_user=current_user,
+                    )
+                )
+
+        self.assertEqual(400, raised.exception.status_code)
+        self.assertEqual("间隔小时必须是整数", raised.exception.detail)
+        fake_db.update_scheduled_task.assert_not_called()
+
+    def test_update_scheduled_task_returns_http_400_for_non_positive_interval_hours(self):
+        task_record = {
+            "id": 61,
+            "user_id": 7,
+            "enabled": True,
+            "task_type": "item_polish",
+            "delay_minutes": 8,
+            "random_delay_max": 10,
+        }
+        fake_db = mock.Mock()
+        fake_db.get_scheduled_task.return_value = task_record
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        with mock.patch.object(reply_server, "db_manager", fake_db):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                asyncio.run(
+                    reply_server.update_scheduled_task(
+                        61,
+                        {"interval_hours": 0},
+                        current_user=current_user,
+                    )
+                )
+
+        self.assertEqual(400, raised.exception.status_code)
+        self.assertEqual("间隔小时必须大于 0", raised.exception.detail)
+        fake_db.update_scheduled_task.assert_not_called()
+
+    def test_scheduled_task_routes_raise_http_500_on_database_failures(self):
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+        task_record = {
+            "id": 61,
+            "user_id": 7,
+            "enabled": True,
+            "task_type": "item_polish",
+            "delay_minutes": 8,
+            "random_delay_max": 10,
+        }
+
+        async def invoke_create():
+            return await reply_server.create_scheduled_task(
+                {"account_id": "acc-demo-1", "run_hour": 8, "random_delay_max": 10, "enabled": True},
+                current_user=current_user,
+            )
+
+        async def invoke_update():
+            return await reply_server.update_scheduled_task(
+                61,
+                {"enabled": False},
+                current_user=current_user,
+            )
+
+        async def invoke_delete():
+            return await reply_server.delete_scheduled_task(
+                61,
+                current_user=current_user,
+            )
+
+        async def invoke_toggle():
+            return await reply_server.toggle_scheduled_task(
+                61,
+                current_user=current_user,
+            )
+
+        with mock.patch.object(reply_server, "db_manager", mock.Mock()) as fake_db, \
+             mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-demo-1"), \
+             mock.patch.object(reply_server.logger, "error"), \
+             mock.patch.object(reply_server.logger, "warning"):
+            fake_db.calculate_next_daily_run.return_value = "2026-06-02 08:00:00"
+            fake_db.get_scheduled_task_by_account.side_effect = RuntimeError("create exploded")
+            with self.assertRaises(reply_server.HTTPException) as create_raised:
+                asyncio.run(invoke_create())
+
+        self.assertEqual(500, create_raised.exception.status_code)
+        self.assertEqual("创建定时任务失败，请稍后重试", create_raised.exception.detail)
+
+        with mock.patch.object(reply_server, "db_manager", mock.Mock()) as fake_db, \
+             mock.patch.object(reply_server.logger, "error"):
+            fake_db.get_scheduled_task.return_value = task_record
+            fake_db.update_scheduled_task.side_effect = RuntimeError("update exploded")
+            with self.assertRaises(reply_server.HTTPException) as update_raised:
+                asyncio.run(invoke_update())
+
+        self.assertEqual(500, update_raised.exception.status_code)
+        self.assertEqual("更新定时任务失败，请稍后重试", update_raised.exception.detail)
+
+        with mock.patch.object(reply_server, "db_manager", mock.Mock()) as fake_db, \
+             mock.patch.object(reply_server.logger, "error"):
+            fake_db.get_scheduled_task.return_value = task_record
+            fake_db.delete_scheduled_task.side_effect = RuntimeError("delete exploded")
+            with self.assertRaises(reply_server.HTTPException) as delete_raised:
+                asyncio.run(invoke_delete())
+
+        self.assertEqual(500, delete_raised.exception.status_code)
+        self.assertEqual("删除定时任务失败，请稍后重试", delete_raised.exception.detail)
+
+        with mock.patch.object(reply_server, "db_manager", mock.Mock()) as fake_db, \
+             mock.patch.object(reply_server.logger, "error"):
+            fake_db.get_scheduled_task.return_value = task_record
+            fake_db.calculate_next_daily_run.return_value = "2026-06-02 08:00:00"
+            fake_db.update_scheduled_task.side_effect = RuntimeError("toggle exploded")
+            with self.assertRaises(reply_server.HTTPException) as toggle_raised:
+                asyncio.run(invoke_toggle())
+
+        self.assertEqual(500, toggle_raised.exception.status_code)
+        self.assertEqual("切换定时任务状态失败，请稍后重试", toggle_raised.exception.detail)
 
     def test_scheduled_task_checker_skips_cross_user_account_binding(self):
         fake_db = mock.Mock()
@@ -8627,9 +13692,8 @@ class ReplyServerScheduledTaskSecurityRuntimeTest(_ReplyServerModuleBindingMixin
         async def _stop_after_first_loop(_seconds):
             raise RuntimeError("stop-loop")
 
-        with mock.patch.object(reply_server, "db_manager", fake_db), mock.patch.object(
-            sys.modules["XianyuAutoAsync"],
-            "XianyuLive",
+        with mock.patch.object(reply_server, "db_manager", fake_db), mock.patch(
+            "XianyuAutoAsync.XianyuLive",
             return_value=fake_live,
         ) as xianyu_live_cls, mock.patch.object(
             reply_server.asyncio,
@@ -8651,8 +13715,52 @@ class ReplyServerScheduledTaskSecurityRuntimeTest(_ReplyServerModuleBindingMixin
         fake_db.calculate_next_daily_run.assert_called_once_with(8, 10, include_today=False)
         fake_db.update_task_run_result.assert_called_once_with(
             52,
-            {"success": False, "message": "执行异常: polish exploded"},
+            {"success": False, "message": "执行异常，请稍后重试"},
             "2026-05-27 08:00:00",
+        )
+
+    def test_scheduled_task_checker_masks_internal_exception_message_in_persisted_result(self):
+        fake_db = mock.Mock()
+        fake_db.get_due_tasks.return_value = [
+            {
+                "id": 53,
+                "name": "每日擦亮-acc-demo-2",
+                "account_id": "acc-demo-2",
+                "user_id": 7,
+                "task_type": "item_polish",
+                "delay_minutes": 8,
+                "random_delay_max": 10,
+            }
+        ]
+        fake_db.get_cookie_details.return_value = {
+            "account_id": "acc-demo-2",
+            "user_id": 7,
+            "cookies_str": "cookie-demo-2",
+        }
+        fake_db.calculate_next_daily_run.return_value = "2026-05-27 08:00:00"
+        fake_live = SimpleNamespace(
+            polish_all_items=mock.AsyncMock(side_effect=RuntimeError("sensitive scheduled failure detail")),
+            close_session=mock.AsyncMock(),
+        )
+
+        async def _stop_after_first_loop(_seconds):
+            raise RuntimeError("stop-loop")
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), mock.patch(
+            "XianyuAutoAsync.XianyuLive",
+            return_value=fake_live,
+        ), mock.patch.object(
+            reply_server.asyncio,
+            "sleep",
+            new=mock.AsyncMock(side_effect=_stop_after_first_loop),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop-loop"):
+                asyncio.run(reply_server.scheduled_task_checker())
+
+        persisted_result = fake_db.update_task_run_result.call_args.args[1]
+        self.assertEqual(
+            {"success": False, "message": "执行异常，请稍后重试"},
+            persisted_result,
         )
 
     def test_scheduled_task_checker_keeps_success_result_when_close_session_fails(self):
@@ -8682,9 +13790,8 @@ class ReplyServerScheduledTaskSecurityRuntimeTest(_ReplyServerModuleBindingMixin
         async def _stop_after_first_loop(_seconds):
             raise RuntimeError("stop-loop")
 
-        with mock.patch.object(reply_server, "db_manager", fake_db), mock.patch.object(
-            sys.modules["XianyuAutoAsync"],
-            "XianyuLive",
+        with mock.patch.object(reply_server, "db_manager", fake_db), mock.patch(
+            "XianyuAutoAsync.XianyuLive",
             return_value=fake_live,
         ) as xianyu_live_cls, mock.patch.object(
             reply_server.asyncio,
@@ -8737,9 +13844,8 @@ class ReplyServerScheduledTaskSecurityRuntimeTest(_ReplyServerModuleBindingMixin
         async def _stop_after_first_loop(_seconds):
             raise RuntimeError("stop-loop")
 
-        with mock.patch.object(reply_server, "db_manager", fake_db), mock.patch.object(
-            sys.modules["XianyuAutoAsync"],
-            "XianyuLive",
+        with mock.patch.object(reply_server, "db_manager", fake_db), mock.patch(
+            "XianyuAutoAsync.XianyuLive",
             return_value=fake_live,
         ) as xianyu_live_cls, mock.patch.object(
             reply_server.asyncio,
@@ -8918,6 +14024,70 @@ class ReplyServerKeywordImportExportValidationTest(_ReplyServerModuleBindingMixi
         self.assertIn("第2行与第3行", raised.exception.detail)
         fake_db.save_text_keywords_only.assert_not_called()
 
+    def test_keyword_tool_routes_surface_internal_failures_with_safe_messages(self):
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+        upload_file = SimpleNamespace(
+            filename="keywords.xlsx",
+            read=mock.AsyncMock(side_effect=RuntimeError("read exploded")),
+        )
+        upload_image_file = SimpleNamespace(
+            content_type="image/png",
+            filename="demo.png",
+            read=mock.AsyncMock(side_effect=RuntimeError("image read exploded")),
+        )
+        request = SimpleNamespace(
+            json=mock.AsyncMock(side_effect=RuntimeError("json exploded"))
+        )
+        fake_db = mock.Mock()
+        fake_db.get_cookie_details.return_value = {"user_id": 7}
+        fake_db.get_keywords_with_type.side_effect = RuntimeError("keywords exploded")
+
+        with mock.patch.object(reply_server, "_ensure_account_access", return_value="acc-demo-1"), \
+             mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(reply_server, "log_with_user"), \
+             mock.patch.object(reply_server.image_manager, "save_image", return_value="/static/uploads/images/demo.png"), \
+             mock.patch.object(reply_server.image_manager, "delete_image"):
+            with self.assertRaises(reply_server.HTTPException) as import_raised:
+                asyncio.run(
+                    reply_server.import_keywords(
+                        "acc-demo-1",
+                        file=upload_file,
+                        current_user=current_user,
+                    )
+                )
+
+            with self.assertRaises(reply_server.HTTPException) as add_image_raised:
+                asyncio.run(
+                    reply_server.add_image_keyword(
+                        "acc-demo-1",
+                        keyword="图片问候",
+                        item_id="",
+                        image=upload_image_file,
+                        current_user=current_user,
+                    )
+                )
+
+            with self.assertRaises(reply_server.HTTPException) as add_batch_raised:
+                asyncio.run(
+                    reply_server.add_image_keyword_batch(
+                        "acc-demo-1",
+                        request,
+                        current_user=current_user,
+                    )
+                )
+
+            with self.assertRaises(reply_server.HTTPException) as get_keywords_raised:
+                reply_server.get_keywords_with_type("acc-demo-1", current_user=current_user)
+
+            with self.assertRaises(reply_server.HTTPException) as delete_keyword_raised:
+                reply_server.delete_keyword_by_index("acc-demo-1", 0, current_user=current_user)
+
+        self.assertEqual((500, "导入关键词失败，请稍后重试"), (import_raised.exception.status_code, import_raised.exception.detail))
+        self.assertEqual((500, "添加图片关键词失败，请稍后重试"), (add_image_raised.exception.status_code, add_image_raised.exception.detail))
+        self.assertEqual((500, "批量添加图片关键词失败，请稍后重试"), (add_batch_raised.exception.status_code, add_batch_raised.exception.detail))
+        self.assertEqual((500, "获取关键词列表失败，请稍后重试"), (get_keywords_raised.exception.status_code, get_keywords_raised.exception.detail))
+        self.assertEqual((500, "删除关键词失败，请稍后重试"), (delete_keyword_raised.exception.status_code, delete_keyword_raised.exception.detail))
+
 
 class ReplyServerUserManagementSessionRevocationRuntimeTest(_ReplyServerModuleBindingMixin, unittest.TestCase):
     def test_user_management_routes_use_module_bound_database_for_list_and_mutations(self):
@@ -9071,7 +14241,7 @@ class ReplyServerUserManagementSessionRevocationRuntimeTest(_ReplyServerModuleBi
                 reply_server.get_all_users(admin_user=admin_user)
 
         self.assertEqual(500, list_raised.exception.status_code)
-        self.assertEqual("user list exploded", list_raised.exception.detail)
+        self.assertEqual("获取用户列表失败，请稍后重试", list_raised.exception.detail)
         list_db.get_all_users.assert_called_once_with()
 
         card_count_db = mock.Mock()
@@ -9086,7 +14256,7 @@ class ReplyServerUserManagementSessionRevocationRuntimeTest(_ReplyServerModuleBi
                 reply_server.get_all_users(admin_user=admin_user)
 
         self.assertEqual(500, card_count_raised.exception.status_code)
-        self.assertEqual("user card count exploded", card_count_raised.exception.detail)
+        self.assertEqual("获取用户列表失败，请稍后重试", card_count_raised.exception.detail)
         card_count_db.get_all_users.assert_called_once_with()
         card_count_db.get_account_ids.assert_called_once_with(7)
         card_count_db.get_all_cards.assert_called_once_with(7, summary_only=True)
@@ -9104,9 +14274,9 @@ class ReplyServerUserManagementSessionRevocationRuntimeTest(_ReplyServerModuleBi
                 reply_server.update_user_admin_status(8, True, admin_user=admin_user)
 
         self.assertEqual(500, delete_lookup_raised.exception.status_code)
-        self.assertEqual("user lookup exploded", delete_lookup_raised.exception.detail)
+        self.assertEqual("删除用户失败，请稍后重试", delete_lookup_raised.exception.detail)
         self.assertEqual(500, update_lookup_raised.exception.status_code)
-        self.assertEqual("user lookup exploded", update_lookup_raised.exception.detail)
+        self.assertEqual("更新用户管理员状态失败，请稍后重试", update_lookup_raised.exception.detail)
         self.assertEqual(
             lookup_db.get_user_by_id.call_args_list,
             [mock.call(7), mock.call(8)],
@@ -9132,9 +14302,9 @@ class ReplyServerUserManagementSessionRevocationRuntimeTest(_ReplyServerModuleBi
                 reply_server.update_user_admin_status(8, True, admin_user=admin_user)
 
         self.assertEqual(500, delete_mutation_raised.exception.status_code)
-        self.assertEqual("user delete exploded", delete_mutation_raised.exception.detail)
+        self.assertEqual("删除用户失败，请稍后重试", delete_mutation_raised.exception.detail)
         self.assertEqual(500, update_mutation_raised.exception.status_code)
-        self.assertEqual("user admin update exploded", update_mutation_raised.exception.detail)
+        self.assertEqual("更新用户管理员状态失败，请稍后重试", update_mutation_raised.exception.detail)
         self.assertEqual(
             mutation_db.get_user_by_id.call_args_list,
             [mock.call(7), mock.call(8)],
@@ -9293,6 +14463,63 @@ class ReplyServerUserManagementSessionRevocationRuntimeTest(_ReplyServerModuleBi
 
         self.assertEqual({"success": True, "message": "删除成功"}, result)
         delete_table_record.assert_called_once_with("cookies", "55")
+        fake_cookie_manager.reload_from_db.assert_called_once_with()
+
+    def test_admin_data_user_delete_surfaces_cookie_manager_reload_failure_as_warning(self):
+        admin_user = {"user_id": 1, "username": "admin", "is_admin": True}
+        fake_cookie_manager = mock.Mock()
+        fake_cookie_manager.reload_from_db.side_effect = RuntimeError("reload exploded")
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "get_user_id_by_rowid",
+            return_value=7,
+        ), mock.patch.object(
+            reply_server.db_manager,
+            "delete_table_record",
+            return_value=True,
+        ), mock.patch.object(
+            reply_server.cookie_manager,
+            "manager",
+            fake_cookie_manager,
+        ), mock.patch.object(reply_server, "log_with_user"):
+            result = reply_server.delete_table_record("users", "42", admin_user=admin_user)
+
+        self.assertEqual(
+            {
+                "success": True,
+                "message": "删除成功",
+                "revoked_sessions": 0,
+                "warning": "删除用户成功，但刷新 CookieManager 缓存失败，请重启系统",
+            },
+            result,
+        )
+        fake_cookie_manager.reload_from_db.assert_called_once_with()
+
+    def test_admin_data_cookie_delete_surfaces_cookie_manager_reload_failure_as_warning(self):
+        admin_user = {"user_id": 1, "username": "admin", "is_admin": True}
+        fake_cookie_manager = mock.Mock()
+        fake_cookie_manager.reload_from_db.side_effect = RuntimeError("reload exploded")
+
+        with mock.patch.object(
+            reply_server.db_manager,
+            "delete_table_record",
+            return_value=True,
+        ), mock.patch.object(
+            reply_server.cookie_manager,
+            "manager",
+            fake_cookie_manager,
+        ), mock.patch.object(reply_server, "log_with_user"):
+            result = reply_server.delete_table_record("cookies", "55", admin_user=admin_user)
+
+        self.assertEqual(
+            {
+                "success": True,
+                "message": "删除成功",
+                "warning": "删除账号成功，但刷新 CookieManager 缓存失败，请重启系统",
+            },
+            result,
+        )
         fake_cookie_manager.reload_from_db.assert_called_once_with()
 
     def test_admin_data_user_delete_blocks_self_deletion_by_rowid_lookup(self):
@@ -9455,7 +14682,7 @@ class ReplyServerSystemSettingsAdminRuntimeTest(_ReplyServerModuleBindingMixin, 
                 )
 
         self.assertEqual(500, raised.exception.status_code)
-        self.assertEqual("刷新缓存失败: reload exploded", raised.exception.detail)
+        self.assertEqual("刷新缓存失败，请稍后重试", raised.exception.detail)
 
         with mock.patch.object(reply_server.cookie_manager, "manager", None):
             with self.assertRaises(reply_server.HTTPException) as raised:
@@ -9465,6 +14692,19 @@ class ReplyServerSystemSettingsAdminRuntimeTest(_ReplyServerModuleBindingMixin, 
 
         self.assertEqual(500, raised.exception.status_code)
         self.assertEqual("CookieManager 未初始化", raised.exception.detail)
+
+    def test_debug_keywords_table_info_surfaces_internal_failures_with_safe_message(self):
+        current_user = {"user_id": 7, "username": "demo-user", "is_admin": False}
+
+        with mock.patch.object(reply_server.db_manager, "db_path", "C:\\demo\\missing.db"), mock.patch(
+            "sqlite3.connect",
+            side_effect=RuntimeError("keywords schema exploded"),
+        ):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                reply_server.debug_keywords_table_info(current_user=current_user)
+
+        self.assertEqual(500, raised.exception.status_code)
+        self.assertEqual("检查表结构失败，请稍后重试", raised.exception.detail)
 
     def test_user_settings_routes_use_module_bound_database_and_normalize_theme_color(self):
         fake_db = mock.Mock()
@@ -9599,7 +14839,7 @@ class ReplyServerSystemSettingsAdminRuntimeTest(_ReplyServerModuleBindingMixin, 
                 )
 
         self.assertEqual(raised.exception.status_code, 500)
-        self.assertEqual(raised.exception.detail, "menu settings replace exploded")
+        self.assertEqual(raised.exception.detail, "原子替换菜单设置失败，请稍后重试")
         fake_db.replace_user_menu_settings.assert_called_once_with(
             7,
             '{"orders":false}',
@@ -9648,6 +14888,28 @@ class ReplyServerSystemSettingsAdminRuntimeTest(_ReplyServerModuleBindingMixin, 
         self.assertEqual({"success": True, "message": "密码修改成功"}, result)
         fake_db.verify_user_password.assert_called_once_with("boss-admin", "old-secret")
         fake_db.update_user_password.assert_called_once_with("boss-admin", "new-secret-123")
+
+    def test_change_admin_password_raises_http_500_on_database_failure(self):
+        fake_db = mock.Mock()
+        fake_db.verify_user_password.side_effect = RuntimeError("password verify exploded")
+        admin_user = {"user_id": 9, "username": "boss-admin", "is_admin": True}
+        password_request = reply_server.ChangePasswordRequest(
+            current_password="old-secret",
+            new_password="new-secret-123",
+        )
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), \
+             mock.patch.object(reply_server.logger, "error"):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                asyncio.run(
+                    reply_server.change_admin_password(
+                        password_request,
+                        admin_user=admin_user,
+                    )
+                )
+
+        self.assertEqual(500, raised.exception.status_code)
+        self.assertEqual("修改管理员密码失败，请稍后重试", raised.exception.detail)
 
     def test_system_settings_and_login_captcha_routes_use_module_bound_database(self):
         fake_db = mock.Mock()
@@ -9782,21 +15044,21 @@ class ReplyServerSystemSettingsAdminRuntimeTest(_ReplyServerModuleBindingMixin, 
                 reply_server.get_login_captcha_enabled()
 
         self.assertEqual(system_list_raised.exception.status_code, 500)
-        self.assertEqual(system_list_raised.exception.detail, "system settings exploded")
+        self.assertEqual(system_list_raised.exception.detail, "获取系统设置失败，请稍后重试")
         self.assertEqual(system_update_raised.exception.status_code, 500)
-        self.assertEqual(system_update_raised.exception.detail, "system settings update exploded")
+        self.assertEqual(system_update_raised.exception.detail, "更新系统设置失败，请稍后重试")
         self.assertEqual(registration_raised.exception.status_code, 500)
-        self.assertEqual(registration_raised.exception.detail, "registration status exploded")
+        self.assertEqual(registration_raised.exception.detail, "获取注册状态失败，请稍后重试")
         self.assertEqual(login_info_raised.exception.status_code, 500)
-        self.assertEqual(login_info_raised.exception.detail, "registration status exploded")
+        self.assertEqual(login_info_raised.exception.detail, "获取登录信息显示状态失败，请稍后重试")
         self.assertEqual(user_list_raised.exception.status_code, 500)
-        self.assertEqual(user_list_raised.exception.detail, "user settings exploded")
+        self.assertEqual(user_list_raised.exception.detail, "获取用户设置失败，请稍后重试")
         self.assertEqual(user_update_raised.exception.status_code, 500)
-        self.assertEqual(user_update_raised.exception.detail, "user settings update exploded")
+        self.assertEqual(user_update_raised.exception.detail, "更新用户设置失败，请稍后重试")
         self.assertEqual(user_detail_raised.exception.status_code, 500)
-        self.assertEqual(user_detail_raised.exception.detail, "user setting detail exploded")
+        self.assertEqual(user_detail_raised.exception.detail, "获取用户设置详情失败，请稍后重试")
         self.assertEqual(login_captcha_enabled_raised.exception.status_code, 500)
-        self.assertEqual(login_captcha_enabled_raised.exception.detail, "registration status exploded")
+        self.assertEqual(login_captcha_enabled_raised.exception.detail, "获取登录验证码设置失败，请稍后重试")
         fake_db.get_all_system_settings.assert_called_once_with()
         fake_db.set_system_setting.assert_called_once_with("theme_color", "#0f172a", "主题色")
         self.assertEqual(
@@ -9810,6 +15072,55 @@ class ReplyServerSystemSettingsAdminRuntimeTest(_ReplyServerModuleBindingMixin, 
         fake_db.get_user_settings.assert_called_once_with(7)
         fake_db.set_user_setting.assert_called_once_with(7, "theme_color", "#0f172a", "主题色")
         fake_db.get_user_setting.assert_called_once_with(7, "theme_color")
+
+    def test_auth_public_setting_routes_surface_database_failures_as_server_errors(self):
+        fake_db = mock.Mock()
+        fake_db.get_system_setting.side_effect = RuntimeError("auth settings exploded")
+        fake_db.set_system_setting.side_effect = RuntimeError("auth settings update exploded")
+
+        admin_user = {"user_id": 1, "username": "admin", "is_admin": True}
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), mock.patch.object(
+            reply_server,
+            "log_with_user",
+        ):
+            with self.assertRaises(reply_server.HTTPException) as registration_raised:
+                reply_server.get_registration_status()
+
+            with self.assertRaises(reply_server.HTTPException) as login_info_raised:
+                reply_server.get_login_info_status()
+
+            with self.assertRaises(reply_server.HTTPException) as login_captcha_settings_raised:
+                reply_server.get_login_captcha_settings(admin_user=admin_user)
+
+            with self.assertRaises(reply_server.HTTPException) as login_captcha_enabled_raised:
+                reply_server.get_login_captcha_enabled()
+
+            with self.assertRaises(reply_server.HTTPException) as registration_update_raised:
+                reply_server.update_registration_settings(
+                    reply_server.RegistrationSettingUpdate(enabled=True),
+                    admin_user=admin_user,
+                )
+
+            with self.assertRaises(reply_server.HTTPException) as login_info_update_raised:
+                reply_server.update_login_info_settings(
+                    reply_server.LoginInfoSettingUpdate(enabled=True),
+                    admin_user=admin_user,
+                )
+
+            with self.assertRaises(reply_server.HTTPException) as login_captcha_update_raised:
+                reply_server.update_login_captcha_settings(
+                    reply_server.LoginInfoSettingUpdate(enabled=True),
+                    admin_user=admin_user,
+                )
+
+        self.assertEqual((500, "获取注册状态失败，请稍后重试"), (registration_raised.exception.status_code, registration_raised.exception.detail))
+        self.assertEqual((500, "获取登录信息显示状态失败，请稍后重试"), (login_info_raised.exception.status_code, login_info_raised.exception.detail))
+        self.assertEqual((500, "获取登录验证码设置失败，请稍后重试"), (login_captcha_settings_raised.exception.status_code, login_captcha_settings_raised.exception.detail))
+        self.assertEqual((500, "获取登录验证码设置失败，请稍后重试"), (login_captcha_enabled_raised.exception.status_code, login_captcha_enabled_raised.exception.detail))
+        self.assertEqual((500, "更新注册设置失败，请稍后重试"), (registration_update_raised.exception.status_code, registration_update_raised.exception.detail))
+        self.assertEqual((500, "更新登录信息显示设置失败，请稍后重试"), (login_info_update_raised.exception.status_code, login_info_update_raised.exception.detail))
+        self.assertEqual((500, "更新登录验证码设置失败，请稍后重试"), (login_captcha_update_raised.exception.status_code, login_captcha_update_raised.exception.detail))
 
 
 class ReplyServerAdminDataProtectionTest(_ReplyServerModuleBindingMixin, unittest.TestCase):
@@ -9849,6 +15160,31 @@ class ReplyServerAdminStatsAndDataManagementRuntimeTest(_ReplyServerModuleBindin
             result = reply_server.clear_table_data("cookies", admin_user=admin_user)
 
         self.assertEqual({"success": True, "message": "清空成功"}, result)
+        fake_db.clear_table_data.assert_called_once_with("cookies")
+        fake_cookie_manager.reload_from_db.assert_called_once_with()
+
+    def test_clear_cookies_surfaces_cookie_manager_reload_failure_as_warning(self):
+        admin_user = {"user_id": 1, "username": "admin", "is_admin": True}
+        fake_db = mock.Mock()
+        fake_db.clear_table_data.return_value = True
+        fake_cookie_manager = mock.Mock()
+        fake_cookie_manager.reload_from_db.side_effect = RuntimeError("reload exploded")
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), mock.patch.object(
+            reply_server.cookie_manager,
+            "manager",
+            fake_cookie_manager,
+        ), mock.patch.object(reply_server, "log_with_user"):
+            result = reply_server.clear_table_data("cookies", admin_user=admin_user)
+
+        self.assertEqual(
+            {
+                "success": True,
+                "message": "清空成功",
+                "warning": "清空账号表成功，但刷新 CookieManager 缓存失败，请重启系统",
+            },
+            result,
+        )
         fake_db.clear_table_data.assert_called_once_with("cookies")
         fake_cookie_manager.reload_from_db.assert_called_once_with()
 
@@ -9957,7 +15293,7 @@ class ReplyServerAdminStatsAndDataManagementRuntimeTest(_ReplyServerModuleBindin
                 reply_server.get_system_stats(admin_user=admin_user)
 
         self.assertEqual(500, stats_raised.exception.status_code)
-        self.assertEqual("admin cards exploded", stats_raised.exception.detail)
+        self.assertEqual("获取系统统计信息失败，请稍后重试", stats_raised.exception.detail)
         stats_db.get_all_users.assert_called_once_with()
         stats_db.get_account_ids.assert_called_once_with()
         stats_db.get_all_cards.assert_called_once_with(summary_only=True)
@@ -10319,15 +15655,15 @@ class ReplyServerNotificationTemplateUserScopeRuntimeTest(_ReplyServerModuleBind
                 reply_server.delete_notification_channel(5, current_user=current_user)
 
         self.assertEqual(list_raised.exception.status_code, 500)
-        self.assertEqual(list_raised.exception.detail, "notification channel list exploded")
+        self.assertEqual(list_raised.exception.detail, "获取通知渠道失败，请稍后重试")
         self.assertEqual(create_raised.exception.status_code, 500)
-        self.assertEqual(create_raised.exception.detail, "notification channel create exploded")
+        self.assertEqual(create_raised.exception.detail, "创建通知渠道失败，请稍后重试")
         self.assertEqual(detail_raised.exception.status_code, 500)
-        self.assertEqual(detail_raised.exception.detail, "notification channel detail exploded")
+        self.assertEqual(detail_raised.exception.detail, "获取通知渠道详情失败，请稍后重试")
         self.assertEqual(update_raised.exception.status_code, 500)
-        self.assertEqual(update_raised.exception.detail, "notification channel update exploded")
+        self.assertEqual(update_raised.exception.detail, "更新通知渠道失败，请稍后重试")
         self.assertEqual(delete_raised.exception.status_code, 500)
-        self.assertEqual(delete_raised.exception.detail, "notification channel delete exploded")
+        self.assertEqual(delete_raised.exception.detail, "删除通知渠道失败，请稍后重试")
         fake_db.get_notification_channels.assert_called_once_with(7)
         fake_db.create_notification_channel.assert_called_once_with("Webhook", "webhook", "{}", 7, enabled=True)
         fake_db.get_notification_channel.assert_called_once_with(5, user_id=7)
@@ -10456,23 +15792,23 @@ class ReplyServerNotificationTemplateUserScopeRuntimeTest(_ReplyServerModuleBind
                 reply_server.reset_notification_template("message", current_user=current_user)
 
         self.assertEqual(list_raised.exception.status_code, 500)
-        self.assertEqual(list_raised.exception.detail, "message notification list exploded")
+        self.assertEqual(list_raised.exception.detail, "获取消息通知配置失败，请稍后重试")
         self.assertEqual(detail_raised.exception.status_code, 500)
-        self.assertEqual(detail_raised.exception.detail, "message notification detail exploded")
+        self.assertEqual(detail_raised.exception.detail, "获取账号消息通知配置失败，请稍后重试")
         self.assertEqual(set_raised.exception.status_code, 500)
-        self.assertEqual(set_raised.exception.detail, "message notification set exploded")
+        self.assertEqual(set_raised.exception.detail, "设置消息通知失败，请稍后重试")
         self.assertEqual(delete_account_raised.exception.status_code, 500)
-        self.assertEqual(delete_account_raised.exception.detail, "message notification bulk delete exploded")
+        self.assertEqual(delete_account_raised.exception.detail, "删除账号消息通知配置失败，请稍后重试")
         self.assertEqual(delete_notification_raised.exception.status_code, 500)
-        self.assertEqual(delete_notification_raised.exception.detail, "message notification delete exploded")
+        self.assertEqual(delete_notification_raised.exception.detail, "删除消息通知失败，请稍后重试")
         self.assertEqual(template_list_raised.exception.status_code, 500)
-        self.assertEqual(template_list_raised.exception.detail, "notification template list exploded")
+        self.assertEqual(template_list_raised.exception.detail, "获取通知模板列表失败，请稍后重试")
         self.assertEqual(template_detail_raised.exception.status_code, 500)
-        self.assertEqual(template_detail_raised.exception.detail, "notification template detail exploded")
+        self.assertEqual(template_detail_raised.exception.detail, "获取通知模板详情失败，请稍后重试")
         self.assertEqual(template_update_raised.exception.status_code, 500)
-        self.assertEqual(template_update_raised.exception.detail, "notification template update exploded")
+        self.assertEqual(template_update_raised.exception.detail, "更新通知模板失败，请稍后重试")
         self.assertEqual(template_reset_raised.exception.status_code, 500)
-        self.assertEqual(template_reset_raised.exception.detail, "notification template reset exploded")
+        self.assertEqual(template_reset_raised.exception.detail, "重置通知模板失败，请稍后重试")
         fake_db.get_account_ids.assert_called_once_with(7)
         self.assertEqual(
             [mock.call(user_id=7), mock.call()],
@@ -10506,7 +15842,7 @@ class ReplyServerNotificationTemplateUserScopeRuntimeTest(_ReplyServerModuleBind
                 )
 
         self.assertEqual(replace_raised.exception.status_code, 500)
-        self.assertEqual(replace_raised.exception.detail, "message notification replace exploded")
+        self.assertEqual(replace_raised.exception.detail, "替换账号消息通知配置失败，请稍后重试")
         replace_db.get_notification_channels.assert_called_once_with(7)
         replace_db.replace_account_notifications.assert_called_once_with(
             "acc-demo-1",
@@ -10514,6 +15850,24 @@ class ReplyServerNotificationTemplateUserScopeRuntimeTest(_ReplyServerModuleBind
             enabled=True,
             user_id=7,
         )
+
+    def test_notification_template_test_route_surfaces_internal_failures_with_safe_message(self):
+        current_user = {"user_id": 7, "username": "scope-user", "is_admin": False}
+        fake_db = mock.Mock()
+        fake_db.get_notification_channels.side_effect = RuntimeError("notification template test exploded")
+
+        with mock.patch.object(reply_server, "db_manager", fake_db):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                asyncio.run(
+                    reply_server.test_notification_template(
+                        reply_server.TestNotificationIn(template_type="message", template="hello"),
+                        current_user=current_user,
+                    )
+                )
+
+        self.assertEqual(500, raised.exception.status_code)
+        self.assertEqual("发送测试通知失败，请稍后重试", raised.exception.detail)
+        fake_db.get_notification_channels.assert_called_once_with(7)
 
     def test_notification_template_routes_pass_current_user_scope_to_db_layer(self):
         current_user = {"user_id": 7, "username": "scope-user"}
@@ -10654,6 +16008,90 @@ class ReplyServerPublicPageRouteCompatibilityTest(_ReplyServerModuleBindingMixin
         self.assertIn('id="registerForm"', register_response.text)
 
 
+class ReplyServerCaptchaSessionFlowTest(_ReplyServerModuleBindingMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        reply_server.verified_captcha_sessions.clear()
+
+    def test_send_verification_code_requires_recent_verified_captcha_session(self):
+        client = TestClient(reply_server.app)
+
+        response = client.post(
+            "/send-verification-code",
+            json={
+                "email": "user@example.com",
+                "type": "login",
+                "session_id": "captcha-session-1",
+            },
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(
+            {"success": False, "message": "请先验证图形验证码"},
+            response.json(),
+        )
+
+    def test_verify_captcha_marks_session_and_send_verification_code_consumes_it(self):
+        client = TestClient(reply_server.app)
+        fake_db = mock.Mock()
+        fake_db.verify_captcha.return_value = True
+        fake_db.get_user_by_email.return_value = {"id": 1, "email": "user@example.com"}
+        fake_db.generate_verification_code.return_value = "123456"
+        fake_db.save_verification_code.return_value = True
+        fake_db.send_verification_email = mock.AsyncMock(return_value=True)
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), mock.patch(
+            "db_manager.db_manager",
+            fake_db,
+        ):
+            verify_response = client.post(
+                "/verify-captcha",
+                json={
+                    "session_id": "captcha-session-2",
+                    "captcha_code": "ABCD",
+                },
+            )
+            self.assertEqual(200, verify_response.status_code)
+            self.assertEqual(
+                {"success": True, "message": "图形验证码验证成功"},
+                verify_response.json(),
+            )
+
+            send_response = client.post(
+                "/send-verification-code",
+                json={
+                    "email": "user@example.com",
+                    "type": "login",
+                    "session_id": "captcha-session-2",
+                },
+            )
+
+        self.assertEqual(200, send_response.status_code)
+        self.assertEqual(
+            {"success": True, "message": "验证码已发送到您的邮箱，请查收"},
+            send_response.json(),
+        )
+        fake_db.verify_captcha.assert_called_once_with("captcha-session-2", "ABCD")
+        fake_db.get_user_by_email.assert_called_once_with("user@example.com")
+        fake_db.generate_verification_code.assert_called_once_with()
+        fake_db.save_verification_code.assert_called_once_with("user@example.com", "123456", "login")
+        fake_db.send_verification_email.assert_awaited_once_with("user@example.com", "123456")
+
+        second_send_response = client.post(
+            "/send-verification-code",
+            json={
+                "email": "user@example.com",
+                "type": "login",
+                "session_id": "captcha-session-2",
+            },
+        )
+        self.assertEqual(200, second_send_response.status_code)
+        self.assertEqual(
+            {"success": False, "message": "请先验证图形验证码"},
+            second_send_response.json(),
+        )
+
+
 class ReplyServerNotificationDeliverySignatureTest(_ReplyServerModuleBindingMixin, unittest.IsolatedAsyncioTestCase):
     async def test_notification_template_test_route_uses_module_bound_database_and_correct_feishu_signature(self):
         fake_db = mock.Mock()
@@ -10704,6 +16142,24 @@ class ReplyServerNotificationDeliverySignatureTest(_ReplyServerModuleBindingMixi
         )
         self.assertIn("通知给 测试账号", payload_capture["post_json"]["content"]["text"])
         fake_db.get_notification_channels.assert_called_once_with(7)
+
+
+class OrderHistoryPageFetcherCloseTest(unittest.IsolatedAsyncioTestCase):
+    async def test_close_still_closes_fetcher_when_session_close_raises(self):
+        from utils.order_history_sync import OrderHistoryPageFetcher
+
+        fetcher = OrderHistoryPageFetcher.__new__(OrderHistoryPageFetcher)
+        fetcher.session = SimpleNamespace(
+            closed=False,
+            close=mock.AsyncMock(side_effect=RuntimeError("session close boom")),
+        )
+        fetcher.fetcher = SimpleNamespace(close=mock.AsyncMock())
+
+        with self.assertRaisesRegex(RuntimeError, "session close boom"):
+            await fetcher.close()
+
+        fetcher.fetcher.close.assert_awaited_once()
+        self.assertIsNone(fetcher.session)
 
     async def test_notification_template_test_route_supports_qq_channel_with_configured_api_url(self):
         fake_db = mock.Mock()
@@ -11036,6 +16492,37 @@ class ReplyServerNotificationDeliverySignatureTest(_ReplyServerModuleBindingMixi
         )
         fake_db.get_notification_channels.assert_called_once_with(7)
 
+    async def test_notification_template_test_route_masks_channel_exception_details_in_failed_channels(self):
+        fake_db = mock.Mock()
+        fake_db.get_notification_channels.return_value = [
+            {
+                "id": 12,
+                "name": "Webhook渠道",
+                "type": "webhook",
+                "enabled": True,
+                "config": '{"webhook_url": "https://example.invalid/hook"}',
+            }
+        ]
+
+        with mock.patch.object(reply_server, "db_manager", fake_db), mock.patch.object(
+            reply_server,
+            "send_channel_notification",
+            new=mock.AsyncMock(side_effect=RuntimeError("webhook 403 forbidden: token=secret-demo")),
+        ):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                await reply_server.test_notification_template(
+                    reply_server.TestNotificationIn(
+                        template_type="message",
+                        template="通知给 {account_id}",
+                    ),
+                    current_user={"user_id": 7, "username": "scope-user"},
+                )
+
+        self.assertEqual(400, raised.exception.status_code)
+        self.assertEqual("所有渠道发送失败: Webhook渠道 (发送失败)", raised.exception.detail)
+        self.assertNotIn("token=secret-demo", str(raised.exception.detail))
+        fake_db.get_notification_channels.assert_called_once_with(7)
+
     async def test_notification_template_test_route_supports_weixin_alias_via_shared_dispatch_helper(self):
         fake_db = mock.Mock()
         fake_db.get_notification_channels.return_value = [
@@ -11316,6 +16803,34 @@ class ReplyServerBackupManagementTest(_ReplyServerModuleBindingMixin, unittest.T
         self.assertEqual(1, result["total"])
         self.assertEqual(backup_path.name, result["backups"][0]["filename"])
 
+    def test_list_backup_files_surfaces_internal_failures_with_safe_message(self):
+        fake_db_manager = SimpleNamespace(db_path="C:\\demo\\missing\\custom.db")
+
+        with mock.patch.object(reply_server, "db_manager", fake_db_manager), \
+             mock.patch.object(reply_server, "log_with_user"), \
+             mock.patch("glob.glob", side_effect=RuntimeError("backup list exploded")):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                reply_server.list_backup_files(
+                    admin_user={"user_id": 1, "username": "admin"},
+                )
+
+        self.assertEqual(500, raised.exception.status_code)
+        self.assertEqual("查询备份文件列表失败，请稍后重试", raised.exception.detail)
+
+    def test_download_database_backup_surfaces_internal_failures_with_safe_message(self):
+        fake_db_manager = SimpleNamespace(db_path="C:\\demo\\missing\\custom.db")
+
+        with mock.patch.object(reply_server, "db_manager", fake_db_manager), \
+             mock.patch.object(reply_server, "log_with_user"), \
+             mock.patch("os.path.exists", side_effect=RuntimeError("backup exists exploded")):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                reply_server.download_database_backup(
+                    admin_user={"user_id": 1, "username": "admin"},
+                )
+
+        self.assertEqual(500, raised.exception.status_code)
+        self.assertEqual("下载数据库备份失败，请稍后重试", raised.exception.detail)
+
     def test_export_backup_uses_module_bound_database_manager_for_current_user_scope(self):
         fake_db = mock.Mock()
         fake_db.export_backup.return_value = {"accounts": ["acc-1"]}
@@ -11336,6 +16851,20 @@ class ReplyServerBackupManagementTest(_ReplyServerModuleBindingMixin, unittest.T
             )
         )
         self.assertEqual(b'{"accounts":["acc-1"]}', response.body)
+
+    def test_export_backup_surfaces_database_failures_as_server_errors(self):
+        fake_db = mock.Mock()
+        fake_db.export_backup.side_effect = RuntimeError("backup export exploded")
+
+        with mock.patch.object(reply_server, "db_manager", fake_db):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                reply_server.export_backup(
+                    current_user={"user_id": 7, "username": "scope-user"},
+                )
+
+        self.assertEqual(500, raised.exception.status_code)
+        self.assertEqual("导出备份失败，请稍后重试", raised.exception.detail)
+        fake_db.export_backup.assert_called_once_with(7)
 
     def test_import_backup_uses_module_bound_database_manager_for_current_user_scope(self):
         fake_db = mock.Mock()
@@ -11379,10 +16908,10 @@ class ReplyServerBackupManagementTest(_ReplyServerModuleBindingMixin, unittest.T
                 )
 
         self.assertEqual(500, raised.exception.status_code)
-        self.assertEqual("导入备份失败: backup import exploded", raised.exception.detail)
+        self.assertEqual("导入备份失败，请稍后重试", raised.exception.detail)
         fake_db.import_backup.assert_called_once_with({"demo": True}, 7)
 
-    def test_import_backup_reports_cookie_manager_reload_failure_as_server_error(self):
+    def test_import_backup_surfaces_cookie_manager_reload_failure_as_warning(self):
         fake_db = mock.Mock()
         fake_db.import_backup.return_value = True
         fake_cookie_manager = mock.Mock()
@@ -11397,14 +16926,18 @@ class ReplyServerBackupManagementTest(_ReplyServerModuleBindingMixin, unittest.T
             "manager",
             fake_cookie_manager,
         ):
-            with self.assertRaises(reply_server.HTTPException) as raised:
-                reply_server.import_backup(
-                    file=backup_file,
-                    current_user={"user_id": 7, "username": "scope-user"},
-                )
+            result = reply_server.import_backup(
+                file=backup_file,
+                current_user={"user_id": 7, "username": "scope-user"},
+            )
 
-        self.assertEqual(500, raised.exception.status_code)
-        self.assertEqual("备份导入成功，但刷新 CookieManager 缓存失败，请重启系统", raised.exception.detail)
+        self.assertEqual(
+            {
+                "message": "备份导入成功",
+                "warning": "备份导入成功，但刷新 CookieManager 缓存失败，请重启系统",
+            },
+            result,
+        )
         fake_db.import_backup.assert_called_once_with({"demo": True}, 7)
         fake_cookie_manager.reload_from_db.assert_called_once_with()
 
@@ -11493,6 +17026,178 @@ class ReplyServerBackupManagementTest(_ReplyServerModuleBindingMixin, unittest.T
             finally:
                 os.chdir(original_cwd)
 
+    def test_upload_database_backup_rolls_back_when_reinit_after_replace_fails(self):
+        import sqlite3
+
+        class FakeDbManager:
+            def __init__(self, db_path=None):
+                resolved_path = db_path if db_path is not None else os.getenv("DB_PATH", "data/xianyu_data.db")
+                if not hasattr(self, "reinit_calls"):
+                    self.reinit_calls = []
+                    self.conn_close_count = 0
+                    self.reinit_failure_armed = True
+                self.reinit_calls.append(resolved_path)
+                self.db_path = resolved_path
+                self.conn = SimpleNamespace(close=self._close_conn)
+                if len(self.reinit_calls) > 1 and self.reinit_failure_armed:
+                    self.reinit_failure_armed = False
+                    raise RuntimeError("reinit exploded after replace")
+
+            def _close_conn(self):
+                self.conn_close_count += 1
+                self.conn = None
+
+            def get_all_users(self):
+                raise AssertionError("reinit 失败后不该继续验证新数据库")
+
+        def fake_move(src, dst):
+            shutil.copy2(src, dst)
+            os.remove(src)
+            return dst
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(temp_dir)
+
+                current_db_dir = Path(temp_dir) / "custom-db-dir"
+                current_db_dir.mkdir(parents=True, exist_ok=True)
+                current_db_path = current_db_dir / "custom.db"
+                original_db_bytes = b"original-db-content"
+                current_db_path.write_bytes(original_db_bytes)
+
+                valid_backup_source = Path(temp_dir) / "valid_backup_source.db"
+                conn = sqlite3.connect(valid_backup_source)
+                try:
+                    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)")
+                    conn.execute("CREATE TABLE cookies (id INTEGER PRIMARY KEY)")
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                backup_file = SimpleNamespace(
+                    filename="restore.db",
+                    read=mock.AsyncMock(return_value=valid_backup_source.read_bytes()),
+                )
+
+                fake_db = FakeDbManager(str(current_db_path))
+                shadow_db = SimpleNamespace(
+                    db_path=str(Path(temp_dir) / "shadow.db"),
+                    conn=None,
+                    get_all_users=mock.Mock(side_effect=AssertionError("数据库恢复不该绕开 reply_server.db_manager")),
+                    __init__=mock.Mock(side_effect=AssertionError("数据库恢复重连不该绕开 reply_server.db_manager")),
+                )
+                db_manager_module = sys.modules["db_manager"]
+
+                with mock.patch.object(reply_server, "db_manager", fake_db), \
+                     mock.patch.object(db_manager_module, "db_manager", shadow_db), \
+                     mock.patch("shutil.move", side_effect=fake_move), \
+                     mock.patch.object(reply_server, "log_with_user"):
+                    with self.assertRaises(reply_server.HTTPException) as raised:
+                        asyncio.run(
+                            reply_server.upload_database_backup(
+                                admin_user={"user_id": 1, "username": "admin"},
+                                backup_file=backup_file,
+                            )
+                        )
+
+                self.assertEqual(500, raised.exception.status_code)
+                self.assertEqual("数据库恢复失败，已回滚到原数据库", raised.exception.detail)
+                self.assertEqual(
+                    [str(current_db_path), str(current_db_path), str(current_db_path)],
+                    fake_db.reinit_calls,
+                )
+                self.assertEqual(1, fake_db.conn_close_count)
+                self.assertEqual(original_db_bytes, current_db_path.read_bytes())
+            finally:
+                os.chdir(original_cwd)
+
+    def test_upload_database_backup_reports_when_rollback_after_restore_failure_also_fails(self):
+        import sqlite3
+        original_copy2 = shutil.copy2
+
+        class FakeDbManager:
+            def __init__(self, db_path=None):
+                resolved_path = db_path if db_path is not None else os.getenv("DB_PATH", "data/xianyu_data.db")
+                if not hasattr(self, "reinit_calls"):
+                    self.reinit_calls = []
+                    self.conn_close_count = 0
+                self.reinit_calls.append(resolved_path)
+                self.db_path = resolved_path
+                self.conn = SimpleNamespace(close=self._close_conn)
+
+            def _close_conn(self):
+                self.conn_close_count += 1
+                self.conn = None
+
+            def get_all_users(self):
+                raise RuntimeError("restored database validation failed")
+
+        def fake_move(src, dst):
+            shutil.copy2(src, dst)
+            os.remove(src)
+            return dst
+
+        copy_call_count = {"value": 0}
+
+        def fake_copy2(src, dst):
+            copy_call_count["value"] += 1
+            if copy_call_count["value"] == 1:
+                return original_copy2(src, dst)
+            raise RuntimeError("rollback copy exploded")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(temp_dir)
+
+                current_db_dir = Path(temp_dir) / "custom-db-dir"
+                current_db_dir.mkdir(parents=True, exist_ok=True)
+                current_db_path = current_db_dir / "custom.db"
+                current_db_path.write_bytes(b"original-db-content")
+
+                valid_backup_source = Path(temp_dir) / "valid_backup_source.db"
+                conn = sqlite3.connect(valid_backup_source)
+                try:
+                    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)")
+                    conn.execute("CREATE TABLE cookies (id INTEGER PRIMARY KEY)")
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                backup_file = SimpleNamespace(
+                    filename="restore.db",
+                    read=mock.AsyncMock(return_value=valid_backup_source.read_bytes()),
+                )
+
+                fake_db = FakeDbManager(str(current_db_path))
+                shadow_db = SimpleNamespace(
+                    db_path=str(Path(temp_dir) / "shadow.db"),
+                    conn=None,
+                    get_all_users=mock.Mock(side_effect=AssertionError("数据库恢复不该绕开 reply_server.db_manager")),
+                    __init__=mock.Mock(side_effect=AssertionError("数据库恢复重连不该绕开 reply_server.db_manager")),
+                )
+                db_manager_module = sys.modules["db_manager"]
+
+                with mock.patch.object(reply_server, "db_manager", fake_db), \
+                     mock.patch.object(db_manager_module, "db_manager", shadow_db), \
+                     mock.patch("shutil.move", side_effect=fake_move), \
+                     mock.patch("shutil.copy2", side_effect=fake_copy2), \
+                     mock.patch.object(reply_server, "log_with_user"):
+                    with self.assertRaises(reply_server.HTTPException) as raised:
+                        asyncio.run(
+                            reply_server.upload_database_backup(
+                                admin_user={"user_id": 1, "username": "admin"},
+                                backup_file=backup_file,
+                            )
+                        )
+
+                self.assertEqual(500, raised.exception.status_code)
+                self.assertEqual("数据库恢复失败，且回滚原数据库失败，请检查数据库文件", raised.exception.detail)
+                self.assertEqual(1, fake_db.conn_close_count)
+            finally:
+                os.chdir(original_cwd)
+
     def test_upload_database_backup_refreshes_cookie_manager_cache_after_successful_restore(self):
         import asyncio
         import sqlite3
@@ -11578,7 +17283,7 @@ class ReplyServerBackupManagementTest(_ReplyServerModuleBindingMixin, unittest.T
             finally:
                 os.chdir(original_cwd)
 
-    def test_upload_database_backup_stops_reporting_success_when_cookie_manager_reload_fails(self):
+    def test_upload_database_backup_surfaces_cookie_manager_reload_failure_as_warning(self):
         import asyncio
         import sqlite3
 
@@ -11646,22 +17351,41 @@ class ReplyServerBackupManagementTest(_ReplyServerModuleBindingMixin, unittest.T
                      mock.patch("shutil.move", side_effect=fake_move), \
                      mock.patch.object(reply_server.cookie_manager, "manager", fake_cookie_manager), \
                      mock.patch.object(reply_server, "log_with_user"):
-                    with self.assertRaises(reply_server.HTTPException) as raised:
-                        asyncio.run(
-                            reply_server.upload_database_backup(
-                                admin_user={"user_id": 1, "username": "admin"},
-                                backup_file=backup_file,
-                            )
+                    result = asyncio.run(
+                        reply_server.upload_database_backup(
+                            admin_user={"user_id": 1, "username": "admin"},
+                            backup_file=backup_file,
                         )
+                    )
 
-                self.assertEqual(500, raised.exception.status_code)
-                self.assertEqual("数据库恢复成功，但刷新 CookieManager 缓存失败，请重启系统", raised.exception.detail)
+                self.assertTrue(result["success"])
+                self.assertEqual("数据库恢复成功", result["message"])
+                self.assertEqual(2, result["user_count"])
+                self.assertEqual("数据库恢复成功，但刷新 CookieManager 缓存失败，请重启系统", result["warning"])
                 self.assertEqual([str(current_db_path)], fake_db.reinit_calls[1:])
                 self.assertEqual(1, fake_db.conn_close_count)
                 self.assertEqual(1, fake_db.get_all_users_calls)
                 fake_cookie_manager.reload_from_db.assert_called_once_with()
             finally:
                 os.chdir(original_cwd)
+
+    def test_upload_database_backup_surfaces_internal_failures_with_safe_message(self):
+        backup_file = SimpleNamespace(
+            filename="restore.db",
+            read=mock.AsyncMock(side_effect=RuntimeError("backup upload exploded")),
+        )
+
+        with mock.patch.object(reply_server, "log_with_user"):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                asyncio.run(
+                    reply_server.upload_database_backup(
+                        admin_user={"user_id": 1, "username": "admin"},
+                        backup_file=backup_file,
+                    )
+                )
+
+        self.assertEqual(500, raised.exception.status_code)
+        self.assertEqual("上传数据库备份失败，请稍后重试", raised.exception.detail)
 
     def test_upload_database_backup_reconciles_sessions_with_restored_users_before_cookie_reload(self):
         import asyncio

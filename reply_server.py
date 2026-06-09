@@ -23,7 +23,9 @@ import asyncio
 import concurrent.futures
 import contextvars
 import queue
+import threading
 from collections import defaultdict
+from contextlib import asynccontextmanager, suppress
 
 import cookie_manager
 from db_manager import db_manager
@@ -169,10 +171,41 @@ def _reload_cookie_manager_cache_or_raise(error_detail: str) -> None:
         raise HTTPException(status_code=500, detail=error_detail)
 
 
+def _reload_cookie_manager_cache_with_warning(error_detail: str) -> Optional[str]:
+    runtime_manager = getattr(cookie_manager, "manager", None)
+    if runtime_manager is None:
+        return None
+
+    try:
+        runtime_manager.reload_from_db()
+        return None
+    except Exception as exc:
+        logger.error(f"刷新 CookieManager 缓存失败: {exc}")
+        return error_detail
+
+
 def _same_user_id(left_user_id: Any, right_user_id: Any) -> bool:
     if left_user_id is None or right_user_id is None:
         return False
     return str(left_user_id).strip() == str(right_user_id).strip()
+
+
+def _parse_loose_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if not normalized:
+            return default
+        if normalized in {'1', 'true', 'yes', 'on'}:
+            return True
+        if normalized in {'0', 'false', 'no', 'off'}:
+            return False
+    return bool(value)
 
 
 def _log_line_matches_level(line: Any, level: Any) -> bool:
@@ -259,6 +292,9 @@ ip_blacklist = set()
 captcha_storage = {}
 CAPTCHA_EXPIRE_SECONDS = 300  # 验证码5分钟过期
 CAPTCHA_REQUIRE_AFTER_FAILURES = 2  # 失败2次后要求验证码
+VERIFIED_CAPTCHA_SESSION_EXPIRE_SECONDS = 300  # 图形验证码验证结果5分钟过期
+verified_captcha_sessions = {}
+verified_captcha_sessions_lock = threading.Lock()
 
 # 防暴力破解参数
 BRUTE_FORCE_CONFIG = {
@@ -313,6 +349,8 @@ ORDER_SALES_TIME_SQL = "COALESCE(NULLIF(platform_paid_at, ''), NULLIF(platform_c
 ORDER_HISTORY_SYNC_JOB_RETENTION_SECONDS = 3600
 order_history_sync_jobs: Dict[str, Dict[str, Any]] = {}
 order_history_sync_tasks: Dict[str, asyncio.Task] = {}
+
+
 def mask_sensitive_text(text: Any) -> str:
     raw_text = str(text or '')
     masked_text = raw_text
@@ -397,6 +435,52 @@ ADMIN_DATA_PROTECTED_CLEAR_TABLES = {
 
 def safe_client_error(message: str = '操作失败，请稍后重试') -> str:
     return message
+
+
+def _cleanup_verified_captcha_sessions(current_time: Optional[float] = None) -> None:
+    now = time.time() if current_time is None else current_time
+    with verified_captcha_sessions_lock:
+        expired_session_ids = [
+            session_id
+            for session_id, expires_at in verified_captcha_sessions.items()
+            if expires_at <= now
+        ]
+        for session_id in expired_session_ids:
+            verified_captcha_sessions.pop(session_id, None)
+
+
+def _mark_captcha_session_verified(session_id: Optional[str], expires_in_seconds: int = VERIFIED_CAPTCHA_SESSION_EXPIRE_SECONDS) -> None:
+    normalized_session_id = str(session_id or '').strip()
+    if not normalized_session_id:
+        return
+
+    with verified_captcha_sessions_lock:
+        verified_captcha_sessions[normalized_session_id] = time.time() + max(1, int(expires_in_seconds))
+
+
+def _clear_verified_captcha_session(session_id: Optional[str]) -> None:
+    normalized_session_id = str(session_id or '').strip()
+    if not normalized_session_id:
+        return
+
+    with verified_captcha_sessions_lock:
+        verified_captcha_sessions.pop(normalized_session_id, None)
+
+
+def _consume_verified_captcha_session(session_id: Optional[str]) -> bool:
+    normalized_session_id = str(session_id or '').strip()
+    if not normalized_session_id:
+        return False
+
+    _cleanup_verified_captcha_sessions()
+    with verified_captcha_sessions_lock:
+        expires_at = verified_captcha_sessions.get(normalized_session_id)
+        if not expires_at or expires_at <= time.time():
+            verified_captcha_sessions.pop(normalized_session_id, None)
+            return False
+
+        verified_captcha_sessions.pop(normalized_session_id, None)
+        return True
 
 
 def normalize_order_status_value(status: Any) -> str:
@@ -734,15 +818,79 @@ def get_ip_failure_count(client_ip: str) -> int:
 
 
 # 账号密码登录会话管理
-password_login_sessions = {}  # {session_id: {'account_id': str, 'account': str, 'show_browser': bool, 'status': str, 'verification_url': str, 'qr_code_url': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
+password_login_sessions = {}  # {session_id: {'account_id': str, 'account': str, 'show_browser': bool, 'status': str, 'verification_url': str, 'qr_code_url': str, 'slider_instance': object, 'task': asyncio.Task, 'worker_thread': threading.Thread, 'timestamp': float}}
 password_login_locks = defaultdict(lambda: asyncio.Lock())
-manual_cookie_import_sessions = {}  # {session_id: {'account_id': str, 'status': str, 'verification_url': str, 'screenshot_path': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
+manual_cookie_import_sessions = {}  # {session_id: {'account_id': str, 'status': str, 'verification_url': str, 'screenshot_path': str, 'slider_instance': object, 'task': asyncio.Task, 'worker_thread': threading.Thread, 'timestamp': float}}
 manual_cookie_import_locks = defaultdict(lambda: asyncio.Lock())
+manual_browser_entry_locks = defaultdict(lambda: asyncio.Lock())
+account_verification_prestart_cancellations = {}
 PASSWORD_LOGIN_TERMINAL_STATUSES = {'success', 'failed', 'cancelled'}
 MANUAL_COOKIE_IMPORT_TERMINAL_STATUSES = {'success', 'failed', 'cancelled'}
 MANUAL_COOKIE_IMPORT_RUNTIME_CLOSED_ERROR = '浏览器会话已关闭或 CDP 已断开'
+ACCOUNT_VERIFICATION_PRESTART_CANCEL_TTL_SECONDS = 600
+ACCOUNT_VERIFICATION_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
 # 不再需要单独的密码初始化，由数据库初始化时处理
+
+
+def _normalize_account_verification_session_id(session_id: Any) -> str:
+    normalized = str(session_id or '').strip()
+    if not normalized:
+        return ''
+    if not ACCOUNT_VERIFICATION_SESSION_ID_PATTERN.fullmatch(normalized):
+        raise ValueError('会话ID格式无效')
+    return normalized
+
+
+def _new_account_verification_session_id(provided_session_id: Any = None) -> str:
+    normalized = _normalize_account_verification_session_id(provided_session_id)
+    return normalized or secrets.token_urlsafe(16)
+
+
+def _prune_account_verification_prestart_cancellations(now_ts: Optional[float] = None) -> None:
+    now = time.time() if now_ts is None else float(now_ts)
+    expired_keys = [
+        key
+        for key, record in list(account_verification_prestart_cancellations.items())
+        if now - float((record or {}).get('timestamp') or 0) > ACCOUNT_VERIFICATION_PRESTART_CANCEL_TTL_SECONDS
+    ]
+    for key in expired_keys:
+        account_verification_prestart_cancellations.pop(key, None)
+
+
+def _record_account_verification_prestart_cancellation(
+    flow: str,
+    session_id: Any,
+    user_id: Any,
+) -> None:
+    try:
+        normalized_session_id = _normalize_account_verification_session_id(session_id)
+    except ValueError:
+        return
+    if not normalized_session_id:
+        return
+    _prune_account_verification_prestart_cancellations()
+    account_verification_prestart_cancellations[(str(flow), normalized_session_id)] = {
+        'user_id': user_id,
+        'timestamp': time.time(),
+    }
+
+
+def _consume_account_verification_prestart_cancellation(
+    flow: str,
+    session_id: str,
+    user_id: Any,
+) -> bool:
+    normalized_session_id = _normalize_account_verification_session_id(session_id)
+    if not normalized_session_id:
+        return False
+    _prune_account_verification_prestart_cancellations()
+    key = (str(flow), normalized_session_id)
+    record = account_verification_prestart_cancellations.get(key)
+    if not record or not _same_user_id(record.get('user_id'), user_id):
+        return False
+    account_verification_prestart_cancellations.pop(key, None)
+    return True
 
 
 def cleanup_qr_check_records():
@@ -1030,7 +1178,6 @@ logger.info("Web服务器启动，文件日志收集器已初始化")
 
 
 # 启动定时任务调度器
-@app.on_event("startup")
 async def start_scheduled_task_checker():
     """应用启动时开启定时任务检查协程"""
     existing_task = getattr(app.state, "scheduled_task_checker_task", None)
@@ -1040,7 +1187,6 @@ async def start_scheduled_task_checker():
     logger.info("定时任务调度器已启动")
 
 
-@app.on_event("shutdown")
 async def stop_scheduled_task_checker():
     """应用关闭时停止定时任务检查协程。"""
     task = getattr(app.state, "scheduled_task_checker_task", None)
@@ -1078,7 +1224,6 @@ async def account_browser_runtime_janitor(
         await asyncio.sleep(interval_seconds)
 
 
-@app.on_event("startup")
 async def start_account_browser_runtime_janitor():
     """应用启动时开启账号级浏览器 runtime janitor。"""
     existing_task = getattr(app.state, "account_browser_runtime_janitor_task", None)
@@ -1090,7 +1235,6 @@ async def start_account_browser_runtime_janitor():
     logger.info("账号浏览器 runtime janitor 已启动")
 
 
-@app.on_event("shutdown")
 async def stop_account_browser_runtime_janitor():
     """应用关闭时停止账号级浏览器 runtime janitor。"""
     task = getattr(app.state, "account_browser_runtime_janitor_task", None)
@@ -1116,6 +1260,20 @@ async def stop_account_browser_runtime_janitor():
             )
     except Exception as cleanup_error:
         logger.warning(f"应用关闭时回收账号浏览器 runtime 失败: {cleanup_error}")
+
+
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI):
+    await start_scheduled_task_checker()
+    await start_account_browser_runtime_janitor()
+    try:
+        yield
+    finally:
+        await stop_scheduled_task_checker()
+        await stop_account_browser_runtime_janitor()
+
+
+app.router.lifespan_context = app_lifespan
 
 
 # 添加请求日志中间件
@@ -1209,7 +1367,7 @@ async def health_check():
             detail={
                 "status": "unhealthy",
                 "timestamp": time.time(),
-                "error": str(e),
+                "error": "健康检查失败，请稍后重试",
             },
         )
 
@@ -1787,7 +1945,7 @@ async def get_sales_data(
         return {
             'success': False,
             'data': None,
-            'message': f'获取销售额数据失败: {str(e)}'
+            'message': safe_client_error('获取销售额数据失败，请稍后重试')
         }
 
 
@@ -1903,7 +2061,7 @@ async def get_sales_summary(
         return {
             'success': False,
             'data': None,
-            'message': f'获取销售额摘要失败: {str(e)}'
+            'message': safe_client_error('获取销售额摘要失败，请稍后重试')
         }
 
 
@@ -2051,7 +2209,7 @@ async def change_admin_password(request: ChangePasswordRequest, admin_user: Dict
 
     except Exception as e:
         logger.error(f"修改管理员密码异常: {e}")
-        return {"success": False, "message": "系统错误"}
+        raise HTTPException(status_code=500, detail=safe_client_error("修改管理员密码失败，请稍后重试"))
 
 
 # 生成图形验证码接口
@@ -2104,17 +2262,20 @@ async def verify_captcha(request: VerifyCaptchaRequest):
 
     try:
         if db_manager.verify_captcha(request.session_id, request.captcha_code):
+            _mark_captcha_session_verified(request.session_id)
             return VerifyCaptchaResponse(
                 success=True,
                 message="图形验证码验证成功"
             )
         else:
+            _clear_verified_captcha_session(request.session_id)
             return VerifyCaptchaResponse(
                 success=False,
                 message="图形验证码错误或已过期"
             )
 
     except Exception as e:
+        _clear_verified_captcha_session(request.session_id)
         logger.error(f"验证图形验证码失败: {e}")
         return VerifyCaptchaResponse(
             success=False,
@@ -2128,19 +2289,11 @@ async def send_verification_code(request: SendCodeRequest):
     from db_manager import db_manager
 
     try:
-        # 检查是否已验证图形验证码
-        # 通过检查数据库中是否存在已验证的图形验证码记录
-        with db_manager.lock:
-            cursor = db_manager.conn.cursor()
-            current_time = time.time()
-
-            # 查找最近5分钟内该session_id的验证记录
-            # 由于验证成功后验证码会被删除，我们需要另一种方式来跟踪验证状态
-            # 这里我们检查该session_id是否在最近验证过（通过检查是否有已删除的记录）
-
-            # 为了简化，我们要求前端在验证图形验证码成功后立即发送邮件验证码
-            # 或者我们可以在验证成功后设置一个临时标记
-            pass
+        if not _consume_verified_captcha_session(request.session_id):
+            return SendCodeResponse(
+                success=False,
+                message="请先验证图形验证码"
+            )
 
         # 根据验证码类型进行不同的检查
         if request.type == 'register':
@@ -2397,10 +2550,14 @@ async def send_message_api(request: SendMessageRequest):
         )
 
         if not send_result.get('success'):
+            normalized_failure_message = _normalize_send_message_failure_message(
+                send_result.get('message'),
+                default_message='消息发送失败，请稍后重试',
+            )
             logger.warning(f"账号消息发送前置检查失败: {cleaned_account_id} - {send_result.get('message')}")
             return SendMessageResponse(
                 success=False,
-                message=str(send_result.get('message') or '消息发送失败'),
+                message=normalized_failure_message,
             )
 
         logger.info(f"API成功发送消息: {cleaned_account_id} -> {cleaned_to_user_id}, 内容: {cleaned_message[:50]}{'...' if len(cleaned_message) > 50 else ''}")
@@ -2479,6 +2636,7 @@ class ManualCookieImportRequest(BaseModel):
     account_id: str
     cookie: str
     show_browser: bool = False
+    session_id: Optional[str] = None
 
 
 class RuntimeTokenRefreshRequest(BaseModel):
@@ -2489,6 +2647,7 @@ class RuntimeTokenRefreshRequest(BaseModel):
 
 class QRLoginGenerateRequest(BaseModel):
     account_id: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class CookieStatusIn(BaseModel):
@@ -2825,6 +2984,183 @@ def _is_runtime_timestamp_recent(value: Any, window_seconds: Any) -> bool:
     return (time.time() - timestamp) <= window
 
 
+def _normalize_runtime_token_error_message(
+    message: Any,
+    *,
+    default_message: str = "Token刷新失败，请稍后重试",
+) -> Optional[str]:
+    normalized = str(message or '').strip()
+    if not normalized:
+        return None
+
+    lowered = normalized.lower()
+    if (
+        "session_expired" in lowered
+        or "session已过期" in normalized
+        or "页面会话已失效" in normalized
+        or "token已过期" in normalized
+        or "需要重新登录" in normalized
+    ):
+        return "Session已过期，系统自动恢复失败，请重新登录"
+
+    if "未配置用户名或密码" in normalized or "无法获取账号信息" in normalized:
+        return normalized
+
+    if "滑块验证失败" in normalized:
+        return "滑块验证失败，请稍后重试"
+
+    if "网络异常" in normalized:
+        return "网络异常，请稍后重试"
+
+    if any(
+        keyword in lowered
+        for keyword in (
+            "timeout",
+            "timed out",
+            "clientconnector",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "network is unreachable",
+        )
+    ):
+        return "网络异常，请稍后重试"
+
+    if (
+        normalized.startswith("{")
+        or normalized.startswith("[")
+        or "missing canonical account_id" in lowered
+        or "cookie合并结果缺失核心字段" in normalized
+        or "密码登录后的token预检失败" in normalized
+        or "token预检返回" in normalized
+        or "debug simulated captcha" in lowered
+        or "traceback" in lowered
+        or "runtimeerror" in lowered
+        or "valueerror" in lowered
+        or "keyerror" in lowered
+    ):
+        return default_message
+
+    return default_message
+
+
+def _normalize_runtime_keepalive_error_message(
+    message: Any,
+    *,
+    default_message: str = "轻量保活失败，请稍后重试",
+) -> Optional[str]:
+    normalized = str(message or '').strip()
+    if not normalized:
+        return None
+
+    lowered = normalized.lower()
+    if (
+        "session_expired" in lowered
+        or "session已过期" in normalized
+        or "页面会话已失效" in normalized
+        or "token已过期" in normalized
+    ):
+        return "Session已过期，请重新登录"
+
+    if "网络异常" in normalized:
+        return "网络异常，请稍后重试"
+
+    if any(
+        keyword in lowered
+        for keyword in (
+            "timeout",
+            "timed out",
+            "clientconnector",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "network is unreachable",
+        )
+    ):
+        return "网络异常，请稍后重试"
+
+    if (
+        normalized.startswith("{")
+        or normalized.startswith("[")
+        or "traceback" in lowered
+        or "runtimeerror" in lowered
+        or "valueerror" in lowered
+        or "keyerror" in lowered
+    ):
+        return default_message
+
+    return default_message
+
+
+def _sanitize_runtime_token_refresh_result(result: Any) -> Any:
+    if not isinstance(result, dict):
+        return result
+
+    sanitized = dict(result)
+    sanitized['last_token_refresh_error_message'] = _normalize_runtime_token_error_message(
+        sanitized.get('last_token_refresh_error_message')
+    )
+    return sanitized
+
+
+def _normalize_send_message_failure_message(
+    message: Any,
+    *,
+    default_message: str = "消息发送失败，请稍后重试",
+) -> str:
+    normalized = str(message or '').strip()
+    if not normalized:
+        return default_message
+
+    if (
+        "账号WebSocket连接状态异常" in normalized
+        or "账号WebSocket连接未就绪" in normalized
+        or "账号实例不存在或未连接" in normalized
+        or "当前有其他浏览器任务正在执行" in normalized
+        or "账号级 browser profile 已被其他 runtime 持有" in normalized
+        or "同账号已存在不兼容的 async runtime 正在使用中" in normalized
+        or "同账号已存在不兼容的 sync runtime 正在使用中" in normalized
+        or "runtime 正在失效回收" in normalized
+        or "CookieManager 未就绪" in normalized
+        or "账号事件循环已关闭" in normalized
+        or "账号事件循环未运行" in normalized
+    ):
+        return normalized
+
+    lowered = normalized.lower()
+    if (
+        "traceback" in lowered
+        or "runtimeerror" in lowered
+        or "valueerror" in lowered
+        or "keyerror" in lowered
+        or "exception" in lowered
+    ):
+        return default_message
+
+    return default_message
+
+
+def _normalize_runtime_account_id_error_message(
+    message: Any,
+    *,
+    default_message: str = "账号ID格式不正确",
+) -> str:
+    normalized = str(message or '').strip()
+    if not normalized:
+        return default_message
+
+    lowered = normalized.lower()
+    if "non-empty, non-default account_id" in lowered:
+        return "账号ID不能为空，且不能使用 default"
+    if "account_id matching" in lowered:
+        return "账号ID只能包含英文字母、数字、下划线和短横线"
+    return default_message
+
+
 async def _build_live_runtime_status(account_id: str) -> Dict[str, Any]:
     normalized_account_id = str(account_id or '').strip()
     runtime_status = {
@@ -3096,14 +3432,18 @@ async def _build_live_runtime_status(account_id: str) -> Dict[str, Any]:
         'message_stream_note': message_stream_note,
         'token_cached': token_cached,
         'token_refresh_status': token_refresh_status,
-        'token_refresh_error_message': live_instance_snapshot.get('last_token_refresh_error_message'),
+        'token_refresh_error_message': _normalize_runtime_token_error_message(
+            live_instance_snapshot.get('last_token_refresh_error_message')
+        ),
         'token_last_refreshed_at': token_refreshed_at,
         'token_last_refreshed_at_display': _format_runtime_timestamp(token_refreshed_at),
         'token_age_seconds': _get_runtime_age_seconds(token_refreshed_at),
         'session_keepalive_status': session_keepalive_status,
         'session_keepalive_display_status': session_display_status,
         'session_keepalive_display_note': session_display_note,
-        'session_keepalive_error_message': live_instance_snapshot.get('last_session_keepalive_error_message'),
+        'session_keepalive_error_message': _normalize_runtime_keepalive_error_message(
+            live_instance_snapshot.get('last_session_keepalive_error_message')
+        ),
         'session_keepalive_at': session_keepalive_at,
         'session_keepalive_at_display': _format_runtime_timestamp(session_keepalive_at),
         'session_keepalive_age_seconds': _get_runtime_age_seconds(session_keepalive_at),
@@ -3197,6 +3537,139 @@ async def _run_live_instance_on_manager_loop(
         if cancel_on_timeout:
             thread_future.cancel()
         raise HTTPException(status_code=504, detail="账号处理超时，请稍后重试")
+    except asyncio.CancelledError:
+        thread_future.cancel()
+        raise
+
+
+async def _close_temporary_xianyu_session(
+    live_instance: Any,
+    *,
+    account_id: str,
+    scene: str,
+) -> None:
+    if live_instance is None:
+        return
+
+    try:
+        await live_instance.close_session()
+    except Exception as exc:
+        logger.warning(f"关闭账号 {account_id} {scene}临时会话失败: {exc}")
+
+
+async def _wait_for_http_request_disconnect(
+    http_request: Request,
+    *,
+    poll_interval: float = 0.25,
+) -> bool:
+    is_disconnected = getattr(http_request, 'is_disconnected', None)
+    if not callable(is_disconnected):
+        return False
+
+    while True:
+        try:
+            if await is_disconnected():
+                return True
+        except Exception as exc:
+            logger.warning(f"监听HTTP请求断开状态失败，跳过本次浏览器任务取消检测: {exc}")
+            return False
+        await asyncio.sleep(poll_interval)
+
+
+async def _cancel_and_drain_task(task: Optional[asyncio.Task], *, context: str) -> None:
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        logger.warning(f"{context} 取消收尾异常，已忽略以保留外层取消语义: {exc}")
+
+
+async def _await_temporary_browser_runtime_operation(
+    operation: Awaitable[Any],
+    *,
+    http_request: Request = None,
+    account_id: str = '',
+    scene: str = '',
+) -> Any:
+    if http_request is None:
+        return await operation
+
+    operation_task = asyncio.create_task(operation)
+    disconnect_task = asyncio.create_task(_wait_for_http_request_disconnect(http_request))
+    try:
+        done, _pending = await asyncio.wait(
+            {operation_task, disconnect_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if operation_task in done:
+            disconnect_task.cancel()
+            return operation_task.result()
+
+        if disconnect_task in done and disconnect_task.result():
+            await _cancel_and_drain_task(
+                operation_task,
+                context=f"账号 {account_id} {scene}浏览器任务",
+            )
+            logger.info(f"请求已断开，取消账号 {account_id} {scene}浏览器任务")
+            raise asyncio.CancelledError()
+
+        return await operation_task
+    except asyncio.CancelledError:
+        await _cancel_and_drain_task(
+            operation_task,
+            context=f"账号 {account_id} {scene}浏览器任务",
+        )
+        await _cancel_and_drain_task(
+            disconnect_task,
+            context=f"账号 {account_id} {scene}请求断开监听任务",
+        )
+        raise
+    finally:
+        await _cancel_and_drain_task(
+            disconnect_task,
+            context=f"账号 {account_id} {scene}请求断开监听任务",
+        )
+
+
+def _close_temporary_xianyu_session_sync(
+    live_instance: Any,
+    *,
+    request_loop: asyncio.AbstractEventLoop,
+    account_id: str,
+    scene: str,
+    timeout: float = 5.0,
+) -> None:
+    if live_instance is None or request_loop is None:
+        return
+
+    try:
+        close_future = asyncio.run_coroutine_threadsafe(
+            _close_temporary_xianyu_session(
+                live_instance,
+                account_id=account_id,
+                scene=scene,
+            ),
+            request_loop,
+        )
+    except Exception as exc:
+        logger.warning(f"调度关闭账号 {account_id} {scene}临时会话失败: {exc}")
+        return
+
+    try:
+        _wait_threadsafe_future_result(
+            close_future,
+            timeout,
+            f"{scene}临时会话关闭在 {timeout:.0f} 秒内未完成",
+            account_id=account_id,
+        )
+    except Exception as exc:
+        logger.warning(f"等待关闭账号 {account_id} {scene}临时会话完成失败: {exc}")
 
 
 async def _run_managed_live_instance_call(
@@ -3214,10 +3687,155 @@ async def _run_managed_live_instance_call(
             raise HTTPException(status_code=400, detail=missing_detail)
         return await coroutine_factory(live_instance)
 
-    return await _run_live_instance_on_manager_loop(
-        account_id,
-        _invoke_with_current_instance,
-        timeout=timeout,
+    try:
+        return await _run_live_instance_on_manager_loop(
+            account_id,
+            _invoke_with_current_instance,
+            timeout=timeout,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        translated_conflict = _translate_managed_runtime_conflict_error(
+            exc,
+            account_id=account_id,
+        )
+        if translated_conflict is not None:
+            raise translated_conflict from exc
+        raise
+
+
+_MANAGED_RUNTIME_UNAVAILABLE_DETAILS = {
+    "账号未启动，暂无法执行当前操作",
+    "CookieManager 未就绪",
+    "账号事件循环已关闭",
+    "账号事件循环未运行",
+}
+
+_MANAGED_RUNTIME_CONFLICT_DETAIL_PATTERNS = (
+    "当前有其他浏览器任务正在执行，请稍后再试",
+    "同账号已存在不兼容的 async runtime 正在使用中，请稍后重试",
+    "同账号已存在不兼容的 sync runtime 正在使用中，请稍后重试",
+    "账号级 browser profile 已被其他 runtime 持有，拒绝并发复用",
+    "runtime 正在失效回收，旧 lease 未释放，拒绝提前重建",
+)
+
+
+_RUNTIME_PURPOSE_LABELS = {
+    "item_search": "商品搜索",
+    "order_detail_fetch": "订单详情抓取",
+    "order_history_sync": "历史订单同步",
+    "verification_recovery": "认证恢复",
+    "qr_login_verification": "扫码登录验证",
+    "password_login": "密码登录",
+    "token_refresh_slider": "Token 刷新滑块验证",
+    "slider_verification": "滑块验证",
+}
+
+
+def _format_runtime_purpose_label(value: Any) -> Optional[str]:
+    purpose = str(value or "").strip()
+    if not purpose:
+        return None
+    return _RUNTIME_PURPOSE_LABELS.get(purpose, purpose.replace("_", " "))
+
+
+def _build_runtime_conflict_context(account_id: Any) -> Dict[str, Any]:
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        return {}
+    try:
+        runtime_snapshot = account_browser_runtime_manager.get_account_runtime_state_snapshot(
+            normalized_account_id
+        )
+    except Exception as exc:
+        logger.warning(f"获取账号 {normalized_account_id} runtime 冲突上下文失败: {mask_sensitive_text(exc)}")
+        return {}
+
+    active_mode = str(runtime_snapshot.get("owner_mode") or "").strip().lower()
+    purpose_key = None
+    active_leases = 0
+    if active_mode == "async":
+        purpose_key = runtime_snapshot.get("async_current_purpose")
+        active_leases = int(runtime_snapshot.get("async_active_leases") or 0)
+    elif active_mode == "sync":
+        purpose_key = runtime_snapshot.get("sync_current_purpose")
+        active_leases = int(runtime_snapshot.get("sync_active_leases") or 0)
+
+    purpose_label = _format_runtime_purpose_label(purpose_key)
+    owner_mode_active_count = int(runtime_snapshot.get("owner_mode_active_count") or 0)
+    return {
+        "owner_mode": active_mode or None,
+        "owner_mode_active_count": owner_mode_active_count,
+        "purpose_key": str(purpose_key or "").strip() or None,
+        "purpose_label": purpose_label,
+        "active_leases": active_leases,
+    }
+
+
+def _build_managed_runtime_conflict_message(
+    detail: str,
+    *,
+    account_id: Any = None,
+) -> str:
+    normalized_detail = str(detail or "").strip()
+    conflict_context = _build_runtime_conflict_context(account_id)
+    purpose_label = str(conflict_context.get("purpose_label") or "").strip()
+    owner_mode = str(conflict_context.get("owner_mode") or "").strip()
+    active_leases = int(conflict_context.get("active_leases") or 0)
+
+    if not purpose_label:
+        return normalized_detail
+
+    if "当前有其他浏览器任务正在执行" in normalized_detail:
+        return f"{normalized_detail} 当前占用任务：{purpose_label}"
+    if "同账号已存在不兼容的 async runtime 正在使用中" in normalized_detail:
+        return f"{normalized_detail} 当前占用任务：{purpose_label}"
+    if "同账号已存在不兼容的 sync runtime 正在使用中" in normalized_detail:
+        return f"{normalized_detail} 当前占用任务：{purpose_label}"
+    if "账号级 browser profile 已被其他 runtime 持有" in normalized_detail:
+        return f"{normalized_detail} 当前占用任务：{purpose_label}"
+    if "runtime 正在失效回收" in normalized_detail:
+        if owner_mode:
+            return (
+                f"{normalized_detail} 当前回收中的任务：{purpose_label}"
+                f"（mode={owner_mode}, active_leases={active_leases}）"
+            )
+        return f"{normalized_detail} 当前回收中的任务：{purpose_label}"
+    return normalized_detail
+
+
+def _extract_managed_runtime_conflict_detail(error: Any) -> Optional[str]:
+    error_text = str(error or "").strip()
+    if not error_text:
+        return None
+    for pattern in _MANAGED_RUNTIME_CONFLICT_DETAIL_PATTERNS:
+        if pattern in error_text:
+            return pattern
+    return None
+
+
+def _translate_managed_runtime_conflict_error(
+    error: Any,
+    *,
+    account_id: Any = None,
+) -> Optional[HTTPException]:
+    detail = _extract_managed_runtime_conflict_detail(error)
+    if not detail:
+        return None
+    return HTTPException(
+        status_code=409,
+        detail=_build_managed_runtime_conflict_message(detail, account_id=account_id),
+    )
+
+
+def _is_managed_runtime_unavailable_http_error(error: Any) -> bool:
+    return isinstance(error, HTTPException) and str(error.detail) in _MANAGED_RUNTIME_UNAVAILABLE_DETAILS
+
+
+def _is_managed_runtime_conflict_http_error(error: Any) -> bool:
+    return isinstance(error, HTTPException) and error.status_code == 409 and bool(
+        _extract_managed_runtime_conflict_detail(error.detail)
     )
 
 
@@ -3255,6 +3873,151 @@ async def _run_managed_live_instance_optional_call(
         _invoke_with_current_instance,
         timeout=timeout,
     )
+
+
+async def _build_live_runtime_status_best_effort(
+    account_id: str,
+    *,
+    scene: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    try:
+        return await _build_live_runtime_status(account_id), None
+    except Exception as exc:
+        logger.warning(f"{scene}后获取账号 {account_id} 运行态快照失败: {mask_sensitive_text(exc)}")
+        return None, safe_client_error("获取账号运行态失败，请稍后重试")
+
+
+def _build_manual_browser_entry_busy_message(account_id: str, action_text: str) -> str:
+    normalized_action_text = str(action_text or '').strip() or '执行当前操作'
+    message = (
+        f"账号 {account_id} 当前有运行中的账号浏览器任务，暂无法{normalized_action_text}。"
+        "请先停止该账号实例或等待当前浏览器任务结束后再试"
+    )
+    conflict_context = _build_runtime_conflict_context(account_id)
+    purpose_label = str(conflict_context.get("purpose_label") or "").strip()
+    if purpose_label:
+        return f"{message} 当前占用任务：{purpose_label}"
+    return message
+
+
+async def _ensure_manual_browser_entry_runtime_available(account_id: str, *, action_text: str) -> None:
+    normalized_account_id = _require_runtime_account_id(
+        account_id,
+        action_text=action_text,
+    )
+    live_instance_snapshot = None
+    try:
+        live_instance_snapshot = await _run_managed_live_instance_optional_call(
+            normalized_account_id,
+            lambda current_live_instance: {
+                'instance_exists': True,
+                'running': bool(getattr(current_live_instance, 'running', False)),
+                'connection_state': getattr(
+                    getattr(current_live_instance, 'connection_state', None),
+                    'value',
+                    str(getattr(current_live_instance, 'connection_state', None) or 'unknown'),
+                ),
+            },
+            timeout=5,
+        )
+    except HTTPException:
+        live_instance_snapshot = None
+
+    if _has_active_async_browser_runtime_for_manual_entry(
+        normalized_account_id,
+        action_text=action_text,
+        live_instance_snapshot=live_instance_snapshot,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=_build_manual_browser_entry_busy_message(
+                normalized_account_id,
+                action_text,
+            ),
+        )
+
+
+def _has_active_async_browser_runtime_for_manual_entry(
+    account_id: str,
+    *,
+    action_text: str,
+    live_instance_snapshot: Optional[Dict[str, Any]] = None,
+) -> bool:
+    normalized_account_id = _require_runtime_account_id(
+        account_id,
+        action_text=action_text,
+    )
+    runtime_snapshot = account_browser_runtime_manager.get_account_runtime_state_snapshot(
+        normalized_account_id
+    )
+    async_owner_active = (
+        runtime_snapshot.get('owner_mode') == 'async'
+        and int(runtime_snapshot.get('owner_mode_active_count') or 0) > 0
+    )
+    # 仅保留空闲缓存 runtime 不应阻断手动浏览器入口；
+    # 真正进入 sync 手动链路时，runtime manager 会负责切模式并失效旧 async runtime。
+    async_runtime_active = any(
+        (
+            int(runtime_snapshot.get('async_active_leases') or 0) > 0,
+            int(runtime_snapshot.get('async_pending_closures') or 0) > 0,
+        )
+    )
+    live_instance_active = bool(
+        live_instance_snapshot
+        and (
+            bool(live_instance_snapshot.get('running'))
+            or str(live_instance_snapshot.get('connection_state') or '').strip().lower()
+            not in {'', 'unknown', 'disconnected', 'closed'}
+        )
+    )
+    return bool(async_owner_active or async_runtime_active or live_instance_active)
+
+
+def _ensure_manual_browser_entry_runtime_available_sync(
+    account_id: str,
+    *,
+    action_text: str,
+) -> None:
+    normalized_account_id = _require_runtime_account_id(
+        account_id,
+        action_text=action_text,
+    )
+    live_instance_snapshot = None
+    runtime_issue = _get_cookie_manager_runtime_issue()
+    if runtime_issue is None:
+        manager = getattr(cookie_manager, 'manager', None)
+        if manager is not None:
+            try:
+                live_instance_snapshot = manager._dispatch_manager_coroutine(  # noqa: SLF001
+                    _run_managed_live_instance_optional_call(
+                        normalized_account_id,
+                        lambda current_live_instance: {
+                            'instance_exists': True,
+                            'running': bool(getattr(current_live_instance, 'running', False)),
+                            'connection_state': getattr(
+                                getattr(current_live_instance, 'connection_state', None),
+                                'value',
+                                str(getattr(current_live_instance, 'connection_state', None) or 'unknown'),
+                            ),
+                        },
+                        timeout=5,
+                    ),
+                    timeout=6,
+                )
+            except Exception:
+                live_instance_snapshot = None
+
+    if _has_active_async_browser_runtime_for_manual_entry(
+        normalized_account_id,
+        action_text=action_text,
+        live_instance_snapshot=live_instance_snapshot,
+    ):
+        raise RuntimeError(
+            _build_manual_browser_entry_busy_message(
+                normalized_account_id,
+                action_text,
+            )
+        )
 
 
 def _get_cookie_manager_runtime_issue() -> Optional[str]:
@@ -3461,7 +4224,13 @@ async def get_cookies_details(
                     'pause_duration': 10,
                 })
         if include_runtime_status:
-            item_details['runtime_status'] = await _build_live_runtime_status(account_id)
+            runtime_status, runtime_status_error = await _build_live_runtime_status_best_effort(
+                account_id,
+                scene="查询账号详情列表",
+            )
+            item_details['runtime_status'] = runtime_status
+            if runtime_status_error:
+                item_details['runtime_status_error'] = runtime_status_error
         result.append(item_details)
     return result
 
@@ -3611,7 +4380,13 @@ async def get_cookie_account_details(
         if not details:
             raise HTTPException(status_code=404, detail="账号不存在")
 
-        runtime_status = await _build_live_runtime_status(account_id) if include_runtime_status else None
+        runtime_status = None
+        runtime_status_error = None
+        if include_runtime_status:
+            runtime_status, runtime_status_error = await _build_live_runtime_status_best_effort(
+                account_id,
+                scene="查询单账号详情",
+            )
 
         if not include_secrets:
             details = {
@@ -3625,10 +4400,14 @@ async def get_cookie_account_details(
             }
             if include_runtime_status:
                 details['runtime_status'] = runtime_status
+                if runtime_status_error:
+                    details['runtime_status_error'] = runtime_status_error
         else:
             details = {**details}
             if include_runtime_status:
                 details['runtime_status'] = runtime_status
+                if runtime_status_error:
+                    details['runtime_status_error'] = runtime_status_error
         
         return details
     except HTTPException:
@@ -3668,7 +4447,7 @@ async def get_conversation_history(
         if not normalized_conversation_id:
             raise HTTPException(status_code=400, detail="缺少会话ID")
 
-        normalized_page_size = max(1, min(int(page_size or 20), 100))
+        normalized_page_size = max(1, min(int(20 if page_size is None else page_size), 100))
 
         log_with_user(
             'info',
@@ -3684,6 +4463,10 @@ async def get_conversation_history(
             timeout=60,
             missing_detail="账号未启动，暂无法查询历史消息",
         )
+        runtime_status, runtime_status_error = await _build_live_runtime_status_best_effort(
+            account_id,
+            scene="查询历史消息",
+        )
         return {
             'success': True,
             'account_id': account_id,
@@ -3691,7 +4474,8 @@ async def get_conversation_history(
             'page_size': normalized_page_size,
             'count': len(history_messages),
             'messages': history_messages,
-            'runtime_status': await _build_live_runtime_status(account_id),
+            'runtime_status': runtime_status,
+            'runtime_status_error': runtime_status_error,
         }
     except HTTPException:
         raise
@@ -3713,12 +4497,16 @@ async def trigger_session_keepalive(account_id: str, current_user: Dict[str, Any
             timeout=40,
             missing_detail="账号未启动，暂无法执行轻量保活",
         )
-        runtime_status = await _build_live_runtime_status(account_id)
+        runtime_status, runtime_status_error = await _build_live_runtime_status_best_effort(
+            account_id,
+            scene="轻量会话保活",
+        )
         return {
             'success': keepalive_ok,
             'account_id': account_id,
             'message': '轻量会话保活成功' if keepalive_ok else '轻量会话保活失败',
             'runtime_status': runtime_status,
+            'runtime_status_error': runtime_status_error,
         }
     except HTTPException:
         raise
@@ -3784,7 +4572,11 @@ async def trigger_runtime_token_refresh(
             timeout=180,
             missing_detail=f"账号 {account_id} 未启动，暂无法执行 Token 刷新",
         )
-        runtime_status = await _build_live_runtime_status(account_id)
+        result = _sanitize_runtime_token_refresh_result(result)
+        runtime_status, runtime_status_error = await _build_live_runtime_status_best_effort(
+            account_id,
+            scene="Token 刷新",
+        )
         return {
             'success': bool(result.get('success')) if isinstance(result, dict) else bool(result),
             'account_id': account_id,
@@ -3792,6 +4584,7 @@ async def trigger_runtime_token_refresh(
             'verification_url': verification_url or None,
             'result': result,
             'runtime_status': runtime_status,
+            'runtime_status_error': runtime_status_error,
         }
     except HTTPException:
         raise
@@ -4171,6 +4964,24 @@ def _set_password_login_session_status(session_id: str, status: str, **fields):
     return True
 
 
+def _get_manual_browser_entry_session_status(session: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(session, dict):
+        return ''
+    return str(session.get('status') or '').strip().lower()
+
+
+def _is_manual_browser_entry_session_cancelled(session: Optional[Dict[str, Any]]) -> bool:
+    return _get_manual_browser_entry_session_status(session) == 'cancelled'
+
+
+def _is_password_login_session_cancelled(session_id: str) -> bool:
+    return _is_manual_browser_entry_session_cancelled(password_login_sessions.get(session_id))
+
+
+def _is_manual_cookie_import_session_cancelled(session_id: str) -> bool:
+    return _is_manual_browser_entry_session_cancelled(manual_cookie_import_sessions.get(session_id))
+
+
 def _resolve_session_verification_material(
     session: Optional[Dict[str, Any]],
     *,
@@ -4314,9 +5125,13 @@ def _finalize_password_login_session_failure(
     session = password_login_sessions.get(session_id)
     if not session:
         return False
+    normalized_error_message = _normalize_password_login_session_failure_message(
+        error_message,
+        default_message='登录失败，请稍后重试',
+    )
 
     extra_fields: Dict[str, Any] = {}
-    if _is_password_login_verification_timeout_message(error_message):
+    if _is_password_login_verification_timeout_message(normalized_error_message):
         extra_fields.update(
             verification_url=None,
             screenshot_path=None,
@@ -4324,23 +5139,25 @@ def _finalize_password_login_session_failure(
             verification_type=None,
         )
 
-    _set_password_login_session_status(
+    status_updated = _set_password_login_session_status(
         session_id,
         'failed',
-        error=error_message,
+        error=normalized_error_message,
         **extra_fields,
     )
+    if not status_updated:
+        return False
     _update_session_risk_log(
         session_id,
         'failed',
-        error_message=(error_message or '')[:200],
+        error_message=(normalized_error_message or '')[:200],
         result_code=result_code,
         event_meta=event_meta,
     )
     _close_password_login_pending_verification_risk_logs(
         session_id,
         'failed',
-        error_message=error_message,
+        error_message=normalized_error_message,
         event_meta=event_meta,
     )
     return True
@@ -4409,19 +5226,27 @@ def _stabilize_password_login_cookies_after_login(
             user_id=user_id,
             register_instance=False,
         )
-        preflight_future = asyncio.run_coroutine_threadsafe(
-            temp_xianyu.preflight_token_after_password_login(),
-            request_loop,
-        )
-        token_result = _wait_threadsafe_future_result(
-            preflight_future,
-            preflight_timeout,
-            f"{stage_label}在 {preflight_timeout:.0f} 秒内未完成",
-            account_id=account_id,
-        )
-        updated_cookie_str = temp_xianyu.cookies_str or cookie_text
-        token_ready = bool(getattr(temp_xianyu, 'current_token', None) or token_result)
-        return updated_cookie_str, token_ready
+        try:
+            preflight_future = asyncio.run_coroutine_threadsafe(
+                temp_xianyu.preflight_token_after_password_login(),
+                request_loop,
+            )
+            token_result = _wait_threadsafe_future_result(
+                preflight_future,
+                preflight_timeout,
+                f"{stage_label}在 {preflight_timeout:.0f} 秒内未完成",
+                account_id=account_id,
+            )
+            updated_cookie_str = temp_xianyu.cookies_str or cookie_text
+            token_ready = bool(getattr(temp_xianyu, 'current_token', None) or token_result)
+            return updated_cookie_str, token_ready
+        finally:
+            _close_temporary_xianyu_session_sync(
+                temp_xianyu,
+                request_loop=request_loop,
+                account_id=account_id,
+                scene="密码登录Token预检",
+            )
 
     def _try_stabilize_with_current_runtime(
         cookie_text: str,
@@ -4872,6 +5697,226 @@ def _purge_account_local_artifacts(
     }
 
 
+def _cleanup_expired_manual_browser_entry_session_screenshot(
+    session: Optional[Dict[str, Any]],
+    *,
+    flow_label: str,
+    current_user: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not isinstance(session, dict):
+        return
+
+    screenshot_path = str(session.get('screenshot_path') or '').strip()
+    if not screenshot_path:
+        return
+
+    try:
+        from utils.image_utils import image_manager
+
+        deleted = image_manager.delete_image(screenshot_path)
+        if current_user is not None:
+            if deleted:
+                log_with_user('info', f"{flow_label}会话过期，已删除验证截图: {screenshot_path}", current_user)
+            else:
+                log_with_user('warning', f"{flow_label}会话过期，但删除验证截图失败: {screenshot_path}", current_user)
+        elif not deleted:
+            logger.warning(f"{flow_label}会话过期，但删除验证截图失败: {screenshot_path}")
+    except Exception as cleanup_err:
+        if current_user is not None:
+            log_with_user('error', f"清理过期{flow_label}截图时出错: {str(cleanup_err)}", current_user)
+        else:
+            logger.error(f"清理过期{flow_label}截图时出错: {cleanup_err}")
+
+
+def _prune_expired_manual_browser_entry_sessions() -> None:
+    current_time = time.time()
+    expired_password_login_session_ids = [
+        session_id
+        for session_id, session in list(password_login_sessions.items())
+        if _should_prune_manual_browser_entry_session(
+            session,
+            current_time=current_time,
+        )
+    ]
+    for session_id in expired_password_login_session_ids:
+        expired_session = password_login_sessions.pop(session_id, None)
+        _cleanup_expired_manual_browser_entry_session_screenshot(
+            expired_session,
+            flow_label='密码登录',
+        )
+
+    expired_manual_cookie_import_session_ids = [
+        session_id
+        for session_id, session in list(manual_cookie_import_sessions.items())
+        if _should_prune_manual_browser_entry_session(
+            session,
+            current_time=current_time,
+        )
+    ]
+    for session_id in expired_manual_cookie_import_session_ids:
+        expired_session = manual_cookie_import_sessions.pop(session_id, None)
+        _cleanup_expired_manual_browser_entry_session_screenshot(
+            expired_session,
+            flow_label='手动导入 Cookie',
+        )
+
+
+def _build_active_manual_browser_entry_conflict_message(
+    account_id: str,
+    *,
+    flow_label: str,
+) -> str:
+    return f"账号 {account_id} 当前已有进行中的{flow_label}，请先完成或取消后再试"
+
+
+def _get_active_manual_browser_entry_conflict(
+    account_id: str,
+    *,
+    user_id: Any,
+) -> Optional[str]:
+    normalized_account_id = str(account_id or '').strip()
+    if not normalized_account_id:
+        return None
+
+    _prune_expired_manual_browser_entry_sessions()
+
+    for session in password_login_sessions.values():
+        if str(session.get('account_id') or '').strip() != normalized_account_id:
+            continue
+        if not _same_user_id(session.get('user_id'), user_id):
+            continue
+        session_status = str(session.get('status') or '').strip().lower()
+        if _finalize_stale_manual_browser_entry_session(
+            session,
+            session_type='password_login',
+        ):
+            session_status = str(session.get('status') or '').strip().lower()
+        if session_status in PASSWORD_LOGIN_TERMINAL_STATUSES:
+            continue
+        return _build_active_manual_browser_entry_conflict_message(
+            normalized_account_id,
+            flow_label='账号密码登录流程',
+        )
+
+    for session in manual_cookie_import_sessions.values():
+        if str(session.get('account_id') or '').strip() != normalized_account_id:
+            continue
+        if not _same_user_id(session.get('user_id'), user_id):
+            continue
+        session_status = str(session.get('status') or '').strip().lower()
+        if _finalize_stale_manual_browser_entry_session(
+            session,
+            session_type='manual_cookie_import',
+        ):
+            session_status = str(session.get('status') or '').strip().lower()
+        if session_status in MANUAL_COOKIE_IMPORT_TERMINAL_STATUSES:
+            continue
+        return _build_active_manual_browser_entry_conflict_message(
+            normalized_account_id,
+            flow_label='手动导入 Cookie 流程',
+        )
+
+    return None
+
+
+def _finalize_stale_manual_browser_entry_session(
+    session: Optional[Dict[str, Any]],
+    *,
+    session_type: str,
+) -> bool:
+    if not isinstance(session, dict):
+        return False
+
+    current_status = str(session.get('status') or '').strip().lower()
+    if session_type == 'password_login':
+        terminal_statuses = PASSWORD_LOGIN_TERMINAL_STATUSES
+        default_error_message = '登录任务已结束，但会话状态未正常回写'
+    else:
+        terminal_statuses = MANUAL_COOKIE_IMPORT_TERMINAL_STATUSES
+        default_error_message = 'Cookie 导入任务已结束，但会话状态未正常回写'
+
+    if current_status in terminal_statuses:
+        return False
+
+    if _manual_browser_entry_worker_thread_alive(session):
+        return False
+
+    if current_status not in {'processing', 'verification_required'}:
+        return False
+
+    if not _manual_browser_entry_async_task_done(session):
+        return False
+
+    session['status'] = 'failed'
+    session['completed_at'] = time.time()
+    if not str(session.get('error') or '').strip():
+        session['error'] = default_error_message
+    return True
+
+
+def _should_prune_manual_browser_entry_session(
+    session: Optional[Dict[str, Any]],
+    *,
+    current_time: float,
+) -> bool:
+    if not isinstance(session, dict):
+        return False
+
+    completed_at = session.get('completed_at')
+    if completed_at:
+        if _manual_browser_entry_worker_thread_alive(session):
+            return False
+        if not _manual_browser_entry_async_task_done(session, default_when_missing=True):
+            return False
+        if current_time - float(completed_at) > 300:
+            return True
+
+    timestamp = float(session.get('timestamp') or 0)
+    if timestamp <= 0 or current_time - timestamp <= 3600:
+        return False
+
+    if _manual_browser_entry_worker_thread_alive(session):
+        return False
+
+    task = session.get('task')
+    if task is None or not hasattr(task, 'done'):
+        return True
+
+    return _manual_browser_entry_async_task_done(session, default_when_missing=True)
+
+
+def _manual_browser_entry_worker_thread_alive(session: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(session, dict):
+        return False
+
+    worker_thread = session.get('worker_thread')
+    if worker_thread is None or not hasattr(worker_thread, 'is_alive'):
+        return False
+
+    try:
+        return bool(worker_thread.is_alive())
+    except Exception:
+        return False
+
+
+def _manual_browser_entry_async_task_done(
+    session: Optional[Dict[str, Any]],
+    *,
+    default_when_missing: bool = False,
+) -> bool:
+    if not isinstance(session, dict):
+        return default_when_missing
+
+    task = session.get('task')
+    if task is None or not hasattr(task, 'done'):
+        return default_when_missing
+
+    try:
+        return bool(task.done())
+    except Exception:
+        return default_when_missing
+
+
 def _set_manual_cookie_import_session_status(session_id: str, status: str, **fields):
     session = manual_cookie_import_sessions.get(session_id)
     if not session:
@@ -4922,11 +5967,45 @@ def _is_manual_cookie_import_runtime_closed_message(message: Any) -> bool:
 
 
 def _normalize_manual_cookie_import_failure_message(message: Any, default_message: str = '滑块验证失败，请稍后重试') -> str:
-    if _is_manual_cookie_import_runtime_closed_message(message):
+    normalized = str(message or '').strip()
+    if not normalized:
+        return default_message
+
+    if _is_manual_cookie_import_runtime_closed_message(normalized):
         return MANUAL_COOKIE_IMPORT_RUNTIME_CLOSED_ERROR
 
-    normalized = str(message or '').strip()
-    return normalized or default_message
+    if (
+        "运行中的账号浏览器任务" in normalized
+        or "当前有其他浏览器任务正在执行" in normalized
+        or "账号级 browser profile 已被其他 runtime 持有" in normalized
+        or "同账号已存在不兼容的 async runtime 正在使用中" in normalized
+        or "同账号已存在不兼容的 sync runtime 正在使用中" in normalized
+        or "runtime 正在失效回收" in normalized
+        or "用户取消Cookie导入验证" in normalized
+        or "滑块验证失败" in normalized
+        or "Cookie 导入验证失败" in normalized
+        or "Cookie导入验证失败" in normalized
+        or "bound_unb" in normalized
+    ):
+        return normalized
+
+    lowered = normalized.lower()
+    if (
+        normalized.startswith("{")
+        or normalized.startswith("[")
+        or "traceback" in lowered
+        or "runtimeerror" in lowered
+        or "valueerror" in lowered
+        or "keyerror" in lowered
+        or "exception" in lowered
+        or "verification_url" in lowered
+    ):
+        return default_message
+
+    if "请稍后重试" in normalized:
+        return normalized
+
+    return default_message
 
 
 def _finalize_manual_cookie_import_session_failure(
@@ -4940,6 +6019,369 @@ def _finalize_manual_cookie_import_session_failure(
         error=_normalize_manual_cookie_import_failure_message(error_message),
         **fields,
     )
+
+
+def _normalize_unexpected_session_failure_message(
+    message: Any,
+    *,
+    default_message: str,
+    runtime_closed_message: Optional[str] = None,
+) -> str:
+    normalized = str(message or '').strip()
+    if runtime_closed_message and _is_manual_cookie_import_runtime_closed_message(normalized):
+        return runtime_closed_message
+    if (
+        "运行中的账号浏览器任务" in normalized
+        or "当前有其他浏览器任务正在执行" in normalized
+        or "账号级 browser profile 已被其他 runtime 持有" in normalized
+        or "同账号已存在不兼容的 async runtime 正在使用中" in normalized
+        or "同账号已存在不兼容的 sync runtime 正在使用中" in normalized
+        or "runtime 正在失效回收" in normalized
+        or "bound_unb" in normalized
+        or "获取真实Cookie异常:" in normalized
+    ):
+        return normalized
+    if "event loop is closing" in normalized.lower():
+        return normalized
+    return default_message
+
+
+def _normalize_qr_login_chain_failure_message(
+    message: Any,
+    *,
+    default_message: str,
+) -> str:
+    normalized = str(message or '').strip()
+    if not normalized:
+        return default_message
+    qr_chain_prefix = '扫码登录未完成：'
+    while normalized.startswith(qr_chain_prefix):
+        normalized = normalized[len(qr_chain_prefix):].strip()
+    if not normalized:
+        return default_message
+    if (
+        "运行中的账号浏览器任务" in normalized
+        or "当前有其他浏览器任务正在执行" in normalized
+        or "账号级 browser profile 已被其他 runtime 持有" in normalized
+        or "同账号已存在不兼容的 async runtime 正在使用中" in normalized
+        or "同账号已存在不兼容的 sync runtime 正在使用中" in normalized
+        or "runtime 正在失效回收" in normalized
+        or "account_id格式非法" in normalized
+        or "缺少account_id" in normalized
+        or "无权访问" in normalized
+        or "真实Cookie获取失败" in normalized
+        or "无法从数据库获取真实Cookie" in normalized
+        or "获取真实Cookie异常:" in normalized
+        or "bound_unb" in normalized
+        or "已绑定其他账号" in normalized
+        or "UNB" in normalized
+    ):
+        return normalized
+    return default_message
+
+
+def _normalize_qr_login_handoff_warning_message(
+    message: Any,
+    *,
+    default_message: str,
+) -> str:
+    normalized = str(message or '').strip()
+    if not normalized:
+        return default_message
+    if (
+        "真实Cookie已获取，但任务管理器未初始化" in normalized
+        or "真实Cookie已获取，但账号事件循环未就绪" in normalized
+        or "真实Cookie已获取，但账号事件循环已关闭" in normalized
+        or "真实Cookie已获取，但账号事件循环未运行" in normalized
+        or "真实Cookie已获取，但账号任务接管状态未知" in normalized
+        or "真实Cookie已获取，但账号任务切换耗时较长，后台仍在处理中" in normalized
+        or "真实Cookie已获取，账号任务已切换；首次Token将在后台继续初始化" in normalized
+    ):
+        return normalized
+    return default_message
+
+
+def _normalize_password_login_session_failure_message(
+    message: Any,
+    *,
+    default_message: str,
+) -> str:
+    normalized = str(message or '').strip()
+    if not normalized:
+        return default_message
+
+    if (
+        "运行中的账号浏览器任务" in normalized
+        or "当前有其他浏览器任务正在执行" in normalized
+        or "账号级 browser profile 已被其他 runtime 持有" in normalized
+        or "同账号已存在不兼容的 async runtime 正在使用中" in normalized
+        or "同账号已存在不兼容的 sync runtime 正在使用中" in normalized
+        or "runtime 正在失效回收" in normalized
+        or "该账号正在执行手动刷新，请稍候再试" in normalized
+        or "无权操作此账号" in normalized
+        or "用户取消登录" in normalized
+        or "登录任务已结束，但会话状态未正常回写" in normalized
+        or "验证已超时" in normalized
+        or "二维码已失效" in normalized
+        or "登录成功但Cookie核心字段仍缺失" in normalized
+        or "登录失败，请检查账号密码是否正确" in normalized
+        or "CookieManager 未就绪" in normalized
+        or "账号事件循环已关闭" in normalized
+        or "账号事件循环未运行" in normalized
+        or "浏览器会话已关闭或 CDP 已断开" in normalized
+        or "bound_unb" in normalized
+    ):
+        return normalized
+
+    lowered = normalized.lower()
+    if (
+        normalized.startswith("{")
+        or normalized.startswith("[")
+        or "traceback" in lowered
+        or "runtimeerror" in lowered
+        or "valueerror" in lowered
+        or "keyerror" in lowered
+        or "exception" in lowered
+    ):
+        return default_message
+
+    if "请稍后重试" in normalized:
+        return normalized
+
+    return default_message
+
+
+def _normalize_qr_login_handoff_failure_message(
+    message: Any,
+    *,
+    default_message: str,
+) -> str:
+    normalized = str(message or '').strip()
+    if not normalized:
+        return default_message
+
+    if (
+        "运行中的账号浏览器任务" in normalized
+        or "当前有其他浏览器任务正在执行" in normalized
+        or "账号级 browser profile 已被其他 runtime 持有" in normalized
+        or "同账号已存在不兼容的 async runtime 正在使用中" in normalized
+        or "同账号已存在不兼容的 sync runtime 正在使用中" in normalized
+        or "runtime 正在失效回收" in normalized
+        or "扫码登录Cookie尚未就绪" in normalized
+        or "扫码登录会话缺少account_id" in normalized
+        or "真实Cookie获取失败" in normalized
+        or "无法从数据库获取真实Cookie" in normalized
+        or "bound_unb" in normalized
+        or "已绑定其他账号" in normalized
+    ):
+        return normalized
+
+    return default_message
+
+
+def _normalize_item_search_failure_message(
+    message: Any,
+    *,
+    default_message: str,
+    preserve_plain_message: bool = False,
+) -> str:
+    normalized = str(message or '').strip()
+    if not normalized:
+        return default_message
+
+    search_failure_prefixes = (
+        '商品搜索失败:',
+        '多页商品搜索失败:',
+        '搜索失败:',
+        '多页搜索失败:',
+    )
+    trimmed = True
+    while normalized and trimmed:
+        trimmed = False
+        for prefix in search_failure_prefixes:
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix):].strip()
+                trimmed = True
+
+    if not normalized or normalized == '未知错误':
+        return default_message
+
+    if (
+        "运行中的账号浏览器任务" in normalized
+        or "当前有其他浏览器任务正在执行" in normalized
+        or "账号级 browser profile 已被其他 runtime 持有" in normalized
+        or "同账号已存在不兼容的 async runtime 正在使用中" in normalized
+        or "同账号已存在不兼容的 sync runtime 正在使用中" in normalized
+        or "runtime 正在失效回收" in normalized
+        or "账号事件循环已关闭" in normalized
+        or "账号事件循环未运行" in normalized
+        or "账号未启动，暂无法执行当前操作" in normalized
+        or "暂无法复用运行中浏览器搜索" in normalized
+        or "没有可用Cookie" in normalized
+        or "缺少可用 Cookie" in normalized
+        or "Playwright 不可用" in normalized
+        or "浏览器未安装" in normalized
+        or "浏览器启动失败" in normalized
+        or "页面加载超时" in normalized
+        or "页面导航失败" in normalized
+        or "浏览器页面被意外关闭" in normalized
+    ):
+        return normalized
+
+    if "滑块验证失败" in normalized:
+        return "滑块验证失败"
+
+    if "未捕获到商品搜索接口响应" in normalized:
+        return "未捕获到商品搜索接口响应，请确认当前账号已登录且搜索页正常加载"
+
+    if "未找到搜索框元素" in normalized or "未找到可用的搜索提交入口" in normalized:
+        return "商品搜索页面未正常加载，请确认当前账号已登录且搜索页可用"
+
+    lowered = normalized.lower()
+    if (
+        normalized.startswith("{")
+        or normalized.startswith("[")
+        or "traceback" in lowered
+        or "runtimeerror" in lowered
+        or "valueerror" in lowered
+        or "keyerror" in lowered
+        or "assertionerror" in lowered
+        or "exception" in lowered
+    ):
+        return default_message
+
+    if preserve_plain_message:
+        return normalized
+
+    return default_message
+
+
+def _normalize_manual_delivery_failure_message(
+    message: Any,
+    *,
+    default_message: str,
+) -> str:
+    normalized = str(message or '').strip()
+    if not normalized:
+        return default_message
+
+    if (
+        "运行中的账号浏览器任务" in normalized
+        or "当前有其他浏览器任务正在执行" in normalized
+        or "账号级 browser profile 已被其他 runtime 持有" in normalized
+        or "同账号已存在不兼容的 async runtime 正在使用中" in normalized
+        or "同账号已存在不兼容的 sync runtime 正在使用中" in normalized
+        or "runtime 正在失效回收" in normalized
+        or "账号事件循环已关闭" in normalized
+        or "账号事件循环未运行" in normalized
+        or "账号未启动，暂无法执行当前操作" in normalized
+        or "未运行，请先启动账号" in normalized
+        or "订单缺少商品信息" in normalized
+        or "订单缺少买家信息" in normalized
+        or "未匹配到发货规则" in normalized
+        or "批量数据预占完成失败" in normalized
+        or "批量数据卡券元数据不完整" in normalized
+        or "批量数据消费失败" in normalized
+        or "发货元数据无效" in normalized
+        or "订单未解析到有效规格信息" in normalized
+        or "订单规格模式与命中规则模式不一致" in normalized
+        or "获取发货内容失败" in normalized
+        or "发货步骤构建失败" in normalized
+        or "未检测到订单ID" in normalized
+    ):
+        return normalized
+
+    if (
+        "missing canonical account_id" in normalized
+        or "missing order_id for delivery finalization" in normalized
+        or "is outside current account scope" in normalized
+        or "自动发货异常:" in normalized
+        or "发货处理异常:" in normalized
+    ):
+        return default_message
+
+    return default_message
+
+
+def _normalize_item_sync_failure_message(
+    message: Any,
+    *,
+    default_message: str,
+) -> str:
+    normalized = str(message or '').strip()
+    if not normalized:
+        return default_message
+
+    if (
+        "运行中的账号浏览器任务" in normalized
+        or "当前有其他浏览器任务正在执行" in normalized
+        or "账号级 browser profile 已被其他 runtime 持有" in normalized
+        or "同账号已存在不兼容的 async runtime 正在使用中" in normalized
+        or "同账号已存在不兼容的 sync runtime 正在使用中" in normalized
+        or "runtime 正在失效回收" in normalized
+        or "账号未启动，暂无法执行当前操作" in normalized
+        or "没有可用Cookie" in normalized
+        or "缺少可用 Cookie" in normalized
+        or "Playwright 不可用" in normalized
+        or "浏览器未安装" in normalized
+        or "浏览器启动失败" in normalized
+        or "页面加载超时" in normalized
+        or "页面导航失败" in normalized
+        or "浏览器页面被意外关闭" in normalized
+        or "获取商品信息失败，重试次数过多" in normalized
+    ):
+        return normalized
+
+    if normalized.startswith("获取商品信息失败: FAIL_SYS_") or normalized.startswith("FAIL_SYS_"):
+        return normalized
+
+    if normalized == '未知错误':
+        return default_message
+
+    return default_message
+
+
+def _normalize_item_polish_failure_message(
+    message: Any,
+    *,
+    default_message: str,
+) -> str:
+    normalized = str(message or '').strip()
+    if not normalized:
+        return default_message
+
+    if (
+        "运行中的账号浏览器任务" in normalized
+        or "当前有其他浏览器任务正在执行" in normalized
+        or "账号级 browser profile 已被其他 runtime 持有" in normalized
+        or "同账号已存在不兼容的 async runtime 正在使用中" in normalized
+        or "同账号已存在不兼容的 sync runtime 正在使用中" in normalized
+        or "runtime 正在失效回收" in normalized
+        or "账号未启动，暂无法执行当前操作" in normalized
+        or "没有在售商品需要擦亮" in normalized
+        or "获取商品列表失败:" in normalized
+        or "没有可用Cookie" in normalized
+        or "缺少可用 Cookie" in normalized
+        or "Playwright 不可用" in normalized
+        or "浏览器未安装" in normalized
+        or "浏览器启动失败" in normalized
+        or "页面加载超时" in normalized
+        or "页面导航失败" in normalized
+        or "浏览器页面被意外关闭" in normalized
+    ):
+        return normalized
+
+    if normalized == '未知错误':
+        return default_message
+
+    return default_message
+
+
+def _normalize_notification_test_channel_failure_label(channel_name: Any) -> str:
+    normalized = str(channel_name or '').strip()
+    if not normalized:
+        return '未命名渠道'
+    return normalized
 
 
 def _empty_slider_session_stats() -> Dict[str, Any]:
@@ -4971,7 +6413,18 @@ def _build_bound_unb_conflict_error(account_id: str, existing_bound_unb: Any, in
     )
 
 
-def _acquire_slider_managed_runtime_sync(account_id: str, purpose: str, slider_instance: Any):
+def _acquire_slider_managed_runtime_sync(
+    account_id: str,
+    purpose: str,
+    slider_instance: Any,
+    *,
+    action_text: Optional[str] = None,
+):
+    if action_text:
+        _ensure_manual_browser_entry_runtime_available_sync(
+            account_id,
+            action_text=action_text,
+        )
     request_builder = getattr(slider_instance, 'build_managed_runtime_request', None)
     if not callable(request_builder):
         raise AttributeError(f"{type(slider_instance).__name__} 缺少 build_managed_runtime_request")
@@ -5033,6 +6486,31 @@ def _invalidate_slider_managed_runtime_sync(account_id: str, *, reason: str = 'i
     )
 
 
+def _invalidate_cancelled_manual_browser_entry_runtime(
+    session: Dict[str, Any],
+    *,
+    reason: str,
+    flow_label: str,
+    current_user: Dict[str, Any],
+) -> bool:
+    account_id = str((session or {}).get('account_id') or '').strip()
+    if not account_id:
+        return False
+
+    try:
+        invalidated = _invalidate_slider_managed_runtime_sync(account_id, reason=reason)
+        if invalidated:
+            log_with_user('info', f"已失效{flow_label}账号级浏览器runtime: {account_id}", current_user)
+        return bool(invalidated)
+    except Exception as runtime_err:
+        log_with_user(
+            'warning',
+            f"失效{flow_label}账号级浏览器runtime失败: {account_id}, 错误: {runtime_err}",
+            current_user,
+        )
+        return False
+
+
 def _escape_powershell_single_quoted(text: str) -> str:
     return str(text or "").replace("'", "''")
 
@@ -5088,9 +6566,15 @@ def _build_delayed_restart_command(*, delay_seconds: float = 2.0) -> Tuple[List[
     )
 
 
-def _bind_cookie_account_unb_or_raise(account_id: str, incoming_unb: str, user_id: int):
+def _bind_cookie_account_unb_or_raise(
+    account_id: str,
+    incoming_unb: str,
+    user_id: int,
+    binding_info: Optional[Dict[str, Any]] = None,
+):
     incoming_unb = str(incoming_unb or '').strip()
-    binding_info = db_manager.get_cookie_binding_info(account_id) or {}
+    if binding_info is None:
+        binding_info = db_manager.get_cookie_binding_info(account_id) or {}
     if not incoming_unb:
         return binding_info
     if not db_manager.bind_cookie_account_unb(account_id, incoming_unb, user_id=user_id):
@@ -5152,12 +6636,16 @@ def _persist_password_login_success(
     merged_cookies_dict: Dict[str, Any],
     is_refresh_mode: bool,
     current_user: Dict[str, Any],
+    binding_info: Optional[Dict[str, Any]] = None,
+    existing_cookie_value: Optional[str] = None,
 ) -> bool:
-    binding_info = _get_same_user_account_binding_info_or_raise(account_id, user_id)
+    if binding_info is None:
+        binding_info = _get_same_user_account_binding_info_or_raise(account_id, user_id)
     if binding_info and binding_info.get('user_id') is not None and _same_user_id(binding_info.get('user_id'), user_id):
         is_new_account = False
     else:
-        existing_cookie_value = _get_user_cookie_snapshot_for_account(account_id, user_id)
+        if existing_cookie_value is None:
+            existing_cookie_value = _get_user_cookie_snapshot_for_account(account_id, user_id)
         is_new_account = _is_cookie_account_new_or_unmaterialized(binding_info, existing_cookie_value)
     if not is_new_account:
         # 已存在的账号：先做 unb 冲突校验，避免 cookie 被错误覆盖到别的账号上。
@@ -5233,9 +6721,36 @@ async def _execute_password_login(
     manual_refresh_acquired = False
     manual_refresh_owner = f"password_login:{session_id}"
     login_thread_started = False
+    slider_instance = None
     manual_refresh_preflight_timeout = 45.0
     request_loop = asyncio.get_running_loop()
+
+    def abort_if_cancelled(stage: str, *, cleanup_slider: bool = False) -> bool:
+        nonlocal slider_instance, manual_refresh_acquired
+        if not _is_password_login_session_cancelled(session_id):
+            return False
+
+        if cleanup_slider and slider_instance is not None:
+            try:
+                slider_instance.close_browser()
+            except Exception:
+                pass
+
+        if manual_refresh_acquired and not login_thread_started:
+            try:
+                from XianyuAutoAsync import XianyuLive
+                XianyuLive.end_manual_refresh(account_id, source=manual_refresh_owner)
+                manual_refresh_acquired = False
+            except Exception:
+                pass
+
+        log_with_user('info', f"密码登录会话已取消，跳过后续执行: {session_id}, stage={stage}", current_user)
+        return True
+
     try:
+        if abort_if_cancelled('execute_start'):
+            return
+
         log_with_user('info', f"开始执行账号密码登录任务: {session_id}, 账号: {account_id}", current_user)
 
         is_refresh_mode = password_login_sessions.get(session_id, {}).get('refresh_mode', False)
@@ -5252,6 +6767,9 @@ async def _execute_password_login(
                 _update_session_risk_log(session_id, 'failed', error_message='账号正在执行手动刷新')
                 log_with_user('warning', f"账号已存在手动刷新任务，拒绝重复触发: {account_id}", current_user)
                 return
+
+        if abort_if_cancelled('after_manual_refresh_preflight'):
+            return
         
         # 导入 XianyuSliderStealth
         from utils.xianyu_slider_stealth import XianyuSliderStealth
@@ -5285,7 +6803,7 @@ async def _execute_password_login(
             verification_url: str = None,
             screenshot_path_new: str = None,
             verification_type: str = None,
-            verification_pending_completion: bool = False,
+                verification_pending_completion: bool = False,
         ):
             """账号验证通知回调（同步）
             
@@ -5297,6 +6815,9 @@ async def _execute_password_login(
                 verification_type: 验证类型
             """
             try:
+                if _is_password_login_session_cancelled(session_id):
+                    return
+
                 # 优先使用新的截图路径参数
                 actual_screenshot_path = screenshot_path_new if screenshot_path_new else screenshot_path
                 verification_type_label = resolve_verification_type_label(
@@ -5449,10 +6970,14 @@ async def _execute_password_login(
             from XianyuAutoAsync import XianyuLive
             runtime_lease = None
             try:
+                if abort_if_cancelled('run_login_start'):
+                    return
+
                 runtime_lease = _acquire_slider_managed_runtime_sync(
                     account_id,
                     'password_login',
                     slider_instance,
+                    action_text='执行账号密码登录',
                 )
                 cookies_dict = slider_instance.login_with_password_browser(
                     account=account,
@@ -5466,6 +6991,9 @@ async def _execute_password_login(
                     failure_message = slider_instance.last_login_error or '登录失败，请检查账号密码是否正确'
                     _finalize_password_login_session_failure(session_id, failure_message)
                     log_with_user('error', f"账号密码登录失败: {account_id}, 错误: {failure_message}", current_user)
+                    return
+
+                if abort_if_cancelled('after_login_success_before_stabilization'):
                     return
                 
                 log_with_user('info', f"账号密码登录成功，获取到 {len(cookies_dict)} 个Cookie字段: {account_id}", current_user)
@@ -5581,28 +7109,41 @@ async def _execute_password_login(
                             account_id,
                             manual_refresh_owner=manual_refresh_owner,
                         )
+                        if abort_if_cancelled('after_manual_refresh_handoff_before_preflight'):
+                            return
                         temp_xianyu = XianyuLive(
                             cookies_str=cookies_str,
                             account_id=runtime_account_id,
                             user_id=user_id,
                             register_instance=False,
                         )
-                        preflight_future = asyncio.run_coroutine_threadsafe(
-                            temp_xianyu.preflight_token_after_manual_refresh(),
-                            request_loop,
-                        )
-                        _wait_threadsafe_future_result(
-                            preflight_future,
-                            manual_refresh_preflight_timeout,
-                            f"手动刷新后的Token预检在 {manual_refresh_preflight_timeout:.0f} 秒内未完成",
-                            account_id=account_id,
-                        )
-                        cookies_str = temp_xianyu.cookies_str
-                        merged_cookies_dict = trans_cookies(cookies_str)
-                        stabilization_meta['token_prewarmed'] = True
-                        log_with_user('info', f"刷新模式Token预检通过，将使用预检后的Cookie继续交接: {account_id}", current_user)
+                        try:
+                            preflight_future = asyncio.run_coroutine_threadsafe(
+                                temp_xianyu.preflight_token_after_manual_refresh(),
+                                request_loop,
+                            )
+                            _wait_threadsafe_future_result(
+                                preflight_future,
+                                manual_refresh_preflight_timeout,
+                                f"手动刷新后的Token预检在 {manual_refresh_preflight_timeout:.0f} 秒内未完成",
+                                account_id=account_id,
+                            )
+                            cookies_str = temp_xianyu.cookies_str
+                            merged_cookies_dict = trans_cookies(cookies_str)
+                            stabilization_meta['token_prewarmed'] = True
+                            log_with_user('info', f"刷新模式Token预检通过，将使用预检后的Cookie继续交接: {account_id}", current_user)
+                        finally:
+                            _close_temporary_xianyu_session_sync(
+                                temp_xianyu,
+                                request_loop=request_loop,
+                                account_id=account_id,
+                                scene="手动刷新Token预检",
+                            )
                     except Exception as preflight_err:
-                        error_message = f"刷新模式认证预检失败，任务未切换: {str(preflight_err)}"
+                        error_message = _normalize_password_login_session_failure_message(
+                            preflight_err,
+                            default_message='刷新模式认证预检失败，任务未切换，请稍后重试',
+                        )
                         log_with_user('error', f"{error_message}: {account_id}", current_user)
                         _finalize_password_login_session_failure(
                             session_id,
@@ -5673,7 +7214,10 @@ async def _execute_password_login(
                                 stabilization_err = retry_err
 
                         if not retry_succeeded:
-                            error_message = f"密码登录后Cookie稳定化失败，任务未切换: {str(stabilization_err)}"
+                            error_message = _normalize_password_login_session_failure_message(
+                                stabilization_err,
+                                default_message='密码登录后Cookie稳定化失败，任务未切换，请稍后重试',
+                            )
                             log_with_user('error', f"{error_message}: {account_id}", current_user)
                             _finalize_password_login_session_failure(
                                 session_id,
@@ -5682,6 +7226,9 @@ async def _execute_password_login(
                                 event_meta={'account_id': account_id},
                             )
                             return
+
+                if abort_if_cancelled('before_persist_success'):
+                    return
                 
                 if not is_refresh_mode and runtime_lease is not None:
                     try:
@@ -5726,6 +7273,9 @@ async def _execute_password_login(
                         current_user,
                     )
 
+                if abort_if_cancelled('before_password_login_persist_success'):
+                    return
+
                 is_new_account = _persist_password_login_success(
                     account_id=account_id,
                     account=account,
@@ -5735,6 +7285,7 @@ async def _execute_password_login(
                     merged_cookies_dict=merged_cookies_dict,
                     is_refresh_mode=is_refresh_mode,
                     current_user=current_user,
+                    binding_info=existing_binding_info,
                 )
                 
                 if is_refresh_mode:
@@ -5749,7 +7300,7 @@ async def _execute_password_login(
                     log_with_user('info', f"密码登录Cookie已通过HTTP预检完成交接，正式Token将在后台实例初始化: {account_id}", current_user)
                 
                 # 更新会话状态
-                _set_password_login_session_status(
+                status_updated = _set_password_login_session_status(
                     session_id,
                     'success',
                     account_id=account_id,
@@ -5759,6 +7310,13 @@ async def _execute_password_login(
                     real_cookie_refreshed=stabilization_meta.get('real_cookie_refreshed', False),
                     fallback_reason=stabilization_meta.get('fallback_reason'),
                 )
+                if not status_updated:
+                    log_with_user(
+                        'info',
+                        f"密码登录成功结果到达时会话已处于终态，跳过成功风控收口和通知: {session_id}",
+                        current_user,
+                    )
+                    return
                 _close_password_login_pending_verification_risk_logs(
                     session_id,
                     'success',
@@ -5784,7 +7342,7 @@ async def _execute_password_login(
                 # 发送登录成功通知（使用模板系统）
                 try:
                     # 根据模式选择不同模板
-                    notify_refresh_mode = password_login_sessions[session_id].get('refresh_mode')
+                    notify_refresh_mode = password_login_sessions.get(session_id, {}).get('refresh_mode', is_refresh_mode)
                     template_type = 'cookie_refresh_success' if notify_refresh_mode else 'password_login_success'
 
                     notification_message = render_notification_template(
@@ -5811,9 +7369,12 @@ async def _execute_password_login(
                     log_with_user('warning', f"发送登录成功通知失败: {account_id}, 错误: {str(notify_err)}", current_user)
                 
             except Exception as e:
-                error_msg = str(e)
+                error_msg = _normalize_unexpected_session_failure_message(
+                    e,
+                    default_message='登录失败，请稍后重试',
+                )
                 _finalize_password_login_session_failure(session_id, error_msg)
-                log_with_user('error', f"账号密码登录失败: {account_id}, 错误: {error_msg}", current_user)
+                log_with_user('error', f"账号密码登录失败: {account_id}, 错误: {str(e)}", current_user)
                 logger.info(f"会话 {session_id} 状态已更新为 failed，错误消息: {error_msg}")  # 添加日志确认状态更新
                 import traceback
                 logger.error(traceback.format_exc())
@@ -5845,23 +7406,38 @@ async def _execute_password_login(
         
         def run_login_via_account_worker():
             try:
+                if abort_if_cancelled('account_worker_dispatch', cleanup_slider=True):
+                    return
                 account_browser_runtime_manager.run_sync_task_on_account_thread(
                     account_id,
                     run_login,
                 )
             except Exception as worker_err:
-                _finalize_password_login_session_failure(session_id, str(worker_err))
+                failure_message = _normalize_unexpected_session_failure_message(
+                    worker_err,
+                    default_message='登录失败，请稍后重试',
+                )
+                _finalize_password_login_session_failure(session_id, failure_message)
                 log_with_user('error', f"账号浏览器 worker 执行登录任务异常: {str(worker_err)}", current_user)
                 import traceback
                 logger.error(traceback.format_exc())
 
         # 在后台线程中调度到账号级浏览器 worker，确保同账号浏览器操作固定落在同一线程。
         login_thread = threading.Thread(target=run_login_via_account_worker, daemon=True)
+        session = password_login_sessions.get(session_id)
+        if isinstance(session, dict):
+            session['worker_thread'] = login_thread
+        if abort_if_cancelled('before_thread_start', cleanup_slider=True):
+            return
         login_thread.start()
         login_thread_started = True
         
     except Exception as e:
-        _finalize_password_login_session_failure(session_id, str(e))
+        failure_message = _normalize_unexpected_session_failure_message(
+            e,
+            default_message='登录失败，请稍后重试',
+        )
+        _finalize_password_login_session_failure(session_id, failure_message)
         log_with_user('error', f"执行账号密码登录任务异常: {str(e)}", current_user)
         if manual_refresh_acquired and not login_thread_started:
             try:
@@ -5881,7 +7457,51 @@ async def _execute_manual_cookie_import(
     user_id: int,
     current_user: Dict[str, Any],
 ):
+    slider_instance = None
+
+    async def allow_immediate_worker_failure_to_settle(
+        worker_thread: Any,
+        *,
+        settle_timeout_seconds: float = 0.2,
+    ) -> None:
+        deadline = time.monotonic() + max(0.0, float(settle_timeout_seconds))
+        while time.monotonic() < deadline:
+            session_snapshot = manual_cookie_import_sessions.get(session_id) or {}
+            session_status = str(session_snapshot.get('status') or '').strip().lower()
+            if session_status in MANUAL_COOKIE_IMPORT_TERMINAL_STATUSES:
+                return
+            if worker_thread is None or not getattr(worker_thread, "is_alive", lambda: False)():
+                break
+            await asyncio.sleep(0.01)
+
+        session_snapshot = manual_cookie_import_sessions.get(session_id) or {}
+        session_status = str(session_snapshot.get('status') or '').strip().lower()
+        if session_status == 'processing' and (
+            worker_thread is None or not getattr(worker_thread, "is_alive", lambda: False)()
+        ):
+            _finalize_manual_cookie_import_session_failure(
+                session_id,
+                'Cookie 导入验证失败，请稍后重试',
+            )
+
+    def abort_if_cancelled(stage: str, *, cleanup_slider: bool = False) -> bool:
+        nonlocal slider_instance
+        if not _is_manual_cookie_import_session_cancelled(session_id):
+            return False
+
+        if cleanup_slider and slider_instance is not None:
+            try:
+                slider_instance.close_browser()
+            except Exception:
+                pass
+
+        log_with_user('info', f"手动导入 Cookie 会话已取消，跳过后续执行: {session_id}, stage={stage}", current_user)
+        return True
+
     try:
+        if abort_if_cancelled('execute_start'):
+            return
+
         from utils.xianyu_slider_stealth import (
             XianyuSliderStealth,
             probe_cookie_verification_from_cookie,
@@ -5934,6 +7554,8 @@ async def _execute_manual_cookie_import(
         def persist_manual_cookie_import_success(merged_cookies_dict: Dict[str, Any], source_label: str):
             if not merged_cookies_dict:
                 raise ValueError(f"手动导入 Cookie {source_label}后未获取到有效 Cookie")
+            if abort_if_cancelled(f'before_manual_cookie_import_persist_{source_label}'):
+                return False
 
             cookies_str = '; '.join([f"{k}={v}" for k, v in merged_cookies_dict.items()])
             is_new_account = _persist_manual_cookie_import_success(
@@ -5942,13 +7564,20 @@ async def _execute_manual_cookie_import(
                 cookies_str=cookies_str,
             )
 
-            _set_manual_cookie_import_session_status(
+            status_updated = _set_manual_cookie_import_session_status(
                 session_id,
                 'success',
                 account_id=account_id,
                 is_new_account=is_new_account,
                 cookie_count=len(merged_cookies_dict),
             )
+            if not status_updated:
+                log_with_user(
+                    'info',
+                    f"手动导入 Cookie {source_label}成功结果到达时会话已处于终态，跳过成功收口: {session_id}",
+                    current_user,
+                )
+                return False
             log_with_user(
                 'info',
                 (
@@ -5957,6 +7586,7 @@ async def _execute_manual_cookie_import(
                 ),
                 current_user,
             )
+            return True
 
         def notification_callback(
             message: str,
@@ -5968,6 +7598,9 @@ async def _execute_manual_cookie_import(
             """手动导入 Cookie 的验证通知回调。"""
             try:
                 import threading
+
+                if _is_manual_cookie_import_session_cancelled(session_id):
+                    return
 
                 actual_screenshot_path = screenshot_path_new if screenshot_path_new else screenshot_path
 
@@ -6063,7 +7696,13 @@ async def _execute_manual_cookie_import(
         def run_import():
             runtime_lease = None
             try:
+                if abort_if_cancelled('run_import_start'):
+                    return
+
                 probe_result = probe_cookie_verification_from_cookie(cookie_value, proxy_config)
+                if abort_if_cancelled('after_cookie_probe'):
+                    return
+
                 if probe_result.get('status') == 'cookie_valid':
                     merged_cookies_dict = merge_cookie_dicts_for_import(
                         probe_result.get('session_cookies'),
@@ -6088,6 +7727,7 @@ async def _execute_manual_cookie_import(
                     account_id,
                     'manual_cookie_import',
                     slider_instance,
+                    action_text='执行手动导入 Cookie',
                 )
                 success, cookies_dict = slider_instance.run(
                     target_url,
@@ -6109,12 +7749,19 @@ async def _execute_manual_cookie_import(
                     log_with_user('error', f"手动导入 Cookie 验证失败: {account_id}, 错误: {failure_message}", current_user)
                     return
 
+                if abort_if_cancelled('before_persist_success'):
+                    return
+
                 merged_cookies_dict = merge_cookie_dicts_for_import(cookies_dict, '浏览器验证')
                 persist_manual_cookie_import_success(merged_cookies_dict, '浏览器验证')
             except Exception as exc:
-                error_message = str(exc)
+                error_message = _normalize_unexpected_session_failure_message(
+                    exc,
+                    default_message='Cookie 导入验证失败，请稍后重试',
+                    runtime_closed_message=MANUAL_COOKIE_IMPORT_RUNTIME_CLOSED_ERROR,
+                )
                 _finalize_manual_cookie_import_session_failure(session_id, error_message)
-                log_with_user('error', f"手动导入 Cookie 执行异常: {account_id}, 错误: {error_message}", current_user)
+                log_with_user('error', f"手动导入 Cookie 执行异常: {account_id}, 错误: {str(exc)}", current_user)
                 import traceback
                 logger.error(traceback.format_exc())
             finally:
@@ -6133,21 +7780,39 @@ async def _execute_manual_cookie_import(
 
         def run_import_via_account_worker():
             try:
+                if abort_if_cancelled('account_worker_dispatch', cleanup_slider=True):
+                    return
                 account_browser_runtime_manager.run_sync_task_on_account_thread(
                     account_id,
                     run_import,
                 )
             except Exception as worker_err:
-                _finalize_manual_cookie_import_session_failure(session_id, str(worker_err))
+                failure_message = _normalize_unexpected_session_failure_message(
+                    worker_err,
+                    default_message='Cookie 导入验证失败，请稍后重试',
+                    runtime_closed_message=MANUAL_COOKIE_IMPORT_RUNTIME_CLOSED_ERROR,
+                )
+                _finalize_manual_cookie_import_session_failure(session_id, failure_message)
                 log_with_user('error', f"账号浏览器 worker 执行手动导入 Cookie 任务异常: {str(worker_err)}", current_user)
                 import traceback
                 logger.error(traceback.format_exc())
 
         import threading
         login_thread = threading.Thread(target=run_import_via_account_worker, daemon=True)
+        session = manual_cookie_import_sessions.get(session_id)
+        if isinstance(session, dict):
+            session['worker_thread'] = login_thread
+        if abort_if_cancelled('before_thread_start', cleanup_slider=True):
+            return
         login_thread.start()
+        await allow_immediate_worker_failure_to_settle(login_thread)
     except Exception as exc:
-        _finalize_manual_cookie_import_session_failure(session_id, str(exc))
+        failure_message = _normalize_unexpected_session_failure_message(
+            exc,
+            default_message='Cookie 导入验证失败，请稍后重试',
+            runtime_closed_message=MANUAL_COOKIE_IMPORT_RUNTIME_CLOSED_ERROR,
+        )
+        _finalize_manual_cookie_import_session_failure(session_id, failure_message)
         log_with_user('error', f"执行手动导入 Cookie 任务异常: {str(exc)}", current_user)
         import traceback
         logger.error(traceback.format_exc())
@@ -6166,66 +7831,109 @@ async def manual_cookie_import(
         user_id = current_user['user_id']
 
         try:
+            session_id = _new_account_verification_session_id(request.session_id)
+        except ValueError as session_id_error:
+            return {'success': False, 'message': str(session_id_error)}
+
+        try:
             account_id = _require_runtime_account_id(
                 account_id,
                 action_text="manual cookie import",
             )
         except ValueError as account_scope_error:
-            return {'success': False, 'message': str(account_scope_error)}
+            return {
+                'success': False,
+                'message': _normalize_runtime_account_id_error_message(account_scope_error),
+            }
 
         if not account_id or not cookie_value:
             return {'success': False, 'message': '账号ID和Cookie不能为空'}
 
-        _cleanup_stale_foreign_pending_placeholder(
-            account_id,
-            user_id,
-            action_text="manual cookie import",
-        )
-        binding_info = db_manager.get_cookie_binding_info(account_id)
-        binding_owner_id = binding_info.get('user_id') if binding_info else None
-        has_binding_owner = binding_owner_id is not None and str(binding_owner_id).strip() != ''
-        if binding_info and has_binding_owner:
+        entry_lock = manual_browser_entry_locks[account_id]
+        async with entry_lock:
+            if _consume_account_verification_prestart_cancellation(
+                'manual_cookie_import',
+                session_id,
+                user_id,
+            ):
+                return {
+                    'success': False,
+                    'status': 'cancelled',
+                    'session_id': session_id,
+                    'message': '手动导入 Cookie 会话已取消',
+                }
+            if session_id in manual_cookie_import_sessions:
+                return {'success': False, 'message': '手动导入 Cookie 会话已存在'}
+
+            active_manual_conflict = _get_active_manual_browser_entry_conflict(
+                account_id,
+                user_id=user_id,
+            )
+            if active_manual_conflict:
+                return {'success': False, 'message': active_manual_conflict}
+
+            _cleanup_stale_foreign_pending_placeholder(
+                account_id,
+                user_id,
+                action_text="manual cookie import",
+            )
+            binding_info = db_manager.get_cookie_binding_info(account_id)
+            binding_owner_id = binding_info.get('user_id') if binding_info else None
+            has_binding_owner = binding_owner_id is not None and str(binding_owner_id).strip() != ''
+            if binding_info and has_binding_owner:
+                try:
+                    db_manager.assert_cookie_belongs_to_user(account_id, user_id)
+                except PermissionError as ownership_error:
+                    return {'success': False, 'message': str(ownership_error)}
+
             try:
-                db_manager.assert_cookie_belongs_to_user(account_id, user_id)
-            except PermissionError as ownership_error:
-                return {'success': False, 'message': str(ownership_error)}
+                await _ensure_manual_browser_entry_runtime_available(
+                    account_id,
+                    action_text='执行手动导入 Cookie',
+                )
+            except HTTPException as runtime_conflict:
+                return {'success': False, 'message': str(runtime_conflict.detail)}
 
-        session_id = secrets.token_urlsafe(16)
-        manual_cookie_import_sessions[session_id] = {
-            'account_id': account_id,
-            'show_browser': show_browser,
-            'status': 'processing',
-            'verification_url': None,
-            'screenshot_path': None,
-            'verification_type': None,
-            'slider_instance': None,
-            'task': None,
-            'timestamp': time.time(),
-            'completed_at': None,
-            'user_id': user_id,
-        }
+            manual_cookie_import_sessions[session_id] = {
+                'account_id': account_id,
+                'show_browser': show_browser,
+                'status': 'processing',
+                'verification_url': None,
+                'screenshot_path': None,
+                'verification_type': None,
+                'slider_instance': None,
+                'task': None,
+                'worker_thread': None,
+                'timestamp': time.time(),
+                'completed_at': None,
+                'user_id': user_id,
+            }
 
-        task = asyncio.create_task(_execute_manual_cookie_import(
-            session_id,
-            account_id,
-            cookie_value,
-            show_browser,
-            user_id,
-            current_user,
-        ))
-        manual_cookie_import_sessions[session_id]['task'] = task
+            try:
+                task = asyncio.create_task(_execute_manual_cookie_import(
+                    session_id,
+                    account_id,
+                    cookie_value,
+                    show_browser,
+                    user_id,
+                    current_user,
+                ))
+            except Exception:
+                manual_cookie_import_sessions.pop(session_id, None)
+                raise
+            manual_cookie_import_sessions[session_id]['task'] = task
 
-        return {
-            'success': True,
-            'session_id': session_id,
-            'status': 'processing',
-            'message': 'Cookie导入验证任务已启动，请等待...',
-        }
+            return {
+                'success': True,
+                'session_id': session_id,
+                'status': 'processing',
+                'message': 'Cookie导入验证任务已启动，请等待...',
+            }
     except Exception as exc:
         log_with_user('error', f"手动导入 Cookie 异常: {str(exc)}", current_user)
         import traceback
         logger.error(traceback.format_exc())
-        return {'success': False, 'message': f'手动导入 Cookie 失败: {str(exc)}'}
+        return {'success': False, 'message': safe_client_error('手动导入 Cookie 失败，请稍后重试')}
 
 
 @app.get("/manual-cookie-import/check/{session_id}")
@@ -6238,11 +7946,19 @@ async def check_manual_cookie_import_status(
         current_time = time.time()
         expired_sessions = [
             sid for sid, session in manual_cookie_import_sessions.items()
-            if (
-                session.get('completed_at') and current_time - session['completed_at'] > 300
-            ) or current_time - session['timestamp'] > 3600
+            if _should_prune_manual_browser_entry_session(
+                session,
+                current_time=current_time,
+            )
         ]
         for sid in expired_sessions:
+            expired_session = manual_cookie_import_sessions.get(sid)
+            if expired_session:
+                _cleanup_expired_manual_browser_entry_session_screenshot(
+                    expired_session,
+                    flow_label='手动导入 Cookie',
+                    current_user=current_user,
+                )
             if sid in manual_cookie_import_sessions:
                 del manual_cookie_import_sessions[sid]
 
@@ -6253,6 +7969,10 @@ async def check_manual_cookie_import_status(
         if not _same_user_id(session.get('user_id'), current_user.get('user_id')):
             return {'status': 'forbidden', 'message': '无权限访问该会话'}
 
+        _finalize_stale_manual_browser_entry_session(
+            session,
+            session_type='manual_cookie_import',
+        )
         status = session['status']
         if status == 'verification_required':
             slider_instance = session.get('slider_instance')
@@ -6283,7 +8003,7 @@ async def check_manual_cookie_import_status(
                 'cookie_count': session.get('cookie_count', 0),
             }
         if status == 'failed':
-            error_msg = session.get('error', 'Cookie 导入验证失败')
+            error_msg = session.get('error') or 'Cookie 导入验证失败'
             return {
                 'status': 'failed',
                 'message': error_msg,
@@ -6302,7 +8022,7 @@ async def check_manual_cookie_import_status(
         }
     except Exception as exc:
         log_with_user('error', f"检查手动导入 Cookie 状态异常: {str(exc)}", current_user)
-        return {'status': 'error', 'message': str(exc)}
+        return {'status': 'error', 'message': safe_client_error('检查 Cookie 导入状态失败，请稍后重试')}
 
 
 @app.post("/manual-cookie-import/cancel/{session_id}")
@@ -6314,7 +8034,12 @@ async def cancel_manual_cookie_import(
     try:
         session = manual_cookie_import_sessions.get(session_id)
         if not session:
-            return {'success': False, 'status': 'not_found', 'message': '会话不存在或已过期'}
+            _record_account_verification_prestart_cancellation(
+                'manual_cookie_import',
+                session_id,
+                current_user.get('user_id'),
+            )
+            return {'success': True, 'status': 'not_found', 'message': '手动导入 Cookie 会话已结束'}
 
         if not _same_user_id(session.get('user_id'), current_user.get('user_id')):
             return {'success': False, 'status': 'forbidden', 'message': '无权限访问该会话'}
@@ -6333,6 +8058,13 @@ async def cancel_manual_cookie_import(
         if task and not task.done():
             task.cancel()
 
+        _invalidate_cancelled_manual_browser_entry_runtime(
+            session,
+            reason='manual_cookie_import_cancelled',
+            flow_label='手动导入 Cookie',
+            current_user=current_user,
+        )
+
         slider_instance = session.get('slider_instance')
         if slider_instance:
             try:
@@ -6350,7 +8082,7 @@ async def cancel_manual_cookie_import(
         log_with_user('error', f"取消手动导入 Cookie 会话异常: {str(exc)}", current_user)
         import traceback
         logger.error(traceback.format_exc())
-        return {'success': False, 'status': 'error', 'message': str(exc)}
+        return {'success': False, 'status': 'error', 'message': safe_client_error('取消 Cookie 导入验证失败，请稍后重试')}
 
 
 @app.post("/password-login")
@@ -6364,11 +8096,15 @@ async def password_login(
         account = request.get('account')
         password = request.get('password')
         show_browser_specified = 'show_browser' in request
-        show_browser = bool(request.get('show_browser', False))
-        refresh_mode = request.get('refresh_mode', False)  # 刷新模式：从数据库读取账密
+        show_browser = _parse_loose_bool(request.get('show_browser'), default=False)
+        refresh_mode = _parse_loose_bool(request.get('refresh_mode'), default=False)  # 刷新模式：从数据库读取账密
         risk_log_id = None
 
         user_id = current_user['user_id']
+        try:
+            session_id = _new_account_verification_session_id(request.get('session_id'))
+        except ValueError as session_id_error:
+            return {'success': False, 'message': str(session_id_error)}
 
         if account_id:
             try:
@@ -6377,7 +8113,10 @@ async def password_login(
                     action_text="password login",
                 )
             except ValueError as account_scope_error:
-                return {'success': False, 'message': str(account_scope_error)}
+                return {
+                    'success': False,
+                    'message': _normalize_runtime_account_id_error_message(account_scope_error),
+                }
 
         if account_id and not refresh_mode:
             binding_info = db_manager.get_cookie_binding_info(account_id)
@@ -6416,7 +8155,7 @@ async def password_login(
                 return {'success': False, 'message': '该账号未配置用户名和密码，无法刷新Cookie'}
 
             if not show_browser_specified:
-                show_browser = bool(cookie_info.get('show_browser', False))
+                show_browser = _parse_loose_bool(cookie_info.get('show_browser'), default=False)
 
             log_with_user('info', f"刷新Cookie模式: {account_id}, 用户名: {account}, headless: {not show_browser}", current_user)
 
@@ -6426,73 +8165,113 @@ async def password_login(
         if not account_id or not account or not password:
             return {'success': False, 'message': '账号ID、登录账号和密码不能为空'}
 
-        log_with_user('info', f"开始账号密码登录: {account_id}, 账号: {account}", current_user)
-        
-        # 生成会话ID
-        session_id = secrets.token_urlsafe(16)
-        risk_session_id = _new_risk_log_session_id('pwd')
+        entry_lock = manual_browser_entry_locks[account_id]
+        async with entry_lock:
+            if _consume_account_verification_prestart_cancellation(
+                'password_login',
+                session_id,
+                user_id,
+            ):
+                return {
+                    'success': False,
+                    'status': 'cancelled',
+                    'session_id': session_id,
+                    'message': '登录会话已取消',
+                }
+            if session_id in password_login_sessions:
+                return {'success': False, 'message': '登录会话已存在'}
 
-        # 记录手动刷新Cookie到风控日志
-        risk_log_id = None
-        if refresh_mode:
+            active_manual_conflict = _get_active_manual_browser_entry_conflict(
+                account_id,
+                user_id=user_id,
+            )
+            if active_manual_conflict:
+                return {'success': False, 'message': active_manual_conflict}
+
             try:
-                risk_log_id = db_manager.add_risk_control_log(
-                    account_id=account_id,
-                    event_type='cookie_refresh',
-                    session_id=risk_session_id,
-                    trigger_scene='manual_password_refresh',
-                    result_code='manual_cookie_refresh_started',
-                    event_description='手动触发账密Cookie刷新',
-                    processing_status='processing',
-                    event_meta=_build_risk_event_meta({
-                        'account_id': account_id,
-                        'refresh_mode': True,
-                    })
+                await _ensure_manual_browser_entry_runtime_available(
+                    account_id,
+                    action_text='执行账号密码登录',
                 )
-            except Exception as log_e:
-                risk_log_id = None
-                logger.error(f"记录风控日志失败: {log_e}")
-        
-        user_id = current_user['user_id']
-        
-        # 创建登录会话
-        password_login_sessions[session_id] = {
-            'account_id': account_id,
-            'account': account,
-            'show_browser': show_browser,
-            'refresh_mode': refresh_mode,  # 保存刷新模式标志
-            'risk_control_log_id': risk_log_id if refresh_mode else None,  # 风控日志ID
-            'risk_session_id': risk_session_id,
-            'status': 'processing',
-            'verification_url': None,
-            'screenshot_path': None,
-            'qr_code_url': None,
-            'verification_type': None,
-            'slider_instance': None,
-            'task': None,
-            'timestamp': time.time(),
-            'completed_at': None,
-            'user_id': user_id
-        }
-        
-        # 启动后台登录任务
-        task = asyncio.create_task(_execute_password_login(
-            session_id, account_id, account, password, show_browser, user_id, current_user
-        ))
-        password_login_sessions[session_id]['task'] = task
-        
-        return {
-            'success': True,
-            'session_id': session_id,
-            'status': 'processing',
-            'message': '登录任务已启动，请等待...'
-        }
-        
+            except HTTPException as runtime_conflict:
+                return {'success': False, 'message': str(runtime_conflict.detail)}
+
+            log_with_user('info', f"开始账号密码登录: {account_id}, 账号: {account}", current_user)
+
+            risk_session_id = _new_risk_log_session_id('pwd')
+
+            # 记录手动刷新Cookie到风控日志
+            risk_log_id = None
+            if refresh_mode:
+                try:
+                    risk_log_id = db_manager.add_risk_control_log(
+                        account_id=account_id,
+                        event_type='cookie_refresh',
+                        session_id=risk_session_id,
+                        trigger_scene='manual_password_refresh',
+                        result_code='manual_cookie_refresh_started',
+                        event_description='手动触发账密Cookie刷新',
+                        processing_status='processing',
+                        event_meta=_build_risk_event_meta({
+                            'account_id': account_id,
+                            'refresh_mode': True,
+                        })
+                    )
+                except Exception as log_e:
+                    risk_log_id = None
+                    logger.error(f"记录风控日志失败: {log_e}")
+
+            user_id = current_user['user_id']
+
+            # 创建登录会话
+            password_login_sessions[session_id] = {
+                'account_id': account_id,
+                'account': account,
+                'show_browser': show_browser,
+                'refresh_mode': refresh_mode,  # 保存刷新模式标志
+                'risk_control_log_id': risk_log_id if refresh_mode else None,  # 风控日志ID
+                'risk_session_id': risk_session_id,
+                'status': 'processing',
+                'verification_url': None,
+                'screenshot_path': None,
+                'qr_code_url': None,
+                'verification_type': None,
+                'slider_instance': None,
+                'task': None,
+                'worker_thread': None,
+                'timestamp': time.time(),
+                'completed_at': None,
+                'user_id': user_id
+            }
+
+            # 启动后台登录任务
+            try:
+                task = asyncio.create_task(_execute_password_login(
+                    session_id, account_id, account, password, show_browser, user_id, current_user
+                ))
+            except Exception:
+                password_login_sessions.pop(session_id, None)
+                raise
+            password_login_sessions[session_id]['task'] = task
+
+            return {
+                'success': True,
+                'session_id': session_id,
+                'status': 'processing',
+                'message': '登录任务已启动，请等待...'
+            }
+
     except Exception as e:
         log_with_user('error', f"账号密码登录异常: {str(e)}", current_user)
         import traceback
         logger.error(traceback.format_exc())
-        return {'success': False, 'message': f'登录失败: {str(e)}'}
+        return {
+            'success': False,
+            'message': _normalize_unexpected_session_failure_message(
+                e,
+                default_message='登录失败，请稍后重试',
+            ),
+        }
 
 
 @app.get("/password-login/check/{session_id}")
@@ -6506,23 +8285,19 @@ async def check_password_login_status(
         current_time = time.time()
         expired_sessions = [
             sid for sid, session in password_login_sessions.items()
-            if (
-                session.get('completed_at') and current_time - session['completed_at'] > 300
-            ) or current_time - session['timestamp'] > 3600
+            if _should_prune_manual_browser_entry_session(
+                session,
+                current_time=current_time,
+            )
         ]
         for sid in expired_sessions:
             expired_session = password_login_sessions.get(sid)
             if expired_session:
-                expired_screenshot_path = expired_session.get('screenshot_path')
-                if expired_screenshot_path:
-                    try:
-                        from utils.image_utils import image_manager
-                        if image_manager.delete_image(expired_screenshot_path):
-                            log_with_user('info', f"密码登录会话过期，已删除验证截图: {expired_screenshot_path}", current_user)
-                        else:
-                            log_with_user('warning', f"密码登录会话过期，但删除验证截图失败: {expired_screenshot_path}", current_user)
-                    except Exception as cleanup_err:
-                        log_with_user('error', f"清理过期密码登录截图时出错: {str(cleanup_err)}", current_user)
+                _cleanup_expired_manual_browser_entry_session_screenshot(
+                    expired_session,
+                    flow_label='密码登录',
+                    current_user=current_user,
+                )
             if sid in password_login_sessions:
                 del password_login_sessions[sid]
         
@@ -6535,6 +8310,10 @@ async def check_password_login_status(
         if not _same_user_id(session.get('user_id'), current_user.get('user_id')):
             return {'status': 'forbidden', 'message': '无权限访问该会话'}
         
+        _finalize_stale_manual_browser_entry_session(
+            session,
+            session_type='password_login',
+        )
         status = session['status']
         
         if status == 'verification_required':
@@ -6555,7 +8334,7 @@ async def check_password_login_status(
                 'fallback_reason': session.get('fallback_reason'),
             }
         elif status == 'failed':
-            error_msg = session.get('error', '登录失败')
+            error_msg = session.get('error') or '登录失败'
             log_with_user('info', f"返回登录失败状态: {session_id}, 错误消息: {error_msg}", current_user)  # 添加日志
             return {
                 'status': 'failed',
@@ -6576,7 +8355,7 @@ async def check_password_login_status(
         
     except Exception as e:
         log_with_user('error', f"检查账号密码登录状态异常: {str(e)}", current_user)
-        return {'status': 'error', 'message': str(e)}
+        return {'status': 'error', 'message': safe_client_error('检查登录状态失败，请稍后重试')}
 
 
 @app.post("/password-login/cancel/{session_id}")
@@ -6588,7 +8367,12 @@ async def cancel_password_login(
     try:
         session = password_login_sessions.get(session_id)
         if not session:
-            return {'success': False, 'status': 'not_found', 'message': '会话不存在或已过期'}
+            _record_account_verification_prestart_cancellation(
+                'password_login',
+                session_id,
+                current_user.get('user_id'),
+            )
+            return {'success': True, 'status': 'not_found', 'message': '登录会话已结束'}
 
         if not _same_user_id(session.get('user_id'), current_user.get('user_id')):
             return {'success': False, 'status': 'forbidden', 'message': '无权限访问该会话'}
@@ -6610,6 +8394,17 @@ async def cancel_password_login(
             result_code='password_login_cancelled',
         )
 
+        task = session.get('task')
+        if task and not task.done():
+            task.cancel()
+
+        _invalidate_cancelled_manual_browser_entry_runtime(
+            session,
+            reason='password_login_cancelled',
+            flow_label='密码登录',
+            current_user=current_user,
+        )
+
         slider_instance = session.get('slider_instance')
         if slider_instance:
             try:
@@ -6627,7 +8422,7 @@ async def cancel_password_login(
         log_with_user('error', f"取消账号密码登录异常: {str(exc)}", current_user)
         import traceback
         logger.error(traceback.format_exc())
-        return {'success': False, 'status': 'error', 'message': str(exc)}
+        return {'success': False, 'status': 'error', 'message': safe_client_error('取消登录失败，请稍后重试')}
 
 
 # ========================= 人脸验证截图相关接口 =========================
@@ -6739,7 +8534,7 @@ async def get_account_face_verification_screenshot(
         log_with_user('error', f"获取验证截图失败: {str(e)}", current_user)
         return {
             'success': False,
-            'message': str(e)
+            'message': safe_client_error('获取验证截图失败，请稍后重试')
         }
 
 
@@ -6778,7 +8573,7 @@ async def delete_account_face_verification_screenshot(
         log_with_user('error', f"删除验证截图失败: {str(e)}", current_user)
         return {
             'success': False,
-            'message': str(e)
+            'message': safe_client_error('删除验证截图失败，请稍后重试')
         }
 
 
@@ -6793,11 +8588,18 @@ async def generate_qr_code(
     try:
         if isinstance(request, dict):
             account_id = str(request.get('account_id') or '').strip()
+            requested_session_id = request.get('session_id')
         else:
             account_id = str(getattr(request, 'account_id', '') or '').strip()
+            requested_session_id = getattr(request, 'session_id', None)
 
         if not account_id:
             raise HTTPException(status_code=400, detail='缺少account_id')
+        try:
+            client_session_id = _normalize_account_verification_session_id(requested_session_id)
+        except ValueError as session_id_error:
+            raise HTTPException(status_code=400, detail=str(session_id_error)) from session_id_error
+
         try:
             account_id = _require_runtime_account_id(
                 account_id,
@@ -6809,6 +8611,18 @@ async def generate_qr_code(
             raise HTTPException(status_code=400, detail='account_id只能包含英文字母、数字、下划线和短横线')
 
         user_id = current_user.get('user_id')
+        if client_session_id and _consume_account_verification_prestart_cancellation(
+            'qr_login',
+            client_session_id,
+            user_id,
+        ):
+            return {
+                'success': False,
+                'status': 'cancelled',
+                'session_id': client_session_id,
+                'message': '扫码登录会话已取消',
+            }
+
         qr_login_manager.cleanup_expired_sessions()
         replaced_session_ids = qr_login_manager.invalidate_account_sessions(
             account_id=account_id,
@@ -6845,10 +8659,13 @@ async def generate_qr_code(
 
         log_with_user('info', f"请求生成扫码登录二维码: {account_id}", current_user)
 
-        result = await qr_login_manager.generate_qr_code(
-            account_id=account_id,
-            user_id=user_id,
-        )
+        generate_kwargs = {
+            'account_id': account_id,
+            'user_id': user_id,
+        }
+        if client_session_id:
+            generate_kwargs['session_id'] = client_session_id
+        result = await qr_login_manager.generate_qr_code(**generate_kwargs)
         if isinstance(result, dict):
             result.setdefault('account_id', account_id)
 
@@ -6863,7 +8680,74 @@ async def generate_qr_code(
         raise
     except Exception as e:
         log_with_user('error', f"生成扫码登录二维码异常: {str(e)}", current_user)
-        return {'success': False, 'message': f'生成二维码失败: {str(e)}'}
+        return {'success': False, 'message': safe_client_error('生成二维码失败，请稍后重试')}
+
+
+@app.post("/qr-login/cancel/{session_id}")
+async def cancel_qr_login_session(
+    session_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """取消扫码登录会话，关闭验证浏览器并释放占位账号。"""
+    try:
+        normalized_session_id = str(session_id or '').strip()
+        if not normalized_session_id:
+            raise HTTPException(status_code=400, detail='缺少扫码登录会话ID')
+
+        session = qr_login_manager.sessions.get(normalized_session_id)
+        if not session:
+            _record_account_verification_prestart_cancellation(
+                'qr_login',
+                normalized_session_id,
+                current_user.get('user_id'),
+            )
+            clear_qr_check_records_for_sessions([normalized_session_id])
+            return {
+                'success': True,
+                'status': 'not_found',
+                'message': '扫码登录会话已结束',
+            }
+
+        if not _same_user_id(getattr(session, 'user_id', None), current_user.get('user_id')):
+            raise HTTPException(status_code=403, detail='无权取消该扫码登录会话')
+
+        current_status = str(getattr(session, 'status', '') or '').strip().lower()
+        if current_status == 'success':
+            return {
+                'success': True,
+                'status': 'success',
+                'message': '扫码登录已完成',
+            }
+
+        qr_login_manager.update_session_fields(
+            normalized_session_id,
+            status='cancelled',
+            phase='cancelled',
+            error_message='用户取消扫码登录',
+            browser_alive=False,
+        )
+        if hasattr(qr_login_manager, 'release_session_assets'):
+            qr_login_manager.release_session_assets(
+                normalized_session_id,
+                reason='qr_login_cancelled_by_user',
+            )
+        qr_login_manager.sessions.pop(normalized_session_id, None)
+        clear_qr_check_records_for_sessions([normalized_session_id])
+        log_with_user('info', f"已取消扫码登录会话: {normalized_session_id}", current_user)
+        return {
+            'success': True,
+            'status': 'cancelled',
+            'message': '已停止扫码登录流程',
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log_with_user('error', f"取消扫码登录会话异常: {str(exc)}", current_user)
+        return {
+            'success': False,
+            'status': 'error',
+            'message': safe_client_error('取消扫码登录失败，请稍后重试'),
+        }
 
 
 @app.get("/qr-login/check/{session_id}")
@@ -6928,6 +8812,68 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
                 processing_status_info,
             )
 
+        def _build_processed_record_session_snapshot(
+            processed_record: Optional[Dict[str, Any]],
+        ) -> Optional[Dict[str, Any]]:
+            if not isinstance(processed_record, dict):
+                return None
+
+            account_info = processed_record.get('account_info') or {}
+            snapshot = {
+                'session_id': session_id,
+                'user_id': processed_record.get('user_id'),
+                'account_id': processed_record.get('account_id') or account_info.get('account_id'),
+                'phase': None,
+                'handoff_status': None,
+                'handoff_error': None,
+                'verification_type': None,
+                'verification_type_label': None,
+                'success_stage': None,
+                'browser_alive': False,
+            }
+
+            error_message = processed_record.get('error')
+            if error_message:
+                snapshot.update({
+                    'status': 'failed',
+                    'phase': 'handoff_failed',
+                    'handoff_status': 'failed',
+                    'handoff_error': error_message,
+                    'error': error_message,
+                })
+                return snapshot
+
+            if processed_record.get('processing'):
+                snapshot.update({
+                    'status': 'success',
+                    'phase': 'handoff_processing',
+                    'handoff_status': 'processing',
+                })
+                return snapshot
+
+            if processed_record.get('processed'):
+                snapshot.update({
+                    'status': 'success',
+                    'phase': 'handoff_completed',
+                    'handoff_status': 'success',
+                })
+                return snapshot
+
+            return None
+
+        def _get_qr_session_status_with_processed_fallback(
+            processed_record: Optional[Dict[str, Any]] = None,
+        ) -> Dict[str, Any]:
+            session_status_info = qr_login_manager.get_session_status(session_id)
+            if session_status_info.get('status') != 'not_found':
+                return session_status_info
+
+            fallback_snapshot = _build_processed_record_session_snapshot(processed_record)
+            if fallback_snapshot is not None:
+                return fallback_snapshot
+
+            return session_status_info
+
         def _assert_qr_session_access(session_status_info: Optional[Dict[str, Any]]) -> None:
             status_info = session_status_info or {}
             if status_info.get('status') == 'not_found':
@@ -6944,7 +8890,7 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
         if session_id in qr_check_processed:
             record = qr_check_processed[session_id]
             if record['processed']:
-                session_status_info = qr_login_manager.get_session_status(session_id)
+                session_status_info = _get_qr_session_status_with_processed_fallback(record)
                 _assert_qr_session_access(session_status_info)
                 log_with_user('debug', f"扫码登录session {session_id} 已处理过，直接返回", current_user)
                 if record.get('error'):
@@ -6989,7 +8935,9 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
         # 使用非阻塞方式尝试获取锁
         if session_lock.locked():
             log_with_user('debug', f"扫码登录session {session_id} 正在被其他请求处理，跳过", current_user)
-            session_status_info = qr_login_manager.get_session_status(session_id)
+            session_status_info = _get_qr_session_status_with_processed_fallback(
+                qr_check_processed.get(session_id),
+            )
             _assert_qr_session_access(session_status_info)
             if session_status_info.get('handoff_status') == 'processing':
                 return _build_confirmed_handoff_payload(session_status_info)
@@ -7004,7 +8952,7 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
             if session_id in qr_check_processed and qr_check_processed[session_id]['processed']:
                 log_with_user('debug', f"扫码登录session {session_id} 在获取锁后发现已处理，直接返回", current_user)
                 record = qr_check_processed[session_id]
-                session_status_info = qr_login_manager.get_session_status(session_id)
+                session_status_info = _get_qr_session_status_with_processed_fallback(record)
                 _assert_qr_session_access(session_status_info)
                 if record.get('error'):
                     failed_status_info = _build_handoff_state_snapshot(
@@ -7064,7 +9012,9 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
                 qr_check_processed[session_id] = {
                     'processed': False,
                     'processing': True,
-                    'timestamp': time.time()
+                    'timestamp': time.time(),
+                    'user_id': current_user.get('user_id'),
+                    'account_id': status_info.get('account_id'),
                 }
                 if callable(handoff_updater):
                     handoff_updater(session_id, 'processing')
@@ -7075,12 +9025,15 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
 
                 if not cookies_info:
                     retry_message = '扫码登录Cookie尚未就绪，请稍后重试'
+                    retry_account_id = status_info.get('account_id')
                     if callable(handoff_updater):
                         handoff_updater(session_id, 'failed', error=retry_message, terminal=False)
                     qr_check_processed[session_id] = {
                         'processed': False,
                         'processing': False,
                         'timestamp': time.time(),
+                        'user_id': current_user.get('user_id'),
+                        'account_id': retry_account_id,
                         'error': retry_message,
                     }
                     return _build_qr_status_payload(
@@ -7125,17 +9078,25 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
                             'processed': True,
                             'processing': False,
                             'timestamp': time.time(),
+                            'user_id': current_user.get('user_id'),
+                            'account_id': account_info.get('account_id') or account_id,
                             'account_info': account_info
                         }
                     except Exception as bg_e:
                         log_with_user('error', f"后台处理扫码Cookie失败: {bg_e}", current_user)
+                        normalized_bg_error = _normalize_qr_login_handoff_failure_message(
+                            bg_e,
+                            default_message='扫码登录Cookie处理失败，请稍后重试',
+                        )
                         if callable(handoff_updater):
-                            handoff_updater(session_id, 'failed', error=str(bg_e))
+                            handoff_updater(session_id, 'failed', error=normalized_bg_error)
                         qr_check_processed[session_id] = {
                             'processed': True,
                             'processing': False,
                             'timestamp': time.time(),
-                            'error': str(bg_e)
+                            'user_id': current_user.get('user_id'),
+                            'account_id': status_info.get('account_id'),
+                            'error': normalized_bg_error
                         }
                     finally:
                         if hasattr(qr_login_manager, 'release_session_assets'):
@@ -7144,7 +9105,42 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
                                 reason='qr_login_handoff_completed',
                             )
 
-                asyncio.create_task(_process_cookies_background())
+                handoff_background_coro = _process_cookies_background()
+                try:
+                    asyncio.create_task(handoff_background_coro)
+                except Exception as schedule_error:
+                    try:
+                        handoff_background_coro.close()
+                    except Exception:
+                        pass
+                    schedule_error_message = _normalize_qr_login_handoff_failure_message(
+                        schedule_error,
+                        default_message='启动扫码登录Cookie处理任务失败，请稍后重试',
+                    )
+                    log_with_user('error', schedule_error_message, current_user)
+                    if callable(handoff_updater):
+                        handoff_updater(session_id, 'failed', error=schedule_error_message)
+                    qr_check_processed[session_id] = {
+                        'processed': True,
+                        'processing': False,
+                        'timestamp': time.time(),
+                        'user_id': current_user.get('user_id'),
+                        'account_id': status_info.get('account_id'),
+                        'error': schedule_error_message,
+                    }
+                    if hasattr(qr_login_manager, 'release_session_assets'):
+                        qr_login_manager.release_session_assets(
+                            session_id,
+                            reason='qr_login_handoff_schedule_failed',
+                        )
+                    return _build_qr_status_payload(
+                        'error',
+                        schedule_error_message,
+                        status_info,
+                        handoff_status='failed',
+                        handoff_error=schedule_error_message,
+                        error=schedule_error_message,
+                    )
 
                 # 立即返回"已确认"状态
                 return _build_confirmed_handoff_payload(
@@ -7159,7 +9155,7 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
         raise
     except Exception as e:
         log_with_user('error', f"检查扫码登录状态异常: {str(e)}", current_user)
-        return {'status': 'error', 'message': str(e)}
+        return {'status': 'error', 'message': safe_client_error('检查扫码登录状态失败，请稍后重试')}
 
 
 async def process_qr_login_cookies(
@@ -7173,6 +9169,9 @@ async def process_qr_login_cookies(
     managed_page: Any = None,
 ) -> Dict[str, Any]:
     """处理扫码登录获取的Cookie - 先获取真实cookie再保存到数据库"""
+    temp_instance = None
+    qr_cookie_refresh_internal_error = '扫码登录真实Cookie处理失败，请稍后重试'
+
     def _build_qr_login_chain_error(message: str) -> RuntimeError:
         return RuntimeError(f"扫码登录未完成：{message}")
 
@@ -7386,7 +9385,10 @@ async def process_qr_login_cookies(
                             if token_prewarmed:
                                 XianyuLive.clear_auth_prewarmed_token(account_id)
                             XianyuLive.clear_qr_login_grace(account_id)
-                            warning_message = f"真实Cookie已获取，但切换账号任务失败: {str(task_switch_e)}"
+                            warning_message = _normalize_qr_login_handoff_warning_message(
+                                task_switch_e,
+                                default_message="真实Cookie已获取，但切换账号任务失败，请稍后重试或手动启动账号任务",
+                            )
                         log_with_user('warning', f"{warning_message}: {account_id}", current_user)
 
                     if not task_restarted:
@@ -7500,12 +9502,24 @@ async def process_qr_login_cookies(
 
         except Exception as refresh_e:
             log_with_user('error', f"扫码登录真实cookie获取异常: {str(refresh_e)}", current_user)
+            normalized_refresh_error = _normalize_qr_login_chain_failure_message(
+                refresh_e,
+                default_message='',
+            )
+            if not normalized_refresh_error:
+                if risk_log_id:
+                    normalized_refresh_error = qr_cookie_refresh_internal_error
+                else:
+                    normalized_refresh_error = _normalize_qr_login_chain_failure_message(
+                        f"获取真实Cookie异常: {refresh_e}",
+                        default_message=qr_cookie_refresh_internal_error,
+                    )
             if risk_log_id:
                 try:
                     db_manager.update_risk_control_log(
                         log_id=risk_log_id,
                         processing_status='failed',
-                        error_message=str(refresh_e)[:200],
+                        error_message=normalized_refresh_error[:200],
                         session_id=risk_session_id,
                         trigger_scene='qr_login',
                         result_code='qr_cookie_refresh_exception',
@@ -7514,7 +9528,13 @@ async def process_qr_login_cookies(
                     )
                 except Exception:
                     pass
-            raise _build_qr_login_chain_error(f"获取真实Cookie异常: {str(refresh_e)}") from refresh_e
+            raise _build_qr_login_chain_error(normalized_refresh_error) from refresh_e
+        finally:
+            await _close_temporary_xianyu_session(
+                temp_instance,
+                account_id=account_id,
+                scene="扫码登录真实Cookie获取",
+            )
 
     except Exception as e:
         log_with_user('error', f"处理扫码登录Cookie失败: {str(e)}", current_user)
@@ -7524,13 +9544,16 @@ async def process_qr_login_cookies(
 @app.post("/qr-login/refresh-cookies")
 async def refresh_cookies_from_qr_login(
     request: Dict[str, Any],
-    current_user: Dict[str, Any] = Depends(get_current_user)
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    http_request: Request = None,
 ):
     """使用扫码登录获取的cookie访问指定界面获取真实cookie并存入数据库"""
+    manual_qr_refresh_internal_error = '扫码刷新Cookie失败，请稍后重试'
     risk_log_id = None
     risk_session_id = None
     risk_log_started_at = time.time()
     account_id = ''
+    temp_instance = None
     try:
         qr_cookies = str(request.get('qr_cookies') or '').strip()
         account_id = str(request.get('account_id') or '').strip()
@@ -7587,10 +9610,15 @@ async def refresh_cookies_from_qr_login(
         )
 
         # 执行cookie刷新
-        success = await temp_instance.refresh_cookies_from_qr_login(
-            qr_cookies_str=qr_cookies,
+        success = await _await_temporary_browser_runtime_operation(
+            temp_instance.refresh_cookies_from_qr_login(
+                qr_cookies_str=qr_cookies,
+                account_id=runtime_account_id,
+                user_id=user_id,
+            ),
+            http_request=http_request,
             account_id=runtime_account_id,
-            user_id=user_id
+            scene="手动扫码刷新真实Cookie",
         )
 
         if success:
@@ -7632,16 +9660,39 @@ async def refresh_cookies_from_qr_login(
                     pass
 
             # 如果cookie_manager存在，更新其中的cookie
+            warning_message = None
             if cookie_manager.manager:
-                # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
-                cookie_manager.manager.update_cookie(account_id, real_cookies, save_to_db=False)
-                log_with_user('info', f"已更新cookie_manager中的cookie: {account_id}", current_user)
+                try:
+                    async def _switch_cookie_manager_runtime() -> None:
+                        manager = cookie_manager.manager
+                        if manager is None:
+                            raise RuntimeError("CookieManager 未就绪")
+                        update_task = manager.update_cookie(account_id, real_cookies, save_to_db=False)
+                        if asyncio.isfuture(update_task):
+                            await update_task
 
-            return {
+                    await _run_live_instance_on_manager_loop(
+                        account_id,
+                        _switch_cookie_manager_runtime,
+                        timeout=25.0,
+                        cancel_on_timeout=False,
+                    )
+                    log_with_user('info', f"已更新cookie_manager中的cookie: {account_id}", current_user)
+                except Exception as runtime_update_error:
+                    warning_message = _normalize_qr_login_handoff_warning_message(
+                        runtime_update_error,
+                        default_message="真实Cookie已保存，但运行中账号任务尚未切换，请稍后重试或手动启动账号任务",
+                    )
+                    log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+
+            response = {
                 'success': True,
                 'message': '真实cookie获取并保存成功',
                 'account_id': account_id
             }
+            if warning_message:
+                response['warning_message'] = warning_message
+            return response
         else:
             log_with_user('error', f"扫码cookie刷新失败: {account_id}", current_user)
             # 更新风控日志状态
@@ -7665,13 +9716,17 @@ async def refresh_cookies_from_qr_login(
         raise
     except Exception as e:
         log_with_user('error', f"扫码cookie刷新异常: {str(e)}", current_user)
+        normalized_refresh_error = _normalize_qr_login_chain_failure_message(
+            e,
+            default_message=manual_qr_refresh_internal_error,
+        )
         # 更新风控日志状态
         if risk_log_id:
             try:
                 db_manager.update_risk_control_log(
                     log_id=risk_log_id,
                     processing_status='failed',
-                    error_message=str(e)[:200],
+                    error_message=normalized_refresh_error[:200],
                     session_id=risk_session_id,
                     trigger_scene='manual_qr_refresh',
                     result_code='manual_qr_refresh_exception',
@@ -7680,7 +9735,13 @@ async def refresh_cookies_from_qr_login(
                 )
             except Exception:
                 pass
-        return {'success': False, 'message': f'刷新cookie失败: {str(e)}'}
+        return {'success': False, 'message': safe_client_error('刷新Cookie失败，请稍后重试')}
+    finally:
+        await _close_temporary_xianyu_session(
+            temp_instance,
+            account_id=account_id,
+            scene="手动扫码刷新真实Cookie",
+        )
 
 
 @app.post("/qr-login/reset-cooldown/{account_id}")
@@ -7729,7 +9790,7 @@ async def reset_qr_cookie_refresh_cooldown(
         raise
     except Exception as e:
         log_with_user('error', f"重置扫码登录冷却时间异常: {str(e)}", current_user)
-        return {'success': False, 'message': f'重置冷却时间失败: {str(e)}'}
+        return {'success': False, 'message': safe_client_error('重置冷却时间失败，请稍后重试')}
 
 
 @app.get("/qr-login/cooldown-status/{account_id}")
@@ -7783,7 +9844,7 @@ async def get_qr_cookie_refresh_cooldown_status(
         raise
     except Exception as e:
         log_with_user('error', f"获取扫码登录冷却状态异常: {str(e)}", current_user)
-        return {'success': False, 'message': f'获取冷却状态失败: {str(e)}'}
+        return {'success': False, 'message': safe_client_error('获取冷却状态失败，请稍后重试')}
 
 
 @app.put('/accounts/{account_id}/status')
@@ -7805,7 +9866,7 @@ def update_cookie_status(account_id: str, status_data: CookieStatusIn, current_u
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=safe_client_error("删除账号失败，请稍后重试"))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新账号状态失败，请稍后重试"))
 
 
 # ------------------------- 默认回复管理接口 -------------------------
@@ -7823,7 +9884,7 @@ def get_default_reply(account_id: str, current_user: Dict[str, Any] = Depends(ge
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取默认回复失败，请稍后重试"))
 
 
 @app.put('/default-replies/{account_id}')
@@ -7836,7 +9897,7 @@ def update_default_reply(account_id: str, reply_data: DefaultReplyIn, current_us
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新默认回复失败，请稍后重试"))
 
 
 @app.get('/default-replies')
@@ -7846,7 +9907,7 @@ def get_all_default_replies(current_user: Dict[str, Any] = Depends(get_current_u
         user_id = current_user['user_id']
         return db_manager.get_all_default_replies(user_id=user_id)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取默认回复列表失败，请稍后重试"))
 
 
 @app.delete('/default-replies/{account_id}')
@@ -7862,7 +9923,7 @@ def delete_default_reply(account_id: str, current_user: Dict[str, Any] = Depends
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("删除默认回复失败，请稍后重试"))
 
 
 @app.post('/default-replies/{account_id}/clear-records')
@@ -7875,7 +9936,7 @@ def clear_default_reply_records(account_id: str, current_user: Dict[str, Any] = 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("清空默认回复记录失败，请稍后重试"))
 
 
 # ------------------------- 通知渠道管理接口 -------------------------
@@ -7888,7 +9949,7 @@ def get_notification_channels(current_user: Dict[str, Any] = Depends(get_current
         channels = db_manager.get_notification_channels(user_id)
         return [_sanitize_notification_channel_for_list(channel) for channel in channels]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取通知渠道失败，请稍后重试"))
 
 
 @app.post('/notification-channels')
@@ -7907,7 +9968,7 @@ def create_notification_channel(channel_data: NotificationChannelIn, current_use
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("创建通知渠道失败，请稍后重试"))
 
 
 @app.get('/notification-channels/{channel_id}')
@@ -7922,7 +9983,7 @@ def get_notification_channel(channel_id: int, current_user: Dict[str, Any] = Dep
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取通知渠道详情失败，请稍后重试"))
 
 
 @app.put('/notification-channels/{channel_id}')
@@ -7946,7 +10007,7 @@ def update_notification_channel(channel_id: int, channel_data: NotificationChann
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新通知渠道失败，请稍后重试"))
 
 
 @app.delete('/notification-channels/{channel_id}')
@@ -7962,7 +10023,7 @@ def delete_notification_channel(channel_id: int, current_user: Dict[str, Any] = 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("删除通知渠道失败，请稍后重试"))
 
 
 # ------------------------- 消息通知配置接口 -------------------------
@@ -8012,7 +10073,7 @@ def get_all_message_notifications(current_user: Dict[str, Any] = Depends(get_cur
         }
         return sanitized_notifications
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取消息通知配置失败，请稍后重试"))
 
 
 @app.get('/message-notifications/{account_id}')
@@ -8025,7 +10086,7 @@ def get_account_notifications(account_id: str, current_user: Dict[str, Any] = De
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取账号消息通知配置失败，请稍后重试"))
 
 
 @app.post('/message-notifications/{account_id}')
@@ -8047,7 +10108,7 @@ def set_message_notification(account_id: str, notification_data: MessageNotifica
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("设置消息通知失败，请稍后重试"))
 
 
 @app.put('/message-notifications/{account_id}/replace')
@@ -8082,7 +10143,7 @@ def replace_account_notifications(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("替换账号消息通知配置失败，请稍后重试"))
 
 
 @app.delete('/message-notifications/account/{account_id}')
@@ -8099,7 +10160,7 @@ def delete_account_notifications(account_id: str, current_user: Dict[str, Any] =
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("删除账号消息通知配置失败，请稍后重试"))
 
 
 @app.delete('/message-notifications/{notification_id}')
@@ -8115,7 +10176,7 @@ def delete_message_notification(notification_id: int, current_user: Dict[str, An
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("删除消息通知失败，请稍后重试"))
 
 
 # ------------------------- 通知模板接口 -------------------------
@@ -8127,7 +10188,7 @@ def get_notification_templates(current_user: Dict[str, Any] = Depends(get_curren
         templates = db_manager.get_all_notification_templates(current_user['user_id'])
         return {'templates': templates}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取通知模板列表失败，请稍后重试"))
 
 
 class TestNotificationIn(BaseModel):
@@ -8230,13 +10291,17 @@ async def test_notification_template(data: TestNotificationIn, current_user: Dic
                 if channel_sent:
                     success_channels.append(channel_name)
                 else:
-                    failed_channels.append(f"{channel_name} (发送失败)")
+                    failed_channels.append(
+                        f"{_normalize_notification_test_channel_failure_label(channel_name)} (发送失败)"
+                    )
 
             except Exception as e:
                 logger.error(f"渠道 {channel_name} 发送失败: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
-                failed_channels.append(f"{channel_name} ({str(e)})")
+                failed_channels.append(
+                    f"{_normalize_notification_test_channel_failure_label(channel_name)} (发送失败)"
+                )
 
         # 返回结果
         if success_channels:
@@ -8255,7 +10320,7 @@ async def test_notification_template(data: TestNotificationIn, current_user: Dic
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("发送测试通知失败，请稍后重试"))
 
 
 @app.get('/notification-templates/{template_type}')
@@ -8279,7 +10344,7 @@ def get_notification_template(template_type: str, current_user: Dict[str, Any] =
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取通知模板详情失败，请稍后重试"))
 
 
 class NotificationTemplateIn(BaseModel):
@@ -8307,7 +10372,7 @@ def update_notification_template(template_type: str, data: NotificationTemplateI
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新通知模板失败，请稍后重试"))
 
 
 @app.post('/notification-templates/{template_type}/reset')
@@ -8330,7 +10395,7 @@ def reset_notification_template(template_type: str, current_user: Dict[str, Any]
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("重置通知模板失败，请稍后重试"))
 
 
 @app.get('/notification-templates/{template_type}/default')
@@ -8348,7 +10413,7 @@ def get_default_notification_template(template_type: str, current_user: Dict[str
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取默认通知模板失败，请稍后重试"))
 
 
 # ------------------------- 系统设置接口 -------------------------
@@ -8363,7 +10428,8 @@ def get_system_settings(admin_user: Dict[str, Any] = Depends(require_admin)):
             del settings['admin_password_hash']
         return settings
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"获取系统设置失败: {e}")
+        raise HTTPException(status_code=500, detail=safe_client_error("获取系统设置失败，请稍后重试"))
 
 
 
@@ -8385,7 +10451,8 @@ def update_system_setting(key: str, setting_data: SystemSettingIn, admin_user: D
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"更新系统设置失败: key={key}, error={e}")
+        raise HTTPException(status_code=500, detail=safe_client_error("更新系统设置失败，请稍后重试"))
 
 
 # ------------------------- 注册设置接口 -------------------------
@@ -8413,7 +10480,7 @@ def get_registration_status():
         }
     except Exception as e:
         logger.error(f"获取注册状态失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取注册状态失败，请稍后重试"))
 
 
 @app.get('/login-info-status')
@@ -8432,7 +10499,7 @@ def get_login_info_status():
         return {"enabled": enabled_bool}
     except Exception as e:
         logger.error(f"获取登录信息显示状态失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取登录信息显示状态失败，请稍后重试"))
 
 
 class RegistrationSettingUpdate(BaseModel):
@@ -8466,7 +10533,7 @@ def update_registration_settings(setting_data: RegistrationSettingUpdate, admin_
         raise
     except Exception as e:
         logger.error(f"更新注册设置失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新注册设置失败，请稍后重试"))
 
 @app.put('/login-info-settings')
 def update_login_info_settings(setting_data: LoginInfoSettingUpdate, admin_user: Dict[str, Any] = Depends(require_admin)):
@@ -8491,7 +10558,7 @@ def update_login_info_settings(setting_data: LoginInfoSettingUpdate, admin_user:
         raise
     except Exception as e:
         logger.error(f"更新登录信息显示设置失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新登录信息显示设置失败，请稍后重试"))
 
 
 @app.get('/login-captcha-settings')
@@ -8510,7 +10577,7 @@ def get_login_captcha_settings(admin_user: Dict[str, Any] = Depends(require_admi
         return {"enabled": enabled_bool}
     except Exception as e:
         logger.error(f"获取登录验证码设置失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取登录验证码设置失败，请稍后重试"))
 
 
 @app.put('/login-captcha-settings')
@@ -8536,7 +10603,7 @@ def update_login_captcha_settings(setting_data: LoginInfoSettingUpdate, admin_us
         raise
     except Exception as e:
         logger.error(f"更新登录验证码设置失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新登录验证码设置失败，请稍后重试"))
 
 
 # 公开接口：获取登录验证码是否启用（供登录页面使用）
@@ -8549,7 +10616,7 @@ def get_login_captcha_enabled():
         return {"enabled": enabled_bool}
     except Exception as e:
         logger.error(f"获取登录验证码设置失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取登录验证码设置失败，请稍后重试"))
 
 
 
@@ -8627,7 +10694,7 @@ def update_auto_confirm(account_id: str, update_data: AutoConfirmUpdate, current
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新自动确认发货设置失败，请稍后重试"))
 
 
 @app.get("/accounts/{account_id}/auto-confirm")
@@ -8645,7 +10712,7 @@ def get_auto_confirm(account_id: str, current_user: Dict[str, Any] = Depends(get
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取自动确认发货设置失败，请稍后重试"))
 
 
 # ==================== 自动好评相关API ====================
@@ -8669,7 +10736,7 @@ def update_auto_comment(account_id: str, update_data: AutoCommentUpdate, current
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新自动好评设置失败，请稍后重试"))
 
 
 @app.get("/accounts/{account_id}/auto-comment")
@@ -8687,7 +10754,7 @@ def get_auto_comment(account_id: str, current_user: Dict[str, Any] = Depends(get
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取自动好评设置失败，请稍后重试"))
 
 
 @app.get("/accounts/{account_id}/comment-templates")
@@ -8704,7 +10771,7 @@ def get_comment_templates(account_id: str, current_user: Dict[str, Any] = Depend
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取好评模板列表失败，请稍后重试"))
 
 
 @app.post("/accounts/{account_id}/comment-templates")
@@ -8730,7 +10797,7 @@ def add_comment_template(account_id: str, template_data: CommentTemplateCreate, 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("添加好评模板失败，请稍后重试"))
 
 
 @app.put("/accounts/{account_id}/comment-templates/{template_id}")
@@ -8756,7 +10823,7 @@ def update_comment_template(account_id: str, template_id: int, template_data: Co
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新好评模板失败，请稍后重试"))
 
 
 @app.delete("/accounts/{account_id}/comment-templates/{template_id}")
@@ -8776,7 +10843,7 @@ def delete_comment_template(account_id: str, template_id: int, current_user: Dic
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("删除好评模板失败，请稍后重试"))
 
 
 @app.put("/accounts/{account_id}/comment-templates/{template_id}/activate")
@@ -8796,7 +10863,7 @@ def activate_comment_template(account_id: str, template_id: int, current_user: D
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("激活好评模板失败，请稍后重试"))
 
 
 @app.put("/accounts/{account_id}/remark")
@@ -8818,7 +10885,7 @@ def update_cookie_remark(account_id: str, update_data: RemarkUpdate, current_use
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新账号备注失败，请稍后重试"))
 
 
 @app.get("/accounts/{account_id}/remark")
@@ -8839,7 +10906,7 @@ def get_cookie_remark(account_id: str, current_user: Dict[str, Any] = Depends(ge
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取账号备注失败，请稍后重试"))
 
 
 @app.put("/accounts/{account_id}/pause-duration")
@@ -8865,7 +10932,7 @@ def update_cookie_pause_duration(account_id: str, update_data: PauseDurationUpda
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新暂停时间失败，请稍后重试"))
 
 
 @app.get("/accounts/{account_id}/pause-duration")
@@ -8883,7 +10950,7 @@ def get_cookie_pause_duration(account_id: str, current_user: Dict[str, Any] = De
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取暂停时间失败，请稍后重试"))
 
 
 
@@ -9008,9 +11075,9 @@ def update_keywords_with_item_id(account_id: str, body: KeywordWithItemIdIn, cur
     keyword_set = set()  # 用于检查当前提交的关键词中是否有重复
 
     for kw_data in body.keywords:
-        keyword = kw_data.get('keyword', '').strip()
-        reply = kw_data.get('reply', '').strip()
-        item_id = kw_data.get('item_id', '').strip() or None
+        keyword = str(kw_data.get('keyword') or '').strip()
+        reply = str(kw_data.get('reply') or '').strip()
+        item_id = str(kw_data.get('item_id') or '').strip() or None
 
         if not keyword:
             raise HTTPException(status_code=400, detail="关键词不能为空")
@@ -9155,7 +11222,7 @@ def export_keywords(account_id: str, current_user: Dict[str, Any] = Depends(get_
 
     except Exception as e:
         logger.error(f"导出关键词失败: {e}")
-        raise HTTPException(status_code=500, detail=f"导出关键词失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("导出关键词失败，请稍后重试"))
 
 
 @app.post("/keywords-import/{account_id}")
@@ -9260,7 +11327,7 @@ async def import_keywords(account_id: str, file: UploadFile = File(...), current
         raise HTTPException(status_code=400, detail="Excel文件格式错误")
     except Exception as e:
         logger.error(f"导入关键词失败: {e}")
-        raise HTTPException(status_code=500, detail=f"导入关键词失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("导入关键词失败，请稍后重试"))
 
 
 @app.post("/keywords/{account_id}/image")
@@ -9337,7 +11404,7 @@ async def add_image_keyword(
         raise
     except Exception as e:
         logger.error(f"添加图片关键词失败: {e}")
-        raise HTTPException(status_code=500, detail=f"添加图片关键词失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("添加图片关键词失败，请稍后重试"))
 
 
 @app.post("/keywords/{account_id}/image-batch")
@@ -9356,7 +11423,7 @@ async def add_image_keyword_batch(
     success_count = 0
     try:
         body = await request.json()
-        image_url = body.get('image_url', '').strip()
+        image_url = str(body.get('image_url') or '').strip()
         keywords = body.get('keywords', [])
         item_ids = body.get('item_ids', [])
 
@@ -9377,12 +11444,12 @@ async def add_image_keyword_batch(
         duplicates = []
 
         for keyword in keywords:
-            keyword = keyword.strip()
+            keyword = str(keyword or '').strip()
             if not keyword:
                 continue
 
             for item_id in item_ids:
-                normalized_item_id = item_id if item_id and item_id.strip() else None
+                normalized_item_id = str(item_id or '').strip() or None
 
                 # 检查是否重复
                 if db_manager.check_keyword_duplicate(account_id, keyword, normalized_item_id):
@@ -9422,7 +11489,7 @@ async def add_image_keyword_batch(
         if success_count == 0 and image_url:
             _delete_keyword_image_if_unreferenced(account_id, image_url)
         logger.error(f"批量添加图片关键词失败: {e}")
-        raise HTTPException(status_code=500, detail=f"批量添加图片关键词失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("批量添加图片关键词失败，请稍后重试"))
 
 
 @app.post("/upload-image")
@@ -9460,7 +11527,7 @@ async def upload_image(
         raise
     except Exception as e:
         logger.error(f"图片上传失败: {e}")
-        raise HTTPException(status_code=500, detail=f"图片上传失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("图片上传失败，请稍后重试"))
 
 
 @app.get("/keywords-with-type/{account_id}")
@@ -9476,7 +11543,7 @@ def get_keywords_with_type(account_id: str, current_user: Dict[str, Any] = Depen
         return keywords
     except Exception as e:
         logger.error(f"获取关键词列表失败: {e}")
-        raise HTTPException(status_code=500, detail=f"获取关键词列表失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("获取关键词列表失败，请稍后重试"))
 
 
 @app.delete("/keywords/{account_id}/{index}")
@@ -9512,7 +11579,7 @@ def delete_keyword_by_index(account_id: str, index: int, current_user: Dict[str,
         raise
     except Exception as e:
         logger.error(f"删除关键词失败: {e}")
-        raise HTTPException(status_code=500, detail=f"删除关键词失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("删除关键词失败，请稍后重试"))
 
 
 @app.get("/debug/keywords-table-info")
@@ -9540,7 +11607,7 @@ def debug_keywords_table_info(current_user: Dict[str, Any] = Depends(get_current
         }
     except Exception as e:
         logger.error(f"检查表结构失败: {e}")
-        raise HTTPException(status_code=500, detail=f"检查表结构失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("检查表结构失败，请稍后重试"))
 
 
 # 卡券管理API
@@ -9554,7 +11621,7 @@ def get_cards(current_user: Dict[str, Any] = Depends(get_current_user)):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取卡券列表失败，请稍后重试"))
 
 
 @app.post("/cards")
@@ -9631,7 +11698,7 @@ def create_card(card_data: dict, current_user: Dict[str, Any] = Depends(get_curr
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         log_with_user('error', f"创建卡券失败: {card_data.get('name', '未知')} - {str(e)}", current_user)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("创建卡券失败，请稍后重试"))
 
 
 @app.get("/cards/{card_id}")
@@ -9647,7 +11714,7 @@ def get_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current_us
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取卡券详情失败，请稍后重试"))
 
 
 @app.put("/cards/{card_id}")
@@ -9690,7 +11757,7 @@ def update_card(card_id: int, card_data: dict, current_user: Dict[str, Any] = De
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新卡券失败，请稍后重试"))
 
 
 @app.put("/cards/{card_id}/image")
@@ -9793,7 +11860,7 @@ async def update_card_with_image(
     except Exception as e:
         cleanup_saved_image_on_failure()
         logger.error(f"更新带图片的卡券失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新带图片的卡券失败，请稍后重试"))
 
 
 # 自动发货规则API
@@ -9807,7 +11874,7 @@ def get_delivery_rules(current_user: Dict[str, Any] = Depends(get_current_user))
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取发货规则列表失败，请稍后重试"))
 
 
 @app.get("/delivery-rules/stats")
@@ -9820,7 +11887,7 @@ def get_delivery_stats(current_user: Dict[str, Any] = Depends(get_current_user))
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取发货统计失败，请稍后重试"))
 
 
 @app.get("/delivery-logs/recent")
@@ -9897,7 +11964,7 @@ def get_recent_delivery_logs(limit: int = 20, current_user: Dict[str, Any] = Dep
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取最近发货日志失败，请稍后重试"))
 
 
 @app.post("/delivery-rules")
@@ -9937,7 +12004,7 @@ def create_delivery_rule(rule_data: dict, current_user: Dict[str, Any] = Depends
             raise HTTPException(status_code=404, detail="卡券不存在")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("创建发货规则失败，请稍后重试"))
 
 
 @app.get("/delivery-rules/{rule_id}")
@@ -9953,7 +12020,7 @@ def get_delivery_rule(rule_id: int, current_user: Dict[str, Any] = Depends(get_c
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取发货规则详情失败，请稍后重试"))
 
 
 @app.put("/delivery-rules/{rule_id}")
@@ -10002,7 +12069,7 @@ def update_delivery_rule(rule_id: int, rule_data: dict, current_user: Dict[str, 
             raise HTTPException(status_code=404, detail="卡券不存在")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新发货规则失败，请稍后重试"))
 
 
 @app.delete("/cards/{card_id}")
@@ -10018,7 +12085,7 @@ def delete_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("删除卡券失败，请稍后重试"))
 
 
 @app.delete("/delivery-rules/{rule_id}")
@@ -10034,7 +12101,7 @@ def delete_delivery_rule(rule_id: int, current_user: Dict[str, Any] = Depends(ge
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("删除发货规则失败，请稍后重试"))
 
 
 # ==================== 备份和恢复 API ====================
@@ -10061,7 +12128,7 @@ def export_backup(current_user: Dict[str, Any] = Depends(get_current_user)):
 
         return response
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"导出备份失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("导出备份失败，请稍后重试"))
 
 
 @app.post("/backup/import")
@@ -10084,15 +12151,15 @@ def import_backup(file: UploadFile = File(...), current_user: Dict[str, Any] = D
         if success:
             # 备份导入成功后，刷新 CookieManager 的内存缓存
             import cookie_manager
+            response_payload = {"message": "备份导入成功"}
             if cookie_manager.manager:
-                try:
-                    cookie_manager.manager.reload_from_db()
+                cache_reload_warning = _reload_cookie_manager_cache_with_warning("备份导入成功，但刷新 CookieManager 缓存失败，请重启系统")
+                if cache_reload_warning:
+                    response_payload["warning"] = cache_reload_warning
+                else:
                     logger.info("备份导入后已刷新 CookieManager 缓存")
-                except Exception as e:
-                    logger.error(f"刷新 CookieManager 缓存失败: {e}")
-                    raise HTTPException(status_code=500, detail="备份导入成功，但刷新 CookieManager 缓存失败，请重启系统")
 
-            return {"message": "备份导入成功"}
+            return response_payload
         else:
             raise HTTPException(status_code=400, detail="备份导入失败")
 
@@ -10101,7 +12168,7 @@ def import_backup(file: UploadFile = File(...), current_user: Dict[str, Any] = D
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"导入备份失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("导入备份失败，请稍后重试"))
 
 
 @app.post("/system/reload-cache")
@@ -10117,7 +12184,7 @@ def reload_cache(admin_user: Dict[str, Any] = Depends(require_admin)):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"刷新缓存失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("刷新缓存失败，请稍后重试"))
 
 
 # ==================== 商品管理 API ====================
@@ -10143,7 +12210,7 @@ def get_all_items(current_user: Dict[str, Any] = Depends(get_current_user)):
 
         return {"items": all_items}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"获取商品信息失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("获取商品信息失败，请稍后重试"))
 
 
 @app.get("/items/count")
@@ -10161,7 +12228,7 @@ def get_items_count(current_user: Dict[str, Any] = Depends(get_current_user)):
 
         return {"count": total_count}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"获取商品数量失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("获取商品数量失败，请稍后重试"))
 
 
 # ==================== 商品搜索 API ====================
@@ -10180,7 +12247,8 @@ class ItemSearchMultipleRequest(BaseModel):
 @app.post("/items/search")
 async def search_items(
     search_request: ItemSearchRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user)
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    http_request: Request = None,
 ):
     """搜索闲鱼商品"""
     user_info = f"【{current_user.get('username', 'unknown')}#{current_user.get('user_id', 'unknown')}】"
@@ -10196,14 +12264,43 @@ async def search_items(
 
         from utils.item_search import search_xianyu_items
 
-        # 执行搜索
-        result = await search_xianyu_items(
-            account_id=account_id,
-            cookie_value=cookie_value,
-            keyword=search_request.keyword,
-            page=search_request.page,
-            page_size=search_request.page_size
-        )
+        try:
+            result = await _await_temporary_browser_runtime_operation(
+                _run_managed_live_instance_call(
+                    account_id,
+                    lambda current_live_instance: current_live_instance.search_items_via_browser_runtime(
+                        keyword=search_request.keyword,
+                        page=search_request.page,
+                        page_size=search_request.page_size,
+                        total_pages=1,
+                    ),
+                    timeout=120,
+                    missing_detail=f"账号 {account_id} 未启动，暂无法复用运行中浏览器搜索",
+                ),
+                http_request=http_request,
+                account_id=account_id,
+                scene="商品搜索",
+            )
+            logger.info(f"{user_info} 商品搜索已复用账号 {account_id} 的运行中浏览器 runtime")
+        except HTTPException as managed_error:
+            if (
+                (managed_error.status_code == 400 and managed_error.detail == f"账号 {account_id} 未启动，暂无法复用运行中浏览器搜索")
+                or _is_managed_runtime_unavailable_http_error(managed_error)
+            ):
+                result = await _await_temporary_browser_runtime_operation(
+                    search_xianyu_items(
+                        account_id=account_id,
+                        cookie_value=cookie_value,
+                        keyword=search_request.keyword,
+                        page=search_request.page,
+                        page_size=search_request.page_size,
+                    ),
+                    http_request=http_request,
+                    account_id=account_id,
+                    scene="商品搜索",
+                )
+            else:
+                raise
 
         if not isinstance(result, dict):
             raise RuntimeError("商品搜索返回结果格式异常")
@@ -10215,7 +12312,14 @@ async def search_items(
 
         if has_error and not items:
             logger.error(f"{user_info} 商品搜索失败: {has_error}")
-            raise HTTPException(status_code=500, detail=has_error)
+            raise HTTPException(
+                status_code=500,
+                detail=_normalize_item_search_failure_message(
+                    has_error,
+                    default_message="商品搜索失败，请稍后重试",
+                    preserve_plain_message=True,
+                ),
+            )
 
         logger.info(f"{user_info} 单页搜索完成: 获取到 {items_count} 条数据" +
                    (f", 错误: {has_error}" if has_error else ""))
@@ -10234,16 +12338,23 @@ async def search_items(
 
         # 如果有错误信息，也包含在响应中
         if has_error:
-            response_data["error"] = has_error
+            response_data["error"] = _normalize_item_search_failure_message(
+                has_error,
+                default_message="商品搜索失败，请稍后重试",
+            )
 
         return response_data
 
     except HTTPException:
         raise
     except Exception as e:
-        error_msg = str(e)
+        error_msg = _normalize_item_search_failure_message(
+            e,
+            default_message="商品搜索失败，请稍后重试",
+            preserve_plain_message=True,
+        )
         logger.error(f"{user_info} 商品搜索失败: {error_msg}")
-        raise HTTPException(status_code=500, detail=f"商品搜索失败: {error_msg}")
+        raise HTTPException(status_code=500, detail=error_msg)
 
 
 @app.get("/accounts/check")
@@ -10283,7 +12394,11 @@ async def check_valid_accounts(
                 target_is_enabled = runtime_manager.get_cookie_status(target_account_id)
             else:
                 target_is_enabled = db_manager.get_cookie_status(target_account_id)
-            target_cookie_value = db_manager.get_cookie(target_account_id) or ''
+            try:
+                target_cookie_value = db_manager.get_cookie(target_account_id) or ''
+            except Exception as cookie_error:
+                logger.error(f"检查指定账号 Cookie 失败: {target_account_id}, 错误: {cookie_error}")
+                raise
             target_has_valid_cookie = len(target_cookie_value) > 50
             target_is_usable = bool(target_is_enabled and target_has_valid_cookie)
 
@@ -10309,7 +12424,11 @@ async def check_valid_accounts(
                 is_enabled = db_manager.get_cookie_status(account_id)
             if is_enabled:
                 enabled_accounts.append(account_id)
-                cookie_value = db_manager.get_cookie(account_id) or ''
+                try:
+                    cookie_value = db_manager.get_cookie(account_id) or ''
+                except Exception as cookie_error:
+                    logger.error(f"检查账号 Cookie 失败: {account_id}, 错误: {cookie_error}")
+                    raise
                 # 检查是否有效（长度大于50）
                 if len(cookie_value) > 50:
                     valid_accounts.append(account_id)
@@ -10326,12 +12445,13 @@ async def check_valid_accounts(
         raise
     except Exception as e:
         logger.error(f"检查cookies失败: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"检查账号状态失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("检查账号状态失败，请稍后重试"))
 
 @app.post("/items/search_multiple")
 async def search_multiple_pages(
     search_request: ItemSearchMultipleRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user)
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    http_request: Request = None,
 ):
     """搜索多页闲鱼商品"""
     user_info = f"【{current_user.get('username', 'unknown')}#{current_user.get('user_id', 'unknown')}】"
@@ -10347,13 +12467,40 @@ async def search_multiple_pages(
 
         from utils.item_search import search_multiple_pages_xianyu
 
-        # 执行多页搜索
-        result = await search_multiple_pages_xianyu(
-            account_id=account_id,
-            cookie_value=cookie_value,
-            keyword=search_request.keyword,
-            total_pages=search_request.total_pages
-        )
+        try:
+            result = await _await_temporary_browser_runtime_operation(
+                _run_managed_live_instance_call(
+                    account_id,
+                    lambda current_live_instance: current_live_instance.search_items_via_browser_runtime(
+                        keyword=search_request.keyword,
+                        total_pages=search_request.total_pages,
+                    ),
+                    timeout=180,
+                    missing_detail=f"账号 {account_id} 未启动，暂无法复用运行中浏览器搜索",
+                ),
+                http_request=http_request,
+                account_id=account_id,
+                scene="多页商品搜索",
+            )
+            logger.info(f"{user_info} 多页商品搜索已复用账号 {account_id} 的运行中浏览器 runtime")
+        except HTTPException as managed_error:
+            if (
+                (managed_error.status_code == 400 and managed_error.detail == f"账号 {account_id} 未启动，暂无法复用运行中浏览器搜索")
+                or _is_managed_runtime_unavailable_http_error(managed_error)
+            ):
+                result = await _await_temporary_browser_runtime_operation(
+                    search_multiple_pages_xianyu(
+                        account_id=account_id,
+                        cookie_value=cookie_value,
+                        keyword=search_request.keyword,
+                        total_pages=search_request.total_pages,
+                    ),
+                    http_request=http_request,
+                    account_id=account_id,
+                    scene="多页商品搜索",
+                )
+            else:
+                raise
 
         if not isinstance(result, dict):
             raise RuntimeError("多页商品搜索返回结果格式异常")
@@ -10365,7 +12512,14 @@ async def search_multiple_pages(
 
         if has_error and not items:
             logger.error(f"{user_info} 多页商品搜索失败: {has_error}")
-            raise HTTPException(status_code=500, detail=has_error)
+            raise HTTPException(
+                status_code=500,
+                detail=_normalize_item_search_failure_message(
+                    has_error,
+                    default_message="商品搜索失败，请稍后重试",
+                    preserve_plain_message=True,
+                ),
+            )
 
         logger.info(f"{user_info} 多页搜索完成: 获取到 {items_count} 条数据" +
                    (f", 错误: {has_error}" if has_error else ""))
@@ -10384,16 +12538,23 @@ async def search_multiple_pages(
 
         # 如果有错误信息，也包含在响应中
         if has_error:
-            response_data["error"] = has_error
+            response_data["error"] = _normalize_item_search_failure_message(
+                has_error,
+                default_message="商品搜索失败，请稍后重试",
+            )
 
         return response_data
 
     except HTTPException:
         raise
     except Exception as e:
-        error_msg = str(e)
+        error_msg = _normalize_item_search_failure_message(
+            e,
+            default_message="商品搜索失败，请稍后重试",
+            preserve_plain_message=True,
+        )
         logger.error(f"{user_info} 多页商品搜索失败: {error_msg}")
-        raise HTTPException(status_code=500, detail=f"多页商品搜索失败: {error_msg}")
+        raise HTTPException(status_code=500, detail=error_msg)
 
 
 
@@ -10408,7 +12569,7 @@ def get_items_by_account(account_id: str, current_user: Dict[str, Any] = Depends
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"获取商品信息失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("获取商品信息失败，请稍后重试"))
 
 
 @app.get("/items/{account_id}/{item_id}")
@@ -10423,7 +12584,7 @@ def get_item_detail(account_id: str, item_id: str, current_user: Dict[str, Any] 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"获取商品详情失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("获取商品详情失败，请稍后重试"))
 
 
 class ItemDetailUpdate(BaseModel):
@@ -10448,7 +12609,7 @@ def update_item_detail(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"更新商品详情失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("更新商品详情失败，请稍后重试"))
 
 
 @app.delete("/items/{account_id}/{item_id}")
@@ -10469,7 +12630,7 @@ def delete_item_info(
         raise
     except Exception as e:
         logger.error(f"删除商品信息异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("删除商品信息失败，请稍后重试"))
 
 
 class ItemBatchDeleteItem(BaseModel):
@@ -10532,7 +12693,7 @@ def batch_delete_items(
         raise
     except Exception as e:
         logger.error(f"批量删除商品信息异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("批量删除商品信息失败，请稍后重试"))
 
 
 # ==================== AI回复管理API ====================
@@ -10548,7 +12709,7 @@ def get_ai_reply_settings(account_id: str, current_user: Dict[str, Any] = Depend
         raise
     except Exception as e:
         logger.error(f"获取AI回复设置异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("获取AI回复设置失败，请稍后重试"))
 
 
 @app.put("/ai-reply-settings/{account_id}")
@@ -10573,7 +12734,7 @@ def update_ai_reply_settings(account_id: str, settings: AIReplySettings, current
         raise
     except Exception as e:
         logger.error(f"更新AI回复设置异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("更新AI回复设置失败，请稍后重试"))
 
 
 @app.get("/ai-reply-settings")
@@ -10584,7 +12745,7 @@ def get_all_ai_reply_settings(current_user: Dict[str, Any] = Depends(get_current
         return db_manager.get_all_ai_reply_settings(user_id=user_id)
     except Exception as e:
         logger.error(f"获取所有AI回复设置异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("获取AI回复设置列表失败，请稍后重试"))
 
 
 @app.get("/ai-config-presets")
@@ -10596,7 +12757,7 @@ def list_ai_config_presets(current_user: Dict[str, Any] = Depends(get_current_us
         return presets
     except Exception as e:
         logger.error(f"获取AI配置预设列表异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("获取AI配置预设列表失败，请稍后重试"))
 
 
 @app.post("/ai-config-presets")
@@ -10627,7 +12788,7 @@ def save_ai_config_preset(
         raise
     except Exception as e:
         logger.error(f"保存AI配置预设异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("保存AI配置预设失败，请稍后重试"))
 
 
 @app.delete("/ai-config-presets/{preset_id}")
@@ -10646,7 +12807,7 @@ def delete_ai_config_preset(
         raise
     except Exception as e:
         logger.error(f"删除AI配置预设异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("删除AI配置预设失败，请稍后重试"))
 
 
 @app.post("/ai-reply-test/{account_id}")
@@ -10686,7 +12847,7 @@ def test_ai_reply(account_id: str, test_data: dict, current_user: Dict[str, Any]
         raise
     except Exception as e:
         logger.error(f"测试AI回复异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("测试AI回复失败，请稍后重试"))
 
 
 # ==================== 日志管理API ====================
@@ -10695,16 +12856,82 @@ def test_ai_reply(account_id: str, test_data: dict, current_user: Dict[str, Any]
 async def get_logs(lines: int = 200, level: str = None, source: str = None, admin_user: Dict[str, Any] = Depends(require_admin)):
     """获取实时系统日志"""
     try:
+        normalized_lines = max(1, min(int(200 if lines is None else lines), 5000))
         # 获取文件日志收集器
         collector = get_file_log_collector()
 
         # 获取日志
-        logs = collector.get_logs(lines=lines, level_filter=level, source_filter=source)
+        logs = collector.get_logs(lines=normalized_lines, level_filter=level, source_filter=source)
 
         return {"success": True, "logs": logs}
 
     except Exception as e:
-        return {"success": False, "message": f"获取日志失败: {str(e)}", "logs": []}
+        log_with_user('error', f"获取日志失败: {str(e)}", admin_user)
+        raise HTTPException(status_code=500, detail=safe_client_error("获取日志失败，请稍后重试"))
+
+
+def _query_risk_control_logs_response(
+    *,
+    account_id: str = None,
+    processing_status: str = None,
+    event_type: str = None,
+    trigger_scene: str = None,
+    session_id: str = None,
+    result_code: str = None,
+    date_from: str = None,
+    date_to: str = None,
+    limit: int = 100,
+    offset: int = 0,
+    admin_user: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    normalized_limit = max(1, min(int(100 if limit is None else limit), 500))
+    normalized_offset = max(0, int(0 if offset is None else offset))
+    target_account_id = str(account_id or '').strip() or None
+    log_with_user(
+        'info',
+        f"查询风控日志: account_id={target_account_id}, processing_status={processing_status}, event_type={event_type}, trigger_scene={trigger_scene}, session_id={session_id}, result_code={result_code}, date_from={date_from}, date_to={date_to}, limit={normalized_limit}, offset={normalized_offset}",
+        admin_user,
+    )
+
+    logs = db_manager.get_risk_control_logs(
+        account_id=target_account_id,
+        processing_status=processing_status,
+        event_type=event_type,
+        trigger_scene=trigger_scene,
+        session_id=session_id,
+        result_code=result_code,
+        date_from=date_from,
+        date_to=date_to,
+        limit=normalized_limit,
+        offset=normalized_offset,
+    )
+    total_count = db_manager.get_risk_control_logs_count(
+        account_id=target_account_id,
+        processing_status=processing_status,
+        event_type=event_type,
+        trigger_scene=trigger_scene,
+        session_id=session_id,
+        result_code=result_code,
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+    normalized_logs = [
+        {
+            **log,
+            'account_id': log.get('account_id'),
+        }
+        for log in logs
+    ]
+
+    log_with_user('info', f"风控日志查询成功，共 {len(normalized_logs)} 条记录，总计 {total_count} 条", admin_user)
+    return {
+        "success": True,
+        "data": normalized_logs,
+        "total": total_count,
+        "limit": normalized_limit,
+        "offset": normalized_offset,
+    }
 
 
 @app.get("/risk-control-logs")
@@ -10723,16 +12950,8 @@ async def get_risk_control_logs(
 ):
     """获取风控日志（管理员专用）"""
     try:
-        target_account_id = str(account_id or '').strip() or None
-        log_with_user(
-            'info',
-            f"查询风控日志: account_id={target_account_id}, processing_status={processing_status}, event_type={event_type}, trigger_scene={trigger_scene}, session_id={session_id}, result_code={result_code}, date_from={date_from}, date_to={date_to}, limit={limit}, offset={offset}",
-            admin_user,
-        )
-
-        # 获取风控日志
-        logs = db_manager.get_risk_control_logs(
-            account_id=target_account_id,
+        return _query_risk_control_logs_response(
+            account_id=account_id,
             processing_status=processing_status,
             event_type=event_type,
             trigger_scene=trigger_scene,
@@ -10741,36 +12960,9 @@ async def get_risk_control_logs(
             date_from=date_from,
             date_to=date_to,
             limit=limit,
-            offset=offset
+            offset=offset,
+            admin_user=admin_user,
         )
-        total_count = db_manager.get_risk_control_logs_count(
-            account_id=target_account_id,
-            processing_status=processing_status,
-            event_type=event_type,
-            trigger_scene=trigger_scene,
-            session_id=session_id,
-            result_code=result_code,
-            date_from=date_from,
-            date_to=date_to,
-        )
-
-        normalized_logs = [
-            {
-                **log,
-                'account_id': log.get('account_id'),
-            }
-            for log in logs
-        ]
-
-        log_with_user('info', f"风控日志查询成功，共 {len(normalized_logs)} 条记录，总计 {total_count} 条", admin_user)
-
-        return {
-            "success": True,
-            "data": normalized_logs,
-            "total": total_count,
-            "limit": limit,
-            "offset": offset
-        }
     except HTTPException:
         raise
     except Exception as e:
@@ -10875,7 +13067,8 @@ async def get_log_stats(admin_user: Dict[str, Any] = Depends(require_admin)):
         return {"success": True, "stats": stats}
 
     except Exception as e:
-        return {"success": False, "message": f"获取日志统计失败: {str(e)}", "stats": {}}
+        log_with_user('error', f"获取日志统计失败: {str(e)}", admin_user)
+        raise HTTPException(status_code=500, detail=safe_client_error("获取日志统计失败，请稍后重试"))
 
 
 @app.post("/logs/clear")
@@ -10888,18 +13081,23 @@ async def clear_logs(admin_user: Dict[str, Any] = Depends(require_admin)):
         return {"success": True, "message": "日志已清空"}
 
     except Exception as e:
-        return {"success": False, "message": f"清空日志失败: {str(e)}"}
+        log_with_user('error', f"清空日志失败: {str(e)}", admin_user)
+        raise HTTPException(status_code=500, detail=safe_client_error("清空日志失败，请稍后重试"))
 
 
 # ==================== 商品管理API ====================
 
 @app.post("/items/get-all-from-account")
-async def get_all_items_from_account(request: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
+async def get_all_items_from_account(
+    request: dict,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    http_request: Request = None,
+):
     """从指定账号获取所有商品信息"""
     xianyu_instance = None
     handled_error = None
     try:
-        account_id = request.get('account_id')
+        account_id = str(request.get('account_id') or '').strip()
         if not account_id:
             return {"success": False, "message": "缺少account_id参数"}
         account_id = _ensure_account_access(account_id, current_user, "操作")
@@ -10919,11 +13117,20 @@ async def get_all_items_from_account(request: dict, current_user: Dict[str, Any]
 
         # 调用获取所有商品信息的方法（自动分页）并同步最新商品详情
         logger.info(f"开始同步账号 {account_id} 的所有商品信息和最新详情")
-        result = await xianyu_instance.get_all_items(sync_item_details=True)
+        result = await _await_temporary_browser_runtime_operation(
+            xianyu_instance.get_all_items(sync_item_details=True),
+            http_request=http_request,
+            account_id=account_id,
+            scene="商品同步",
+        )
 
         if result.get('error'):
+            normalized_error = _normalize_item_sync_failure_message(
+                result.get('error'),
+                default_message="获取商品信息失败，请稍后重试",
+            )
             logger.error(f"获取商品信息失败: {result['error']}")
-            return {"success": False, "message": result['error']}
+            return {"success": False, "message": normalized_error}
         else:
             total_count = result.get('total_count', 0)
             total_pages = result.get('total_pages', 1)
@@ -10939,9 +13146,16 @@ async def get_all_items_from_account(request: dict, current_user: Dict[str, Any]
         handled_error = exc
         raise
     except Exception as e:
+        translated_conflict = _translate_managed_runtime_conflict_error(
+            e,
+            account_id=account_id,
+        )
+        if translated_conflict is not None:
+            handled_error = translated_conflict
+            raise translated_conflict from e
         handled_error = e
         logger.error(f"获取账号商品信息异常: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"获取商品信息失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("获取商品信息失败，请稍后重试"))
     finally:
         if xianyu_instance is not None:
             try:
@@ -10951,13 +13165,17 @@ async def get_all_items_from_account(request: dict, current_user: Dict[str, Any]
 
 
 @app.post("/items/get-by-page")
-async def get_items_by_page(request: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
+async def get_items_by_page(
+    request: dict,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    http_request: Request = None,
+):
     """从指定账号按页获取商品信息"""
     xianyu_instance = None
     handled_error = None
     try:
         # 验证参数
-        account_id = request.get('account_id')
+        account_id = str(request.get('account_id') or '').strip()
         page_number = request.get('page_number', 1)
         page_size = request.get('page_size', 20)
 
@@ -10993,11 +13211,20 @@ async def get_items_by_page(request: dict, current_user: Dict[str, Any] = Depend
 
         # 调用获取指定页商品信息的方法并同步最新商品详情
         logger.info(f"开始同步账号 {account_id} 第{page_number}页商品信息和最新详情（每页{page_size}条）")
-        result = await xianyu_instance.get_item_list_info(page_number, page_size, sync_item_details=True)
+        result = await _await_temporary_browser_runtime_operation(
+            xianyu_instance.get_item_list_info(page_number, page_size, sync_item_details=True),
+            http_request=http_request,
+            account_id=account_id,
+            scene="分页商品同步",
+        )
 
         if result.get('error'):
+            normalized_error = _normalize_item_sync_failure_message(
+                result.get('error'),
+                default_message="获取商品信息失败，请稍后重试",
+            )
             logger.error(f"获取商品信息失败: {result['error']}")
-            return {"success": False, "message": result['error']}
+            return {"success": False, "message": normalized_error}
         else:
             current_count = result.get('current_count', 0)
             logger.info(f"成功同步账号 {account_id} 第{page_number}页 {current_count} 个商品")
@@ -11013,9 +13240,16 @@ async def get_items_by_page(request: dict, current_user: Dict[str, Any] = Depend
         handled_error = exc
         raise
     except Exception as e:
+        translated_conflict = _translate_managed_runtime_conflict_error(
+            e,
+            account_id=account_id,
+        )
+        if translated_conflict is not None:
+            handled_error = translated_conflict
+            raise translated_conflict from e
         handled_error = e
         logger.error(f"获取账号商品信息异常: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"获取商品信息失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("获取商品信息失败，请稍后重试"))
     finally:
         if xianyu_instance is not None:
             try:
@@ -11099,7 +13333,7 @@ def get_user_settings(current_user: Dict[str, Any] = Depends(get_current_user)):
         settings = db_manager.get_user_settings(user_id)
         return settings
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取用户设置失败，请稍后重试"))
 
 @app.put('/user-settings/menu-settings/replace')
 def replace_user_menu_settings(
@@ -11126,7 +13360,7 @@ def replace_user_menu_settings(
         raise
     except Exception as e:
         log_with_user('error', f"原子替换菜单设置失败: {str(e)}", current_user)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("原子替换菜单设置失败，请稍后重试"))
 
 @app.put('/user-settings/{key}')
 def update_user_setting(key: str, setting_data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
@@ -11159,7 +13393,7 @@ def update_user_setting(key: str, setting_data: dict, current_user: Dict[str, An
         raise
     except Exception as e:
         log_with_user('error', f"更新用户设置异常: {key} - {str(e)}", current_user)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新用户设置失败，请稍后重试"))
 
 @app.get('/user-settings/{key}')
 def get_user_setting(key: str, current_user: Dict[str, Any] = Depends(get_current_user)):
@@ -11174,7 +13408,7 @@ def get_user_setting(key: str, current_user: Dict[str, Any] = Depends(get_curren
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取用户设置详情失败，请稍后重试"))
 
 
 # ------------------------- 管理员专用接口 -------------------------
@@ -11205,7 +13439,7 @@ def get_all_users(admin_user: Dict[str, Any] = Depends(require_admin)):
         return {"users": users}
     except Exception as e:
         log_with_user('error', f"获取用户信息失败: {str(e)}", admin_user)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取用户列表失败，请稍后重试"))
 
 @app.delete('/admin/users/{user_id}')
 def delete_user(user_id: int, admin_user: Dict[str, Any] = Depends(require_admin)):
@@ -11244,7 +13478,7 @@ def delete_user(user_id: int, admin_user: Dict[str, Any] = Depends(require_admin
         raise
     except Exception as e:
         log_with_user('error', f"删除用户异常: {str(e)}", admin_user)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("删除用户失败，请稍后重试"))
 
 @app.put('/admin/users/{user_id}/admin-status')
 def update_user_admin_status(user_id: int, is_admin: bool, admin_user: Dict[str, Any] = Depends(require_admin)):
@@ -11287,7 +13521,7 @@ def update_user_admin_status(user_id: int, is_admin: bool, admin_user: Dict[str,
         raise
     except Exception as e:
         log_with_user('error', f"更新用户管理员状态异常: {str(e)}", admin_user)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新用户管理员状态失败，请稍后重试"))
 
 @app.get('/admin/risk-control-logs')
 async def get_admin_risk_control_logs(
@@ -11305,16 +13539,8 @@ async def get_admin_risk_control_logs(
 ):
     """获取风控日志（管理员专用）"""
     try:
-        target_account_id = str(account_id or '').strip() or None
-        log_with_user(
-            'info',
-            f"查询风控日志: account_id={target_account_id}, processing_status={processing_status}, event_type={event_type}, trigger_scene={trigger_scene}, session_id={session_id}, result_code={result_code}, date_from={date_from}, date_to={date_to}, limit={limit}, offset={offset}",
-            admin_user,
-        )
-
-        # 获取风控日志
-        logs = db_manager.get_risk_control_logs(
-            account_id=target_account_id,
+        return _query_risk_control_logs_response(
+            account_id=account_id,
             processing_status=processing_status,
             event_type=event_type,
             trigger_scene=trigger_scene,
@@ -11323,36 +13549,9 @@ async def get_admin_risk_control_logs(
             date_from=date_from,
             date_to=date_to,
             limit=limit,
-            offset=offset
+            offset=offset,
+            admin_user=admin_user,
         )
-        total_count = db_manager.get_risk_control_logs_count(
-            account_id=target_account_id,
-            processing_status=processing_status,
-            event_type=event_type,
-            trigger_scene=trigger_scene,
-            session_id=session_id,
-            result_code=result_code,
-            date_from=date_from,
-            date_to=date_to,
-        )
-
-        normalized_logs = [
-            {
-                **log,
-                'account_id': log.get('account_id'),
-            }
-            for log in logs
-        ]
-
-        log_with_user('info', f"风控日志查询成功，共 {len(normalized_logs)} 条记录，总计 {total_count} 条", admin_user)
-
-        return {
-            "success": True,
-            "data": normalized_logs,
-            "total": total_count,
-            "limit": limit,
-            "offset": offset
-        }
     except HTTPException:
         raise
     except Exception as e:
@@ -11412,7 +13611,7 @@ def get_admin_cookies(admin_user: Dict[str, Any] = Depends(require_admin)):
         raise
     except Exception as e:
         log_with_user('error', f"获取Cookie信息失败: {str(e)}", admin_user)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取Cookie信息失败，请稍后重试"))
 
 
 def _collect_admin_log_file_paths(include_archives: bool = True) -> List[str]:
@@ -11449,6 +13648,7 @@ def get_system_logs(admin_user: Dict[str, Any] = Depends(require_admin),
     import os
 
     try:
+        normalized_lines = max(1, min(int(100 if lines is None else lines), 5000))
         log_with_user('info', f"查询系统日志，行数: {lines}, 级别: {level}", admin_user)
 
         # 查找日志文件
@@ -11483,7 +13683,11 @@ def get_system_logs(admin_user: Dict[str, Any] = Depends(require_admin),
                     filtered_lines = all_lines
 
                 # 获取最后N行
-                recent_lines = filtered_lines[-lines:] if len(filtered_lines) > lines else filtered_lines
+                recent_lines = (
+                    filtered_lines[-normalized_lines:]
+                    if len(filtered_lines) > normalized_lines
+                    else filtered_lines
+                )
                 logger.info(f"取最后 {len(recent_lines)} 行日志")
 
                 for line in recent_lines:
@@ -11492,7 +13696,11 @@ def get_system_logs(admin_user: Dict[str, Any] = Depends(require_admin),
         except Exception as e:
             logger.error(f"读取日志文件失败: {str(e)}")
             log_with_user('error', f"读取日志文件失败: {str(e)}", admin_user)
-            return {"logs": [], "message": f"读取日志文件失败: {str(e)}", "success": False}
+            return {
+                "logs": [],
+                "message": safe_client_error("读取日志文件失败，请稍后重试"),
+                "success": False,
+            }
 
         log_with_user('info', f"返回日志记录 {len(logs)} 条", admin_user)
         logger.info(f"成功返回 {len(logs)} 条日志记录")
@@ -11507,7 +13715,11 @@ def get_system_logs(admin_user: Dict[str, Any] = Depends(require_admin),
     except Exception as e:
         logger.error(f"获取系统日志失败: {str(e)}")
         log_with_user('error', f"获取系统日志失败: {str(e)}", admin_user)
-        return {"logs": [], "message": f"获取系统日志失败: {str(e)}", "success": False}
+        return {
+            "logs": [],
+            "message": safe_client_error("获取系统日志失败，请稍后重试"),
+            "success": False,
+        }
 
 @app.get('/admin/log-files')
 def list_log_files(admin_user: Dict[str, Any] = Depends(require_admin)):
@@ -11545,7 +13757,7 @@ def list_log_files(admin_user: Dict[str, Any] = Depends(require_admin)):
     except Exception as e:
         logger.error(f"获取日志文件列表失败: {str(e)}")
         log_with_user('error', f"获取日志文件列表失败: {str(e)}", admin_user)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取日志文件列表失败，请稍后重试"))
 
 @app.get('/admin/logs/export')
 def export_log_file(file: str, admin_user: Dict[str, Any] = Depends(require_admin)):
@@ -11595,7 +13807,7 @@ def export_log_file(file: str, admin_user: Dict[str, Any] = Depends(require_admi
     except Exception as e:
         logger.error(f"导出日志文件失败: {str(e)}")
         log_with_user('error', f"导出日志文件失败: {str(e)}", admin_user)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("导出日志文件失败，请稍后重试"))
 
 @app.get('/admin/stats')
 def get_system_stats(admin_user: Dict[str, Any] = Depends(require_admin)):
@@ -11641,7 +13853,7 @@ def get_system_stats(admin_user: Dict[str, Any] = Depends(require_admin)):
 
     except Exception as e:
         log_with_user('error', f"获取系统统计信息失败: {str(e)}", admin_user)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("获取系统统计信息失败，请稍后重试"))
 
 # ------------------------- 指定商品回复接口 -------------------------
 
@@ -11670,7 +13882,7 @@ def get_all_items(current_user: Dict[str, Any] = Depends(get_current_user)):
 
         return {"items": all_items}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"获取商品回复信息失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("获取商品回复信息失败，请稍后重试"))
 
 @app.get("/itemReplays/account/{account_id}")
 def get_item_replays_by_account(account_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
@@ -11683,7 +13895,7 @@ def get_item_replays_by_account(account_id: str, current_user: Dict[str, Any] = 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"获取商品信息失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("获取商品信息失败，请稍后重试"))
 
 @app.put("/item-reply/{account_id}/{item_id}")
 def update_item_reply(
@@ -11698,7 +13910,7 @@ def update_item_reply(
     try:
         account_id = _ensure_account_access(account_id, current_user, "访问")
 
-        reply_content = data.get("reply_content", "").strip()
+        reply_content = str(data.get("reply_content") or "").strip()
         if not reply_content:
             raise HTTPException(status_code=400, detail="回复内容不能为空")
 
@@ -11715,7 +13927,7 @@ def update_item_reply(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"更新商品回复失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("更新商品回复失败，请稍后重试"))
 
 @app.delete("/item-reply/{account_id}/{item_id}")
 def delete_item_reply(account_id: str, item_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
@@ -11734,7 +13946,7 @@ def delete_item_reply(account_id: str, item_id: str, current_user: Dict[str, Any
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"删除商品回复失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("删除商品回复失败，请稍后重试"))
 
 class ItemReplyDeleteItem(BaseModel):
     account_id: str
@@ -11752,22 +13964,27 @@ async def batch_delete_item_reply(
     """
     批量删除商品回复
     """
-    if not req.items:
-        raise HTTPException(status_code=400, detail="删除列表不能为空")
+    try:
+        if not req.items:
+            raise HTTPException(status_code=400, detail="删除列表不能为空")
 
-    normalized_items: List[dict] = []
-    for item in req.items:
-        account_id = _ensure_account_access(item.account_id, current_user, "访问")
-        normalized_items.append({
-            "account_id": account_id,
-            "item_id": item.item_id,
-        })
+        normalized_items: List[dict] = []
+        for item in req.items:
+            account_id = _ensure_account_access(item.account_id, current_user, "访问")
+            normalized_items.append({
+                "account_id": account_id,
+                "item_id": item.item_id,
+            })
 
-    result = db_manager.batch_delete_item_replies(normalized_items)
-    return {
-        "success_count": result["success_count"],
-        "failed_count": result["failed_count"]
-    }
+        result = db_manager.batch_delete_item_replies(normalized_items)
+        return {
+            "success_count": result["success_count"],
+            "failed_count": result["failed_count"]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=safe_client_error("批量删除商品回复失败，请稍后重试"))
 
 @app.get("/item-reply/{account_id}/{item_id}")
 def get_item_reply(account_id: str, item_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
@@ -11791,7 +14008,7 @@ def get_item_reply(account_id: str, item_id: str, current_user: Dict[str, Any] =
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"获取商品回复失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("获取商品回复失败，请稍后重试"))
 
 
 # ------------------------- 数据库备份和恢复接口 -------------------------
@@ -11830,7 +14047,7 @@ def download_database_backup(admin_user: Dict[str, Any] = Depends(require_admin)
         raise
     except Exception as e:
         log_with_user('error', f"下载数据库备份失败: {str(e)}", admin_user)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("下载数据库备份失败，请稍后重试"))
 
 @app.post('/admin/backup/upload')
 async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_admin),
@@ -11843,6 +14060,22 @@ async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_ad
     from datetime import datetime
 
     try:
+        current_db_path = None
+        backup_current_path = None
+
+        def _rollback_restored_database_or_raise() -> None:
+            if not current_db_path or not backup_current_path or not os.path.exists(backup_current_path):
+                log_with_user('error', "数据库恢复失败，且缺少可用的原数据库备份，无法回滚", admin_user)
+                raise HTTPException(status_code=500, detail="数据库恢复失败，且无法回滚到原数据库，请检查数据库文件")
+
+            try:
+                shutil.copy2(backup_current_path, current_db_path)
+                db_manager.__init__(current_db_path)
+                log_with_user('info', "已恢复原数据库", admin_user)
+            except Exception as rollback_error:
+                log_with_user('error', f"回滚原数据库失败: {str(rollback_error)}", admin_user)
+                raise HTTPException(status_code=500, detail="数据库恢复失败，且回滚原数据库失败，请检查数据库文件") from rollback_error
+
         log_with_user('info', f"开始上传数据库备份: {backup_file.filename}", admin_user)
 
         # 验证文件类型
@@ -11912,26 +14145,22 @@ async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_ad
             db_manager.conn.close()
             log_with_user('info', "已关闭当前数据库连接", admin_user)
 
-        # 替换数据库文件
-        shutil.move(temp_file_path, current_db_path)
-        log_with_user('info', f"数据库文件已替换: {current_db_path}", admin_user)
-
-        # 重新初始化数据库连接（使用原有的db_path）
-        db_manager.__init__(current_db_path)
-        log_with_user('info', "数据库连接已重新初始化", admin_user)
-
-        # 验证新数据库
         try:
+            # 替换数据库文件
+            shutil.move(temp_file_path, current_db_path)
+            log_with_user('info', f"数据库文件已替换: {current_db_path}", admin_user)
+
+            # 重新初始化数据库连接（使用原有的db_path）
+            db_manager.__init__(current_db_path)
+            log_with_user('info', "数据库连接已重新初始化", admin_user)
+
+            # 验证新数据库
             test_users = db_manager.get_all_users()
             log_with_user('info', f"数据库恢复成功，包含 {len(test_users)} 个用户", admin_user)
         except Exception as e:
-            log_with_user('error', f"数据库恢复后验证失败: {str(e)}", admin_user)
-            # 如果验证失败，尝试恢复原数据库
-            if os.path.exists(backup_current_path):
-                shutil.copy2(backup_current_path, current_db_path)
-                db_manager.__init__(current_db_path)
-                log_with_user('info', "已恢复原数据库", admin_user)
-            raise HTTPException(status_code=500, detail="数据库恢复失败，已回滚到原数据库")
+            log_with_user('error', f"数据库恢复过程失败: {str(e)}", admin_user)
+            _rollback_restored_database_or_raise()
+            raise HTTPException(status_code=500, detail="数据库恢复失败，已回滚到原数据库") from e
 
         session_reconcile_result = _reconcile_sessions_with_users(test_users)
         log_with_user(
@@ -11946,20 +14175,20 @@ async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_ad
 
         # 恢复数据库后同步刷新内存中的账号缓存，避免继续使用旧数据
         import cookie_manager
-        if cookie_manager.manager:
-            try:
-                cookie_manager.manager.reload_from_db()
-                log_with_user('info', "数据库恢复后已刷新 CookieManager 缓存", admin_user)
-            except Exception as e:
-                log_with_user('error', f"刷新 CookieManager 缓存失败: {str(e)}", admin_user)
-                raise HTTPException(status_code=500, detail="数据库恢复成功，但刷新 CookieManager 缓存失败，请重启系统")
-
-        return {
+        response_payload = {
             "success": True,
             "message": "数据库恢复成功",
             "backup_file": backup_current_path,
             "user_count": len(test_users)
         }
+        if cookie_manager.manager:
+            cache_reload_warning = _reload_cookie_manager_cache_with_warning("数据库恢复成功，但刷新 CookieManager 缓存失败，请重启系统")
+            if cache_reload_warning:
+                response_payload["warning"] = cache_reload_warning
+            else:
+                log_with_user('info', "数据库恢复后已刷新 CookieManager 缓存", admin_user)
+
+        return response_payload
 
     except HTTPException:
         if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
@@ -11973,7 +14202,7 @@ async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_ad
         # 清理临时文件
         if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("上传数据库备份失败，请稍后重试"))
 
 @app.get('/admin/backup/list')
 def list_backup_files(admin_user: Dict[str, Any] = Depends(require_admin)):
@@ -12016,7 +14245,7 @@ def list_backup_files(admin_user: Dict[str, Any] = Depends(require_admin)):
 
     except Exception as e:
         log_with_user('error', f"查询备份文件列表失败: {str(e)}", admin_user)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("查询备份文件列表失败，请稍后重试"))
 
 
 # ------------------------- 数据管理接口 -------------------------
@@ -12138,14 +14367,18 @@ def delete_table_record(table_name: str, record_id: str, admin_user: Dict[str, A
             if table_name == 'users':
                 revoked_session_count = _revoke_user_sessions(target_user_id)
                 response_payload["revoked_sessions"] = revoked_session_count
-                _reload_cookie_manager_cache_or_raise("删除用户成功，但刷新 CookieManager 缓存失败，请重启系统")
+                cache_reload_warning = _reload_cookie_manager_cache_with_warning("删除用户成功，但刷新 CookieManager 缓存失败，请重启系统")
+                if cache_reload_warning:
+                    response_payload["warning"] = cache_reload_warning
                 log_with_user(
                     'info',
                     f"表记录删除成功: {table_name}.{record_id}，目标用户={target_user_id}，已撤销 {revoked_session_count} 个活动会话",
                     admin_user,
                 )
             elif table_name == 'cookies':
-                _reload_cookie_manager_cache_or_raise("删除账号成功，但刷新 CookieManager 缓存失败，请重启系统")
+                cache_reload_warning = _reload_cookie_manager_cache_with_warning("删除账号成功，但刷新 CookieManager 缓存失败，请重启系统")
+                if cache_reload_warning:
+                    response_payload["warning"] = cache_reload_warning
                 log_with_user('info', f"表记录删除成功并已刷新 CookieManager 缓存: {table_name}.{record_id}", admin_user)
             else:
                 log_with_user('info', f"表记录删除成功: {table_name}.{record_id}", admin_user)
@@ -12179,12 +14412,15 @@ def clear_table_data(table_name: str, admin_user: Dict[str, Any] = Depends(requi
         success = db_manager.clear_table_data(table_name)
 
         if success:
+            response_payload = {"success": True, "message": "清空成功"}
             if table_name == 'cookies':
-                _reload_cookie_manager_cache_or_raise("清空账号表成功，但刷新 CookieManager 缓存失败，请重启系统")
+                cache_reload_warning = _reload_cookie_manager_cache_with_warning("清空账号表成功，但刷新 CookieManager 缓存失败，请重启系统")
+                if cache_reload_warning:
+                    response_payload["warning"] = cache_reload_warning
                 log_with_user('info', f"表数据清空成功并已刷新 CookieManager 缓存: {table_name}", admin_user)
-                return {"success": True, "message": "清空成功"}
+                return response_payload
             log_with_user('info', f"表数据清空成功: {table_name}", admin_user)
-            return {"success": True, "message": "清空成功"}
+            return response_payload
         else:
             log_with_user('warning', f"表数据清空失败: {table_name}", admin_user)
             raise HTTPException(status_code=400, detail="清空失败")
@@ -12214,7 +14450,7 @@ def update_item_multi_spec(account_id: str, item_id: str, spec_data: dict, curre
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新商品多规格状态失败，请稍后重试"))
 
 
 # 商品多数量发货管理API
@@ -12235,7 +14471,7 @@ def update_item_multi_quantity_delivery(account_id: str, item_id: str, delivery_
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_client_error("更新商品多数量发货状态失败，请稍后重试"))
 
 
 
@@ -12316,6 +14552,92 @@ def _append_order_history_sync_warning(job: Dict[str, Any], message: str) -> Non
     warnings.append(str(message))
 
 
+def _build_order_history_sync_completed_message(job: Dict[str, Any]) -> str:
+    scanned = int(job.get('orders_discovered') or 0)
+    matched = int(job.get('matched_orders') or 0)
+    saved = int(job.get('orders_saved') or 0)
+    failed = int(job.get('orders_failed') or 0)
+    skipped = int(job.get('orders_skipped') or 0)
+    warnings_count = len(job.get('warnings') or [])
+
+    message_parts = [
+        f"历史订单同步完成，共扫描 {scanned} 单",
+        f"命中时间范围 {matched} 单",
+        f"入库/更新 {saved} 单",
+    ]
+    if failed > 0:
+        message_parts.append(f"处理失败 {failed} 单")
+    if skipped > 0:
+        message_parts.append(f"跳过 {skipped} 单")
+    if warnings_count > 0:
+        message_parts.append(f"伴随 {warnings_count} 条警告")
+    return '，'.join(message_parts)
+
+
+def _resolve_manual_delivery_result_state(
+    aggregate_status: Optional[str],
+    *,
+    finalized_count: int = 0,
+    pending_finalize_count: int = 0,
+    failed_count: int = 0,
+) -> str:
+    normalized_status = str(aggregate_status or '').strip().lower()
+    if normalized_status == 'shipped':
+        if pending_finalize_count > 0 or failed_count > 0:
+            return 'warning'
+        return 'success'
+
+    if normalized_status in {'partial_pending_finalize', 'partial_success'}:
+        return 'warning'
+
+    if pending_finalize_count > 0 or failed_count > 0:
+        return 'warning'
+
+    if finalized_count > 0:
+        return 'success'
+
+    return 'idle'
+
+
+def _normalize_order_history_sync_failure_message(
+    message: Any,
+    *,
+    default_message: str,
+) -> str:
+    normalized = str(message or '').strip()
+    if not normalized:
+        return default_message
+    if (
+        "日期格式错误" in normalized
+        or "开始日期必须早于结束日期" in normalized
+        or "指定账号不存在或无权限访问" in normalized
+        or "当前没有可同步的账号" in normalized
+        or "账号未启动，暂无法执行当前操作" in normalized
+        or "运行中的账号浏览器任务" in normalized
+        or "当前有其他浏览器任务正在执行" in normalized
+        or "账号级 browser profile 已被其他 runtime 持有" in normalized
+        or "同账号已存在不兼容的 async runtime 正在使用中" in normalized
+        or "同账号已存在不兼容的 sync runtime 正在使用中" in normalized
+        or "runtime 正在失效回收" in normalized
+    ):
+        return normalized
+    return default_message
+
+
+def _normalize_order_history_sync_warning_message(
+    message: Any,
+    *,
+    default_message: str,
+) -> str:
+    normalized = _normalize_order_history_sync_failure_message(
+        message,
+        default_message='',
+    ).strip()
+    if normalized:
+        return normalized
+    return default_message
+
+
 def _cleanup_order_history_sync_jobs() -> None:
     now_ts = time.time()
     expired_job_ids = []
@@ -12328,6 +14650,31 @@ def _cleanup_order_history_sync_jobs() -> None:
     for job_id in expired_job_ids:
         order_history_sync_jobs.pop(job_id, None)
         order_history_sync_tasks.pop(job_id, None)
+
+
+def _cancel_asyncio_task_threadsafe(task: Any) -> bool:
+    if not task or task.done():
+        return False
+
+    try:
+        loop = task.get_loop()
+    except Exception:
+        loop = None
+
+    if loop is not None and getattr(loop, "is_running", lambda: False)():
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        if current_loop is loop:
+            task.cancel()
+        else:
+            loop.call_soon_threadsafe(task.cancel)
+        return True
+
+    task.cancel()
+    return True
 
 
 def _get_active_order_history_sync_job_for_user(user_id: int) -> Optional[Dict[str, Any]]:
@@ -12398,6 +14745,7 @@ async def _run_order_history_sync_job(job_id: str) -> None:
     job = order_history_sync_jobs.get(job_id)
     if not job:
         return
+    internal_failure_message = '历史订单同步失败，请稍后重试'
 
     request_data = dict(job.get('request') or {})
     user_info = dict(job.get('user_info') or {})
@@ -12413,16 +14761,8 @@ async def _run_order_history_sync_job(job_id: str) -> None:
         if utc_start >= utc_end_exclusive:
             raise ValueError('开始日期必须早于结束日期')
 
-        max_orders = int(request_data.get('max_orders') or 120)
-        max_orders = min(max(max_orders, 1), 500)
-        fetch_details = bool(request_data.get('fetch_details', True))
-        managed_runtime_fallback_details = {
-            '账号未启动，暂无法执行当前操作',
-            'CookieManager 未就绪',
-            '账号事件循环已关闭',
-            '账号事件循环未运行',
-        }
-
+        max_orders = _parse_history_sync_max_orders(request_data.get('max_orders'), default=120)
+        fetch_details = _parse_loose_bool(request_data.get('fetch_details'), default=True)
         selected_account_id = _normalize_history_optional_text(request_data.get('account_id'))
         user_account_ids = db_manager.get_account_ids(current_user_id)
         if selected_account_id:
@@ -12491,7 +14831,7 @@ async def _run_order_history_sync_job(job_id: str) -> None:
                         missing_detail='账号未启动，暂无法执行当前操作',
                     )
                 except HTTPException as managed_exc:
-                    if managed_exc.status_code in {400, 500} and str(managed_exc.detail) in managed_runtime_fallback_details:
+                    if _is_managed_runtime_unavailable_http_error(managed_exc):
                         logger.info(
                             f"历史订单列表抓取未命中受管 runtime，回退 fetcher: "
                             f"account_id={account_id}, reason={managed_exc.detail}"
@@ -12501,6 +14841,17 @@ async def _run_order_history_sync_job(job_id: str) -> None:
                             utc_start=utc_start,
                             utc_end_exclusive=utc_end_exclusive,
                         )
+                    elif _is_managed_runtime_conflict_http_error(managed_exc):
+                        logger.warning(
+                            f"历史订单列表抓取遇到账号浏览器占用，跳过列表回退: "
+                            f"account_id={account_id}, reason={managed_exc.detail}"
+                        )
+                        _append_order_history_sync_warning(
+                            job,
+                            f'账号 {account_id} 历史订单列表抓取遇到账号浏览器占用: {managed_exc.detail}'
+                        )
+                        job['accounts_completed'] = account_index
+                        continue
                     else:
                         raise
                 candidates = list(fetch_result.get('orders') or [])
@@ -12557,22 +14908,42 @@ async def _run_order_history_sync_job(job_id: str) -> None:
                                 ),
                                 missing_detail='账号未启动，暂无法执行当前操作',
                             )
-                            if detail_result:
-                                detail_saved = _save_history_order_detail_result(account_id, candidate, detail_result)
                         except HTTPException as managed_exc:
-                            if managed_exc.status_code in {400, 500} and str(managed_exc.detail) in managed_runtime_fallback_details:
+                            if _is_managed_runtime_unavailable_http_error(managed_exc):
                                 logger.info(
                                     f"历史订单详情刷新未命中受管 runtime，回退 fetcher: "
                                     f"account_id={account_id}, order_id={order_id}, reason={managed_exc.detail}"
                                 )
                                 detail_result = await _get_history_fetcher().fetch_order_detail(order_id, force_refresh=True)
-                                if detail_result:
-                                    detail_saved = _save_history_order_detail_result(account_id, candidate, detail_result)
+                            elif _is_managed_runtime_conflict_http_error(managed_exc):
+                                logger.warning(
+                                    f"历史订单详情刷新遇到账号浏览器占用，跳过详情回退: "
+                                    f"account_id={account_id}, order_id={order_id}, reason={managed_exc.detail}"
+                                )
+                                _append_order_history_sync_warning(
+                                    job,
+                                    f'订单 {order_id} 详情刷新遇到账号浏览器占用: {managed_exc.detail}'
+                                )
                             else:
                                 raise
                         except Exception as sync_exc:
                             logger.warning(f"历史订单详情同步失败: account_id={account_id}, order_id={order_id}, error={sync_exc}")
-                            _append_order_history_sync_warning(job, f'订单 {order_id} 详情刷新失败: {sync_exc}')
+                            _append_order_history_sync_warning(
+                                job,
+                                _normalize_order_history_sync_warning_message(
+                                    sync_exc,
+                                    default_message=f'订单 {order_id} 详情刷新失败，请稍后重试',
+                                ),
+                            )
+
+                        if job.get('status') == 'cancelled':
+                            return
+
+                        if detail_result:
+                            detail_saved = _save_history_order_detail_result(account_id, candidate, detail_result)
+
+                    if job.get('status') == 'cancelled':
+                        return
 
                     if not fetch_details or not detail_saved:
                         if _save_history_order_candidate(account_id, candidate):
@@ -12589,13 +14960,25 @@ async def _run_order_history_sync_job(job_id: str) -> None:
                 job['accounts_completed'] = account_index
             finally:
                 if history_fetcher is not None:
-                    await history_fetcher.close()
+                    try:
+                        await history_fetcher.close()
+                    except Exception as close_err:
+                        logger.warning(
+                            f"关闭历史订单抓取器失败: account_id={account_id}, error={close_err}"
+                        )
+                        _append_order_history_sync_warning(
+                            job,
+                            _normalize_order_history_sync_warning_message(
+                                close_err,
+                                default_message=f'账号 {account_id} 历史订单抓取器关闭失败，请稍后重试',
+                            )
+                        )
+
+        if job.get('status') == 'cancelled':
+            return
 
         job['status'] = 'completed'
-        job['message'] = (
-            f"历史订单同步完成，共扫描 {job.get('orders_discovered', 0)} 单，"
-            f"命中时间范围 {job.get('matched_orders', 0)} 单，入库/更新 {job.get('orders_saved', 0)} 单"
-        )
+        job['message'] = _build_order_history_sync_completed_message(job)
     except asyncio.CancelledError:
         logger.info(f"历史订单同步任务已取消: {job_id}")
         job['status'] = 'cancelled'
@@ -12603,9 +14986,13 @@ async def _run_order_history_sync_job(job_id: str) -> None:
         job['message'] = job.get('message') or '历史订单同步已取消'
     except Exception as exc:
         logger.error(f"历史订单同步任务失败: {exc}")
+        normalized_error = _normalize_order_history_sync_failure_message(
+            exc,
+            default_message=internal_failure_message,
+        )
         job['status'] = 'failed'
-        job['error'] = str(exc)
-        job['message'] = f'历史订单同步失败: {exc}'
+        job['error'] = normalized_error
+        job['message'] = normalized_error
     finally:
         job['current_order_id'] = None
         job['current_account'] = None
@@ -12631,10 +15018,11 @@ async def start_order_history_sync(request: OrderHistorySyncRequest, current_use
             raise HTTPException(status_code=400, detail='开始日期必须早于结束日期')
 
         account_id = _normalize_history_optional_text(request_data.get('account_id'))
-        max_orders = int(request_data.get('max_orders') or 120)
-        if max_orders < 1 or max_orders > 500:
-            raise HTTPException(status_code=400, detail='最多同步单数需在 1 到 500 之间')
-        fetch_details = bool(request_data.get('fetch_details', True))
+        try:
+            max_orders = _parse_history_sync_max_orders(request_data.get('max_orders'), default=120)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        fetch_details = _parse_loose_bool(request_data.get('fetch_details'), default=True)
         user_account_ids = db_manager.get_account_ids(current_user['user_id'])
         if account_id and account_id not in user_account_ids:
             raise HTTPException(status_code=403, detail='指定账号不存在或无权限访问')
@@ -12711,7 +15099,7 @@ async def start_order_history_sync(request: OrderHistorySyncRequest, current_use
         raise
     except Exception as exc:
         log_with_user('error', f"创建历史订单同步任务失败: {exc}", current_user)
-        raise HTTPException(status_code=500, detail=f"创建历史订单同步任务失败: {exc}")
+        raise HTTPException(status_code=500, detail=safe_client_error("创建历史订单同步任务失败，请稍后重试"))
 
 
 @app.get('/api/orders/history-sync/{job_id}')
@@ -12747,8 +15135,7 @@ def cancel_order_history_sync(job_id: str, current_user: Dict[str, Any] = Depend
     job['finished_ts'] = time.time()
 
     task = order_history_sync_tasks.get(job_id)
-    if task and not task.done():
-        task.cancel()
+    _cancel_asyncio_task_threadsafe(task)
 
     return {"success": True, "data": _create_order_history_sync_job_snapshot(job)}
 
@@ -12780,7 +15167,7 @@ def get_user_orders(current_user: Dict[str, Any] = Depends(get_current_user)):
 
     except Exception as e:
         log_with_user('error', f"查询用户订单失败: {str(e)}", current_user)
-        raise HTTPException(status_code=500, detail=f"查询订单失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("查询订单失败，请稍后重试"))
 
 
 @app.get('/api/orders/stream')
@@ -12840,6 +15227,7 @@ async def manual_deliver_order(
     order_id: str,
     account_id: str = None,
     current_user: Dict[str, Any] = Depends(get_current_user),
+    http_request: Request = None,
 ):
     """手动发货 - 根据订单信息匹配发货规则并发送卡券"""
     try:
@@ -12886,6 +15274,10 @@ async def manual_deliver_order(
                     item_id=item_id
                 )
                 if not finalize_result.get('success'):
+                    finalize_error_message = _normalize_manual_delivery_failure_message(
+                        finalize_result.get('error'),
+                        default_message='检测到已有发货记录，但补完成收尾失败，请稍后重试',
+                    )
                     live_instance._persist_delivery_finalization_state(
                         order_id=order_id,
                         item_id=item_id,
@@ -12893,9 +15285,13 @@ async def manual_deliver_order(
                         delivery_meta=pending_finalize_meta,
                         channel='manual',
                         status='sent',
-                        last_error=finalize_result.get('error') or f'检测到第 {unit_index} 个发货单元已发送记录，但补完成收尾失败'
+                        last_error=finalize_error_message or f'检测到第 {unit_index} 个发货单元已发送记录，但补完成收尾失败'
                     )
-                    return {"success": False, "delivered": False, "message": finalize_result.get('error') or f'检测到第 {unit_index} 个发货单元已发送记录，但补完成收尾失败'}
+                    return {
+                        "success": False,
+                        "delivered": False,
+                        "message": finalize_error_message or f'检测到第 {unit_index} 个发货单元已发送记录，但补完成收尾失败'
+                    }
 
                 live_instance._persist_delivery_finalization_state(
                     order_id=order_id,
@@ -13167,6 +15563,10 @@ async def manual_deliver_order(
                             item_id=item_id
                         )
                         if not finalize_result.get('success'):
+                            finalize_error_message = _normalize_manual_delivery_failure_message(
+                                finalize_result.get('error'),
+                                default_message='发送成功但提交发货后续处理失败，请稍后重试',
+                            )
                             live_instance._persist_delivery_finalization_state(
                                 order_id=order_id,
                                 item_id=item_id,
@@ -13174,7 +15574,7 @@ async def manual_deliver_order(
                                 delivery_meta=rule_meta,
                                 channel='manual',
                                 status='sent',
-                                last_error=finalize_result.get('error') or f'第 {unit_index} 个发货单元发送成功但提交发货副作用失败'
+                                last_error=finalize_error_message or f'第 {unit_index} 个发货单元发送成功但提交发货副作用失败'
                             )
                             db_manager.create_delivery_log(
                                 user_id=user_id,
@@ -13189,9 +15589,9 @@ async def manual_deliver_order(
                                 match_mode=rule_meta.get('match_mode'),
                                 channel='manual',
                                 status='failed',
-                                reason=format_delivery_reason(finalize_result.get('error') or f'第 {unit_index} 个发货单元发送成功但提交发货副作用失败', rule_meta.get('order_spec_mode'), rule_meta.get('rule_spec_mode'), rule_meta.get('item_config_mode'))
+                                reason=format_delivery_reason(finalize_error_message or f'第 {unit_index} 个发货单元发送成功但提交发货副作用失败', rule_meta.get('order_spec_mode'), rule_meta.get('rule_spec_mode'), rule_meta.get('item_config_mode'))
                             )
-                            unit_results.append({'unit_index': unit_index, 'status': 'pending_finalize', 'error': finalize_result.get('error') or '发送成功但提交发货副作用失败'})
+                            unit_results.append({'unit_index': unit_index, 'status': 'pending_finalize', 'error': finalize_error_message or '发送成功但提交发货副作用失败'})
                             continue
 
                         live_instance._persist_delivery_finalization_state(
@@ -13288,13 +15688,30 @@ async def manual_deliver_order(
             if not message_parts:
                 message_parts.append("订单当前没有可推进的发货单元")
 
-            return {"success": True, "delivered": delivered, "message": '，'.join(message_parts)}
+            result_state = _resolve_manual_delivery_result_state(
+                aggregate_status,
+                finalized_count=int(progress_summary_after.get('finalized_count') or 0),
+                pending_finalize_count=int(progress_summary_after.get('pending_finalize_count') or 0),
+                failed_count=len(failed_now),
+            )
+
+            return {
+                "success": True,
+                "delivered": delivered,
+                "message": '，'.join(message_parts),
+                "result_state": result_state,
+            }
 
         try:
-            return await _run_managed_live_instance_call(
-                order_account_id,
-                _execute_manual_delivery,
-                missing_detail=missing_instance_message,
+            return await _await_temporary_browser_runtime_operation(
+                _run_managed_live_instance_call(
+                    order_account_id,
+                    _execute_manual_delivery,
+                    missing_detail=missing_instance_message,
+                ),
+                http_request=http_request,
+                account_id=order_account_id,
+                scene="手动发货",
             )
         except HTTPException as managed_error:
             if managed_error.status_code == 400 and managed_error.detail == missing_instance_message:
@@ -13315,6 +15732,7 @@ async def refresh_order_status(
     order_id: str,
     account_id: str = None,
     current_user: Dict[str, Any] = Depends(get_current_user),
+    http_request: Request = None,
 ):
     """刷新订单状态 - 从闲鱼平台获取最新订单状态"""
     try:
@@ -13343,10 +15761,15 @@ async def refresh_order_status(
             )
 
         try:
-            result = await _run_managed_live_instance_call(
-                order_account_id,
-                _refresh_order_via_managed_runtime,
-                missing_detail=missing_instance_message,
+            result = await _await_temporary_browser_runtime_operation(
+                _run_managed_live_instance_call(
+                    order_account_id,
+                    _refresh_order_via_managed_runtime,
+                    missing_detail=missing_instance_message,
+                ),
+                http_request=http_request,
+                account_id=order_account_id,
+                scene="订单状态刷新",
             )
         except HTTPException as managed_error:
             if managed_error.status_code == 400 and managed_error.detail == missing_instance_message:
@@ -13394,6 +15817,13 @@ async def restart_application(current_user: Dict[str, Any] = Depends(get_current
         
         log_with_user('info', "用户请求重启应用", current_user)
 
+        existing_restart_task = getattr(app.state, "delayed_restart_task", None)
+        if isinstance(existing_restart_task, asyncio.Task) and not existing_restart_task.done():
+            return {
+                "success": True,
+                "message": "应用重启已在进行中"
+            }
+
         # 返回响应后异步重启
         async def delayed_restart():
             await asyncio.sleep(2)  # 等待2秒让响应返回
@@ -13404,9 +15834,21 @@ async def restart_application(current_user: Dict[str, Any] = Depends(get_current
 
             # 退出当前进程
             os._exit(0)
-        
-        # 创建后台任务
-        asyncio.create_task(delayed_restart())
+
+        restart_task = asyncio.create_task(delayed_restart())
+        app.state.delayed_restart_task = restart_task
+
+        def _clear_delayed_restart_task(done_task: asyncio.Task) -> None:
+            if getattr(app.state, "delayed_restart_task", None) is done_task:
+                app.state.delayed_restart_task = None
+            try:
+                done_task.result()
+            except (asyncio.CancelledError, SystemExit):
+                pass
+            except Exception as task_error:
+                logger.error(f"延迟重启后台任务异常: {task_error}")
+
+        restart_task.add_done_callback(_clear_delayed_restart_task)
         
         return {
             "success": True,
@@ -13417,13 +15859,17 @@ async def restart_application(current_user: Dict[str, Any] = Depends(get_current
         raise
     except Exception as e:
         logger.error(f"重启应用失败: {e}")
-        raise HTTPException(status_code=500, detail=f"重启应用失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("重启应用失败，请稍后重试"))
 
 
 # ==================== 一键擦亮API ====================
 
 @app.post("/accounts/{account_id}/polish-items")
-async def polish_account_items(account_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+async def polish_account_items(
+    account_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    http_request: Request = None,
+):
     """擦亮指定账号的所有在售商品"""
     xianyu_instance = None
     handled_error = None
@@ -13441,7 +15887,21 @@ async def polish_account_items(account_id: str, current_user: Dict[str, Any] = D
         xianyu_instance = XianyuLive(cookies_str, account_id=account_id, register_instance=False)
 
         logger.info(f"开始擦亮账号 {account_id} 的所有商品")
-        result = await xianyu_instance.polish_all_items()
+        result = await _await_temporary_browser_runtime_operation(
+            xianyu_instance.polish_all_items(),
+            http_request=http_request,
+            account_id=account_id,
+            scene="商品擦亮",
+        )
+
+        if isinstance(result, dict) and result.get('success') is False:
+            normalized_error = _normalize_item_polish_failure_message(
+                result.get('message'),
+                default_message="擦亮商品失败，请稍后重试",
+            )
+            normalized_result = dict(result)
+            normalized_result['message'] = normalized_error
+            return normalized_result
 
         return result
 
@@ -13449,9 +15909,16 @@ async def polish_account_items(account_id: str, current_user: Dict[str, Any] = D
         handled_error = exc
         raise
     except Exception as e:
+        translated_conflict = _translate_managed_runtime_conflict_error(
+            e,
+            account_id=account_id,
+        )
+        if translated_conflict is not None:
+            handled_error = translated_conflict
+            raise translated_conflict from e
         handled_error = e
         logger.error(f"擦亮账号商品异常: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"擦亮商品失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=safe_client_error("擦亮商品失败，请稍后重试"))
     finally:
         if xianyu_instance is not None:
             try:
@@ -13474,23 +15941,48 @@ def _parse_enabled_flag(value):
 
 
 def _parse_run_hour(value, default=8):
-    run_hour = default if value is None else int(value)
+    if value is None:
+        run_hour = default
+    else:
+        try:
+            run_hour = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("运行时间必须是整数") from exc
     if run_hour < 0 or run_hour > 23:
         raise ValueError("运行时间必须在 0-23 之间")
     return run_hour
 
 
 def _parse_random_delay(value, default=10):
-    random_delay_max = default if value is None else int(value)
+    if value is None:
+        random_delay_max = default
+    else:
+        try:
+            random_delay_max = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("随机分钟必须是整数") from exc
     if random_delay_max < 0:
         raise ValueError("随机分钟不能小于 0")
     return random_delay_max
+
+
+def _parse_history_sync_max_orders(value, default=120):
+    if value is None:
+        max_orders = default
+    else:
+        try:
+            max_orders = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("最多同步单数需在 1 到 500 之间") from exc
+    if max_orders < 1 or max_orders > 500:
+        raise ValueError("最多同步单数需在 1 到 500 之间")
+    return max_orders
 
 @app.post("/scheduled-tasks")
 async def create_scheduled_task(request: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
     """创建定时任务"""
     try:
-        account_id = request.get('account_id', '').strip()
+        account_id = str(request.get('account_id') or '').strip()
         run_hour = _parse_run_hour(request.get('run_hour', request.get('delay_minutes', 8)))
         random_delay_max = _parse_random_delay(request.get('random_delay_max', 10), 10)
         enabled = _parse_enabled_flag(request.get('enabled', True))
@@ -13543,12 +16035,14 @@ async def create_scheduled_task(request: dict, current_user: Dict[str, Any] = De
             return {"success": True, "message": "定时擦亮任务创建成功", "task_id": task_id, "task": task}
         else:
             return {"success": False, "message": "创建定时任务失败"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except HTTPException as e:
         logger.warning(f"创建定时任务被拒绝: account_id={request.get('account_id', '')}, detail={e.detail}")
-        return {"success": False, "message": str(e.detail or "创建定时任务失败")}
+        raise
     except Exception as e:
         logger.error(f"创建定时任务异常: {str(e)}")
-        return {"success": False, "message": f"创建定时任务异常: {str(e)}"}
+        raise HTTPException(status_code=500, detail=safe_client_error("创建定时任务失败，请稍后重试"))
 
 
 @app.get("/scheduled-tasks")
@@ -13559,7 +16053,7 @@ async def list_scheduled_tasks(current_user: Dict[str, Any] = Depends(get_curren
         return {"success": True, "tasks": tasks}
     except Exception as e:
         logger.error(f"获取定时任务列表异常: {str(e)}")
-        return {"success": False, "message": f"获取定时任务列表异常: {str(e)}"}
+        raise HTTPException(status_code=500, detail=safe_client_error("获取定时任务列表失败，请稍后重试"))
 
 
 @app.put("/scheduled-tasks/{task_id}")
@@ -13580,7 +16074,12 @@ async def update_scheduled_task(task_id: int, request: dict, current_user: Dict[
                 kwargs['name'] = name
 
         if 'interval_hours' in request:
-            kwargs['interval_hours'] = int(request.get('interval_hours', task.get('interval_hours', 24)))
+            try:
+                kwargs['interval_hours'] = int(request.get('interval_hours', task.get('interval_hours', 24)))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("间隔小时必须是整数") from exc
+            if kwargs['interval_hours'] <= 0:
+                raise ValueError("间隔小时必须大于 0")
 
         if 'run_hour' in request or 'delay_minutes' in request:
             kwargs['delay_minutes'] = _parse_run_hour(request.get('run_hour', request.get('delay_minutes')))
@@ -13619,9 +16118,13 @@ async def update_scheduled_task(task_id: int, request: dict, current_user: Dict[
             return {"success": True, "message": "定时任务更新成功", "task": updated_task}
         else:
             return {"success": False, "message": "更新失败"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"更新定时任务异常: {str(e)}")
-        return {"success": False, "message": f"更新定时任务异常: {str(e)}"}
+        raise HTTPException(status_code=500, detail=safe_client_error("更新定时任务失败，请稍后重试"))
 
 
 @app.delete("/scheduled-tasks/{task_id}")
@@ -13638,9 +16141,11 @@ async def delete_scheduled_task(task_id: int, current_user: Dict[str, Any] = Dep
             return {"success": True, "message": "定时任务已删除"}
         else:
             return {"success": False, "message": "删除失败"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"删除定时任务异常: {str(e)}")
-        return {"success": False, "message": f"删除定时任务异常: {str(e)}"}
+        raise HTTPException(status_code=500, detail=safe_client_error("删除定时任务失败，请稍后重试"))
 
 
 @app.put("/scheduled-tasks/{task_id}/toggle")
@@ -13673,9 +16178,11 @@ async def toggle_scheduled_task(task_id: int, current_user: Dict[str, Any] = Dep
             }
         else:
             return {"success": False, "message": "操作失败"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"切换定时任务状态异常: {str(e)}")
-        return {"success": False, "message": f"操作异常: {str(e)}"}
+        raise HTTPException(status_code=500, detail=safe_client_error("切换定时任务状态失败，请稍后重试"))
 
 
 # ==================== 定时任务调度器 ====================
@@ -13748,7 +16255,7 @@ async def scheduled_task_checker():
                         )
                         db_manager.update_task_run_result(
                             task_id,
-                            {"success": False, "message": f"执行异常: {str(e)}"},
+                            {"success": False, "message": safe_client_error("执行异常，请稍后重试")},
                             next_run_str,
                         )
                     except Exception as update_error:

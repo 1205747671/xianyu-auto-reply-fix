@@ -131,6 +131,30 @@ def test_xianyu_async_does_not_contain_known_garbled_text():
         assert phrase not in source_text
 
 
+def test_xianyu_async_cookie_detail_logs_are_masked():
+    source_text = SOURCE_FILE.read_text(encoding="utf-8")
+
+    expected_phrases = [
+        "display_value = self._mask_secret_value(cookie_value, head=4, tail=2)",
+        "display_value = self._mask_secret_value(value, head=4, tail=2)",
+        "Cookie摘要: {self._summarize_cookie_string(real_cookies_str)}",
+        "Cookie字符串摘要: {self._summarize_cookie_string(new_cookies_str)}",
+    ]
+    unsafe_phrases = [
+        "str(value)[:30]}...{str(value)[-20:]}",
+        'display_value = f"{value[:20]}...{value[-20:]}"',
+        "display_value = value",
+        'display_value = f"{cookie_value[:8]}...{cookie_value[-8:]}"',
+        "display_value = cookie_value",
+    ]
+
+    for phrase in expected_phrases:
+        assert phrase in source_text
+
+    for phrase in unsafe_phrases:
+        assert phrase not in source_text
+
+
 def test_browser_runtime_test_fixtures_are_restored():
     source_text = BROWSER_RUNTIME_TEST_FILE.read_text(encoding="utf-8")
 

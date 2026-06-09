@@ -32,11 +32,71 @@ if os.getenv('DOCKER_ENV'):
         logger.warning(f"设置SelectorEventLoop失败: {e}")
 
 try:
-    from utils.account_browser_runtime import account_browser_runtime_manager
+    from utils.account_browser_runtime import (
+        account_browser_runtime_manager,
+        capture_owner_lock_token,
+        release_owner_lock_if_owned,
+    )
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
     logger.warning("Playwright 未安装，将使用模拟数据")
+
+
+def _get_account_browser_owner_lock(account_id: str):
+    from XianyuAutoAsync import XianyuLive
+
+    return XianyuLive._get_browser_owner_lock(account_id)
+
+
+def _resolve_account_browser_owner_lock(account_id: str):
+    current_module = sys.modules.get(__name__)
+    resolver = getattr(current_module, "_get_account_browser_owner_lock", None)
+    if callable(resolver) and resolver is not _get_account_browser_owner_lock:
+        return resolver(account_id)
+    return _get_account_browser_owner_lock(account_id)
+
+
+def _bind_runtime_owner_lock(lease: Any, owner_lock: Any, acquired: bool) -> None:
+    if lease is None:
+        return
+    try:
+        setattr(lease, "_owner_lock", owner_lock)
+        setattr(lease, "_owner_lock_acquired", bool(acquired))
+        setattr(lease, "_owner_lock_token", capture_owner_lock_token(owner_lock))
+    except Exception:
+        pass
+
+
+async def _release_runtime_owner_lock(lease: Any) -> None:
+    if lease is None:
+        return
+    owner_lock = getattr(lease, "_owner_lock", None)
+    owner_lock_acquired = bool(getattr(lease, "_owner_lock_acquired", False))
+    owner_lock_token = getattr(lease, "_owner_lock_token", None)
+    if owner_lock_acquired and owner_lock is not None:
+        release_owner_lock_if_owned(owner_lock, owner_lock_token)
+    try:
+        setattr(lease, "_owner_lock_acquired", False)
+        setattr(lease, "_owner_lock_token", None)
+    except Exception:
+        pass
+
+
+async def _release_account_runtime_shielded(lease: Any, *, reason: str, log_prefix: str) -> None:
+    release_task = asyncio.create_task(
+        account_browser_runtime_manager.release_runtime(lease, reason=reason)
+    )
+    try:
+        await asyncio.shield(release_task)
+    except asyncio.CancelledError:
+        try:
+            await release_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as release_error:
+            logger.warning(f"{log_prefix}取消收尾释放失败，保留取消语义: {release_error}")
+        raise
 
 
 class XianyuSearcher:
@@ -51,6 +111,8 @@ class XianyuSearcher:
         self.page = None
         self._runtime_lease = None
         self._runtime_handles_managed = False
+        self._runtime_lease_owned = False
+        self._response_handler = None
         self.api_responses = []
         self.account_id = account_id
         self.cookie_value = str(cookie_value or "").strip()
@@ -58,9 +120,163 @@ class XianyuSearcher:
         self.enable_manual_scratch_captcha_debug = False
         self.use_remote_control = False
 
+    def attach_managed_runtime(
+        self,
+        *,
+        lease: Any,
+        browser: Any = None,
+        context: Any = None,
+        page: Any = None,
+    ) -> None:
+        """绑定上游已申请好的账号级 runtime。"""
+        self._runtime_lease = lease
+        self._runtime_handles_managed = True
+        self._runtime_lease_owned = False
+        runtime = getattr(lease, "runtime", None) if lease is not None else None
+        self.browser = browser or getattr(runtime, "browser", None)
+        self.context = context or getattr(runtime, "context", None)
+        self.page = page or getattr(runtime, "page", None)
+
+    def _build_runtime_request(self, profile_dir: str) -> Dict[str, Any]:
+        browser_args = [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--no-first-run',
+            '--disable-extensions',
+            '--disable-default-apps',
+            '--no-default-browser-check',
+        ]
+
+        if os.getenv('DOCKER_ENV') == 'true':
+            browser_args.append('--disable-gpu')
+
+        return {
+            "headless": True,
+            "use_persistent_context": True,
+            "profile_dir": profile_dir,
+            "launch_options": {
+                "headless": True,
+                "args": browser_args,
+            },
+        }
+
     def _is_manual_scratch_captcha_debug_enabled(self) -> bool:
         """仅在显式 debug 开关开启时允许人工远控刮刮乐。"""
         return bool(getattr(self, "enable_manual_scratch_captcha_debug", False))
+
+    def _safe_str(self, error: Any) -> str:
+        try:
+            return str(error)
+        except Exception:
+            try:
+                return repr(error)
+            except Exception:
+                return "未知错误"
+
+    def _clear_response_handler(self) -> None:
+        if not self._response_handler or self.page is None:
+            self._response_handler = None
+            return
+        try:
+            remove_listener = getattr(self.page, "remove_listener", None)
+            if callable(remove_listener):
+                remove_listener("response", self._response_handler)
+            else:
+                off = getattr(self.page, "off", None)
+                if callable(off):
+                    off("response", self._response_handler)
+        except Exception as e:
+            logger.debug(f"移除商品搜索 response 监听器失败: {e}")
+        finally:
+            self._response_handler = None
+
+    async def _snapshot_page_context(self) -> Dict[str, str]:
+        title = ""
+        url = ""
+        page = self.page
+        if page is None:
+            return {"title": title, "url": url}
+
+        try:
+            url = str(getattr(page, "url", "") or "")
+        except Exception:
+            url = ""
+
+        try:
+            if not page.is_closed():
+                title = await page.title()
+        except Exception:
+            title = ""
+
+        return {"title": title.strip(), "url": url.strip()}
+
+    async def _wait_for_networkidle_or_continue(self, stage: str, timeout: int) -> None:
+        if self.page is None or self.page.is_closed():
+            raise Exception(f"页面在{stage}前已关闭")
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=timeout)
+        except Exception as wait_error:
+            logger.warning(f"{stage} 等待 networkidle 超时，继续尝试页面元素探测: {self._safe_str(wait_error)}")
+
+    async def _find_search_input(self):
+        search_selectors = [
+            'input[class*="search-input"]',
+            'input[placeholder*="搜索"]',
+            'input[type="search"]',
+            'input[type="text"]',
+            '.search-input',
+            '#search-input',
+        ]
+
+        for selector in search_selectors:
+            try:
+                logger.info(f"尝试查找搜索框，选择器: {selector}")
+                search_input = await self.page.wait_for_selector(selector, timeout=5000, state='visible')
+                if search_input:
+                    logger.info(f"✅ 找到搜索框，使用选择器: {selector}")
+                    return search_input, selector
+            except Exception as selector_error:
+                logger.info(f"❌ 选择器 {selector} 未找到搜索框: {self._safe_str(selector_error)}")
+
+        page_context = await self._snapshot_page_context()
+        raise Exception(
+            "未找到搜索框元素"
+            f"（当前页面标题: {page_context.get('title') or 'unknown'}，URL: {page_context.get('url') or 'unknown'}）"
+        )
+
+    async def _submit_search(self, search_input) -> str:
+        submit_selectors = [
+            'button[type="submit"]',
+            'button.search-btn',
+            'button[class*="search"]',
+            '.search-btn',
+            '[data-testid*="search"] button',
+            'form button',
+        ]
+
+        for selector in submit_selectors:
+            try:
+                logger.info(f"尝试查找搜索提交按钮，选择器: {selector}")
+                submit_button = await self.page.wait_for_selector(selector, timeout=3000, state='visible')
+                if submit_button:
+                    await submit_button.click()
+                    logger.info(f"✅ 已通过按钮提交搜索，选择器: {selector}")
+                    return selector
+            except Exception as selector_error:
+                logger.info(f"❌ 选择器 {selector} 未找到可用搜索按钮: {self._safe_str(selector_error)}")
+
+        try:
+            await search_input.press("Enter")
+            logger.info("✅ 已通过搜索框 Enter 提交搜索")
+            return "input:Enter"
+        except Exception as submit_error:
+            page_context = await self._snapshot_page_context()
+            raise Exception(
+                "未找到可用的搜索提交入口"
+                f"（当前页面标题: {page_context.get('title') or 'unknown'}，URL: {page_context.get('url') or 'unknown'}，"
+                f"最后错误: {self._safe_str(submit_error)}）"
+            ) from submit_error
 
     def _create_slider_handler(self, page, context, browser, playwright):
         from utils.xianyu_slider_stealth import XianyuSliderStealth
@@ -165,6 +381,11 @@ class XianyuSearcher:
                 while elapsed_time < max_wait_time:
                     await asyncio.sleep(check_interval)
                     elapsed_time += check_interval
+
+                    session_exists = getattr(captcha_controller, 'session_exists', None)
+                    if callable(session_exists) and not session_exists(session_id):
+                        logger.warning(f"远程验证会话已关闭，停止等待: {session_id}")
+                        return False
                     
                     # 检查是否完成
                     if captcha_controller.is_completed(session_id):
@@ -686,69 +907,90 @@ class XianyuSearcher:
             logger.error(f"设置浏览器cookies失败: {str(e)}")
             return False
 
+    async def _release_init_runtime_lease(self, lease: Any, *, reason: str) -> None:
+        if lease is None:
+            return
+        if self._runtime_lease is lease:
+            await self._release_runtime_lease(reason=reason)
+            return
+        try:
+            await _release_account_runtime_shielded(
+                lease,
+                reason=reason,
+                log_prefix="商品搜索初始化 runtime",
+            )
+        except Exception as e:
+            logger.warning(f"释放商品搜索初始化 runtime 失败: {e}")
+        finally:
+            await _release_runtime_owner_lock(lease)
+
     async def init_browser(self):
         """初始化浏览器（通过账号级 runtime manager 申请独立页面）"""
         if not PLAYWRIGHT_AVAILABLE:
             raise Exception("Playwright 未安装，无法使用真实搜索功能")
 
+        if self._runtime_lease is not None and self.context is not None and self.page is not None:
+            logger.info("商品搜索复用上游已绑定的账号级 runtime")
+            return
+
         lease = None
+        owner_lock = None
+        lock_acquired = False
+        owner_lock_token = None
         try:
             if self._runtime_lease is not None:
                 await self._release_runtime_lease(reason="refresh_item_search_page")
 
+            owner_lock = _resolve_account_browser_owner_lock(self.account_id)
+            await asyncio.wait_for(owner_lock.acquire(), timeout=15.0)
+            lock_acquired = True
+            owner_lock_token = capture_owner_lock_token(owner_lock)
             user_data_dir = account_browser_runtime_manager.resolve_profile_dir(self.account_id)
             logger.info(f"使用账号级持久化数据目录: {user_data_dir}")
-
-            browser_args = [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--no-first-run',
-                '--disable-extensions',
-                '--disable-default-apps',
-                '--no-default-browser-check',
-            ]
-
-            if os.getenv('DOCKER_ENV') == 'true':
-                browser_args.append('--disable-gpu')
-
-            logger.info("正在通过账号级 runtime manager 申请搜索页面...")
             lease = await account_browser_runtime_manager.acquire_runtime(
                 self.account_id,
                 "item_search",
                 exclusive=False,
-                runtime_request={
-                    "headless": True,
-                    "use_persistent_context": True,
-                    "profile_dir": user_data_dir,
-                    "launch_options": {
-                        "headless": True,
-                        "args": browser_args,
-                    },
-                },
+                runtime_request=self._build_runtime_request(user_data_dir),
             )
+            _bind_runtime_owner_lock(lease, owner_lock, lock_acquired)
             self.page, self.context = await account_browser_runtime_manager.get_fresh_page(lease)
             self._runtime_lease = lease
             self._runtime_handles_managed = True
+            self._runtime_lease_owned = True
             lease_runtime = getattr(lease, "runtime", None)
             self.browser = getattr(lease_runtime, "browser", None)
-
             logger.info("浏览器初始化完成（账号级 runtime 已就绪）")
-        except Exception:
-            if lease is not None and self._runtime_lease is None:
-                try:
-                    await account_browser_runtime_manager.release_runtime(
-                        lease,
-                        reason="item_search_init_failed",
-                    )
-                except Exception:
-                    pass
+        except asyncio.TimeoutError as timeout_error:
+            raise RuntimeError(
+                f"账号 {self.account_id} 当前有其他浏览器任务正在执行，请稍后再试"
+            ) from timeout_error
+        except asyncio.CancelledError:
+            await self._release_init_runtime_lease(
+                lease,
+                reason="item_search_init_cancelled",
+            )
             raise
+        except Exception:
+            await self._release_init_runtime_lease(
+                lease,
+                reason="item_search_init_failed",
+            )
+            raise
+        finally:
+            if (
+                lock_acquired
+                and owner_lock is not None
+                and not bool(getattr(lease, "_owner_lock_acquired", False))
+            ):
+                release_owner_lock_if_owned(owner_lock, owner_lock_token)
 
     async def _release_runtime_lease(self, reason: str) -> None:
         lease = self._runtime_lease
+        self._clear_response_handler()
         self._runtime_lease = None
         self._runtime_handles_managed = False
+        self._runtime_lease_owned = False
         self.browser = None
         self.context = None
         self.page = None
@@ -757,25 +999,37 @@ class XianyuSearcher:
             return
 
         try:
-            await account_browser_runtime_manager.release_runtime(lease, reason=reason)
+            await _release_account_runtime_shielded(
+                lease,
+                reason=reason,
+                log_prefix="商品搜索 runtime",
+            )
         except Exception as e:
             logger.warning(f"释放商品搜索 runtime 失败: {e}")
+        finally:
+            await _release_runtime_owner_lock(lease)
 
     def _detach_managed_runtime_handles_without_close(self, reason: str) -> bool:
         if not self._runtime_handles_managed:
             return False
 
         logger.warning(f"检测到受管商品搜索 runtime handles 缺少 lease，跳过 direct close: {reason}")
+        self._clear_response_handler()
+        self._runtime_lease = None
         self.page = None
         self.context = None
         self.browser = None
         self._runtime_handles_managed = False
+        self._runtime_lease_owned = False
         return True
 
     async def close_browser(self):
         """关闭浏览器"""
         try:
-            if self._runtime_lease is not None:
+            self._clear_response_handler()
+            if self._runtime_lease is not None and (
+                self._runtime_lease_owned or not self._runtime_handles_managed
+            ):
                 await self._release_runtime_lease(reason="close_item_search_page")
                 logger.debug("商品搜索器浏览器已关闭（runtime lease 已释放）")
                 return
@@ -819,7 +1073,9 @@ class XianyuSearcher:
 
             logger.info(f"使用 Playwright 搜索闲鱼商品: 关键词='{keyword}', 页码={page}, 每页={page_size}")
 
-            await self.init_browser()
+            browser_ready = await self.init_browser()
+            if browser_ready is False or self.page is None or self.context is None:
+                raise RuntimeError("浏览器启动失败")
 
             # 清空之前的API响应
             self.api_responses = []
@@ -873,7 +1129,7 @@ class XianyuSearcher:
                 logger.info("正在设置cookies进行登录...")
                 cookie_success = await self.set_browser_cookies(self.cookie_value)
                 if not cookie_success:
-                    logger.warning("设置cookies失败，将以未登录状态继续")
+                    raise RuntimeError("设置浏览器cookies失败，无法执行商品搜索")
                 else:
                     logger.info("✅ cookies设置成功，已登录")
                     # 刷新页面以应用cookies
@@ -882,17 +1138,21 @@ class XianyuSearcher:
                
                     
 
-                await self.page.wait_for_load_state("networkidle", timeout=10000)
+                await self._wait_for_networkidle_or_continue("加载闲鱼首页", timeout=10000)
 
                 logger.info(f"正在搜索关键词: {keyword}")
-                await self.page.fill('input[class*="search-input"]', keyword)
+                search_input, selector_used = await self._find_search_input()
+                await search_input.fill(keyword)
+                logger.info(f"✅ 搜索关键词 '{keyword}' 已填入搜索框（选择器: {selector_used}）")
 
                 # 注册响应监听
+                self._clear_response_handler()
+                self._response_handler = on_response
                 self.page.on("response", on_response)
 
-                await self.page.click('button[type="submit"]')
+                await self._submit_search(search_input)
                                   
-                await self.page.wait_for_load_state("networkidle", timeout=15000)
+                await self._wait_for_networkidle_or_continue("提交商品搜索", timeout=15000)
 
                 # 等待第一页API响应（缩短等待时间）
                 logger.info("等待第一页API响应...")
@@ -902,7 +1162,7 @@ class XianyuSearcher:
                 try:
                     await self.page.keyboard.press('Escape')
                     await asyncio.sleep(0.5)
-                except:
+                except Exception:
                     pass
                 # 【核心】检测并处理滑块验证 → 使用公共方法
                 logger.info(f"检测是否有滑块验证...")
@@ -923,6 +1183,18 @@ class XianyuSearcher:
                     }
                 # 等待更多数据
                 await asyncio.sleep(3)
+
+                if not self.api_responses:
+                    page_context = await self._snapshot_page_context()
+                    return {
+                        'items': [],
+                        'total': 0,
+                        'error': (
+                            "未捕获到商品搜索接口响应，请确认当前账号已登录且搜索页正常加载"
+                            f"（当前页面标题: {page_context.get('title') or 'unknown'}，"
+                            f"URL: {page_context.get('url') or 'unknown'}）"
+                        )
+                    }
 
                 first_page_count = len(data_list)
                 logger.info(f"第1页完成，获取到 {first_page_count} 条数据")
@@ -1217,7 +1489,9 @@ class XianyuSearcher:
             logger.info(f"使用 Playwright 搜索多页闲鱼商品: 关键词='{keyword}', 总页数={total_pages}")
 
             # 确保浏览器初始化
-            await self.init_browser()
+            browser_ready = await self.init_browser()
+            if browser_ready is False or self.page is None or self.context is None:
+                raise RuntimeError("浏览器启动失败")
             browser_initialized = True
 
             # 验证浏览器状态
@@ -1282,7 +1556,7 @@ class XianyuSearcher:
                 logger.info("正在设置cookies进行登录...")
                 cookie_success = await self.set_browser_cookies(self.cookie_value)
                 if not cookie_success:
-                    logger.warning("设置cookies失败，将以未登录状态继续")
+                    raise RuntimeError("设置浏览器cookies失败，无法执行商品搜索")
                 else:
                     logger.info("✅ cookies设置成功，已登录")
                     # 刷新页面以应用cookies
@@ -1294,7 +1568,7 @@ class XianyuSearcher:
                     raise Exception("页面在导航后被关闭")
 
                 logger.info("等待页面加载完成...")
-                await self.page.wait_for_load_state("networkidle", timeout=15000)
+                await self._wait_for_networkidle_or_continue("加载闲鱼首页", timeout=15000)
 
                 # 等待页面稳定
                 logger.info("等待页面稳定...")
@@ -1312,45 +1586,24 @@ class XianyuSearcher:
 
                 logger.info(f"正在搜索关键词: {keyword}")
 
-                # 尝试多种搜索框选择器
-                search_selectors = [
-                    'input[class*="search-input"]',
-                    'input[placeholder*="搜索"]',
-                    'input[type="text"]',
-                    '.search-input',
-                    '#search-input'
-                ]
-
-                search_input = None
-                for selector in search_selectors:
-                    try:
-                        logger.info(f"尝试查找搜索框，选择器: {selector}")
-                        search_input = await self.page.wait_for_selector(selector, timeout=5000)
-                        if search_input:
-                            logger.info(f"✅ 找到搜索框，使用选择器: {selector}")
-                            break
-                    except Exception as e:
-                        logger.info(f"❌ 选择器 {selector} 未找到搜索框: {str(e)}")
-                        continue
-
-                if not search_input:
-                    raise Exception("未找到搜索框元素")
+                search_input, selector_used = await self._find_search_input()
 
                 # 检查页面状态
                 if self.page.is_closed():
                     raise Exception("页面在查找搜索框后被关闭")
 
                 await search_input.fill(keyword)
-                logger.info(f"✅ 搜索关键词 '{keyword}' 已填入搜索框")
+                logger.info(f"✅ 搜索关键词 '{keyword}' 已填入搜索框（选择器: {selector_used}）")
 
                 # 注册响应监听
+                self._clear_response_handler()
+                self._response_handler = on_response
                 self.page.on("response", on_response)
 
-                logger.info("🖱️ 准备点击搜索按钮...")
-                await self.page.click('button[type="submit"]')
-                logger.info("✅ 搜索按钮已点击")
+                logger.info("🖱️ 准备提交搜索...")
+                await self._submit_search(search_input)
                     
-                await self.page.wait_for_load_state("networkidle", timeout=15000)
+                await self._wait_for_networkidle_or_continue("提交多页商品搜索", timeout=15000)
 
                 # 等待第一页API响应（优化等待时间）
                 logger.info("等待第一页API响应...")
@@ -1360,7 +1613,7 @@ class XianyuSearcher:
                 try:
                     await self.page.keyboard.press('Escape')
                     await asyncio.sleep(0.5)
-                except:
+                except Exception:
                     pass
                 # 【核心】检测并处理滑块验证 → 使用公共方法
                 logger.info(f"检测是否有滑块验证...")
@@ -1381,6 +1634,18 @@ class XianyuSearcher:
                     }
                 # 等待更多数据
                 await asyncio.sleep(3)
+
+                if not self.api_responses:
+                    page_context = await self._snapshot_page_context()
+                    return {
+                        'items': [],
+                        'total': 0,
+                        'error': (
+                            "未捕获到商品搜索接口响应，请确认当前账号已登录且搜索页正常加载"
+                            f"（当前页面标题: {page_context.get('title') or 'unknown'}，"
+                            f"URL: {page_context.get('url') or 'unknown'}）"
+                        )
+                    }
 
                 first_page_count = len(all_data_list)
                 logger.info(f"第1页完成，获取到 {first_page_count} 条数据")
@@ -1580,6 +1845,12 @@ async def search_xianyu_items(
             if result.get('items') or not result.get('error'):
                 logger.info(f"单页搜索成功，获取到 {len(result.get('items', []))} 条数据")
                 return result
+            if attempt == max_retries:
+                return {
+                    'items': result.get('items', []),
+                    'total': result.get('total', 0),
+                    'error': str(result.get('error') or '商品搜索失败'),
+                }
 
         except Exception as e:
             error_msg = str(e)
@@ -1651,6 +1922,12 @@ async def search_multiple_pages_xianyu(
             if result.get('items') or not result.get('error'):
                 logger.info(f"多页搜索成功，获取到 {len(result.get('items', []))} 条数据")
                 return result
+            if attempt == max_retries:
+                return {
+                    'items': result.get('items', []),
+                    'total': result.get('total', 0),
+                    'error': str(result.get('error') or '多页商品搜索失败'),
+                }
 
         except Exception as e:
             error_msg = str(e)

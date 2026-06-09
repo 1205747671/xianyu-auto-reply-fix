@@ -110,6 +110,32 @@ class ReplyServerManagedRuntimeHelperTest(unittest.TestCase):
         )
         runtime_manager.release_runtime_sync.assert_not_called()
 
+    def test_acquire_slider_managed_runtime_sync_rejects_running_async_runtime_when_action_text_provided(self):
+        slider = mock.Mock()
+        runtime_manager = SimpleNamespace(
+            acquire_runtime_sync=mock.Mock(),
+            get_fresh_page_sync=mock.Mock(),
+            release_runtime_sync=mock.Mock(),
+        )
+
+        with mock.patch.object(reply_server, "account_browser_runtime_manager", runtime_manager), \
+             mock.patch.object(
+                 reply_server,
+                 "_ensure_manual_browser_entry_runtime_available_sync",
+                 side_effect=RuntimeError("账号 acc-busy 当前有运行中的账号浏览器任务"),
+             ):
+            with self.assertRaisesRegex(RuntimeError, "运行中的账号浏览器任务"):
+                reply_server._acquire_slider_managed_runtime_sync(
+                    "acc-busy",
+                    "manual_cookie_import",
+                    slider,
+                    action_text="执行手动导入 Cookie",
+                )
+
+        runtime_manager.acquire_runtime_sync.assert_not_called()
+        runtime_manager.get_fresh_page_sync.assert_not_called()
+        runtime_manager.release_runtime_sync.assert_not_called()
+
     def test_slider_managed_runtime_request_keeps_same_account_profile_dir_across_purposes(self):
         from utils.xianyu_slider_stealth import XianyuSliderStealth
 
@@ -260,6 +286,45 @@ class ReplyServerManualCookieImportFlowTest(unittest.TestCase):
         self.assertIn("cookie2=updated_cookie2", saved_cookie_value)
         fake_manager.add_cookie.assert_called_once()
 
+    def test_execute_manual_cookie_import_cancelled_session_does_not_start_probe_or_browser(self):
+        session_id = "manual_import_cancelled_before_execute"
+        account_id = "manual_import_cancelled_account"
+        reply_server.manual_cookie_import_sessions[session_id] = {
+            "account_id": account_id,
+            "status": "cancelled",
+            "verification_url": None,
+            "screenshot_path": None,
+            "verification_type": None,
+            "slider_instance": None,
+            "task": None,
+            "worker_thread": None,
+            "timestamp": time.time(),
+            "completed_at": time.time(),
+            "user_id": 1,
+            "error": "用户取消Cookie导入验证",
+        }
+
+        async def invoke():
+            await reply_server._execute_manual_cookie_import(
+                session_id=session_id,
+                account_id=account_id,
+                cookie_value="unb=test_user; cookie2=old_cookie2",
+                show_browser=False,
+                user_id=1,
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        with mock.patch("utils.xianyu_slider_stealth.XianyuSliderStealth") as slider_cls, \
+             mock.patch("utils.xianyu_slider_stealth.probe_cookie_verification_from_cookie") as probe_mock, \
+             mock.patch.object(reply_server, "_acquire_slider_managed_runtime_sync") as acquire_runtime_mock, \
+             mock.patch.object(reply_server, "log_with_user"):
+            asyncio.run(invoke())
+
+        slider_cls.assert_not_called()
+        probe_mock.assert_not_called()
+        acquire_runtime_mock.assert_not_called()
+        self.assertEqual("cancelled", reply_server.manual_cookie_import_sessions[session_id]["status"])
+
     def test_execute_manual_cookie_import_acquires_managed_runtime_when_browser_repair_is_required(self):
         session_id = "manual_import_managed_runtime_session"
         account_id = "manual_import_managed_runtime_account"
@@ -289,7 +354,7 @@ class ReplyServerManualCookieImportFlowTest(unittest.TestCase):
             "payload": {"ret": ["FAIL_SYS_USER_VALIDATE"]},
         }
 
-        def acquire_runtime(account_id_value, purpose, slider_instance):
+        def acquire_runtime(account_id_value, purpose, slider_instance, **_kwargs):
             self.assertEqual(account_id_value, account_id)
             self.assertEqual(purpose, "manual_cookie_import")
             self.assertIs(slider_instance, fake_slider)
@@ -344,6 +409,180 @@ class ReplyServerManualCookieImportFlowTest(unittest.TestCase):
         release_mock.assert_called_once_with(fake_lease, reason="manual_cookie_import_completed")
         save_cookie_mock.assert_called_once()
 
+    def test_execute_manual_cookie_import_does_not_persist_when_cancelled_after_browser_success(self):
+        session_id = "manual_import_cancelled_after_browser_success"
+        account_id = "manual_import_cancelled_after_browser_success_account"
+        reply_server.manual_cookie_import_sessions[session_id] = {
+            "account_id": account_id,
+            "status": "processing",
+            "verification_url": None,
+            "screenshot_path": None,
+            "verification_type": None,
+            "slider_instance": None,
+            "task": None,
+            "timestamp": time.time(),
+            "completed_at": None,
+            "user_id": 1,
+        }
+
+        fake_slider = _FakeManagedManualCookieSlider()
+        fake_manager = SimpleNamespace(
+            cookies={},
+            add_cookie=mock.Mock(),
+            update_cookie=mock.Mock(),
+        )
+        fake_lease = SimpleNamespace(account_id=account_id, purpose="manual_cookie_import")
+        probe_result = {
+            "status": "verification_required",
+            "verification_url": "https://passport.goofish.com/iv/test",
+            "payload": {"ret": ["FAIL_SYS_USER_VALIDATE"]},
+        }
+
+        def acquire_runtime(account_id_value, purpose, slider_instance, **_kwargs):
+            self.assertEqual(account_id_value, account_id)
+            self.assertEqual(purpose, "manual_cookie_import")
+            self.assertIs(slider_instance, fake_slider)
+            slider_instance.browser = object()
+            slider_instance.context = object()
+            slider_instance.page = object()
+            return fake_lease
+
+        def merge_and_cancel(_existing_cookie_dict, incoming_cookie_dict):
+            reply_server._set_manual_cookie_import_session_status(
+                session_id,
+                "cancelled",
+                error="用户取消Cookie导入验证",
+            )
+            return {
+                "incoming_missing_protected_fields": [],
+                "preserved_protected_fields": [],
+                "merged_cookies_dict": dict(incoming_cookie_dict),
+            }
+
+        async def invoke():
+            await reply_server._execute_manual_cookie_import(
+                session_id=session_id,
+                account_id=account_id,
+                cookie_value="unb=test_user; cookie2=old_cookie2",
+                show_browser=False,
+                user_id=1,
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        with mock.patch("utils.xianyu_slider_stealth.XianyuSliderStealth", return_value=fake_slider), \
+             mock.patch("utils.xianyu_slider_stealth.probe_cookie_verification_from_cookie", return_value=probe_result), \
+             mock.patch("utils.xianyu_slider_stealth.concurrency_manager.unregister_instance"), \
+             mock.patch.object(reply_server, "_acquire_slider_managed_runtime_sync", side_effect=acquire_runtime), \
+             mock.patch.object(reply_server, "_release_slider_managed_runtime_sync") as release_mock, \
+             mock.patch("XianyuAutoAsync.XianyuLive.protected_merge_cookie_dicts", side_effect=merge_and_cancel), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_details", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_binding_info", return_value={"bound_unb": "", "bind_status": "pending_bind"}), \
+             mock.patch.object(reply_server.db_manager, "bind_cookie_account_unb", return_value=True), \
+             mock.patch.object(reply_server.db_manager, "save_cookie") as save_cookie_mock, \
+             mock.patch.object(reply_server.db_manager, "get_all_cookies", return_value={}), \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "log_with_user"):
+            asyncio.run(invoke())
+
+            deadline = time.time() + 2
+            while (
+                reply_server.manual_cookie_import_sessions[session_id]["status"] == "processing"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+
+        self.assertEqual("cancelled", reply_server.manual_cookie_import_sessions[session_id]["status"])
+        release_mock.assert_called_once_with(fake_lease, reason="manual_cookie_import_completed")
+        save_cookie_mock.assert_not_called()
+        fake_manager.add_cookie.assert_not_called()
+
+    def test_execute_manual_cookie_import_does_not_log_success_when_cancelled_after_persist(self):
+        session_id = "manual_import_cancelled_after_persist"
+        account_id = "manual_import_cancelled_after_persist_account"
+        reply_server.manual_cookie_import_sessions[session_id] = {
+            "account_id": account_id,
+            "status": "processing",
+            "verification_url": None,
+            "screenshot_path": None,
+            "verification_type": None,
+            "slider_instance": None,
+            "task": None,
+            "timestamp": time.time(),
+            "completed_at": None,
+            "user_id": 1,
+        }
+
+        fake_slider = _FakeManagedManualCookieSlider()
+        fake_lease = SimpleNamespace(account_id=account_id, purpose="manual_cookie_import")
+        probe_result = {
+            "status": "verification_required",
+            "verification_url": "https://passport.goofish.com/iv/test",
+            "payload": {"ret": ["FAIL_SYS_USER_VALIDATE"]},
+        }
+
+        def acquire_runtime(account_id_value, purpose, slider_instance, **_kwargs):
+            self.assertEqual(account_id_value, account_id)
+            self.assertEqual(purpose, "manual_cookie_import")
+            self.assertIs(slider_instance, fake_slider)
+            slider_instance.browser = object()
+            slider_instance.context = object()
+            slider_instance.page = object()
+            return fake_lease
+
+        def persist_and_cancel(**_kwargs):
+            reply_server._set_manual_cookie_import_session_status(
+                session_id,
+                "cancelled",
+                error="用户取消Cookie导入验证",
+            )
+            return False
+
+        async def invoke():
+            await reply_server._execute_manual_cookie_import(
+                session_id=session_id,
+                account_id=account_id,
+                cookie_value="unb=test_user; cookie2=old_cookie2",
+                show_browser=False,
+                user_id=1,
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        with mock.patch("utils.xianyu_slider_stealth.XianyuSliderStealth", return_value=fake_slider), \
+             mock.patch("utils.xianyu_slider_stealth.probe_cookie_verification_from_cookie", return_value=probe_result), \
+             mock.patch("utils.xianyu_slider_stealth.concurrency_manager.unregister_instance"), \
+             mock.patch.object(reply_server, "_acquire_slider_managed_runtime_sync", side_effect=acquire_runtime), \
+             mock.patch.object(reply_server, "_release_slider_managed_runtime_sync") as release_mock, \
+             mock.patch.object(reply_server, "_persist_manual_cookie_import_success", side_effect=persist_and_cancel) as persist_mock, \
+             mock.patch("XianyuAutoAsync.XianyuLive.protected_merge_cookie_dicts", return_value={
+                 "incoming_missing_protected_fields": [],
+                 "preserved_protected_fields": [],
+                 "merged_cookies_dict": {
+                     "unb": "test_user",
+                     "_m_h5_tk": "browser_token_12345",
+                     "cookie2": "browser_cookie2",
+                 },
+             }), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_details", return_value={}), \
+             mock.patch.object(reply_server, "log_with_user") as log_mock:
+            asyncio.run(invoke())
+
+            deadline = time.time() + 2
+            while (
+                reply_server.manual_cookie_import_sessions[session_id]["status"] == "processing"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+
+        self.assertEqual("cancelled", reply_server.manual_cookie_import_sessions[session_id]["status"])
+        persist_mock.assert_called_once()
+        release_mock.assert_called_once_with(fake_lease, reason="manual_cookie_import_completed")
+        success_logs = [
+            call
+            for call in log_mock.call_args_list
+            if "成功并已保存" in str(call)
+        ]
+        self.assertEqual([], success_logs)
+
     def test_execute_manual_cookie_import_does_not_overwrite_old_cookie_or_bound_unb_on_binding_conflict(self):
         session_id = "manual_import_bound_unb_conflict_session"
         account_id = "manual_import_bound_unb_conflict_account"
@@ -379,7 +618,7 @@ class ReplyServerManualCookieImportFlowTest(unittest.TestCase):
             "payload": {"ret": ["FAIL_SYS_USER_VALIDATE"]},
         }
 
-        def acquire_runtime(_account_id, _purpose, slider_instance):
+        def acquire_runtime(_account_id, _purpose, slider_instance, **_kwargs):
             slider_instance.browser = object()
             slider_instance.context = object()
             slider_instance.page = object()
@@ -462,7 +701,7 @@ class ReplyServerManualCookieImportFlowTest(unittest.TestCase):
             "payload": {"ret": ["FAIL_SYS_USER_VALIDATE"]},
         }
 
-        def acquire_runtime(_account_id, _purpose, slider_instance):
+        def acquire_runtime(_account_id, _purpose, slider_instance, **_kwargs):
             slider_instance.browser = object()
             slider_instance.context = object()
             slider_instance.page = object()
@@ -503,6 +742,49 @@ class ReplyServerManualCookieImportFlowTest(unittest.TestCase):
         save_cookie_mock.assert_not_called()
         update_cookie_mock.assert_not_called()
 
+    def test_execute_manual_cookie_import_masks_unexpected_failure_message_in_session(self):
+        session_id = "manual_import_unexpected_failure_session"
+        account_id = "manual_import_unexpected_failure_account"
+        reply_server.manual_cookie_import_sessions[session_id] = {
+            "account_id": account_id,
+            "status": "processing",
+            "verification_url": None,
+            "screenshot_path": None,
+            "verification_type": None,
+            "slider_instance": None,
+            "task": None,
+            "timestamp": time.time(),
+            "completed_at": None,
+            "user_id": 1,
+        }
+
+        fake_slider = _FakeSlider()
+
+        async def invoke():
+            await reply_server._execute_manual_cookie_import(
+                session_id=session_id,
+                account_id=account_id,
+                cookie_value="unb=test_user; cookie2=old_cookie2",
+                show_browser=False,
+                user_id=1,
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        with mock.patch("utils.xianyu_slider_stealth.XianyuSliderStealth", return_value=fake_slider), \
+             mock.patch("utils.xianyu_slider_stealth.concurrency_manager.unregister_instance"), \
+             mock.patch.object(
+                 reply_server,
+                 "_acquire_slider_managed_runtime_sync",
+                 side_effect=RuntimeError("manual import worker exploded with sensitive detail"),
+             ), \
+             mock.patch.object(reply_server, "log_with_user"), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_details", return_value={}):
+            asyncio.run(invoke())
+
+        session = reply_server.manual_cookie_import_sessions[session_id]
+        self.assertEqual(session["status"], "failed")
+        self.assertEqual(session["error"], "Cookie 导入验证失败，请稍后重试")
+
 
 class ReplyServerManualCookieImportStatusTest(unittest.TestCase):
     def setUp(self):
@@ -540,6 +822,28 @@ class ReplyServerManualCookieImportStatusTest(unittest.TestCase):
             reply_server.manual_cookie_import_sessions[session_id]["status"],
             "failed",
         )
+
+    def test_check_manual_cookie_import_status_preserves_safe_failed_message_from_session(self):
+        session_id = "manual_import_safe_failed_status_session"
+        reply_server.manual_cookie_import_sessions[session_id] = {
+            "account_id": "safe_failed_account",
+            "status": "failed",
+            "error": "Cookie 导入验证失败，请稍后重试",
+            "timestamp": time.time(),
+            "completed_at": time.time(),
+            "user_id": 1,
+        }
+
+        result = asyncio.run(
+            reply_server.check_manual_cookie_import_status(
+                session_id,
+                current_user={"user_id": 1, "username": "admin"},
+            )
+        )
+
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("Cookie 导入验证失败，请稍后重试", result["message"])
+        self.assertEqual("Cookie 导入验证失败，请稍后重试", result["error"])
 
 
 class ReplyServerQrCodeStatusTest(unittest.TestCase):
@@ -1082,6 +1386,9 @@ class _FakePasswordLoginPreflightSuccessLive:
         type(self).browser_refresh_calls += 1
         return True
 
+    async def close_session(self):
+        return None
+
 
 class _FakePasswordLoginFallbackLive(_FakePasswordLoginPreflightSuccessLive):
     async def preflight_token_after_password_login(self):
@@ -1142,6 +1449,42 @@ class ReplyServerPasswordLoginStatusTest(unittest.TestCase):
             reply_server.password_login_sessions[session_id]["screenshot_path"]
         )
 
+    def test_finalize_password_login_failure_does_not_rewrite_risk_log_after_cancelled(self):
+        session_id = "password_login_cancelled_before_worker_failure"
+        reply_server.password_login_sessions[session_id] = {
+            "account_id": "cancelled_account",
+            "account": "test_user",
+            "show_browser": False,
+            "refresh_mode": False,
+            "risk_control_log_id": 123,
+            "risk_session_id": session_id,
+            "status": "cancelled",
+            "verification_url": None,
+            "screenshot_path": None,
+            "qr_code_url": None,
+            "verification_type": None,
+            "slider_instance": None,
+            "task": None,
+            "timestamp": time.time(),
+            "completed_at": time.time(),
+            "user_id": 1,
+            "error": "用户取消登录",
+        }
+
+        with mock.patch.object(reply_server, "_update_session_risk_log") as update_risk_log, \
+             mock.patch.object(reply_server, "_close_password_login_pending_verification_risk_logs") as close_risk_logs:
+            result = reply_server._finalize_password_login_session_failure(
+                session_id,
+                "worker exploded after cancel",
+                result_code="password_login_failed",
+            )
+
+        self.assertFalse(result)
+        self.assertEqual("cancelled", reply_server.password_login_sessions[session_id]["status"])
+        self.assertEqual("用户取消登录", reply_server.password_login_sessions[session_id]["error"])
+        update_risk_log.assert_not_called()
+        close_risk_logs.assert_not_called()
+
 
 class ReplyServerPasswordLoginExecutionTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -1151,12 +1494,15 @@ class ReplyServerPasswordLoginExecutionTest(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         reply_server.password_login_sessions = self._original_sessions
 
-    async def _wait_for_password_login_status(self, session_id, expected_status, timeout=2.0):
+    async def _wait_for_password_login_status(self, session_id, expected_status, timeout=5.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            current_status = reply_server.password_login_sessions[session_id]["status"]
+            session = reply_server.password_login_sessions[session_id]
+            current_status = session["status"]
             if current_status == expected_status:
-                return
+                worker_thread = session.get("worker_thread")
+                if worker_thread is None or not worker_thread.is_alive():
+                    return
             await asyncio.sleep(0.01)
         self.fail(
             f"password login session {session_id} did not reach {expected_status}, "
@@ -1196,7 +1542,7 @@ class ReplyServerPasswordLoginExecutionTest(unittest.IsolatedAsyncioTestCase):
         fake_slider = _FakePasswordLoginSlider()
         fake_lease = SimpleNamespace(account_id="test_user", purpose="password_login")
 
-        def acquire_runtime(_account_id, _purpose, slider_instance):
+        def acquire_runtime(_account_id, _purpose, slider_instance, **_kwargs):
             slider_instance.browser = object()
             slider_instance.context = object()
             slider_instance.page = object()
@@ -1252,7 +1598,7 @@ class ReplyServerPasswordLoginExecutionTest(unittest.IsolatedAsyncioTestCase):
         fake_slider = _FakeManagedPasswordLoginSlider()
         fake_lease = SimpleNamespace(account_id="test_user", purpose="password_login")
 
-        def acquire_runtime(account_id, purpose, slider_instance):
+        def acquire_runtime(account_id, purpose, slider_instance, **_kwargs):
             self.assertEqual(account_id, "test_user")
             self.assertEqual(purpose, "password_login")
             self.assertIs(slider_instance, fake_slider)
@@ -1294,6 +1640,318 @@ class ReplyServerPasswordLoginExecutionTest(unittest.IsolatedAsyncioTestCase):
         acquire_mock.assert_called_once()
         release_mock.assert_called_once_with(fake_lease, reason="password_login_handoff_release")
 
+    async def test_execute_password_login_does_not_persist_when_cancelled_after_handoff_mark(self):
+        session_id = "password_login_cancelled_after_handoff_mark"
+        self._build_password_login_session(session_id)
+
+        fake_manager = SimpleNamespace(
+            cookies={},
+            add_cookie=mock.Mock(),
+            update_cookie=mock.Mock(),
+        )
+        fake_slider = _FakeManagedPasswordLoginSlider()
+        fake_lease = SimpleNamespace(account_id="test_user", purpose="password_login")
+
+        class _CancellingHandoffLive(_FakePasswordLoginPreflightSuccessLive):
+            @staticmethod
+            def mark_manual_refresh_handoff(account_id=None, source='manual_refresh_handoff', ttl=None):
+                _ = account_id, source, ttl
+                reply_server._set_password_login_session_status(
+                    session_id,
+                    "cancelled",
+                    error="用户取消登录",
+                )
+                return {"updated": True, "phase": "handoff_recovery"}
+
+        def acquire_runtime(account_id, purpose, slider_instance, **_kwargs):
+            self.assertEqual(account_id, "test_user")
+            self.assertEqual(purpose, "password_login")
+            self.assertIs(slider_instance, fake_slider)
+            slider_instance.browser = object()
+            slider_instance.context = object()
+            slider_instance.page = object()
+            return fake_lease
+
+        with mock.patch("utils.xianyu_slider_stealth.XianyuSliderStealth", return_value=fake_slider), \
+             mock.patch("utils.xianyu_slider_stealth.concurrency_manager.unregister_instance", return_value=True), \
+             mock.patch("XianyuAutoAsync.XianyuLive", _CancellingHandoffLive), \
+             mock.patch.object(reply_server, "_acquire_slider_managed_runtime_sync", side_effect=acquire_runtime), \
+             mock.patch.object(reply_server, "_release_slider_managed_runtime_sync") as release_mock, \
+             mock.patch.object(reply_server, "_persist_password_login_success", return_value=False) as persist_mock, \
+             mock.patch.object(reply_server.db_manager, "get_cookie_details", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_proxy_config", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_all_cookies", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_binding_info", return_value={"bound_unb": "", "bind_status": "pending_bind"}), \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "dispatch_account_notifications_sync", return_value=False), \
+             mock.patch.object(reply_server, "render_notification_template", return_value="login ok"), \
+             mock.patch.object(reply_server, "_close_password_login_pending_verification_risk_logs"), \
+             mock.patch.object(reply_server, "_update_session_risk_log"), \
+             mock.patch.object(reply_server, "log_with_user"):
+            await reply_server._execute_password_login(
+                session_id=session_id,
+                account_id="test_user",
+                account="test_account",
+                password="test_password",
+                show_browser=False,
+                user_id=1,
+                current_user={"user_id": 1, "username": "admin"},
+            )
+            await self._wait_for_password_login_status(session_id, "cancelled")
+
+        self.assertEqual("cancelled", reply_server.password_login_sessions[session_id]["status"])
+        release_mock.assert_called_once_with(fake_lease, reason="password_login_handoff_release")
+        persist_mock.assert_not_called()
+
+    async def test_execute_password_login_does_not_emit_success_when_cancelled_after_persist(self):
+        session_id = "password_login_cancelled_after_persist"
+        self._build_password_login_session(session_id)
+
+        fake_manager = SimpleNamespace(
+            cookies={},
+            add_cookie=mock.Mock(),
+            update_cookie=mock.Mock(),
+        )
+        fake_slider = _FakeManagedPasswordLoginSlider()
+        fake_lease = SimpleNamespace(account_id="test_user", purpose="password_login")
+
+        def acquire_runtime(account_id, purpose, slider_instance, **_kwargs):
+            self.assertEqual(account_id, "test_user")
+            self.assertEqual(purpose, "password_login")
+            self.assertIs(slider_instance, fake_slider)
+            slider_instance.browser = object()
+            slider_instance.context = object()
+            slider_instance.page = object()
+            return fake_lease
+
+        def persist_and_cancel(**_kwargs):
+            reply_server._set_password_login_session_status(
+                session_id,
+                "cancelled",
+                error="用户取消登录",
+            )
+            return False
+
+        with mock.patch("utils.xianyu_slider_stealth.XianyuSliderStealth", return_value=fake_slider), \
+             mock.patch("utils.xianyu_slider_stealth.concurrency_manager.unregister_instance", return_value=True), \
+             mock.patch("XianyuAutoAsync.XianyuLive", _FakePasswordLoginPreflightSuccessLive), \
+             mock.patch.object(reply_server, "_acquire_slider_managed_runtime_sync", side_effect=acquire_runtime), \
+             mock.patch.object(reply_server, "_release_slider_managed_runtime_sync") as release_mock, \
+             mock.patch.object(reply_server, "_persist_password_login_success", side_effect=persist_and_cancel) as persist_mock, \
+             mock.patch.object(reply_server.db_manager, "get_cookie_details", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_proxy_config", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_all_cookies", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_binding_info", return_value={"bound_unb": "", "bind_status": "pending_bind"}), \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "dispatch_account_notifications_sync", return_value=False) as dispatch_mock, \
+             mock.patch.object(reply_server, "render_notification_template", return_value="login ok") as render_mock, \
+             mock.patch.object(reply_server, "_close_password_login_pending_verification_risk_logs") as close_risk_logs, \
+             mock.patch.object(reply_server, "_update_session_risk_log") as update_risk_log, \
+             mock.patch.object(reply_server, "log_with_user"):
+            await reply_server._execute_password_login(
+                session_id=session_id,
+                account_id="test_user",
+                account="test_account",
+                password="test_password",
+                show_browser=False,
+                user_id=1,
+                current_user={"user_id": 1, "username": "admin"},
+            )
+            await self._wait_for_password_login_status(session_id, "cancelled")
+
+        self.assertEqual("cancelled", reply_server.password_login_sessions[session_id]["status"])
+        release_mock.assert_called_once_with(fake_lease, reason="password_login_handoff_release")
+        persist_mock.assert_called_once()
+        close_risk_logs.assert_not_called()
+        update_risk_log.assert_not_called()
+        render_mock.assert_not_called()
+        dispatch_mock.assert_not_called()
+
+    async def test_execute_password_refresh_stops_preflight_when_cancelled_after_handoff_mark(self):
+        session_id = "password_refresh_cancelled_after_handoff_mark"
+        self._build_password_login_session(session_id)
+        reply_server.password_login_sessions[session_id]["refresh_mode"] = True
+
+        fake_manager = SimpleNamespace(
+            cookies={},
+            add_cookie=mock.Mock(),
+            update_cookie=mock.Mock(),
+        )
+        fake_slider = _FakeManagedPasswordLoginSlider()
+        fake_lease = SimpleNamespace(account_id="test_user", purpose="password_login")
+
+        class _CancellingRefreshHandoffLive(_FakePasswordLoginPreflightSuccessLive):
+            begin_calls = 0
+            end_calls = 0
+            handoff_calls = 0
+            manual_preflight_calls = 0
+
+            @classmethod
+            def begin_manual_refresh(cls, account_id, source='manual_refresh'):
+                _ = account_id, source
+                cls.begin_calls += 1
+                return {"started": True, "already_active": False}
+
+            @classmethod
+            def end_manual_refresh(cls, account_id, source='manual_refresh'):
+                _ = account_id, source
+                cls.end_calls += 1
+                return {"ended": True}
+
+            @classmethod
+            def mark_manual_refresh_handoff(cls, account_id=None, source='manual_refresh_handoff', ttl=None):
+                _ = account_id, source, ttl
+                cls.handoff_calls += 1
+                reply_server._set_password_login_session_status(
+                    session_id,
+                    "cancelled",
+                    error="用户取消刷新",
+                )
+                return {"updated": True, "phase": "handoff_recovery"}
+
+            async def preflight_token_after_manual_refresh(self):
+                type(self).manual_preflight_calls += 1
+                self.cookies_str = (
+                    "unb=test_user; _m_h5_tk=refresh_prewarmed_token_12345; "
+                    "cookie2=refresh_prewarmed_cookie2"
+                )
+                return "refresh_prewarmed_token_12345"
+
+        def acquire_runtime(account_id, purpose, slider_instance, **_kwargs):
+            self.assertEqual(account_id, "test_user")
+            self.assertEqual(purpose, "password_login")
+            self.assertIs(slider_instance, fake_slider)
+            slider_instance.browser = object()
+            slider_instance.context = object()
+            slider_instance.page = object()
+            return fake_lease
+
+        with mock.patch("utils.xianyu_slider_stealth.XianyuSliderStealth", return_value=fake_slider), \
+             mock.patch("utils.xianyu_slider_stealth.concurrency_manager.unregister_instance", return_value=True), \
+             mock.patch("XianyuAutoAsync.XianyuLive", _CancellingRefreshHandoffLive), \
+             mock.patch.object(reply_server, "_acquire_slider_managed_runtime_sync", side_effect=acquire_runtime), \
+             mock.patch.object(reply_server, "_release_slider_managed_runtime_sync") as release_mock, \
+             mock.patch.object(reply_server, "_invalidate_slider_managed_runtime_sync"), \
+             mock.patch.object(reply_server, "_persist_password_login_success", return_value=False) as persist_mock, \
+             mock.patch.object(reply_server.db_manager, "get_cookie_details", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_proxy_config", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_all_cookies", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_cookie", return_value=""), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_binding_info", return_value={"bound_unb": "", "bind_status": "pending_bind"}), \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "dispatch_account_notifications_sync", return_value=False), \
+             mock.patch.object(reply_server, "render_notification_template", return_value="login ok"), \
+             mock.patch.object(reply_server, "_close_password_login_pending_verification_risk_logs"), \
+             mock.patch.object(reply_server, "_update_session_risk_log"), \
+             mock.patch.object(reply_server, "log_with_user"):
+            await reply_server._execute_password_login(
+                session_id=session_id,
+                account_id="test_user",
+                account="test_account",
+                password="test_password",
+                show_browser=False,
+                user_id=1,
+                current_user={"user_id": 1, "username": "admin"},
+            )
+            await self._wait_for_password_login_status(session_id, "cancelled")
+
+        self.assertEqual("cancelled", reply_server.password_login_sessions[session_id]["status"])
+        self.assertEqual(1, _CancellingRefreshHandoffLive.begin_calls)
+        self.assertEqual(1, _CancellingRefreshHandoffLive.handoff_calls)
+        self.assertEqual(1, _CancellingRefreshHandoffLive.end_calls)
+        self.assertEqual(0, _CancellingRefreshHandoffLive.manual_preflight_calls)
+        release_mock.assert_called_once_with(fake_lease, reason="password_login_captured_cookies")
+        persist_mock.assert_not_called()
+
+    async def test_execute_password_login_fails_when_runtime_becomes_busy_before_worker_acquire(self):
+        session_id = "password_login_runtime_busy_before_worker_acquire"
+        self._build_password_login_session(session_id)
+
+        fake_manager = SimpleNamespace(
+            cookies={},
+            add_cookie=mock.Mock(),
+            update_cookie=mock.Mock(),
+        )
+        fake_slider = _FakePasswordLoginSlider()
+
+        with mock.patch("utils.xianyu_slider_stealth.XianyuSliderStealth", return_value=fake_slider), \
+             mock.patch("utils.xianyu_slider_stealth.concurrency_manager.unregister_instance", return_value=True), \
+             mock.patch.object(
+                 reply_server,
+                 "_acquire_slider_managed_runtime_sync",
+                 side_effect=RuntimeError("账号 test_user 当前有运行中的账号浏览器任务，暂无法执行账号密码登录。请先停止该账号实例或等待当前浏览器任务结束后再试"),
+             ) as acquire_mock, \
+             mock.patch.object(reply_server.db_manager, "get_cookie_details", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_proxy_config", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_all_cookies", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_binding_info", return_value={"bound_unb": "", "bind_status": "pending_bind"}), \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "dispatch_account_notifications_sync", return_value=False), \
+             mock.patch.object(reply_server, "render_notification_template", return_value="login ok"), \
+             mock.patch.object(reply_server, "_close_password_login_pending_verification_risk_logs"), \
+             mock.patch.object(reply_server, "_update_session_risk_log"), \
+             mock.patch.object(reply_server, "log_with_user"):
+            await reply_server._execute_password_login(
+                session_id=session_id,
+                account_id="test_user",
+                account="test_account",
+                password="test_password",
+                show_browser=False,
+                user_id=1,
+                current_user={"user_id": 1, "username": "admin"},
+            )
+            await self._wait_for_password_login_status(session_id, "failed")
+
+        session = reply_server.password_login_sessions[session_id]
+        self.assertIn("运行中的账号浏览器任务", session["error"])
+        acquire_mock.assert_called_once()
+        fake_manager.add_cookie.assert_not_called()
+        fake_manager.update_cookie.assert_not_called()
+
+    async def test_execute_password_login_masks_unexpected_failure_message_in_session(self):
+        session_id = "password_login_unexpected_failure_session"
+        self._build_password_login_session(session_id)
+
+        fake_manager = SimpleNamespace(
+            cookies={},
+            add_cookie=mock.Mock(),
+            update_cookie=mock.Mock(),
+        )
+        fake_slider = _FakePasswordLoginSlider()
+
+        with mock.patch("utils.xianyu_slider_stealth.XianyuSliderStealth", return_value=fake_slider), \
+             mock.patch("utils.xianyu_slider_stealth.concurrency_manager.unregister_instance", return_value=True), \
+             mock.patch.object(
+                 reply_server,
+                 "_acquire_slider_managed_runtime_sync",
+                 side_effect=RuntimeError("password login worker exploded with sensitive detail"),
+             ), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_details", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_proxy_config", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_all_cookies", return_value={}), \
+             mock.patch.object(reply_server.db_manager, "get_cookie_binding_info", return_value={"bound_unb": "", "bind_status": "pending_bind"}), \
+             mock.patch.object(reply_server.cookie_manager, "manager", fake_manager), \
+             mock.patch.object(reply_server, "dispatch_account_notifications_sync", return_value=False), \
+             mock.patch.object(reply_server, "render_notification_template", return_value="login ok"), \
+             mock.patch.object(reply_server, "_close_password_login_pending_verification_risk_logs"), \
+             mock.patch.object(reply_server, "_update_session_risk_log"), \
+             mock.patch.object(reply_server, "log_with_user"):
+            await reply_server._execute_password_login(
+                session_id=session_id,
+                account_id="test_user",
+                account="test_account",
+                password="test_password",
+                show_browser=False,
+                user_id=1,
+                current_user={"user_id": 1, "username": "admin"},
+            )
+            await self._wait_for_password_login_status(session_id, "failed")
+
+        session = reply_server.password_login_sessions[session_id]
+        self.assertEqual("登录失败，请稍后重试", session["error"])
+        fake_manager.add_cookie.assert_not_called()
+        fake_manager.update_cookie.assert_not_called()
+
     async def test_execute_password_login_defers_handoff_without_second_browser_refresh_when_token_preflight_fails(self):
         session_id = "password_login_browser_refresh_fallback_session"
         self._build_password_login_session(session_id)
@@ -1307,7 +1965,7 @@ class ReplyServerPasswordLoginExecutionTest(unittest.IsolatedAsyncioTestCase):
         fake_slider = _FakePasswordLoginSlider()
         fake_lease = SimpleNamespace(account_id="test_user", purpose="password_login")
 
-        def acquire_runtime(_account_id, _purpose, slider_instance):
+        def acquire_runtime(_account_id, _purpose, slider_instance, **_kwargs):
             slider_instance.browser = object()
             slider_instance.context = object()
             slider_instance.page = object()
@@ -1365,7 +2023,7 @@ class ReplyServerPasswordLoginExecutionTest(unittest.IsolatedAsyncioTestCase):
         fake_slider = _FakeManagedPasswordLoginSlider()
         fake_lease = SimpleNamespace(account_id="test_user", purpose="password_login")
 
-        def acquire_runtime(_account_id, _purpose, slider_instance):
+        def acquire_runtime(_account_id, _purpose, slider_instance, **_kwargs):
             slider_instance.browser = object()
             slider_instance.context = object()
             slider_instance.page = object()

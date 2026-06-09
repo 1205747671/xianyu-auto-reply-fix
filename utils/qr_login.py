@@ -19,9 +19,19 @@ from loguru import logger
 import hashlib
 from urllib.parse import urlparse
 
-from utils.account_browser_runtime import account_browser_runtime_manager
+from utils.account_browser_runtime import (
+    account_browser_runtime_manager,
+    capture_owner_lock_token,
+    release_owner_lock_if_owned,
+)
 from utils.image_utils import image_manager
 from utils.xianyu_slider_stealth import get_runtime_browser_identity
+
+
+def _get_account_browser_owner_lock(account_id: str):
+    from XianyuAutoAsync import XianyuLive
+
+    return XianyuLive._get_browser_owner_lock(account_id)
 
 
 QR_CROSS_DOMAIN_COOKIE_NAMES = {
@@ -111,6 +121,8 @@ class QRLoginSession:
         self.verification_url = None  # 风控验证URL
         self.screenshot_path = None  # 风控验证截图
         self.verification_task = None  # 风控验证页面保持任务
+        self.monitor_task = None  # 二维码状态轮询任务
+        self.asset_cleanup_task = None  # runtime/页面句柄异步收尾任务
         self.success_source = None  # 登录成功来源: api/browser
         self.managed_runtime_lease = None
         self.managed_runtime = None
@@ -164,6 +176,25 @@ class QRLoginManager:
         
         # 配置超时时间
         self.timeout = httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=60.0)
+
+    @staticmethod
+    def _normalize_qr_session_error_message(
+        message: Any,
+        *,
+        default_message: str,
+    ) -> str:
+        normalized = str(message or '').strip()
+        if not normalized:
+            return default_message
+        if (
+            "当前有其他浏览器任务正在执行" in normalized
+            or "账号级 browser profile 已被其他 runtime 持有" in normalized
+            or "同账号已存在不兼容的 async runtime 正在使用中" in normalized
+            or "同账号已存在不兼容的 sync runtime 正在使用中" in normalized
+            or "runtime 正在失效回收" in normalized
+        ):
+            return normalized
+        return default_message
 
     def _cookie_marshal(self, cookies: dict) -> str:
         """将Cookie字典转换为字符串"""
@@ -326,6 +357,57 @@ class QRLoginManager:
             raise ValueError("扫码登录验证会话缺少account_id，拒绝按unb/session_id派生profile")
         return account_browser_runtime_manager.resolve_profile_dir(account_id)
 
+    @staticmethod
+    def _bind_runtime_owner_lock(lease: Any, owner_lock: Any, acquired: bool) -> None:
+        if lease is None:
+            return
+        try:
+            setattr(lease, "_owner_lock", owner_lock)
+            setattr(lease, "_owner_lock_acquired", bool(acquired))
+            setattr(lease, "_owner_lock_token", capture_owner_lock_token(owner_lock))
+        except Exception:
+            pass
+
+    async def _release_runtime_owner_lock(self, lease: Any) -> None:
+        if lease is None:
+            return
+        owner_lock = getattr(lease, "_owner_lock", None)
+        owner_lock_acquired = bool(getattr(lease, "_owner_lock_acquired", False))
+        owner_lock_token = getattr(lease, "_owner_lock_token", None)
+        if owner_lock_acquired and owner_lock is not None:
+            release_owner_lock_if_owned(owner_lock, owner_lock_token)
+        try:
+            setattr(lease, "_owner_lock_acquired", False)
+            setattr(lease, "_owner_lock_token", None)
+        except Exception:
+            pass
+
+    async def _release_verification_runtime_lease(self, lease: Any, *, reason: str) -> None:
+        if lease is None:
+            return
+        release_task = None
+        try:
+            release_task = asyncio.create_task(
+                account_browser_runtime_manager.release_runtime(
+                    lease,
+                    reason=reason,
+                )
+            )
+            await asyncio.shield(release_task)
+        except asyncio.CancelledError:
+            if release_task is not None:
+                try:
+                    await release_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as release_error:
+                    logger.warning(
+                        f"扫码登录 runtime lease 取消收尾释放失败，保留取消语义: {release_error}"
+                    )
+            raise
+        finally:
+            await self._release_runtime_owner_lock(lease)
+
     async def _launch_verification_browser_context(self, session: QRLoginSession):
         show_browser = self._should_show_verification_browser()
         launch_options = {
@@ -348,28 +430,82 @@ class QRLoginManager:
             'persistent_context_options': context_options,
         }
 
+        owner_lock = _get_account_browser_owner_lock(session.account_id)
+        lock_acquired = False
+        owner_lock_token = None
+        lease = None
+
+        async def _release_failed_runtime(reason: str) -> None:
+            nonlocal lease, lock_acquired, owner_lock_token
+            if lease is not None:
+                release_lease = lease
+                lease = None
+                lock_acquired = False
+                owner_lock_token = None
+                await self._release_verification_runtime_lease(
+                    release_lease,
+                    reason=reason,
+                )
+                return
+            if lock_acquired:
+                release_owner_lock_if_owned(owner_lock, owner_lock_token)
+                lock_acquired = False
+                owner_lock_token = None
+
         try:
+            await asyncio.wait_for(owner_lock.acquire(), timeout=20.0)
+            lock_acquired = True
+            owner_lock_token = capture_owner_lock_token(owner_lock)
             lease = await account_browser_runtime_manager.acquire_runtime(
                 session.account_id,
                 'qr_login_verification',
                 exclusive=True,
                 runtime_request=runtime_request,
             )
+            self._bind_runtime_owner_lock(lease, owner_lock, lock_acquired)
             runtime = getattr(lease, 'runtime', None)
             context = getattr(runtime, 'context', None)
             browser = getattr(context, 'browser', None) or getattr(runtime, 'browser', None)
             if context is None:
-                await account_browser_runtime_manager.release_runtime(
-                    lease,
-                    reason='verification_context_missing',
+                missing_context_error = RuntimeError(
+                    f"扫码登录验证页 runtime 缺少 context: {session.session_id}"
                 )
-                raise RuntimeError(f"扫码登录验证页 runtime 缺少 context: {session.session_id}")
+                try:
+                    await _release_failed_runtime(
+                        reason='verification_context_missing',
+                    )
+                except Exception as release_error:
+                    logger.warning(
+                        f"扫码登录持久化画像缺少 context 后释放 runtime 失败: {session.session_id}, "
+                        f"错误: {release_error}"
+                    )
+                raise missing_context_error
             logger.info(
                 f"扫码登录验证页复用 CloakBrowser 持久化画像: {session.session_id}, "
                 f"profile_dir: {profile_dir}, headless: {not show_browser}"
             )
             return lease, browser, context, show_browser
+        except asyncio.TimeoutError as timeout_error:
+            if lock_acquired:
+                release_owner_lock_if_owned(owner_lock, owner_lock_token)
+            raise RuntimeError(
+                f"账号 {session.account_id} 当前有其他浏览器任务正在执行，请稍后再试"
+            ) from timeout_error
+        except asyncio.CancelledError:
+            try:
+                await _release_failed_runtime('verification_context_attach_cancelled')
+            except Exception as release_error:
+                logger.warning(
+                    f"扫码登录持久化画像取消收尾释放失败: {session.session_id}, 错误: {release_error}"
+                )
+            raise
         except Exception as persistent_error:
+            try:
+                await _release_failed_runtime('verification_context_attach_failed')
+            except Exception as release_error:
+                logger.warning(
+                    f"扫码登录持久化画像异常收尾释放失败: {session.session_id}, 错误: {release_error}"
+                )
             logger.error(
                 f"扫码登录持久化画像启动失败，拒绝降级到匿名上下文: {session.session_id}, "
                 f"错误: {persistent_error}"
@@ -639,6 +775,24 @@ class QRLoginManager:
             '/iv/' not in current_url
         )
 
+    @staticmethod
+    def _is_active_verification_session(session: Optional[QRLoginSession]) -> bool:
+        if not session:
+            return False
+
+        if str(getattr(session, 'status', '') or '').strip() != 'verification_required':
+            return False
+
+        if not str(getattr(session, 'verification_url', '') or '').strip():
+            return False
+
+        verification_task = getattr(session, 'verification_task', None)
+        verification_task_active = bool(
+            verification_task is not None
+            and not getattr(verification_task, 'done', lambda: True)()
+        )
+        return bool(getattr(session, 'browser_alive', False) or verification_task_active)
+
     def _mark_session_success(
         self,
         session: QRLoginSession,
@@ -698,6 +852,33 @@ class QRLoginManager:
         """提取浏览器上下文中的Cookie字典"""
         cookies = await context.cookies()
         return self._normalize_cookie_dict(cookies)
+
+    async def _close_browser_handle_shielded(self, close_target: Any, *, log_label: str) -> bool:
+        """关闭浏览器句柄；外层取消时也先等 close 完成，避免未跟踪句柄泄漏。"""
+        if not close_target:
+            return False
+        close_method = getattr(close_target, 'close', None)
+        if not callable(close_method):
+            return False
+
+        async def _close_handle() -> None:
+            try:
+                await close_method()
+            except Exception as close_error:
+                logger.debug(f"{log_label}关闭失败，忽略: {close_error}")
+
+        close_task = asyncio.create_task(_close_handle())
+        try:
+            await asyncio.shield(close_task)
+            return False
+        except asyncio.CancelledError:
+            try:
+                await close_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as close_error:
+                logger.debug(f"{log_label}取消收尾关闭失败，忽略: {close_error}")
+            return True
 
     async def _probe_browser_login_success(
         self,
@@ -806,12 +987,16 @@ class QRLoginManager:
             logger.debug(f"扫码登录浏览器侧探测未确认成功: {session.session_id}, 错误: {e}")
         finally:
             if probe_page and not keep_probe_page:
+                close_cancelled = False
                 try:
-                    await probe_page.close()
-                except Exception:
-                    pass
+                    close_cancelled = await self._close_browser_handle_shielded(
+                        probe_page,
+                        log_label=f"扫码登录浏览器侧探测页面: {session.session_id}, ",
+                    )
                 finally:
                     self._untrack_runtime_lease_page(managed_runtime_lease, probe_page)
+                if close_cancelled:
+                    raise asyncio.CancelledError()
 
         return False
 
@@ -843,16 +1028,16 @@ class QRLoginManager:
 
     async def _close_managed_browser_handles(self, runtime, context, page):
         """关闭扫码验证页暂存的浏览器句柄。"""
-        for close_target in (page, context, runtime):
-            if not close_target:
-                continue
-            close_method = getattr(close_target, "close", None)
-            if not callable(close_method):
-                continue
-            try:
-                await close_method()
-            except Exception as close_error:
-                logger.debug(f"关闭扫码登录暂存句柄失败，忽略: {close_error}")
+        close_cancelled = False
+        for close_target, log_label in (
+            (page, "扫码登录暂存 page: "),
+            (context, "扫码登录暂存 context: "),
+            (runtime, "扫码登录暂存 runtime: "),
+        ):
+            if await self._close_browser_handle_shielded(close_target, log_label=log_label):
+                close_cancelled = True
+        if close_cancelled:
+            raise asyncio.CancelledError()
 
     async def _launch_verification_page(self, session_id: str):
         """在服务端打开验证页面并截取二维码，保持原始会话存活"""
@@ -937,7 +1122,10 @@ class QRLoginManager:
             logger.info(f"扫码登录验证页面任务已取消: {session_id}")
             raise
         except Exception as e:
-            launch_error_message = str(e)
+            launch_error_message = self._normalize_qr_session_error_message(
+                e,
+                default_message='打开验证页面失败，请稍后重试',
+            )
             logger.error(f"打开扫码登录验证页面失败: {session_id}, 错误: {e}")
         finally:
             if launch_error_message:
@@ -959,7 +1147,7 @@ class QRLoginManager:
             managed_release_failed = False
             if runtime_lease is not None and not keep_session_handles:
                 try:
-                    await account_browser_runtime_manager.release_runtime(
+                    await self._release_verification_runtime_lease(
                         runtime_lease,
                         reason='qr_login_verification_page_closed',
                     )
@@ -969,24 +1157,25 @@ class QRLoginManager:
                     logger.warning(
                         f"释放扫码登录 verification runtime lease 失败，保留受管 handles 等待统一回收: {release_error}"
                     )
-            try:
-                if page and not keep_current_page and not released_runtime_lease and not managed_release_failed:
-                    await page.close()
-            except Exception:
-                pass
-            finally:
-                if page and not keep_current_page and not released_runtime_lease and not managed_release_failed:
+            direct_close_cancelled = False
+            if page and not keep_current_page and not released_runtime_lease and not managed_release_failed:
+                try:
+                    direct_close_cancelled = await self._close_browser_handle_shielded(
+                        page,
+                        log_label=f"扫码登录验证 page: {session_id}, ",
+                    ) or direct_close_cancelled
+                finally:
                     self._untrack_runtime_lease_page(runtime_lease, page)
-            try:
-                if context and not keep_session_handles and not released_runtime_lease and not managed_release_failed:
-                    await context.close()
-            except Exception:
-                pass
-            try:
-                if browser and not keep_session_handles and not released_runtime_lease and not managed_release_failed:
-                    await browser.close()
-            except Exception:
-                pass
+            if context and not keep_session_handles and not released_runtime_lease and not managed_release_failed:
+                direct_close_cancelled = await self._close_browser_handle_shielded(
+                    context,
+                    log_label=f"扫码登录验证 context: {session_id}, ",
+                ) or direct_close_cancelled
+            if browser and not keep_session_handles and not released_runtime_lease and not managed_release_failed:
+                direct_close_cancelled = await self._close_browser_handle_shielded(
+                    browser,
+                    log_label=f"扫码登录验证 browser: {session_id}, ",
+                ) or direct_close_cancelled
             if latest_session:
                 if not keep_session_handles:
                     latest_session.browser_alive = False
@@ -1007,6 +1196,8 @@ class QRLoginManager:
                     )
 
             logger.info(f"扫码登录验证页面已关闭: {session_id}")
+            if direct_close_cancelled:
+                raise asyncio.CancelledError()
 
     def _ensure_verification_task(self, session: QRLoginSession):
         """确保风控验证页面任务只启动一次"""
@@ -1017,10 +1208,25 @@ class QRLoginManager:
 
     def _cleanup_session_assets(self, session: QRLoginSession, *, reason: str = 'qr_login_session_cleanup'):
         """清理会话关联的截图和后台任务"""
-        task = session.verification_task
-        if task and not task.done():
-            task.cancel()
+        current_task = None
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+
+        for task in (session.verification_task, session.monitor_task):
+            if task and task is not current_task and not task.done():
+                task.cancel()
         session.verification_task = None
+        session.monitor_task = None
+
+        asset_cleanup_task = getattr(session, "asset_cleanup_task", None)
+        if (
+            asset_cleanup_task
+            and asset_cleanup_task is not current_task
+            and not asset_cleanup_task.done()
+        ):
+            return
 
         if session.screenshot_path:
             image_manager.delete_image(session.screenshot_path)
@@ -1038,39 +1244,48 @@ class QRLoginManager:
         session.managed_handles_owned_by_runtime = False
 
         if not any((managed_runtime_lease, managed_runtime, managed_context, managed_page)):
+            session.asset_cleanup_task = None
             return
 
         async def _release_or_close_handles():
-            if managed_runtime_lease is not None:
-                try:
-                    await account_browser_runtime_manager.release_runtime(
-                        managed_runtime_lease,
-                        reason=reason,
-                    )
-                    return
-                except Exception as release_error:
+            current_cleanup_task = asyncio.current_task()
+            try:
+                if managed_runtime_lease is not None:
+                    try:
+                        await self._release_verification_runtime_lease(
+                            managed_runtime_lease,
+                            reason=reason,
+                        )
+                        return
+                    except Exception as release_error:
+                        logger.warning(
+                            f"释放扫码登录 runtime lease 失败，保留受管 handles 等待统一回收: {release_error}"
+                        )
+                        return
+                if managed_handles_owned_by_runtime:
                     logger.warning(
-                        f"释放扫码登录 runtime lease 失败，保留受管 handles 等待统一回收: {release_error}"
+                        "检测到扫码登录受管 handles 缺少 runtime lease，跳过 direct close，等待 runtime manager 统一回收"
                     )
                     return
-            if managed_handles_owned_by_runtime:
-                logger.warning(
-                    "检测到扫码登录受管 handles 缺少 runtime lease，跳过 direct close，等待 runtime manager 统一回收"
+                await self._close_managed_browser_handles(
+                    managed_runtime,
+                    managed_context,
+                    managed_page,
                 )
-                return
-            await self._close_managed_browser_handles(
-                managed_runtime,
-                managed_context,
-                managed_page,
-            )
+            finally:
+                if getattr(session, "asset_cleanup_task", None) is current_cleanup_task:
+                    session.asset_cleanup_task = None
 
         close_coro = _release_or_close_handles()
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            asyncio.run(close_coro)
+            try:
+                asyncio.run(close_coro)
+            finally:
+                session.asset_cleanup_task = None
         else:
-            loop.create_task(close_coro)
+            session.asset_cleanup_task = loop.create_task(close_coro)
 
     def release_session_assets(self, session_id: str, *, reason: str = 'qr_login_session_cleanup') -> None:
         session = self.sessions.get(session_id)
@@ -1099,9 +1314,8 @@ class QRLoginManager:
             if user_id is not None and str(getattr(session, 'user_id', '')) != str(user_id):
                 continue
 
-            session_status = str(getattr(session, 'status', '') or '').strip()
-            handoff_status = str(getattr(session, 'handoff_status', '') or '').strip()
-            if session_status == 'success' and handoff_status == 'success':
+            session_status = str(getattr(session, 'status', '') or '').strip().lower()
+            if session_status == 'success':
                 continue
 
             self._cleanup_pending_account_placeholder(
@@ -1227,7 +1441,12 @@ class QRLoginManager:
                 logger.error("获取登录参数时连接错误")
                 raise
     
-    async def generate_qr_code(self, user_id: Optional[int] = None, account_id: Optional[str] = None) -> Dict[str, Any]:
+    async def generate_qr_code(
+        self,
+        user_id: Optional[int] = None,
+        account_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """生成二维码"""
         try:
             account_id = str(account_id or '').strip()
@@ -1235,7 +1454,12 @@ class QRLoginManager:
                 return {'success': False, 'message': '缺少account_id'}
 
             # 创建新的会话
-            session_id = str(uuid.uuid4())
+            normalized_session_id = str(session_id or '').strip()
+            if normalized_session_id and not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", normalized_session_id):
+                return {'success': False, 'message': '会话ID格式无效'}
+            session_id = normalized_session_id or str(uuid.uuid4())
+            if session_id in self.sessions:
+                return {'success': False, 'message': '扫码登录会话已存在'}
             session = QRLoginSession(session_id, user_id=user_id, account_id=account_id)
 
             # 1. 获取m_h5_tk
@@ -1304,7 +1528,7 @@ class QRLoginManager:
                     self.sessions[session_id] = session
 
                     # 启动状态检查任务
-                    asyncio.create_task(self._monitor_qr_status(session_id))
+                    session.monitor_task = asyncio.create_task(self._monitor_qr_status(session_id))
 
                     logger.info(f"二维码生成成功: {session_id}")
                     return {
@@ -1327,7 +1551,7 @@ class QRLoginManager:
             return {'success': False, 'message': f'连接错误，请检查网络或代理设置'}
         except Exception as e:
             logger.exception("二维码生成过程中发生异常")
-            return {'success': False, 'message': f'生成二维码失败: {str(e)}'}
+            return {'success': False, 'message': '生成二维码失败，请稍后重试'}
     
     async def _poll_qrcode_status(self, session: QRLoginSession) -> httpx.Response:
         """获取二维码扫描状态"""
@@ -1346,6 +1570,11 @@ class QRLoginManager:
 
     async def _monitor_qr_status(self, session_id: str):
         """监控二维码状态"""
+        current_task = None
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
         try:
             session = self.sessions.get(session_id)
             if not session:
@@ -1461,9 +1690,16 @@ class QRLoginManager:
                     self.sessions[session_id],
                     status='failed',
                     phase='monitor_failed',
-                    error_message=str(e),
+                    error_message=self._normalize_qr_session_error_message(
+                        e,
+                        default_message='扫码状态检查失败，请稍后重试',
+                    ),
                     browser_alive=False,
                 )
+        finally:
+            session = self.sessions.get(session_id)
+            if session is not None and session.monitor_task is current_task:
+                session.monitor_task = None
     
     def get_session_status(self, session_id: str) -> Dict[str, Any]:
         """获取会话状态"""
@@ -1471,7 +1707,11 @@ class QRLoginManager:
         if not session:
             return {'status': 'not_found'}
 
-        if session.is_expired() and session.status != 'success':
+        if (
+            session.is_expired()
+            and session.status != 'success'
+            and not self._is_active_verification_session(session)
+        ):
             self._update_session_state(
                 session,
                 status='expired',
@@ -1533,6 +1773,12 @@ class QRLoginManager:
         """清理过期会话"""
         expired_sessions = []
         for session_id, session in self.sessions.items():
+            session_status = str(getattr(session, 'status', '') or '').strip().lower()
+            handoff_status = str(getattr(session, 'handoff_status', '') or '').strip().lower()
+            if session_status == 'success' and handoff_status in {'', 'idle', 'pending', 'processing'}:
+                continue
+            if self._is_active_verification_session(session):
+                continue
             if session.is_expired():
                 expired_sessions.append(session_id)
 
@@ -1541,7 +1787,10 @@ class QRLoginManager:
                 self.sessions[session_id],
                 reason='qr_login_session_expired_cleanup',
             )
-            self._cleanup_session_assets(self.sessions[session_id])
+            self._cleanup_session_assets(
+                self.sessions[session_id],
+                reason='qr_login_session_expired_cleanup',
+            )
             del self.sessions[session_id]
             logger.info(f"清理过期会话: {session_id}")
 

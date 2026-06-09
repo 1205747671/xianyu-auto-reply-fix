@@ -466,10 +466,21 @@ class OrderHistoryPageFetcher:
         return True
 
     async def close(self) -> None:
-        if self.session and not self.session.closed:
-            await self.session.close()
-        self.session = None
-        await self.fetcher.close()
+        close_error = None
+        try:
+            if self.session and not self.session.closed:
+                await self.session.close()
+        except Exception as exc:
+            close_error = exc
+        finally:
+            self.session = None
+            try:
+                await self.fetcher.close()
+            except Exception:
+                if close_error is None:
+                    raise
+            if close_error is not None:
+                raise close_error
 
     async def fetch_recent_orders(
         self,

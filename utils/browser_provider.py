@@ -12,17 +12,59 @@ from urllib.parse import quote, urlparse, urlunparse
 
 import psutil
 
-from cloakbrowser import (
-    build_args,
-    ensure_binary,
-    launch as cloak_launch,
-    launch_async as cloak_launch_async,
-    launch_context as cloak_launch_context,
-    launch_context_async as cloak_launch_context_async,
-    launch_persistent_context as cloak_launch_persistent_context,
-    launch_persistent_context_async as cloak_launch_persistent_context_async,
-    maybe_resolve_geoip,
-)
+import cloakbrowser as _cloakbrowser
+
+
+def _missing_cloakbrowser_attr(name: str):
+    def _missing(*_args, **_kwargs):
+        raise RuntimeError(f"cloakbrowser.{name} is unavailable")
+
+    return _missing
+
+
+def _get_cloakbrowser_attr(name: str):
+    attr = getattr(_cloakbrowser, name, None)
+    if attr is None:
+        return _missing_cloakbrowser_attr(name)
+    return attr
+
+
+def _fallback_build_args(
+    _stealth_args: bool,
+    extra_args: Optional[Sequence[str]],
+    *,
+    timezone: Optional[str] = None,
+    locale: Optional[str] = None,
+    headless: bool = True,
+) -> list[str]:
+    resolved_args = list(extra_args or [])
+    if headless and not any(arg == "--headless" or str(arg).startswith("--headless=") for arg in resolved_args):
+        resolved_args.append("--headless=new")
+    if timezone and not any(str(arg).startswith("--fingerprint-timezone=") for arg in resolved_args):
+        resolved_args.append(f"--fingerprint-timezone={timezone}")
+    if locale and not any(str(arg).startswith("--lang=") for arg in resolved_args):
+        resolved_args.append(f"--lang={locale}")
+    return resolved_args
+
+
+def _fallback_maybe_resolve_geoip(
+    _geoip: bool,
+    _proxy: Any,
+    timezone: Optional[str],
+    locale: Optional[str],
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    return timezone, locale, None
+
+
+build_args = getattr(_cloakbrowser, "build_args", _fallback_build_args)
+ensure_binary = _get_cloakbrowser_attr("ensure_binary")
+cloak_launch = _get_cloakbrowser_attr("launch")
+cloak_launch_async = _get_cloakbrowser_attr("launch_async")
+cloak_launch_context = _get_cloakbrowser_attr("launch_context")
+cloak_launch_context_async = _get_cloakbrowser_attr("launch_context_async")
+cloak_launch_persistent_context = _get_cloakbrowser_attr("launch_persistent_context")
+cloak_launch_persistent_context_async = _get_cloakbrowser_attr("launch_persistent_context_async")
+maybe_resolve_geoip = getattr(_cloakbrowser, "maybe_resolve_geoip", _fallback_maybe_resolve_geoip)
 
 BrowserLike = Any
 BrowserContextLike = Any
@@ -372,6 +414,7 @@ def _read_devtools_active_port(
     deadline = time.monotonic() + startup_timeout
     process_exited = False
     while time.monotonic() < deadline:
+        retry_delay = 0.1
         if process.poll() is not None:
             process_exited = True
         if port_file.exists():
@@ -382,8 +425,8 @@ def _read_devtools_active_port(
             except (OSError, ValueError):
                 # Windows 上 Chromium/CloakBrowser 初始写入 DevToolsActivePort 时
                 # 可能短暂持有独占锁，继续轮询即可。
-                pass
-        sleep(0.1)
+                retry_delay = 0.01
+        sleep(min(retry_delay, max(0.0, deadline - time.monotonic())))
     if process_exited:
         raise RuntimeError("CloakBrowser process exited before DevToolsActivePort was ready")
     raise TimeoutError(f"Timed out waiting for {DEVTOOLS_ACTIVE_PORT}")
@@ -398,6 +441,7 @@ async def _read_devtools_active_port_async(
     deadline = time.monotonic() + startup_timeout
     process_exited = False
     while time.monotonic() < deadline:
+        retry_delay = 0.1
         if process.poll() is not None:
             process_exited = True
         if port_file.exists():
@@ -408,8 +452,8 @@ async def _read_devtools_active_port_async(
             except (OSError, ValueError):
                 # Windows 上 Chromium/CloakBrowser 初始写入 DevToolsActivePort 时
                 # 可能短暂持有独占锁，继续轮询即可。
-                pass
-        await asyncio.sleep(0.1)
+                retry_delay = 0.01
+        await asyncio.sleep(min(retry_delay, max(0.0, deadline - time.monotonic())))
     if process_exited:
         raise RuntimeError("CloakBrowser process exited before DevToolsActivePort was ready")
     raise TimeoutError(f"Timed out waiting for {DEVTOOLS_ACTIVE_PORT}")
